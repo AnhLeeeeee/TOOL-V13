@@ -1,0 +1,10 @@
+TOOL TIKTOK V13.4 - XPATH-ONLY CLEANUP
+
+- Xoa TesseractOcr.cs va moi code khoi dong tesseract.exe.
+- Xoa ImageMatcher.cs; runtime khong con decode/crop screenshot.
+- Viewer chi dung XPathExists + GetText + ViewerCountParser.
+- Xoa fallback toa do/RX viewer va cac key OCR legacy khi Save.
+- Xoa hai API screenshot CDP khong con caller.
+- Giu parser K/M/B va logic threshold/confirm/ArrowDown+F5 nhu truoc.
+- Cap nhat UI Nguoi xem de ghi ro khong can OCR/Tesseract.
+- Tang version assembly/UI len 13.4.

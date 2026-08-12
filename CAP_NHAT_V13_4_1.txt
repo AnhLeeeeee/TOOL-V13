@@ -1,0 +1,16 @@
+CAP NHAT V13.4 -> V13.4.1
+
+1. Dong Manager/Worker V13.4 va Chrome do tool mo.
+2. Copy toan bo noi dung thu muc patch nay vao source V13.4, chon Replace.
+3. Chay BUILD_V13.bat.
+4. Build OK thi chay RUN_V13_DEV.bat.
+
+THAY DOI GIAO DIEN:
+- Xoa toan bo khoi Chrome V13 (CDP) o dau tab Dieu khien / XPath:
+  Mo Chrome, Thu nho Chrome, Ket noi TikTok, Mo thu muc profile,
+  Profile TikTok, Them, Them profile co san, Mo thu muc, Xoa,
+  va dong Chi XPath/CDP.
+- Giu lai 2 dong trang thai: Trang thai Chrome va TikTok.
+- Logic ConnectChromeAsync/CDP van duoc giu nguyen ben trong; chi bo nut thao tac trung lap tren UI.
+- XPath/CDP-only duoc co dinh noi bo = true.
+- Khong thay doi flow automation.

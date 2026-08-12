@@ -1,0 +1,16 @@
+**/bin/
+**/obj/
+dist_v13/
+dist_v125/
+.vs/
+*.user
+build_verify/
+
+# Runtime/user data - never commit to source
+**/logs/
+**/config_backups/
+**/live_cu_tam/
+TikTokProfiles/
+profiles/
+*.log
+runtime_stats.json

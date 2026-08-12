@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <AssemblyName>ToolTikTokManagerV13</AssemblyName>
+    <RootNamespace>ToolTikTokManagerV13</RootNamespace>
+    <Product>Tool TikTok Manager V13</Product>
+    <Version>13.4.1</Version>
+    <FileVersion>13.4.1.0</FileVersion>
+    <AssemblyVersion>13.4.1.0</AssemblyVersion>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <OutputPath>..\dist_v13\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\ManagerShared\Models\*.cs" Link="Shared\Models\%(Filename)%(Extension)" />
+    <Compile Include="..\ManagerShared\Services\*.cs" Link="Shared\Services\%(Filename)%(Extension)" />
+    <Compile Include="..\ManagerShared\Utils\*.cs" Link="Shared\Utils\%(Filename)%(Extension)" />
+    <Compile Include="..\ManagerShared\Controls\*.cs" Link="Shared\Controls\%(Filename)%(Extension)" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\ToolTikTokWorkerV13\ToolTikTokWorkerV13.csproj" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+</Project>

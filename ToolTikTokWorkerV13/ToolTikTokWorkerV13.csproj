@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <AssemblyName>ToolTikTokWorkerV13</AssemblyName>
+    <RootNamespace>ToolTikTokV11</RootNamespace>
+    <Product>Tool TikTok V13 - DOM Input Guard Worker</Product>
+    <Version>13.4.1</Version>
+    <FileVersion>13.4.1.0</FileVersion>
+    <AssemblyVersion>13.4.1.0</AssemblyVersion>
+    <ApplicationManifest>..\V115Core\app.manifest</ApplicationManifest>
+    <OutputPath>..\dist_v13\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\V115Core\MainForm.cs" Link="V115Core\MainForm.cs" />
+    <Compile Include="..\V115Core\MainForm.V13InputGuard.cs" Link="V115Core\MainForm.V13InputGuard.cs" />
+    <Compile Include="..\V115Core\MainForm.V13VmOptimization.cs" Link="V115Core\MainForm.V13VmOptimization.cs" />
+    <Compile Include="..\V115Core\Models\*.cs" Link="V115Core\Models\%(Filename)%(Extension)" />
+    <Compile Include="..\V115Core\Services\*.cs" Link="V115Core\Services\%(Filename)%(Extension)" />
+    <Compile Include="..\V115Core\Utils\*.cs" Link="V115Core\Utils\%(Filename)%(Extension)" />
+    <Compile Include="..\ManagerShared\Services\ChromeProfileNameSyncService.cs" Link="Shared\ChromeProfileNameSyncService.cs" />
+    <Compile Include="..\ManagerShared\Controls\*.cs" Link="Shared\Controls\%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="..\defaults\**\*" Link="defaults\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>
