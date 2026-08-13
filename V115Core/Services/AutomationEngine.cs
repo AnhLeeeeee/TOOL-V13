@@ -41,15 +41,18 @@ public sealed partial class AutomationEngine
     const int F5WaitMs = 1000;
     const int MultiActionGapMs = 600;
     const int LiveVerifyPollMs = 250;
+    const int LiveFastChangePollMs = 100;
     const int LiveVerifyTimeoutMs = 5000;
-    const int ArrowDownSettleBeforeReloadMs = 2000;
-    const int ArrowDownVerifyBeforeReloadMs = 3000;
-    const int ArrowDownRetryAttempts = 2;
+    // Sau ArrowDown, đợi tối đa 5 giây để TikTok bắt đầu đổi roomId/URL.
+    // Đây chỉ là tín hiệu timing để tránh F5 quá sớm; timeout vẫn F5, tuyệt đối không chặn transition.
+    const int ArrowDownWaitForPageChangeMs = 5000;
     const int ArrowDownRetryDelayMs = 750;
-    const int LiveSwitchStuckCooldownMs = 10000;
     const int PriorityPauseMs = 5000;
     const int OldLiveScanIntervalMs = 1500;
     const int OldLiveScanRetryMs = 2500;
+    const int ViewerReadRetryCount = 5;
+    const int ViewerReadRetryDelayMs = 350;
+    const int ViewerGateRetryCooldownMs = 1000;
     const string OldLiveDirectoryName = "live_cu_tam";
     const string OldLiveManifestFileName = "old_live_identity_manifest.json";
     const int RequiredXPathRecoveryMaxAttempts = 3;
@@ -94,7 +97,6 @@ public sealed partial class AutomationEngine
     readonly List<OldLiveEntry> _activeOldLives = [];
     bool _oldLiveManifestLoaded;
     DateTime _nextOldLiveScan = DateTime.MaxValue;
-    DateTime _nextViewer = DateTime.MaxValue;
     DateTime _stopAt = DateTime.MaxValue;
     bool _periodicExecuting;
     PeriodicF5Snapshot _periodicSnapshot = new(false, false, false, DateTime.MaxValue);
@@ -205,9 +207,8 @@ public sealed partial class AutomationEngine
         ResetInputGuardConsecutive("khởi động");
 
         var now = DateTime.Now;
-        // Khi vừa bắt đầu tool, nếu bật kiểm tra người xem thì đọc XPath ngay ở vòng đầu tiên
-        // để có thể đi thẳng vào chuỗi ↓ + F5 hiện có trước khi gửi nội dung.
-        _nextViewer = _s.Viewer.Enabled ? now : DateTime.MaxValue;
+        // V13.4.1 Viewer Gate: không còn lịch đọc người xem định kỳ.
+        // Nếu Viewer bật, số người xem được kiểm tra trực tiếp trước mỗi Click 1/2.
         _stopAt = _s.TimerStopMinutes > 0 ? now.AddMinutes(_s.TimerStopMinutes) : DateTime.MaxValue;
         EnsureOldLivesReadyForRun();
         // Runtime không còn lập lịch quét ảnh vùng lỗi/STOP/ban acc.
@@ -287,10 +288,9 @@ public sealed partial class AutomationEngine
                     // xử lý ở ranh giới giữa các bước, không chen giữa click/dán/Enter.
                     if (await HandleOldLiveExpiryAndScanAsync(ct)) continue;
                     if (await HandlePeriodicCaptureAndF5Async(ct)) continue;
-                    if (await HandleViewerDueAsync(ct)) continue;
 
-                    // V13: InputGuard DOM chạy ngay trước hai bước Click (1 và 5).
-                    // Không screenshot/image-match vùng lỗi trong runtime chính.
+                    // Viewer không còn chạy theo chu kỳ thời gian. Nếu bật, Viewer Gate được
+                    // kiểm tra ngay trong bước 1/5 trước mỗi Click. InputGuard vẫn giữ nguyên.
                     await ExecuteOneStepAsync(ct);
                     ResetRecoveryFailures("workflow chính đã chạy thành công");
                 }
@@ -653,7 +653,8 @@ public sealed partial class AutomationEngine
             {
                 case 1:
                 {
-                    SetStatus("BƯỚC 1/8", $"Kiểm tra ô nhập → Click ô 1 • nội dung {_contentIndex + 1}/{_contents.Count}");
+                    SetStatus("BƯỚC 1/8", $"Kiểm tra người xem + ô nhập → Click ô 1 • nội dung {_contentIndex + 1}/{_contents.Count}");
+                    if (!await EnsureViewerGateBeforeActionAsync("trước Click điểm 1", ct)) return;
                     if (await GuardAndProcessBeforeClickAsync(_s.XPathPoint1, "điểm 1", ct)) return;
                     _log.Info($"Nội dung {_contentIndex + 1}/{_contents.Count}: ô nhập 1 bình thường, bắt đầu click.");
                     await ClickRequiredXPathAsync("Điểm/ô nhập 1", _s.XPathPoint1, ct);
@@ -685,7 +686,8 @@ public sealed partial class AutomationEngine
 
                 case 5:
                 {
-                    SetStatus("BƯỚC 5/8", $"Kiểm tra ô nhập → Click ô 2 • nội dung {_contentIndex + 1}/{_contents.Count}");
+                    SetStatus("BƯỚC 5/8", $"Kiểm tra người xem + ô nhập → Click ô 2 • nội dung {_contentIndex + 1}/{_contents.Count}");
+                    if (!await EnsureViewerGateBeforeActionAsync("trước Click điểm 2", ct)) return;
                     if (await GuardAndProcessBeforeClickAsync(_s.XPathPoint2, "điểm 2", ct)) return;
                     _log.Info($"Nội dung {_contentIndex + 1}/{_contents.Count}: ô nhập 2 bình thường, bắt đầu click.");
                     await ClickRequiredXPathAsync("Điểm/ô nhập 2", _s.XPathPoint2, ct);
@@ -829,8 +831,8 @@ public sealed partial class AutomationEngine
         if (_s.OldLive.Enabled && _activeOldLives.Count > 0)
             _log.Info("F5 định kỳ hoàn tất; giữ nguyên mọi định danh Live cũ active cho tới khi từng entry hết TTL.");
 
-        if (_s.Viewer.Enabled) _nextViewer = DateTime.Now;
-        else await Task.Delay(ActionDelay(), ct);
+        // Viewer Gate sẽ tự kiểm tra ngay trước Click kế tiếp; không còn đặt lịch Viewer định kỳ.
+        if (!_s.Viewer.Enabled) await Task.Delay(ActionDelay(), ct);
         return true;
     }
 
@@ -900,7 +902,7 @@ public sealed partial class AutomationEngine
                 return false;
             }
             _nextOldLiveScan = DateTime.Now.AddMilliseconds(OldLiveScanRetryMs);
-            if (_s.Viewer.Enabled) _nextViewer = DateTime.Now;
+            // Viewer Gate sẽ kiểm tra LIVE mới trước Click kế tiếp.
             return true;
         }
         catch (Exception ex)
@@ -1034,89 +1036,129 @@ public sealed partial class AutomationEngine
 
     static string GenerateOldLiveId(DateTime now) => $"old_live_{now:yyyyMMdd_HHmmss}_{Guid.NewGuid().ToString("N")[..6]}";
 
-    async Task<bool> HandleViewerDueAsync(CancellationToken ct)
+    async Task<(int value, string raw)> ReadViewerWithRetryAsync(string source, CancellationToken ct, int attempts = ViewerReadRetryCount)
     {
-        if (!_s.Viewer.Enabled || DateTime.Now < _nextViewer) return false;
-        await RunViewerCheckNowAsync(ct, _rounds == 0 && _step == 1 ? "kiểm tra lúc khởi động" : "kiểm tra định kỳ");
-        return true;
+        attempts = Math.Clamp(attempts, 1, ViewerReadRetryCount);
+        (int value, string raw) last = (-1, "");
+
+        for (int attempt = 1; attempt <= attempts && _running; attempt++)
+        {
+            await WaitIfPausedAsync(ct);
+            last = await ReadViewerAsync(ct);
+            if (last.value >= 0)
+            {
+                if (attempt > 1)
+                    _log.Info($"[VIEWER_GATE_RENDERED] source={source} attempt={attempt}/{attempts} value={last.value} raw={last.raw}");
+                return last;
+            }
+
+            if (attempt < attempts)
+            {
+                _log.Warn($"[VIEWER_GATE_WAIT_RENDER] source={source} attempt={attempt}/{attempts} waitMs={ViewerReadRetryDelayMs}");
+                await Task.Delay(ViewerReadRetryDelayMs, ct);
+            }
+        }
+
+        return last;
     }
 
-    async Task RunViewerCheckNowAsync(CancellationToken ct, string source)
+    async Task<bool> EnsureViewerGateBeforeActionAsync(string source, CancellationToken ct)
     {
-        if (!_s.Viewer.Enabled) return;
-        SetStatus("ĐỌC NGƯỜI XEM", $"{source} • đang đọc XPath người xem");
-        var (value, raw) = await ReadViewerAsync(ct);
+        if (!_s.Viewer.Enabled) return true;
+
+        SetStatus("KIỂM TRA NGƯỜI XEM", $"{source} • bắt buộc đọc XPath trước khi thao tác");
+        var (value, raw) = await ReadViewerWithRetryAsync(source, ct);
+
         if (value < 0)
         {
-            _log.Warn($"Không đọc được người xem từ XPath ({source}); bỏ qua lần kiểm tra này.");
-            ScheduleNextViewer();
-            return;
+            _log.Warn($"[VIEWER_GATE_UNREADABLE] source={source} Không đọc được người xem sau {ViewerReadRetryCount} lần; KHÔNG cho workflow Click/Dán/Enter. Chuyển LIVE để tìm LIVE đọc được.");
+            return await FindAcceptableViewerLiveAsync(source + " / không đọc được Viewer", null, ct);
         }
 
-        _log.Info($"Kiểm tra người xem ({source}): {value}; ngưỡng={_s.Viewer.Threshold}; raw={raw}");
+        _log.Info($"[VIEWER_GATE_READ] source={source} value={value} threshold={_s.Viewer.Threshold} raw={raw}");
         if (value > _s.Viewer.Threshold)
         {
-            ScheduleNextViewer();
-            return;
+            _log.Info($"[VIEWER_GATE_OK] source={source} value={value} > threshold={_s.Viewer.Threshold}");
+            return true;
         }
 
-        // V10: kết quả thấp đầu tiên được xác nhận ngay trong cùng một lượt, cách nhau 2 giây.
-        int lowCount = 1;
+        // Giữ xác nhận thấp cũ để tránh một lần DOM chớp số thấp gây chuyển LIVE nhầm.
+        var lowCount = 1;
         while (lowCount < Math.Max(1, _s.Viewer.ConfirmLow))
         {
             await Task.Delay(2000, ct);
             await WaitIfPausedAsync(ct);
-            var (confirm, rawConfirm) = await ReadViewerAsync(ct);
+            var (confirm, rawConfirm) = await ReadViewerWithRetryAsync(source + " / xác nhận thấp", ct);
             if (confirm < 0)
             {
-                _log.Warn("Không đọc được khi xác nhận số người xem thấp; bỏ qua lần này.");
-                ScheduleNextViewer();
-                return;
+                _log.Warn($"[VIEWER_GATE_CONFIRM_UNREADABLE] source={source} Không đọc được khi xác nhận thấp; KHÔNG cho workflow tiếp tục.");
+                return await FindAcceptableViewerLiveAsync(source + " / xác nhận Viewer không đọc được", null, ct);
             }
+
             lowCount++;
-            _log.Info($"Xác nhận thấp {lowCount}/{_s.Viewer.ConfirmLow}: {confirm}; raw={rawConfirm}");
+            _log.Info($"[VIEWER_GATE_CONFIRM_LOW] source={source} {lowCount}/{_s.Viewer.ConfirmLow} value={confirm} raw={rawConfirm}");
             if (confirm > _s.Viewer.Threshold)
             {
-                ScheduleNextViewer();
-                return;
+                _log.Info($"[VIEWER_GATE_OK] source={source} xác nhận lại value={confirm} > threshold={_s.Viewer.Threshold}");
+                return true;
             }
             value = confirm;
         }
 
-        await HandleLowViewerLoopAsync(value, ct);
-        if (_running) ScheduleNextViewer();
+        return await FindAcceptableViewerLiveAsync(source, value, ct);
     }
 
-    void ScheduleNextViewer() => _nextViewer = _s.Viewer.Enabled
-        ? DateTime.Now.AddSeconds(Math.Max(1, _s.Viewer.IntervalSec))
-        : DateTime.MaxValue;
-
-    async Task HandleLowViewerLoopAsync(int initial, CancellationToken ct)
+    async Task<bool> FindAcceptableViewerLiveAsync(string source, int? initialLow, CancellationToken ct)
     {
-        int max = Math.Max(1, _s.Viewer.MaxF5);
-        _log.Warn($"Bắt đầu xử lý người xem thấp {initial} ≤ {_s.Viewer.Threshold}; tối đa {max} vòng ↓ + F5.");
+        var max = Math.Max(1, _s.Viewer.MaxF5);
+        if (initialLow.HasValue)
+            _log.Warn($"[VIEWER_GATE_LOW] source={source} value={initialLow.Value} <= threshold={_s.Viewer.Threshold}; tối đa {max} vòng ↓ + F5 để tìm LIVE đủ người.");
+        else
+            _log.Warn($"[VIEWER_GATE_NO_VALUE] source={source}; tối đa {max} vòng ↓ + F5 để tìm LIVE có Viewer đọc được và > ngưỡng.");
 
         for (int i = 1; i <= max && _running; i++)
         {
             await WaitIfPausedAsync(ct);
-            if (!await TransitionAsync($"người xem thấp vòng {i}/{max}", TransitionAction.ArrowDown, "", 1, scheduledPeriodic: false, ct,
-                Math.Max(0, _s.Viewer.WaitAfterF5Sec * 1000)))
+            SetStatus("TÌM LIVE ĐỦ NGƯỜI", $"{source} • vòng {i}/{max}");
+
+            var transitioned = await TransitionAsync(
+                $"Viewer Gate {source} vòng {i}/{max}",
+                TransitionAction.ArrowDown,
+                "",
+                1,
+                scheduledPeriodic: false,
+                ct,
+                Math.Max(0, _s.Viewer.WaitAfterF5Sec * 1000));
+
+            if (!transitioned)
             {
-                ReportProblem("VIEWER_TRANSITION_FAILED", "Người xem thấp", $"Vòng {i}/{max} không thực hiện được thao tác chuyển live; đã dừng riêng chuỗi xử lý người xem.", error: true, throttleSeconds: 15);
-                return;
+                ReportProblem("VIEWER_GATE_TRANSITION_FAILED", "Người xem",
+                    $"{source}: vòng {i}/{max} không chuyển LIVE được. Workflow vẫn bị khóa và sẽ thử lại ở vòng chính.",
+                    error: true, throttleSeconds: 15);
+                await Task.Delay(ViewerGateRetryCooldownMs, ct);
+                return false;
             }
 
-            var (value, raw) = await ReadViewerAsync(ct);
+            var (value, raw) = await ReadViewerWithRetryAsync($"{source} / sau chuyển {i}/{max}", ct);
             if (value < 0)
             {
-                _log.Warn("Sau F5 vẫn không đọc được người xem từ XPath; kết thúc riêng phần kiểm tra người xem và tiếp tục vòng chính.");
-                return;
+                _log.Warn($"[VIEWER_GATE_AFTER_SWITCH_UNREADABLE] source={source} vòng={i}/{max}; Viewer chưa đọc được sau retry → KHÔNG mở workflow, chuyển LIVE tiếp.");
+                continue;
             }
-            _log.Info($"Sau F5 vòng {i}/{max}: {value} người xem; raw={raw}");
-            if (value > _s.Viewer.Threshold) return;
+
+            _log.Info($"[VIEWER_GATE_AFTER_SWITCH] source={source} vòng={i}/{max} value={value} threshold={_s.Viewer.Threshold} raw={raw}");
+            if (value > _s.Viewer.Threshold)
+            {
+                _log.Info($"[VIEWER_GATE_RECOVERED] source={source} vòng={i}/{max} value={value} > threshold={_s.Viewer.Threshold}; cho phép workflow tiếp tục.");
+                return true;
+            }
         }
 
-        await SkipCurrentLiveAsync("VIEWER_LOW_PERSISTENT", "Người xem thấp", $"Số người xem vẫn không vượt {_s.Viewer.Threshold} sau {max} vòng ↓ + F5.", ct);
+        ReportProblem("VIEWER_GATE_NO_SAFE_LIVE", "Người xem",
+            $"{source}: chưa tìm được LIVE có người xem > {_s.Viewer.Threshold} sau {max} vòng. Không Click/Dán/Enter; vòng chính sẽ kiểm tra lại.",
+            throttleSeconds: 10);
+        await Task.Delay(ViewerGateRetryCooldownMs, ct);
+        return false;
     }
 
     async Task<(int value, string raw)> ReadViewerAsync(CancellationToken ct)
@@ -1165,10 +1207,32 @@ public sealed partial class AutomationEngine
         return string.IsNullOrWhiteSpace(identity) ? "(unknown)" : identity;
     }
 
-    static string ExtractLiveIdentityPart(string identity, string name)
+    static bool HasReliableLiveIdentity(string identity)
+        => !string.IsNullOrWhiteSpace(identity)
+        && !identity.Equals("(unknown)", StringComparison.Ordinal)
+        && (identity.Contains("roomId=", StringComparison.OrdinalIgnoreCase)
+            || identity.Contains("broadcaster=", StringComparison.OrdinalIgnoreCase)
+            || identity.Contains("/live/", StringComparison.OrdinalIgnoreCase));
+
+    async Task<LiveSwitchVerification> WaitForLiveChangedAsync(string source, string beforeIdentity, int attempt, int maxAttempts, CancellationToken ct)
+    {
+        _log.Info($"[LIVE_VERIFY_WAIT] source={source} attempt={attempt}/{maxAttempts} timeoutMs={LiveVerifyTimeoutMs} intervalMs={LiveVerifyPollMs}");
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        string latestIdentity = beforeIdentity;
+        while (sw.ElapsedMilliseconds < LiveVerifyTimeoutMs)
+        {
+            await Task.Delay(LiveVerifyPollMs, ct);
+            latestIdentity = await GetCurrentLiveIdentityAsync(ct);
+            if (!string.Equals(latestIdentity, beforeIdentity, StringComparison.Ordinal))
+                return new LiveSwitchVerification(true, beforeIdentity, latestIdentity, attempt, sw.ElapsedMilliseconds);
+        }
+        return new LiveSwitchVerification(false, beforeIdentity, latestIdentity, attempt, sw.ElapsedMilliseconds);
+    }
+
+    static string ExtractLiveIdentityField(string identity, string field)
     {
         if (string.IsNullOrWhiteSpace(identity)) return "";
-        var marker = name + "=";
+        var marker = field + "=";
         var start = identity.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
         if (start < 0) return "";
         start += marker.Length;
@@ -1177,119 +1241,96 @@ public sealed partial class AutomationEngine
         return identity[start..end].Trim();
     }
 
-    static string GetStableLiveIdentityKey(string identity)
+    static string GetLivePageChangeKey(string identity)
     {
-        if (string.IsNullOrWhiteSpace(identity) || identity.Equals("(unknown)", StringComparison.Ordinal)) return "";
-
-        var roomId = ExtractLiveIdentityPart(identity, "roomId");
+        // Chỉ dùng roomId/URL để biết TikTok đã bắt đầu sang LIVE khác.
+        // Không dùng title/broadcaster/text DOM vì các phần đó có thể đổi khi cùng một LIVE đang render.
+        var roomId = ExtractLiveIdentityField(identity, "roomId");
         if (!string.IsNullOrWhiteSpace(roomId)) return "roomId=" + roomId;
 
-        var href = ExtractLiveIdentityPart(identity, "href");
-        if (!string.IsNullOrWhiteSpace(href) && href.Contains("/live", StringComparison.OrdinalIgnoreCase))
-            return "href=" + href;
+        var href = ExtractLiveIdentityField(identity, "href");
+        if (!string.IsNullOrWhiteSpace(href)) return "href=" + href;
 
-        var canonical = ExtractLiveIdentityPart(identity, "canonical");
-        if (!string.IsNullOrWhiteSpace(canonical) && canonical.Contains("/live", StringComparison.OrdinalIgnoreCase))
-            return "canonical=" + canonical;
+        var canonical = ExtractLiveIdentityField(identity, "canonical");
+        if (!string.IsNullOrWhiteSpace(canonical)) return "canonical=" + canonical;
 
         return "";
     }
 
-    static bool HasReliableLiveIdentity(string identity)
-        => !string.IsNullOrWhiteSpace(GetStableLiveIdentityKey(identity));
-
-    static bool HasLiveActuallyChanged(string beforeIdentity, string afterIdentity)
+    async Task<LiveSwitchVerification> WaitForPageChangeBeforeReloadAsync(string source, string beforeIdentity, CancellationToken ct)
     {
-        var beforeKey = GetStableLiveIdentityKey(beforeIdentity);
-        var afterKey = GetStableLiveIdentityKey(afterIdentity);
-        return !string.IsNullOrWhiteSpace(beforeKey)
-            && !string.IsNullOrWhiteSpace(afterKey)
-            && !string.Equals(beforeKey, afterKey, StringComparison.OrdinalIgnoreCase);
-    }
-
-    async Task<LiveSwitchVerification> WaitForLiveChangedAsync(string source, string beforeIdentity, int attempt, int maxAttempts, CancellationToken ct, int timeoutMs = LiveVerifyTimeoutMs)
-    {
-        timeoutMs = Math.Max(LiveVerifyPollMs, timeoutMs);
-        _log.Info($"[LIVE_VERIFY_WAIT] source={source} attempt={attempt}/{maxAttempts} timeoutMs={timeoutMs} intervalMs={LiveVerifyPollMs} beforeKey={GetStableLiveIdentityKey(beforeIdentity)}");
+        var beforeKey = GetLivePageChangeKey(beforeIdentity);
+        var beforeTitle = ExtractLiveIdentityField(beforeIdentity, "title");
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        string latestIdentity = beforeIdentity;
-        while (sw.ElapsedMilliseconds < timeoutMs)
+        var latestIdentity = beforeIdentity;
+
+        _log.Info($"[LIVE_SWITCH_WAIT_PAGE_CHANGE] source={source} maxWaitMs={ArrowDownWaitForPageChangeMs} pollMs={LiveFastChangePollMs} beforeKey={beforeKey} beforeTitle={TrimIdentityForLog(beforeTitle, 100)}");
+
+        while (sw.ElapsedMilliseconds < ArrowDownWaitForPageChangeMs)
         {
-            await Task.Delay(LiveVerifyPollMs, ct);
+            await Task.Delay(LiveFastChangePollMs, ct);
             latestIdentity = await GetCurrentLiveIdentityAsync(ct);
-            if (HasLiveActuallyChanged(beforeIdentity, latestIdentity))
-                return new LiveSwitchVerification(true, beforeIdentity, latestIdentity, attempt, sw.ElapsedMilliseconds);
+            var latestKey = GetLivePageChangeKey(latestIdentity);
+            var latestTitle = ExtractLiveIdentityField(latestIdentity, "title");
+
+            var stableKeyChanged = !string.IsNullOrWhiteSpace(beforeKey)
+                && !string.IsNullOrWhiteSpace(latestKey)
+                && !string.Equals(beforeKey, latestKey, StringComparison.OrdinalIgnoreCase);
+
+            // TikTok có lúc đã render LIVE mới nhưng URL/roomId cập nhật chậm hơn.
+            // Title đổi được dùng như tín hiệu tăng tốc để F5 ngay; không dùng để chặn transition.
+            var titleChanged = !string.IsNullOrWhiteSpace(beforeTitle)
+                && !string.IsNullOrWhiteSpace(latestTitle)
+                && !string.Equals(beforeTitle, latestTitle, StringComparison.Ordinal);
+
+            if (stableKeyChanged || titleChanged)
+            {
+                var trigger = stableKeyChanged ? "roomId/url" : "title";
+                _log.Info($"[LIVE_SWITCH_PAGE_CHANGED] source={source} elapsedMs={sw.ElapsedMilliseconds} trigger={trigger} beforeKey={beforeKey} afterKey={latestKey} beforeTitle={TrimIdentityForLog(beforeTitle, 100)} afterTitle={TrimIdentityForLog(latestTitle, 100)} action=F5_NGAY");
+                return new LiveSwitchVerification(true, beforeIdentity, latestIdentity, 1, sw.ElapsedMilliseconds);
+            }
         }
-        return new LiveSwitchVerification(false, beforeIdentity, latestIdentity, attempt, sw.ElapsedMilliseconds);
+
+        _log.Warn($"[LIVE_SWITCH_PAGE_CHANGE_TIMEOUT] source={source} waitedMs={sw.ElapsedMilliseconds} beforeKey={beforeKey} latestKey={GetLivePageChangeKey(latestIdentity)} action=VAN_F5");
+        return new LiveSwitchVerification(false, beforeIdentity, latestIdentity, 1, sw.ElapsedMilliseconds);
     }
 
-    async Task<LiveSwitchVerification> TryArrowDownSwitchAsync(string source, string fallbackXPath, int count, int waitAfterReloadMs, CancellationToken ct)
+    async Task<LiveSwitchVerification> TryArrowDownSwitchAsync(string source, int count, int waitAfterReloadMs, CancellationToken ct)
     {
         string beforeIdentity = await GetCurrentLiveIdentityAsync(ct);
-        var beforeKey = GetStableLiveIdentityKey(beforeIdentity);
+        var beforeKey = GetLivePageChangeKey(beforeIdentity);
         _log.Info($"[LIVE_VERIFY_BEFORE] source={source} key={beforeKey} identity={TrimIdentityForLog(beforeIdentity)}");
 
-        if (!HasReliableLiveIdentity(beforeIdentity))
-            _log.Warn($"[LIVE_VERIFY_WEAK_IDENTITY] source={source} Không lấy được roomId/href ổn định; sẽ không F5 mù. Nếu ArrowDown không xác nhận được LIVE mới, tool sẽ fallback XPath nút LIVE.");
+        await _chrome.PressKeyAsync("ArrowDown", Math.Clamp(count, 1, 4), MultiActionGapMs, ct);
+        _log.Info($"[LIVE_KEY_SENT] source={source} key=ArrowDown count={Math.Clamp(count, 1, 4)}");
 
-        for (int attempt = 1; attempt <= ArrowDownRetryAttempts; attempt++)
+        // Chỉ chờ để tránh F5 khi TikTok vẫn chưa bắt đầu chuyển trang.
+        // Nếu thấy roomId/URL đổi thì F5 ngay. Nếu hết 5 giây vẫn chưa đọc được thay đổi,
+        // vẫn F5 như flow cũ; kết quả probe này KHÔNG bao giờ chặn transition.
+        var preReload = await WaitForPageChangeBeforeReloadAsync(source, beforeIdentity, ct);
+
+        await _chrome.ReloadAndWaitAsync(Math.Max(0, waitAfterReloadMs), 15000, ct);
+        _log.Info($"[LIVE_SWITCH_DOM_READY] source={source} preReloadChanged={preReload.Changed}");
+        await StopIfFatalTikTokRestrictionAsync($"sau chuyển LIVE: {source}", ct);
+
+        var afterIdentity = await GetCurrentLiveIdentityAsync(ct);
+        var afterKey = GetLivePageChangeKey(afterIdentity);
+        var postReloadChanged = !string.IsNullOrWhiteSpace(beforeKey)
+            && !string.IsNullOrWhiteSpace(afterKey)
+            && !string.Equals(beforeKey, afterKey, StringComparison.OrdinalIgnoreCase);
+
+        if (postReloadChanged)
         {
-            await _chrome.PressKeyAsync("ArrowDown", Math.Clamp(count, 1, 4), MultiActionGapMs, ct);
-            _log.Info($"[LIVE_KEY_SENT] source={source} attempt={attempt}/{ArrowDownRetryAttempts} key=ArrowDown count={Math.Clamp(count, 1, 4)}");
-
-            // V13.4.1 fix: xác nhận roomId/href đổi TRƯỚC khi F5. Nếu phím ↓ không có
-            // tác dụng thì tuyệt đối không reload cùng LIVE, tránh vòng lặp F5 vô hạn.
-            var verify = await WaitForLiveChangedAsync(source, beforeIdentity, attempt, ArrowDownRetryAttempts, ct, ArrowDownVerifyBeforeReloadMs);
-            if (verify.Changed)
-            {
-                _log.Info($"[LIVE_SWITCH_CONFIRMED_PRE_RELOAD] source={source} attempt={attempt}/{ArrowDownRetryAttempts} beforeKey={GetStableLiveIdentityKey(verify.BeforeIdentity)} afterKey={GetStableLiveIdentityKey(verify.AfterIdentity)} elapsed={verify.ElapsedMs}ms");
-
-                // Giữ settle cũ trước F5 nhưng chỉ chạy sau khi đã biết chắc LIVE đổi.
-                var remainingSettle = Math.Max(0, ArrowDownSettleBeforeReloadMs - (int)Math.Min(int.MaxValue, verify.ElapsedMs));
-                if (remainingSettle > 0) await Task.Delay(remainingSettle, ct);
-
-                await _chrome.ReloadAndWaitAsync(Math.Max(0, waitAfterReloadMs), 15000, ct);
-                _log.Info($"[LIVE_SWITCH_DOM_READY] source={source} attempt={attempt}/{ArrowDownRetryAttempts} mode=ArrowDownVerified");
-                await StopIfFatalTikTokRestrictionAsync($"sau chuyển LIVE: {source}", ct);
-
-                var afterReloadIdentity = await GetCurrentLiveIdentityAsync(ct);
-                _log.Info($"[LIVE_SWITCH_CONFIRMED] source={source} attempt={attempt}/{ArrowDownRetryAttempts} before={TrimIdentityForLog(beforeIdentity)} after={TrimIdentityForLog(afterReloadIdentity)}");
-                return new LiveSwitchVerification(true, beforeIdentity, afterReloadIdentity, attempt, verify.ElapsedMs);
-            }
-
-            _log.Warn($"[LIVE_SWITCH_NOT_CHANGED_NO_RELOAD] source={source} attempt={attempt}/{ArrowDownRetryAttempts} beforeKey={beforeKey} afterKey={GetStableLiveIdentityKey(verify.AfterIdentity)} action=KHONG_F5");
-            if (attempt < ArrowDownRetryAttempts)
-            {
-                _log.Warn($"[LIVE_SWITCH_RETRY] source={source} nextAttempt={attempt + 1}/{ArrowDownRetryAttempts} waitMs={ArrowDownRetryDelayMs}");
-                await Task.Delay(ArrowDownRetryDelayMs, ct);
-            }
-        }
-
-        // ArrowDown thất bại 2 lần: dùng đúng XPath nút chuyển LIVE dự phòng hiện có.
-        // Với InputGuard, fallbackXPath truyền vào rỗng nên dùng XPathPeriodicAction chung.
-        var xp = string.IsNullOrWhiteSpace(fallbackXPath) ? _s.XPathPeriodicAction : fallbackXPath;
-        if (!string.IsNullOrWhiteSpace(xp))
-        {
-            _log.Warn($"[LIVE_SWITCH_FALLBACK_XPATH] source={source} ArrowDown không đổi LIVE sau {ArrowDownRetryAttempts} lần; thử XPath nút LIVE. XPath={xp}");
-            var fallback = await TryClickSwitchAsync(source + " fallback XPath", xp, 1, ct);
-            if (fallback.Changed)
-            {
-                await _chrome.ReloadAndWaitAsync(Math.Max(0, waitAfterReloadMs), 15000, ct);
-                _log.Info($"[LIVE_SWITCH_DOM_READY] source={source} action=FallbackXPath");
-                await StopIfFatalTikTokRestrictionAsync($"sau chuyển LIVE fallback XPath: {source}", ct);
-                return fallback;
-            }
+            _log.Info($"[LIVE_SWITCH_CONFIRMED] source={source} beforeKey={beforeKey} afterKey={afterKey} before={TrimIdentityForLog(beforeIdentity)} after={TrimIdentityForLog(afterIdentity)}");
         }
         else
         {
-            _log.Warn($"[LIVE_SWITCH_FALLBACK_XPATH_MISSING] source={source} ArrowDown không đổi LIVE và chưa có XPath nút chuyển LIVE dự phòng.");
+            // Không dùng identity sau F5 để chặn/retry nữa. InputGuard/Viewer/XPath ở vòng kế tiếp
+            // sẽ là nguồn xác nhận thực tế rằng trang mới đã sẵn sàng.
+            _log.Warn($"[LIVE_SWITCH_AFTER_RELOAD_UNVERIFIED] source={source} beforeKey={beforeKey} afterKey={afterKey} action=TIEP_TUC_KHONG_CHAN");
         }
 
-        ReportProblem("LIVE_SWITCH_STUCK", source,
-            $"ArrowDown không đổi được roomId/href sau {ArrowDownRetryAttempts} lần và fallback XPath không thành công. Không F5 cùng LIVE; cooldown {LiveSwitchStuckCooldownMs / 1000}s rồi mới cho vòng sau thử lại.",
-            throttleSeconds: 10);
-        await Task.Delay(LiveSwitchStuckCooldownMs, ct);
-        return new LiveSwitchVerification(false, beforeIdentity, beforeIdentity, ArrowDownRetryAttempts, ArrowDownVerifyBeforeReloadMs);
+        return new LiveSwitchVerification(true, beforeIdentity, afterIdentity, 1, preReload.ElapsedMs);
     }
 
     async Task<LiveSwitchVerification> TryClickSwitchAsync(string source, string xpath, int count, CancellationToken ct)
@@ -1469,7 +1510,7 @@ public sealed partial class AutomationEngine
         int waitAfterReloadMs, CancellationToken ct)
     {
         if (action == TransitionAction.ArrowDown)
-            return await TryArrowDownSwitchAsync(source, xpath, count, waitAfterReloadMs, ct);
+            return await TryArrowDownSwitchAsync(source, count, waitAfterReloadMs, ct);
 
         var verify = await TryClickSwitchAsync(source, xpath, count, ct);
         if (!verify.Changed) return verify;

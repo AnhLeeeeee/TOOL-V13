@@ -63,7 +63,6 @@ public sealed class SettingsService
             XPath = ini.Get("NguoiXem", "XPath"),
             Threshold = ini.GetInt("NguoiXem", "Threshold", 100),
             ConfirmLow = ini.GetInt("NguoiXem", "ConfirmLow", 2),
-            IntervalSec = ini.GetInt("NguoiXem", "IntervalSec", 120),
             WaitAfterF5Sec = ini.GetInt("NguoiXem", "WaitAfterF5Sec", 2),
             MaxF5 = ini.GetInt("NguoiXem", "MaxF5", 100)
         };
@@ -97,7 +96,9 @@ public sealed class SettingsService
         ini.Set("VM", "Mode", s.VmOptimization.Mode.ToString());
         ini.Set("NguoiXem", "Enabled", s.Viewer.Enabled ? 1 : 0); ini.Set("NguoiXem", "XPath", s.Viewer.XPath);
         ini.Set("NguoiXem", "Threshold", s.Viewer.Threshold); ini.Set("NguoiXem", "ConfirmLow", s.Viewer.ConfirmLow);
-        ini.Set("NguoiXem", "IntervalSec", s.Viewer.IntervalSec); ini.Set("NguoiXem", "WaitAfterF5Sec", s.Viewer.WaitAfterF5Sec);
+        ini.Set("NguoiXem", "WaitAfterF5Sec", s.Viewer.WaitAfterF5Sec);
+        // Viewer Gate đọc trước mỗi Click 1/2; key chu kỳ cũ không còn dùng.
+        ini.Remove("NguoiXem", "IntervalSec");
         ini.Set("NguoiXem", "MaxF5", s.Viewer.MaxF5);
         // V13.4.1 XPath-only: xóa hoàn toàn cấu hình OCR/toạ độ viewer legacy.
         foreach (var key in new[] { "OcrRetries", "RX1", "RY1", "RX2", "RY2", "X1", "Y1", "X2", "Y2" }) ini.Remove("NguoiXem", key);

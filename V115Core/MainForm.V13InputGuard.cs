@@ -61,7 +61,7 @@ public sealed partial class MainForm
                    "Hai dòng XPath phía trên dùng chung trực tiếp với Điểm/ô nhập 1 và 2 ở tab Điều khiển / XPath. " +
                    "Bình thường = ô tồn tại, hiển thị, editable, rỗng và còn chữ/placeholder cấu hình (mặc định ‘Nhập’). " +
                    "Nếu bất thường liên tiếp theo số lần xác nhận, tool gọi nguyên flow chuyển LIVE cũ (↓/nút LIVE → chờ → F5 → xác nhận LIVE mới). " +
-                   "Các vùng ảnh lỗi/STOP/ban acc V12.5 không còn chạy trong runtime. Viewer và F5 định kỳ giữ nguyên; Live cũ V13.4.1 dùng định danh tài khoản DOM/XPath."
+                   "Các vùng ảnh lỗi/STOP/ban acc V12.5 không còn chạy trong runtime. Viewer dùng cổng bắt buộc trước mỗi Click 1/2 (không còn chu kỳ định kỳ); F5 định kỳ vẫn giữ nguyên; Live cũ V13.4.1 dùng định danh tài khoản DOM/XPath."
         });
 
         tab.Controls.Add(root);

@@ -1,0 +1,30 @@
+V13.4.1 - VIEWER GATE / BO KIEM TRA DINH KY
+
+Ap dung tren dung source ToolTikTokWorkerV13.zip da gui ngay 13/08/2026.
+
+Thay doi:
+- Bo hoan toan lich doc nguoi xem theo chu ky giay.
+- Xoa muc "Chu ky giay" khoi tab Nguoi xem.
+- Neu bat Nguoi xem: bat buoc doc XPath Viewer truoc Click diem 1 va truoc Click diem 2.
+- Chi khi doc duoc Viewer > nguong moi cho Click/Dan/Enter.
+- Neu Viewer thap: giu logic xac nhan thap, sau do chuyen LIVE + F5 de tim LIVE du nguoi.
+- Neu khong doc duoc Viewer: retry 5 lan, moi lan cach 350 ms; van khong doc duoc thi KHONG cho workflow gui noi dung, chuyen LIVE de tim lai.
+- Sau moi lan chuyen: retry doc Viewer; neu van khong doc duoc thi tiep tuc chuyen, khong fail-open.
+- Max chuyen dung dung cau hinh "Max down+F5" hien tai.
+- InputGuard, Live cu, F5 dinh ky, logic ArrowDown/F5 hien tai khong thay doi.
+
+Cach ap dung:
+1. Dong Manager + tat Worker dang chay.
+2. Copy toan bo noi dung patch vao thu muc source, chon Replace.
+3. Chay BUILD_V13.bat.
+4. Build OK -> RUN_V13_DEV.bat.
+
+Log moi:
+[VIEWER_GATE_READ]
+[VIEWER_GATE_OK]
+[VIEWER_GATE_LOW]
+[VIEWER_GATE_WAIT_RENDER]
+[VIEWER_GATE_UNREADABLE]
+[VIEWER_GATE_AFTER_SWITCH]
+[VIEWER_GATE_RECOVERED]
+[VIEWER_GATE_NO_SAFE_LIVE]

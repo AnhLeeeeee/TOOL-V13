@@ -53,7 +53,7 @@ public sealed partial class MainForm : Form
 
     readonly CheckBox _viewerEnabled = new() { Text = "Bật kiểm tra người xem" };
     readonly TextBox _viewerXp = new();
-    readonly NumericUpDown _viewerThreshold = Num(0, 1000000000), _viewerConfirm = Num(1, 20), _viewerInterval = Num(1, 86400), _viewerWait = Num(0, 60), _viewerMaxF5 = Num(1, 9999);
+    readonly NumericUpDown _viewerThreshold = Num(0, 1000000000), _viewerConfirm = Num(1, 20), _viewerWait = Num(0, 60), _viewerMaxF5 = Num(1, 9999);
     readonly Label _viewerTest = new() { AutoSize = true, Text = "Chưa thử" };
 
     readonly CheckBox _oldEnabled = new() { Text = "Bật Live cũ" };
@@ -743,12 +743,12 @@ public sealed partial class MainForm : Form
         var tab = new TabPage("Người xem"); var p = VerticalPanel();
         p.Controls.Add(_viewerEnabled); p.Controls.Add(XPathLine("XPath số người xem", _viewerXp, () => PickIntoAsync(_viewerXp), async () => await TestViewerAsync()));
         var flow = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Top, WrapContents = true };
-        AddLabeled(flow, "Ngưỡng", _viewerThreshold); AddLabeled(flow, "Xác nhận thấp", _viewerConfirm); AddLabeled(flow, "Chu kỳ giây", _viewerInterval);
+        AddLabeled(flow, "Ngưỡng", _viewerThreshold); AddLabeled(flow, "Xác nhận thấp", _viewerConfirm);
         AddLabeled(flow, "Chờ sau F5 giây", _viewerWait); AddLabeled(flow, "Max ↓+F5", _viewerMaxF5);
         p.Controls.Add(flow);
         var testViewerFlow = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Top };
         testViewerFlow.Controls.Add(Btn("Đọc thử người xem", async (_, _) => await TestViewerAsync())); testViewerFlow.Controls.Add(_viewerTest); p.Controls.Add(testViewerFlow);
-        p.Controls.Add(new Label { AutoSize = true, MaximumSize = new Size(980, 0), Text = "V13.4.1 chỉ đọc số người xem trực tiếp từ XPath/DOM. Parser hiểu 4.3K=4300, 15.6K=15600, 2.5M=2500000. Không dùng screenshot, OCR hay Tesseract; thiếu/không tìm thấy XPath sẽ báo rõ lỗi Người xem và bỏ qua lần kiểm tra." });
+        p.Controls.Add(new Label { AutoSize = true, MaximumSize = new Size(980, 0), Text = "Viewer Gate: khi bật, tool bắt buộc đọc số người xem bằng XPath/DOM trước mỗi Click điểm 1 và điểm 2; không còn kiểm tra theo chu kỳ thời gian. Chỉ khi đọc được số > ngưỡng mới cho Click/Dán/Enter. Nếu thấp hoặc không đọc được sau retry, tool chuyển LIVE + F5 và tiếp tục tìm LIVE đủ người. Parser hiểu 4.3K=4300, 15.6K=15600, 2.5M=2500000." });
         tab.Controls.Add(p); return tab;
     }
 
@@ -854,7 +854,7 @@ public sealed partial class MainForm : Form
         SelectCombo(_periodicMin, _settings.PeriodicF5Minutes == 0 ? "Không dùng" : _settings.PeriodicF5Minutes.ToString()); _timerStop.Value = Clamp(_settings.TimerStopMinutes, _timerStop);
         SetContentsLines(_settingsService.LoadContents());
         _viewerEnabled.Checked = _settings.Viewer.Enabled; _viewerXp.Text = _settings.Viewer.XPath; _viewerThreshold.Value = Clamp(_settings.Viewer.Threshold, _viewerThreshold);
-        _viewerConfirm.Value = Clamp(_settings.Viewer.ConfirmLow, _viewerConfirm); _viewerInterval.Value = Clamp(_settings.Viewer.IntervalSec, _viewerInterval); _viewerWait.Value = Clamp(_settings.Viewer.WaitAfterF5Sec, _viewerWait);
+        _viewerConfirm.Value = Clamp(_settings.Viewer.ConfirmLow, _viewerConfirm); _viewerWait.Value = Clamp(_settings.Viewer.WaitAfterF5Sec, _viewerWait);
         _viewerMaxF5.Value = Clamp(_settings.Viewer.MaxF5, _viewerMaxF5);
         _oldEnabled.Checked = _settings.OldLive.Enabled; _oldIdentityXp.Text = _settings.OldLive.IdentityXPath; _oldActionXp.Text = _settings.OldLive.ActionXPath;
         SelectCombo(_oldKeep, _settings.OldLive.KeepMinutes.ToString());
@@ -937,7 +937,7 @@ public sealed partial class MainForm : Form
             SaveVmOptimizationFromUi();
             ApplyVmOptimizationSettings();
             _settings.Viewer.Enabled = _viewerEnabled.Checked; _settings.Viewer.XPath = _viewerXp.Text.Trim(); _settings.Viewer.Threshold = (int)_viewerThreshold.Value; _settings.Viewer.ConfirmLow = (int)_viewerConfirm.Value;
-            _settings.Viewer.IntervalSec = (int)_viewerInterval.Value; _settings.Viewer.WaitAfterF5Sec = (int)_viewerWait.Value; _settings.Viewer.MaxF5 = (int)_viewerMaxF5.Value;
+            _settings.Viewer.WaitAfterF5Sec = (int)_viewerWait.Value; _settings.Viewer.MaxF5 = (int)_viewerMaxF5.Value;
             _settings.OldLive.Enabled = _oldEnabled.Checked; _settings.OldLive.IdentityXPath = _oldIdentityXp.Text.Trim(); _settings.OldLive.ActionXPath = _oldActionXp.Text.Trim();
             _settings.OldLive.KeepMinutes = int.TryParse(_oldKeep.Text, out var km) ? km : 10;
             _settingsService.Save(_settings); _settingsService.SaveContents(_contents.Text); _log.Info("Đã lưu cấu hình V13.4.1 + XPath/InputGuard/VM mode vào auto_chrome.ini.");

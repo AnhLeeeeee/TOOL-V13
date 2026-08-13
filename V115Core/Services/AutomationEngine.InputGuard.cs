@@ -72,9 +72,8 @@ public sealed partial class AutomationEngine
                     ResetInputGuardConsecutive("LIVE mới có ô nhập bình thường");
                     _log.Info($"[INPUT_GUARD_RECOVERED] point={pointName} LIVE mới đã có ô nhập bình thường.");
 
-                    // Giữ hành vi V12.5: sau khi hết trạng thái hạn chế mới đọc người xem ngay.
-                    if (_s.Viewer.Enabled)
-                        await RunViewerCheckNowAsync(ct, "sau khi ô nhập trở lại bình thường");
+                    // Viewer Gate sẽ tự đọc lại ở đầu đúng bước 1/5 trước khi Click,
+                    // nên không đọc Viewer lặp thêm tại đây.
 
                     if (_running && !_paused) await Task.Delay(ActionDelay(), ct);
                     return true;

@@ -33,7 +33,6 @@ public sealed class ViewerSettings
     public string XPath { get; set; } = "";
     public int Threshold { get; set; } = 100;
     public int ConfirmLow { get; set; } = 2;
-    public int IntervalSec { get; set; } = 120;
     public int WaitAfterF5Sec { get; set; } = 2;
     public int MaxF5 { get; set; } = 100;
 }
