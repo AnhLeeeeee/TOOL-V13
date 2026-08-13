@@ -605,7 +605,7 @@ public sealed partial class MainForm : Form
             Dock = DockStyle.Fill,
             MaximumSize = new Size(780, 0),
             Margin = new Padding(0),
-            Text = "F5 định kỳ, Live cũ và CLICK_F5 dùng ArrowDown CDP → chờ → F5.",
+            Text = "Chuyển LIVE: ArrowDown CDP → xác nhận roomId/href đã đổi → mới F5; nếu ↓ không đổi LIVE sẽ thử XPath nút LIVE dự phòng.",
             TextAlign = ContentAlignment.MiddleLeft
         };
         downWrap.Controls.Add(downFlow, 0, 0);

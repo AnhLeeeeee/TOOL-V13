@@ -1,0 +1,25 @@
+TOOL TIKTOK V13.4.1 - LIVE SWITCH NO-RELOAD FIX
+
+Mục tiêu:
+- Khi ArrowDown không đổi LIVE, KHÔNG F5/reload lại cùng phòng.
+- Chỉ F5 sau khi xác nhận roomId/href đã đổi.
+- Nếu ArrowDown thất bại 2 lần, tự fallback XPath nút LIVE dự phòng hiện có.
+- Nếu cả ArrowDown và XPath đều thất bại, ghi LIVE_SWITCH_STUCK và cooldown 10 giây; không reload mù.
+
+Logic mới:
+1. Lưu roomId/href LIVE hiện tại.
+2. Gửi ArrowDown CDP (giữ logic focus/bring-to-front hiện có).
+3. Poll tối đa 3 giây để xác nhận roomId/href đổi.
+4. Nếu đổi -> mới F5 + chờ DOM ready + tiếp tục flow cũ.
+5. Nếu chưa đổi -> KHÔNG F5, retry ArrowDown lần 2.
+6. Nếu vẫn chưa đổi -> thử XPath nút chuyển LIVE (có hover nếu cấu hình hiện tại yêu cầu).
+7. Nếu XPath cũng thất bại -> LIVE_SWITCH_STUCK, cooldown 10 giây.
+
+Không thay đổi:
+- InputGuard
+- Viewer XPath
+- Live cũ
+- trang vi phạm -> dừng tool
+- VM Safe / VM Max
+- delay chính
+- dữ liệu profile / TikTokProfiles

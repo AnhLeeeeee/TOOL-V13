@@ -43,8 +43,10 @@ public sealed partial class AutomationEngine
     const int LiveVerifyPollMs = 250;
     const int LiveVerifyTimeoutMs = 5000;
     const int ArrowDownSettleBeforeReloadMs = 2000;
+    const int ArrowDownVerifyBeforeReloadMs = 3000;
     const int ArrowDownRetryAttempts = 2;
     const int ArrowDownRetryDelayMs = 750;
+    const int LiveSwitchStuckCooldownMs = 10000;
     const int PriorityPauseMs = 5000;
     const int OldLiveScanIntervalMs = 1500;
     const int OldLiveScanRetryMs = 2500;
@@ -1163,65 +1165,99 @@ public sealed partial class AutomationEngine
         return string.IsNullOrWhiteSpace(identity) ? "(unknown)" : identity;
     }
 
-    static bool HasReliableLiveIdentity(string identity)
-        => !string.IsNullOrWhiteSpace(identity)
-        && !identity.Equals("(unknown)", StringComparison.Ordinal)
-        && (identity.Contains("roomId=", StringComparison.OrdinalIgnoreCase)
-            || identity.Contains("broadcaster=", StringComparison.OrdinalIgnoreCase)
-            || identity.Contains("/live/", StringComparison.OrdinalIgnoreCase));
-
-    async Task<LiveSwitchVerification> WaitForLiveChangedAsync(string source, string beforeIdentity, int attempt, int maxAttempts, CancellationToken ct)
+    static string ExtractLiveIdentityPart(string identity, string name)
     {
-        _log.Info($"[LIVE_VERIFY_WAIT] source={source} attempt={attempt}/{maxAttempts} timeoutMs={LiveVerifyTimeoutMs} intervalMs={LiveVerifyPollMs}");
+        if (string.IsNullOrWhiteSpace(identity)) return "";
+        var marker = name + "=";
+        var start = identity.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+        if (start < 0) return "";
+        start += marker.Length;
+        var end = identity.IndexOf(" | ", start, StringComparison.Ordinal);
+        if (end < 0) end = identity.Length;
+        return identity[start..end].Trim();
+    }
+
+    static string GetStableLiveIdentityKey(string identity)
+    {
+        if (string.IsNullOrWhiteSpace(identity) || identity.Equals("(unknown)", StringComparison.Ordinal)) return "";
+
+        var roomId = ExtractLiveIdentityPart(identity, "roomId");
+        if (!string.IsNullOrWhiteSpace(roomId)) return "roomId=" + roomId;
+
+        var href = ExtractLiveIdentityPart(identity, "href");
+        if (!string.IsNullOrWhiteSpace(href) && href.Contains("/live", StringComparison.OrdinalIgnoreCase))
+            return "href=" + href;
+
+        var canonical = ExtractLiveIdentityPart(identity, "canonical");
+        if (!string.IsNullOrWhiteSpace(canonical) && canonical.Contains("/live", StringComparison.OrdinalIgnoreCase))
+            return "canonical=" + canonical;
+
+        return "";
+    }
+
+    static bool HasReliableLiveIdentity(string identity)
+        => !string.IsNullOrWhiteSpace(GetStableLiveIdentityKey(identity));
+
+    static bool HasLiveActuallyChanged(string beforeIdentity, string afterIdentity)
+    {
+        var beforeKey = GetStableLiveIdentityKey(beforeIdentity);
+        var afterKey = GetStableLiveIdentityKey(afterIdentity);
+        return !string.IsNullOrWhiteSpace(beforeKey)
+            && !string.IsNullOrWhiteSpace(afterKey)
+            && !string.Equals(beforeKey, afterKey, StringComparison.OrdinalIgnoreCase);
+    }
+
+    async Task<LiveSwitchVerification> WaitForLiveChangedAsync(string source, string beforeIdentity, int attempt, int maxAttempts, CancellationToken ct, int timeoutMs = LiveVerifyTimeoutMs)
+    {
+        timeoutMs = Math.Max(LiveVerifyPollMs, timeoutMs);
+        _log.Info($"[LIVE_VERIFY_WAIT] source={source} attempt={attempt}/{maxAttempts} timeoutMs={timeoutMs} intervalMs={LiveVerifyPollMs} beforeKey={GetStableLiveIdentityKey(beforeIdentity)}");
         var sw = System.Diagnostics.Stopwatch.StartNew();
         string latestIdentity = beforeIdentity;
-        while (sw.ElapsedMilliseconds < LiveVerifyTimeoutMs)
+        while (sw.ElapsedMilliseconds < timeoutMs)
         {
             await Task.Delay(LiveVerifyPollMs, ct);
             latestIdentity = await GetCurrentLiveIdentityAsync(ct);
-            if (!string.Equals(latestIdentity, beforeIdentity, StringComparison.Ordinal))
+            if (HasLiveActuallyChanged(beforeIdentity, latestIdentity))
                 return new LiveSwitchVerification(true, beforeIdentity, latestIdentity, attempt, sw.ElapsedMilliseconds);
         }
         return new LiveSwitchVerification(false, beforeIdentity, latestIdentity, attempt, sw.ElapsedMilliseconds);
     }
 
-    async Task<LiveSwitchVerification> TryArrowDownSwitchAsync(string source, int count, int waitAfterReloadMs, CancellationToken ct)
+    async Task<LiveSwitchVerification> TryArrowDownSwitchAsync(string source, string fallbackXPath, int count, int waitAfterReloadMs, CancellationToken ct)
     {
         string beforeIdentity = await GetCurrentLiveIdentityAsync(ct);
-        _log.Info($"[LIVE_VERIFY_BEFORE] source={source} identity={TrimIdentityForLog(beforeIdentity)}");
-        var canVerifyIdentity = HasReliableLiveIdentity(beforeIdentity);
+        var beforeKey = GetStableLiveIdentityKey(beforeIdentity);
+        _log.Info($"[LIVE_VERIFY_BEFORE] source={source} key={beforeKey} identity={TrimIdentityForLog(beforeIdentity)}");
+
+        if (!HasReliableLiveIdentity(beforeIdentity))
+            _log.Warn($"[LIVE_VERIFY_WEAK_IDENTITY] source={source} Không lấy được roomId/href ổn định; sẽ không F5 mù. Nếu ArrowDown không xác nhận được LIVE mới, tool sẽ fallback XPath nút LIVE.");
 
         for (int attempt = 1; attempt <= ArrowDownRetryAttempts; attempt++)
         {
             await _chrome.PressKeyAsync("ArrowDown", Math.Clamp(count, 1, 4), MultiActionGapMs, ct);
             _log.Info($"[LIVE_KEY_SENT] source={source} attempt={attempt}/{ArrowDownRetryAttempts} key=ArrowDown count={Math.Clamp(count, 1, 4)}");
 
-            // Keep the stable V11.5 sequence.  Checking XPath/identity before this
-            // reload races TikTok's virtualized live player and was the source of
-            // false LIVE_SWITCH_FAILED loops in V12.5.
-            await Task.Delay(ArrowDownSettleBeforeReloadMs, ct);
-            _log.Info($"[LIVE_SWITCH_SETTLED] source={source} attempt={attempt}/{ArrowDownRetryAttempts} waitMs={ArrowDownSettleBeforeReloadMs}");
-            await _chrome.ReloadAndWaitAsync(Math.Max(0, waitAfterReloadMs), 15000, ct);
-            _log.Info($"[LIVE_SWITCH_DOM_READY] source={source} attempt={attempt}/{ArrowDownRetryAttempts}");
-            await StopIfFatalTikTokRestrictionAsync($"sau chuyển LIVE: {source}", ct);
-
-            var afterIdentity = await GetCurrentLiveIdentityAsync(ct);
-            if (!canVerifyIdentity || !HasReliableLiveIdentity(afterIdentity))
+            // V13.4.1 fix: xác nhận roomId/href đổi TRƯỚC khi F5. Nếu phím ↓ không có
+            // tác dụng thì tuyệt đối không reload cùng LIVE, tránh vòng lặp F5 vô hạn.
+            var verify = await WaitForLiveChangedAsync(source, beforeIdentity, attempt, ArrowDownRetryAttempts, ct, ArrowDownVerifyBeforeReloadMs);
+            if (verify.Changed)
             {
-                // Some TikTok layouts expose no stable room id.  A successful
-                // ArrowDown + reload + DOM-ready sequence is usable; the following
-                // XPath scan is the authoritative readiness check in that layout.
-                _log.Warn($"[LIVE_SWITCH_UNVERIFIED] source={source} attempt={attempt}/{ArrowDownRetryAttempts} before={TrimIdentityForLog(beforeIdentity)} after={TrimIdentityForLog(afterIdentity)}");
-                return new LiveSwitchVerification(true, beforeIdentity, afterIdentity, attempt, ArrowDownSettleBeforeReloadMs);
+                _log.Info($"[LIVE_SWITCH_CONFIRMED_PRE_RELOAD] source={source} attempt={attempt}/{ArrowDownRetryAttempts} beforeKey={GetStableLiveIdentityKey(verify.BeforeIdentity)} afterKey={GetStableLiveIdentityKey(verify.AfterIdentity)} elapsed={verify.ElapsedMs}ms");
+
+                // Giữ settle cũ trước F5 nhưng chỉ chạy sau khi đã biết chắc LIVE đổi.
+                var remainingSettle = Math.Max(0, ArrowDownSettleBeforeReloadMs - (int)Math.Min(int.MaxValue, verify.ElapsedMs));
+                if (remainingSettle > 0) await Task.Delay(remainingSettle, ct);
+
+                await _chrome.ReloadAndWaitAsync(Math.Max(0, waitAfterReloadMs), 15000, ct);
+                _log.Info($"[LIVE_SWITCH_DOM_READY] source={source} attempt={attempt}/{ArrowDownRetryAttempts} mode=ArrowDownVerified");
+                await StopIfFatalTikTokRestrictionAsync($"sau chuyển LIVE: {source}", ct);
+
+                var afterReloadIdentity = await GetCurrentLiveIdentityAsync(ct);
+                _log.Info($"[LIVE_SWITCH_CONFIRMED] source={source} attempt={attempt}/{ArrowDownRetryAttempts} before={TrimIdentityForLog(beforeIdentity)} after={TrimIdentityForLog(afterReloadIdentity)}");
+                return new LiveSwitchVerification(true, beforeIdentity, afterReloadIdentity, attempt, verify.ElapsedMs);
             }
 
-            if (!string.Equals(afterIdentity, beforeIdentity, StringComparison.Ordinal))
-            {
-                _log.Info($"[LIVE_SWITCH_CONFIRMED] source={source} attempt={attempt}/{ArrowDownRetryAttempts} before={TrimIdentityForLog(beforeIdentity)} after={TrimIdentityForLog(afterIdentity)}");
-                return new LiveSwitchVerification(true, beforeIdentity, afterIdentity, attempt, ArrowDownSettleBeforeReloadMs);
-            }
-
-            _log.Warn($"[LIVE_SWITCH_NOT_CHANGED] source={source} attempt={attempt}/{ArrowDownRetryAttempts} before={TrimIdentityForLog(beforeIdentity)} after={TrimIdentityForLog(afterIdentity)}");
+            _log.Warn($"[LIVE_SWITCH_NOT_CHANGED_NO_RELOAD] source={source} attempt={attempt}/{ArrowDownRetryAttempts} beforeKey={beforeKey} afterKey={GetStableLiveIdentityKey(verify.AfterIdentity)} action=KHONG_F5");
             if (attempt < ArrowDownRetryAttempts)
             {
                 _log.Warn($"[LIVE_SWITCH_RETRY] source={source} nextAttempt={attempt + 1}/{ArrowDownRetryAttempts} waitMs={ArrowDownRetryDelayMs}");
@@ -1229,7 +1265,31 @@ public sealed partial class AutomationEngine
             }
         }
 
-        return new LiveSwitchVerification(false, beforeIdentity, beforeIdentity, ArrowDownRetryAttempts, LiveVerifyTimeoutMs);
+        // ArrowDown thất bại 2 lần: dùng đúng XPath nút chuyển LIVE dự phòng hiện có.
+        // Với InputGuard, fallbackXPath truyền vào rỗng nên dùng XPathPeriodicAction chung.
+        var xp = string.IsNullOrWhiteSpace(fallbackXPath) ? _s.XPathPeriodicAction : fallbackXPath;
+        if (!string.IsNullOrWhiteSpace(xp))
+        {
+            _log.Warn($"[LIVE_SWITCH_FALLBACK_XPATH] source={source} ArrowDown không đổi LIVE sau {ArrowDownRetryAttempts} lần; thử XPath nút LIVE. XPath={xp}");
+            var fallback = await TryClickSwitchAsync(source + " fallback XPath", xp, 1, ct);
+            if (fallback.Changed)
+            {
+                await _chrome.ReloadAndWaitAsync(Math.Max(0, waitAfterReloadMs), 15000, ct);
+                _log.Info($"[LIVE_SWITCH_DOM_READY] source={source} action=FallbackXPath");
+                await StopIfFatalTikTokRestrictionAsync($"sau chuyển LIVE fallback XPath: {source}", ct);
+                return fallback;
+            }
+        }
+        else
+        {
+            _log.Warn($"[LIVE_SWITCH_FALLBACK_XPATH_MISSING] source={source} ArrowDown không đổi LIVE và chưa có XPath nút chuyển LIVE dự phòng.");
+        }
+
+        ReportProblem("LIVE_SWITCH_STUCK", source,
+            $"ArrowDown không đổi được roomId/href sau {ArrowDownRetryAttempts} lần và fallback XPath không thành công. Không F5 cùng LIVE; cooldown {LiveSwitchStuckCooldownMs / 1000}s rồi mới cho vòng sau thử lại.",
+            throttleSeconds: 10);
+        await Task.Delay(LiveSwitchStuckCooldownMs, ct);
+        return new LiveSwitchVerification(false, beforeIdentity, beforeIdentity, ArrowDownRetryAttempts, ArrowDownVerifyBeforeReloadMs);
     }
 
     async Task<LiveSwitchVerification> TryClickSwitchAsync(string source, string xpath, int count, CancellationToken ct)
@@ -1409,7 +1469,7 @@ public sealed partial class AutomationEngine
         int waitAfterReloadMs, CancellationToken ct)
     {
         if (action == TransitionAction.ArrowDown)
-            return await TryArrowDownSwitchAsync(source, count, waitAfterReloadMs, ct);
+            return await TryArrowDownSwitchAsync(source, xpath, count, waitAfterReloadMs, ct);
 
         var verify = await TryClickSwitchAsync(source, xpath, count, ct);
         if (!verify.Changed) return verify;
