@@ -37,15 +37,10 @@ jobs:
           Get-ChildItem .\publish -Recurse -Filter *.pdb | Remove-Item -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path .\publish\TikTokProfiles | Out-Null
           New-Item -ItemType Directory -Force -Path .\publish\profiles | Out-Null
-          '@echo off`r`ncd /d "%~dp0"`r`nstart "" ".\ToolTikTokManagerV13.exe"`r`n' | Set-Content -Encoding ascii .\publish\CHAY_TOOL_V13_4.bat
-          @'
-TOOL TIKTOK V13.4.1 - WINDOWS X64 PORTABLE
-- Khong can cai .NET 8.
-- Khong can Tesseract/OCR.
-- Can Google Chrome.
-- Chay CHAY_TOOL_V13_4.bat hoac ToolTikTokManagerV13.exe.
-- Chrome profile: TikTokProfiles\ten_profile\chrome_profile
-'@ | Set-Content -Encoding utf8 .\publish\README_MAY_KHACH.txt
+          $bat = @('@echo off','cd /d "%~dp0"','start "" ".\ToolTikTokManagerV13.exe"')
+          $bat | Set-Content -Encoding ascii .\publish\CHAY_TOOL_V13_4.bat
+          $readme = @('TOOL TIKTOK V13.4.1 - WINDOWS X64 PORTABLE','- Khong can cai .NET 8.','- Khong can Tesseract/OCR.','- Can Google Chrome.','- Chay CHAY_TOOL_V13_4.bat hoac ToolTikTokManagerV13.exe.','- Chrome profile: TikTokProfiles\ten_profile\chrome_profile')
+          $readme | Set-Content -Encoding utf8 .\publish\README_MAY_KHACH.txt
 
       - name: Upload portable artifact
         uses: actions/upload-artifact@v4
