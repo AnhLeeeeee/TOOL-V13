@@ -277,6 +277,10 @@ public sealed partial class AutomationEngine
                         break;
                     }
 
+                    // Stop guard DOM: trạng thái vi phạm/tính năng bị khóa là lỗi cấp tài khoản,
+                    // không được coi như ô nhập bất thường rồi tiếp tục đổi LIVE.
+                    await StopIfFatalTikTokRestrictionAsync("ranh giới vòng chính", ct);
+
                     // V13 không còn quét ảnh ưu tiên/STOP runtime. Các timer còn lại vẫn chỉ
                     // xử lý ở ranh giới giữa các bước, không chen giữa click/dán/Enter.
                     if (await HandleOldLiveExpiryAndScanAsync(ct)) continue;
@@ -353,6 +357,38 @@ public sealed partial class AutomationEngine
         if (error) _log.Error(msg); else _log.Warn(msg);
         Problem?.Invoke(msg);
         SetStatus(error ? "LỖI" : "CẢNH BÁO", msg);
+    }
+
+    async Task StopIfFatalTikTokRestrictionAsync(string context, CancellationToken ct)
+    {
+        if (!_running || !_chrome.Connected) return;
+
+        string marker;
+        try
+        {
+            marker = await _chrome.DetectFatalFeatureRestrictionAsync(ct);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            // Guard phụ không được làm thay đổi recovery hiện tại nếu CDP vừa rớt đúng lúc quét.
+            // Các đường EnsureCdpRecovered/RecoverAndContinue vẫn chịu trách nhiệm phần đó.
+            if (!IsLikelyCdpIssue(ex))
+                ReportProblem("TIKTOK_FATAL_PAGE_CHECK_FAILED", context,
+                    "Không kiểm tra được trạng thái trang vi phạm: " + ex.Message, throttleSeconds: 60);
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(marker)) return;
+
+        const string reason = "TikTok báo tài khoản đã vi phạm quy tắc và hiện không thể sử dụng tính năng này. Tool đã dừng để tránh tiếp tục thao tác.";
+        ReportProblem("TIKTOK_FEATURE_BLOCKED_STOP", context,
+            $"{reason} marker={marker}", error: true, throttleSeconds: 300);
+        Stop(reason);
+
+        // Stop() đã cancel token của LoopAsync. Ném OCE để mọi flow lồng nhau (Viewer,
+        // InputGuard, transition/recovery) thoát ngay thay vì chạy thêm một thao tác.
+        throw new OperationCanceledException(reason, ct);
     }
 
     void ResetRecoveryFailures(string reason)
@@ -1167,6 +1203,7 @@ public sealed partial class AutomationEngine
             _log.Info($"[LIVE_SWITCH_SETTLED] source={source} attempt={attempt}/{ArrowDownRetryAttempts} waitMs={ArrowDownSettleBeforeReloadMs}");
             await _chrome.ReloadAndWaitAsync(Math.Max(0, waitAfterReloadMs), 15000, ct);
             _log.Info($"[LIVE_SWITCH_DOM_READY] source={source} attempt={attempt}/{ArrowDownRetryAttempts}");
+            await StopIfFatalTikTokRestrictionAsync($"sau chuyển LIVE: {source}", ct);
 
             var afterIdentity = await GetCurrentLiveIdentityAsync(ct);
             if (!canVerifyIdentity || !HasReliableLiveIdentity(afterIdentity))
@@ -1379,6 +1416,7 @@ public sealed partial class AutomationEngine
 
         await _chrome.ReloadAndWaitAsync(Math.Max(0, waitAfterReloadMs), 15000, ct);
         _log.Info($"[LIVE_SWITCH_DOM_READY] source={source} action=ClickXPath");
+        await StopIfFatalTikTokRestrictionAsync($"sau chuyển LIVE: {source}", ct);
         return verify;
     }
 

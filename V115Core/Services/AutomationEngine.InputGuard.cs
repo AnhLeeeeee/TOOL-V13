@@ -6,6 +6,10 @@ public sealed partial class AutomationEngine
 {
     async Task<bool> GuardAndProcessBeforeClickAsync(string inputXPath, string pointName, CancellationToken ct)
     {
+        // Chặn trang vi phạm trước khi InputGuard diễn giải việc mất ô nhập là một LIVE lỗi
+        // thông thường và cố chuyển LIVE tiếp.
+        await StopIfFatalTikTokRestrictionAsync($"InputGuard {pointName}", ct);
+
         if (!_s.InputGuard.Enabled)
         {
             ResetInputGuardConsecutive("InputGuard tắt");
@@ -30,6 +34,7 @@ public sealed partial class AutomationEngine
             while (_running && !ct.IsCancellationRequested)
             {
                 await WaitIfPausedAsync(ct);
+                await StopIfFatalTikTokRestrictionAsync($"InputGuard recovery {pointName}", ct);
                 var count = Math.Min(Math.Clamp(_s.InputGuard.ConsecutiveMax, 1, 4), _inputGuardConsecutiveCount);
                 var source = $"ô nhập bất thường tại {pointName}";
                 _log.Warn($"[INPUT_GUARD_SWITCH] point={pointName} reason={snapshot.Reason} consecutive={_inputGuardConsecutiveCount} actionCount={count}");

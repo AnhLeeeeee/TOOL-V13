@@ -1,8 +1,0 @@
-TOOL TIKTOK V13.4.1 - UI CLEANUP
-
-- Xoa toan bo khoi dieu khien Chrome/Profile trung lap o dau tab Dieu khien / XPath.
-- Giu 2 dong trang thai Chrome va TikTok de theo doi ket noi.
-- Xoa checkbox "Chi XPath/CDP — khong dung toa do/chuot fallback"; StrictXPathOnly luon = true.
-- Nut "Ket noi TikTok" bi xoa khoi UI, nhung ConnectChromeAsync va logic tu ket noi CDP van duoc giu nguyen.
-- Khong thay doi automation, InputGuard, Viewer XPath, Live cu DOM, F5, ArrowDown, VM Safe/Max.
-- Version UI/assembly: 13.4.1.

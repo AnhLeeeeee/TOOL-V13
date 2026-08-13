@@ -988,6 +988,47 @@ public sealed class ChromeController : IAsyncDisposable
         return r.TryGetProperty("value", out var v) ? v.GetString() ?? "" : "";
     }
 
+    /// <summary>
+    /// Phát hiện trang TikTok báo tài khoản đã vi phạm quy tắc và không thể dùng tính năng.
+    /// Chỉ đọc DOM/text qua CDP; không dùng ảnh, OCR hay tọa độ. Chuỗi trả về rỗng nếu
+    /// không thấy trạng thái này, ngược lại trả marker ngắn để AutomationEngine dừng tool.
+    /// </summary>
+    public async Task<string> DetectFatalFeatureRestrictionAsync(CancellationToken ct = default)
+    {
+        const string js = """
+(() => {
+  const norm = (value) => String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    // Unicode NFD không tách ký tự tiếng Việt 'đ', nên phải chuẩn hóa riêng.
+    // Nếu thiếu dòng này, "Bạn đã vi phạm..." thành "ban đa vi pham..."
+    // và marker ASCII "ban da vi pham..." sẽ không bao giờ khớp.
+    .replace(/đ/g, 'd')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const bodyText = norm(document.body?.innerText || '');
+  const hasViolation = bodyText.includes('ban da vi pham cac quy tac');
+  const hasFeatureBlocked = bodyText.includes('khong the su dung tinh nang nay');
+  if (!hasViolation || !hasFeatureBlocked) return '';
+
+  const retryVisible = Array.from(document.querySelectorAll('button,[role="button"],a')).some((el) => {
+    const r = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    if (r.width < 2 || r.height < 2 || style.display === 'none' || style.visibility === 'hidden') return false;
+    return norm(el.innerText || el.textContent || '') === 'thu lai';
+  });
+
+  return retryVisible ? 'VI_RULES_FEATURE_BLOCKED|RETRY_VISIBLE' : 'VI_RULES_FEATURE_BLOCKED';
+})()
+""";
+        var r = await EvalAsync(js, ct: ct);
+        return r.TryGetProperty("value", out var v) && v.ValueKind == JsonValueKind.String
+            ? (v.GetString() ?? "").Trim()
+            : "";
+    }
+
     public Task<DomBox?> GetBoxAsync(string xpath, CancellationToken ct = default)
         => GetBoxNoScrollAsync(xpath, ct);
 
