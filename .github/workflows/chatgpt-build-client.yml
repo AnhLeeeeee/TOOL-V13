@@ -48,6 +48,14 @@ jobs:
           }
           finally { $archive.Dispose() }
 
+      - name: Apply page recovery 30min patch
+        shell: pwsh
+        run: |
+          git apply --whitespace=nowarn .\.buildpatch\page_recovery_ae.patch
+          git apply --whitespace=nowarn .\.buildpatch\page_recovery_cc.patch
+          Select-String -Path .\V115Core\Services\AutomationEngine.cs -Pattern 'PageMaintenanceReloadMinutes = 30' | Out-Null
+          Select-String -Path .\V115Core\Services\ChromeController.cs -Pattern 'RecoverCurrentPageAsync' | Out-Null
+
       - name: Setup .NET 8
         uses: actions/setup-dotnet@v4
         with:
@@ -63,7 +71,7 @@ jobs:
       - name: Upload worker artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ToolTikTok_V13.4.1_LATEST_WORKER_WIN_X64
+          name: ToolTikTok_V13.4.1_PAGE_RECOVERY_30MIN_WORKER_WIN_X64
           path: worker_publish/**
           if-no-files-found: error
           compression-level: 6
