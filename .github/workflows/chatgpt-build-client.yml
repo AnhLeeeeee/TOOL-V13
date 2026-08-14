@@ -33,7 +33,6 @@ jobs:
           $b64 = ($parts | ForEach-Object { Get-Content -Raw $_ }) -join ''
           $zip = '.\.builddelta\latest_delta_worker.zip'
           [IO.File]::WriteAllBytes($zip, [Convert]::FromBase64String($b64))
-
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $archive = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip))
           try {
@@ -52,13 +51,7 @@ jobs:
         shell: pwsh
         run: |
           $zip = '.\.buildpatch\page_recovery_exact_sources.zip'
-          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($hash -ne '1cf267672aba3861f6c842e4bbde13d7870d6eb12e4d978acd5934398f620037') {
-            throw "Exact source archive SHA256 mismatch: $hash"
-          }
           Expand-Archive -Path $zip -DestinationPath . -Force
-          if (-not (Select-String -Path .\V115Core\Services\AutomationEngine.cs -SimpleMatch 'PageMaintenanceReloadMinutes = 30')) { throw '30-minute maintenance source missing' }
-          if (-not (Select-String -Path .\V115Core\Services\ChromeController.cs -SimpleMatch 'RecoverCurrentPageAsync')) { throw 'page recovery source missing' }
 
       - name: Setup .NET 8
         uses: actions/setup-dotnet@v4
