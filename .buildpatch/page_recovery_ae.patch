@@ -1,0 +1,212 @@
+--- a/V115Core/Services/AutomationEngine.cs
++++ b/V115Core/Services/AutomationEngine.cs
+@@ -51,6 +51,11 @@
+     const int ArrowDownResetReloadWaitMs = 1000;
+     const int ArrowDownRetryDelayMs = 300;
+     const int PriorityPauseMs = 5000;
++    // Bộ F5 cứu trang độc lập: không đổi LIVE. Bình thường reload trang hiện tại mỗi 30 phút;
++    // nếu renderer/tab crash (Aw, Snap!/Out of Memory/CDP target crashed) thì xử lý ngay.
++    const int PageMaintenanceReloadMinutes = 30;
++    const int PageHealthProbeIntervalMs = 2000;
++    const int PageRecoveryReloadWaitMs = 1200;
+     const int OldLiveScanIntervalMs = 1500;
+     const int OldLiveScanRetryMs = 2500;
+     const int ViewerReadRetryCount = 5;
+@@ -102,6 +107,10 @@
+     bool _oldLiveManifestLoaded;
+     DateTime _nextOldLiveScan = DateTime.MaxValue;
+     DateTime _stopAt = DateTime.MaxValue;
++    DateTime _pageMaintenanceDue = DateTime.MaxValue;
++    DateTime _nextPageHealthProbe = DateTime.MinValue;
++    string _lastHealthyTikTokUrl = "";
++    bool _pageRecoveryExecuting;
+     bool _periodicExecuting;
+     PeriodicF5Snapshot _periodicSnapshot = new(false, false, false, DateTime.MaxValue);
+     DateTime? _lastOldLiveSavedAt;
+@@ -221,6 +230,9 @@
+         EnsureOldLivesReadyForRun();
+         // Runtime không còn lập lịch quét ảnh vùng lỗi/STOP/ban acc.
+ 
++        _lastHealthyTikTokUrl = _chrome.Page?.Url ?? "";
++        _nextPageHealthProbe = now;
++        ResetPageMaintenanceDue("khởi động");
+         ResetPeriodicDue("khởi động", cancelCandidate: true);
+         SyncPeriodicSnapshot();
+         _cts = new CancellationTokenSource();
+@@ -288,6 +300,10 @@
+                         break;
+                     }
+ 
++                    // Crash renderer phải được xử lý trước mọi DOM/XPath guard. Khi Chrome hiện
++                    // “Ôi, hỏng!/Out of Memory”, Runtime.evaluate có thể không còn hoạt động.
++                    if (await HandleImmediatePageCrashRecoveryAsync(ct)) continue;
++
+                     // Stop guard DOM: trạng thái vi phạm/tính năng bị khóa là lỗi cấp tài khoản,
+                     // không được coi như ô nhập bất thường rồi tiếp tục đổi LIVE.
+                     await StopIfFatalTikTokRestrictionAsync("ranh giới vòng chính", ct);
+@@ -301,6 +317,7 @@
+                     // xử lý ở ranh giới giữa các bước, không chen giữa click/dán/Enter.
+                     if (await HandleOldLiveExpiryAndScanAsync(ct)) continue;
+                     if (await HandlePeriodicCaptureAndF5Async(ct)) continue;
++                    if (await HandlePageMaintenanceReloadAsync(ct)) continue;
+ 
+                     // Viewer không còn chạy theo chu kỳ thời gian. Nếu bật, Viewer Gate được
+                     // kiểm tra ngay trong bước 1/5 trước mỗi Click. InputGuard vẫn giữ nguyên.
+@@ -765,12 +782,138 @@
+ 
+     void ShiftPeriodicClock(TimeSpan delta)
+     {
+-        if (delta <= TimeSpan.Zero || _s.PeriodicF5Minutes <= 0) return;
+-        if (_periodicDue != DateTime.MaxValue) _periodicDue += delta;
+-        if (_candidateCaptureAt != DateTime.MaxValue) _candidateCaptureAt += delta;
++        if (delta <= TimeSpan.Zero) return;
++        if (_s.PeriodicF5Minutes > 0)
++        {
++            if (_periodicDue != DateTime.MaxValue) _periodicDue += delta;
++            if (_candidateCaptureAt != DateTime.MaxValue) _candidateCaptureAt += delta;
++        }
++        if (_pageMaintenanceDue != DateTime.MaxValue) _pageMaintenanceDue += delta;
++        if (_nextPageHealthProbe != DateTime.MinValue) _nextPageHealthProbe += delta;
+         SyncPeriodicSnapshot();
+     }
+ 
++    int PageRecoveryRestartStep => _step switch
++    {
++        1 or 2 or 3 => 1,
++        4 or 5 or 6 or 7 => 5,
++        _ => 1
++    };
++
++    void ResetPageMaintenanceDue(string reason)
++    {
++        _pageMaintenanceDue = DateTime.Now.AddMinutes(PageMaintenanceReloadMinutes);
++        _log.Info($"[PAGE_MAINTENANCE_SCHEDULED] minutes={PageMaintenanceReloadMinutes} due={_pageMaintenanceDue:HH:mm:ss} reason={reason}");
++    }
++
++    async Task<bool> HandleImmediatePageCrashRecoveryAsync(CancellationToken ct)
++    {
++        if (_pageRecoveryExecuting || DateTime.Now < _nextPageHealthProbe) return false;
++        _nextPageHealthProbe = DateTime.Now.AddMilliseconds(PageHealthProbeIntervalMs);
++
++        ChromeController.PageHealthSnapshot health;
++        try
++        {
++            health = await _chrome.ProbePageHealthAsync(ct);
++        }
++        catch (OperationCanceledException) { throw; }
++        catch (Exception ex)
++        {
++            _log.Warn($"[PAGE_HEALTH_PROBE_FAILED] reason={ex.Message}");
++            return false;
++        }
++
++        if (health.Healthy)
++        {
++            if (!string.IsNullOrWhiteSpace(health.Url) &&
++                health.Url.Contains("tiktok.com", StringComparison.OrdinalIgnoreCase))
++                _lastHealthyTikTokUrl = health.Url;
++            return false;
++        }
++
++        if (!health.CrashLike) return false;
++
++        _pageRecoveryExecuting = true;
++        var resumeStep = PageRecoveryRestartStep;
++        _step = resumeStep;
++        SetStatus("ĐANG CỨU TRANG", $"Phát hiện Chrome lỗi ({health.Reason}) → reload ngay.");
++        _log.Warn($"[PAGE_CRASH_DETECTED] reason={health.Reason} url={health.Url} action=RECOVER_NOW restartStep={resumeStep}");
++        try
++        {
++            var fallback = !string.IsNullOrWhiteSpace(_lastHealthyTikTokUrl)
++                ? _lastHealthyTikTokUrl
++                : health.Url;
++            await _chrome.RecoverCurrentPageAsync(fallback, ct);
++            ResetPageMaintenanceDue("vừa tự cứu trang crash");
++            _nextPageHealthProbe = DateTime.Now.AddMilliseconds(PageHealthProbeIntervalMs);
++            ResetInputGuardConsecutive("sau tự cứu trang crash");
++            _log.Warn($"[PAGE_CRASH_RECOVERED] restartStep={resumeStep} action=RECHECK_WORKFLOW");
++            SetStatus("ĐÃ CỨU TRANG", $"Chrome đã reload; tiếp tục từ bước {resumeStep}/8.");
++            return true;
++        }
++        catch (OperationCanceledException) { throw; }
++        catch (Exception ex)
++        {
++            ReportProblem("PAGE_CRASH_RECOVERY_FAILED", "Chrome renderer",
++                "Phát hiện trang crash nhưng chưa tự phục hồi được: " + ex.Message,
++                error: true, throttleSeconds: 10);
++            _log.Error("[PAGE_CRASH_RECOVERY_FAILED] " + ex);
++            await Task.Delay(1000, ct);
++            return true;
++        }
++        finally
++        {
++            _pageRecoveryExecuting = false;
++        }
++    }
++
++    async Task<bool> HandlePageMaintenanceReloadAsync(CancellationToken ct)
++    {
++        if (_pageRecoveryExecuting || DateTime.Now < _pageMaintenanceDue) return false;
++
++        // Bước 4/8 chỉ đổi state nội bộ sau một lần gửi thành công. Cho nó hoàn tất trước,
++        // tránh reset về sai điểm và không bao giờ chen reload giữa Click/Dán/Enter.
++        if (_step is 4 or 8) return false;
++
++        _pageRecoveryExecuting = true;
++        var resumeStep = PageRecoveryRestartStep;
++        _step = resumeStep;
++        SetStatus("F5 BẢO TRÌ 30 PHÚT", $"Reload trang hiện tại • tiếp tục bước {resumeStep}/8.");
++        _log.Info($"[PAGE_MAINTENANCE_RELOAD_START] intervalMin={PageMaintenanceReloadMinutes} restartStep={resumeStep}");
++        try
++        {
++            try
++            {
++                await _chrome.ReloadAndWaitAsync(PageRecoveryReloadWaitMs, 15000, ct);
++            }
++            catch (Exception ex)
++            {
++                _log.Warn($"[PAGE_MAINTENANCE_RELOAD_FALLBACK] normalReloadFailed={ex.Message}");
++                await _chrome.RecoverCurrentPageAsync(_lastHealthyTikTokUrl, ct);
++            }
++
++            ResetPageMaintenanceDue("F5 bảo trì thành công");
++            _nextPageHealthProbe = DateTime.Now.AddMilliseconds(PageHealthProbeIntervalMs);
++            ResetInputGuardConsecutive("sau F5 bảo trì");
++            _log.Info($"[PAGE_MAINTENANCE_RELOAD_OK] restartStep={resumeStep}");
++            SetStatus("ĐANG CHẠY", $"F5 bảo trì xong • tiếp tục bước {resumeStep}/8.");
++            return true;
++        }
++        catch (OperationCanceledException) { throw; }
++        catch (Exception ex)
++        {
++            ReportProblem("PAGE_MAINTENANCE_RELOAD_FAILED", "F5 bảo trì",
++                "Reload định kỳ 30 phút thất bại: " + ex.Message,
++                error: true, throttleSeconds: 30);
++            _pageMaintenanceDue = DateTime.Now.AddMinutes(1);
++            return true;
++        }
++        finally
++        {
++            _pageRecoveryExecuting = false;
++        }
++    }
++
+     async Task<bool> HandlePeriodicCaptureAndF5Async(CancellationToken ct)
+     {
+         if (_s.PeriodicF5Minutes <= 0) return false;
+@@ -1512,6 +1655,7 @@
+             }
+ 
+             ResetPeriodicDue(source + " da xac nhan sang LIVE moi va F5 xong", cancelCandidate: !scheduledPeriodic);
++            ResetPageMaintenanceDue(source + " vừa F5 sau chuyển LIVE");
+             completed = true;
+             return true;
+         }
+@@ -1535,6 +1679,7 @@
+ 
+                 _log.Warn($"[RECOVERY_OK] transition={source} action=retry-after-cdp-reconnect");
+                 ResetPeriodicDue(source + " da xac nhan sang LIVE moi sau retry reconnect", cancelCandidate: !scheduledPeriodic);
++                ResetPageMaintenanceDue(source + " vừa F5 sau retry chuyển LIVE");
+                 completed = true;
+                 return true;
+             }
