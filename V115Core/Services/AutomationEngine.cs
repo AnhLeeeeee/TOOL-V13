@@ -43,10 +43,13 @@ public sealed partial class AutomationEngine
     const int LiveVerifyPollMs = 250;
     const int LiveFastChangePollMs = 100;
     const int LiveVerifyTimeoutMs = 5000;
-    // Sau ArrowDown, đợi tối đa 5 giây để TikTok bắt đầu đổi roomId/URL.
-    // Đây chỉ là tín hiệu timing để tránh F5 quá sớm; timeout vẫn F5, tuyệt đối không chặn transition.
-    const int ArrowDownWaitForPageChangeMs = 5000;
-    const int ArrowDownRetryDelayMs = 750;
+    // ArrowDown CDP có thể mất hiệu lực sau nhiều lần reload dù session vẫn báo gửi key thành công.
+    // Retry theo từng lần, reconnect/focus lại giống hiệu ứng người dùng dừng rồi chạy lại.
+    const int ArrowDownAttemptWaitMs = 1600;
+    const int ArrowDownRecoveryAttempts = 3;
+    const int ArrowDownPostResetAttemptWaitMs = 2600;
+    const int ArrowDownResetReloadWaitMs = 1000;
+    const int ArrowDownRetryDelayMs = 300;
     const int PriorityPauseMs = 5000;
     const int OldLiveScanIntervalMs = 1500;
     const int OldLiveScanRetryMs = 2500;
@@ -88,6 +91,7 @@ public sealed partial class AutomationEngine
     int _contentIndex;
     int _step = 1; // V10: buocHienTai 1..8
     long _rounds;
+    int _lastViewerValue = -1; // snapshot nhẹ cho Manager/Chrome Monitor
     System.Diagnostics.Stopwatch? _loopPerf;
     long _loopPerfTotalMs;
     long _loopPerfCount;
@@ -132,6 +136,8 @@ public sealed partial class AutomationEngine
     public bool Paused => _paused;
     public AutomationRunState RunState => !_running ? AutomationRunState.Stopped : _paused ? AutomationRunState.Paused : AutomationRunState.Running;
     public long Rounds => _rounds;
+    public int CurrentStep => Math.Clamp(_step, 1, 8);
+    public int LastViewerValue => Volatile.Read(ref _lastViewerValue);
     public Task CompletionTask => _task ?? Task.CompletedTask;
     public event Action<string>? Status;
     public event Action<string>? Problem;
@@ -198,12 +204,14 @@ public sealed partial class AutomationEngine
         _contentIndex = 0;
         _step = 1;
         _rounds = 0;
+        Volatile.Write(ref _lastViewerValue, -1);
         _loopPerf = System.Diagnostics.Stopwatch.StartNew();
         _loopPerfTotalMs = 0;
         _loopPerfCount = 0;
         _paused = false;
         _running = true;
         _transitioning = false;
+        ResetPostEnterCommentRestrictionState();
         ResetInputGuardConsecutive("khởi động");
 
         var now = DateTime.Now;
@@ -283,6 +291,11 @@ public sealed partial class AutomationEngine
                     // Stop guard DOM: trạng thái vi phạm/tính năng bị khóa là lỗi cấp tài khoản,
                     // không được coi như ô nhập bất thường rồi tiếp tục đổi LIVE.
                     await StopIfFatalTikTokRestrictionAsync("ranh giới vòng chính", ct);
+
+                    // Nếu Enter vừa bị TikTok từ chối bằng toast “Bạn hiện bị cấm bình luận”,
+                    // khóa workflow tại đây cho đến khi đã thực hiện xong một lần chuyển LIVE.
+                    // Không để Viewer/InputGuard bình thường vô tình cho gửi lại ngay trên LIVE cũ.
+                    if (await HandlePendingPostEnterCommentRestrictionAsync(ct)) continue;
 
                     // V13 không còn quét ảnh ưu tiên/STOP runtime. Các timer còn lại vẫn chỉ
                     // xử lý ở ranh giới giữa các bước, không chen giữa click/dán/Enter.
@@ -671,12 +684,10 @@ public sealed partial class AutomationEngine
 
                 case 3:
                 {
-                    SetStatus("BƯỚC 3/8", "Enter ô 1 • chờ TikTok phản hồi");
+                    SetStatus("BƯỚC 3/8", "Enter ô 1 • theo dõi phản hồi cấm bình luận");
                     await _chrome.PressKeyAsync("Enter", ct: ct);
+                    if (await WatchPostEnterCommentRestrictionAsync("điểm 1", restartStep: 1, ct)) return;
                     _step = 4;
-                    // Vẫn giữ đúng khoảng chờ phản hồi cũ; chỉ dời full-scan sang ngay
-                    // trước Click kế tiếp để không thay đổi nhịp nghiệp vụ.
-                    await Task.Delay(EnterReactionScanMs, ct);
                     break;
                 }
                 case 4:
@@ -704,10 +715,10 @@ public sealed partial class AutomationEngine
 
                 case 7:
                 {
-                    SetStatus("BƯỚC 7/8", "Enter ô 2 • chờ TikTok phản hồi");
+                    SetStatus("BƯỚC 7/8", "Enter ô 2 • theo dõi phản hồi cấm bình luận");
                     await _chrome.PressKeyAsync("Enter", ct: ct);
+                    if (await WatchPostEnterCommentRestrictionAsync("điểm 2", restartStep: 5, ct)) return;
                     _step = 8;
-                    await Task.Delay(EnterReactionScanMs, ct);
                     break;
                 }
                 case 8:
@@ -1166,6 +1177,7 @@ public sealed partial class AutomationEngine
         if (string.IsNullOrWhiteSpace(_s.Viewer.XPath))
         {
             ReportProblem("VIEWER_XPATH_MISSING", "Người xem", "Chưa cấu hình XPath người xem", error: true, throttleSeconds: 30);
+            Volatile.Write(ref _lastViewerValue, -1);
             return (-1, "");
         }
 
@@ -1174,11 +1186,13 @@ public sealed partial class AutomationEngine
             if (!await _chrome.XPathExistsAsync(_s.Viewer.XPath, ct))
             {
                 ReportProblem("VIEWER_XPATH_NOT_FOUND", "Người xem", $"Không tìm thấy XPath người xem trên trang hiện tại: {_s.Viewer.XPath}", throttleSeconds: 30);
+                Volatile.Write(ref _lastViewerValue, -1);
                 return (-1, "");
             }
 
             var text = await _chrome.GetTextAsync(_s.Viewer.XPath, ct);
             var value = ViewerCountParser.Parse(text, _log);
+            Volatile.Write(ref _lastViewerValue, value >= 0 ? value : -1);
             if (value >= 0) return (value, text);
 
             ReportProblem("VIEWER_PARSE_FAILED", "Người xem", $"raw=\"{text}\"", throttleSeconds: 30);
@@ -1187,6 +1201,7 @@ public sealed partial class AutomationEngine
         catch (Exception ex)
         {
             ReportProblem("VIEWER_READ_ERROR", "Người xem", $"Đọc XPath người xem lỗi: {ex.Message}", throttleSeconds: 20);
+            Volatile.Write(ref _lastViewerValue, -1);
             return (-1, "");
         }
     }
@@ -1257,16 +1272,17 @@ public sealed partial class AutomationEngine
         return "";
     }
 
-    async Task<LiveSwitchVerification> WaitForPageChangeBeforeReloadAsync(string source, string beforeIdentity, CancellationToken ct)
+    async Task<LiveSwitchVerification> WaitForPageChangeBeforeReloadAsync(string source, string beforeIdentity, int maxWaitMs, int attempt, CancellationToken ct)
     {
+        maxWaitMs = Math.Max(LiveFastChangePollMs, maxWaitMs);
         var beforeKey = GetLivePageChangeKey(beforeIdentity);
         var beforeTitle = ExtractLiveIdentityField(beforeIdentity, "title");
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var latestIdentity = beforeIdentity;
 
-        _log.Info($"[LIVE_SWITCH_WAIT_PAGE_CHANGE] source={source} maxWaitMs={ArrowDownWaitForPageChangeMs} pollMs={LiveFastChangePollMs} beforeKey={beforeKey} beforeTitle={TrimIdentityForLog(beforeTitle, 100)}");
+        _log.Info($"[LIVE_SWITCH_WAIT_PAGE_CHANGE] source={source} attempt={attempt} maxWaitMs={maxWaitMs} pollMs={LiveFastChangePollMs} beforeKey={beforeKey} beforeTitle={TrimIdentityForLog(beforeTitle, 100)}");
 
-        while (sw.ElapsedMilliseconds < ArrowDownWaitForPageChangeMs)
+        while (sw.ElapsedMilliseconds < maxWaitMs)
         {
             await Task.Delay(LiveFastChangePollMs, ct);
             latestIdentity = await GetCurrentLiveIdentityAsync(ct);
@@ -1276,9 +1292,6 @@ public sealed partial class AutomationEngine
             var stableKeyChanged = !string.IsNullOrWhiteSpace(beforeKey)
                 && !string.IsNullOrWhiteSpace(latestKey)
                 && !string.Equals(beforeKey, latestKey, StringComparison.OrdinalIgnoreCase);
-
-            // TikTok có lúc đã render LIVE mới nhưng URL/roomId cập nhật chậm hơn.
-            // Title đổi được dùng như tín hiệu tăng tốc để F5 ngay; không dùng để chặn transition.
             var titleChanged = !string.IsNullOrWhiteSpace(beforeTitle)
                 && !string.IsNullOrWhiteSpace(latestTitle)
                 && !string.Equals(beforeTitle, latestTitle, StringComparison.Ordinal);
@@ -1286,51 +1299,77 @@ public sealed partial class AutomationEngine
             if (stableKeyChanged || titleChanged)
             {
                 var trigger = stableKeyChanged ? "roomId/url" : "title";
-                _log.Info($"[LIVE_SWITCH_PAGE_CHANGED] source={source} elapsedMs={sw.ElapsedMilliseconds} trigger={trigger} beforeKey={beforeKey} afterKey={latestKey} beforeTitle={TrimIdentityForLog(beforeTitle, 100)} afterTitle={TrimIdentityForLog(latestTitle, 100)} action=F5_NGAY");
-                return new LiveSwitchVerification(true, beforeIdentity, latestIdentity, 1, sw.ElapsedMilliseconds);
+                _log.Info($"[LIVE_SWITCH_PAGE_CHANGED] source={source} attempt={attempt} elapsedMs={sw.ElapsedMilliseconds} trigger={trigger} beforeKey={beforeKey} afterKey={latestKey} action=F5_NGAY");
+                return new LiveSwitchVerification(true, beforeIdentity, latestIdentity, attempt, sw.ElapsedMilliseconds);
             }
         }
 
-        _log.Warn($"[LIVE_SWITCH_PAGE_CHANGE_TIMEOUT] source={source} waitedMs={sw.ElapsedMilliseconds} beforeKey={beforeKey} latestKey={GetLivePageChangeKey(latestIdentity)} action=VAN_F5");
-        return new LiveSwitchVerification(false, beforeIdentity, latestIdentity, 1, sw.ElapsedMilliseconds);
+        _log.Warn($"[LIVE_SWITCH_PAGE_CHANGE_TIMEOUT] source={source} attempt={attempt} waitedMs={sw.ElapsedMilliseconds} beforeKey={beforeKey} latestKey={GetLivePageChangeKey(latestIdentity)} action=CHUA_F5");
+        return new LiveSwitchVerification(false, beforeIdentity, latestIdentity, attempt, sw.ElapsedMilliseconds);
+    }
+
+    async Task<LiveSwitchVerification> ReloadAfterConfirmedArrowDownAsync(string source, LiveSwitchVerification changed, int waitAfterReloadMs, CancellationToken ct)
+    {
+        await _chrome.ReloadAndWaitAsync(Math.Max(0, waitAfterReloadMs), 15000, ct);
+        _log.Info($"[LIVE_SWITCH_DOM_READY] source={source} preReloadChanged=True attempt={changed.Attempt}");
+        await StopIfFatalTikTokRestrictionAsync($"sau chuyển LIVE: {source}", ct);
+        var afterIdentity = await GetCurrentLiveIdentityAsync(ct);
+        _log.Info($"[LIVE_SWITCH_CONFIRMED] source={source} attempt={changed.Attempt} before={TrimIdentityForLog(changed.BeforeIdentity)} after={TrimIdentityForLog(afterIdentity)}");
+        return new LiveSwitchVerification(true, changed.BeforeIdentity, afterIdentity, changed.Attempt, changed.ElapsedMs);
     }
 
     async Task<LiveSwitchVerification> TryArrowDownSwitchAsync(string source, int count, int waitAfterReloadMs, CancellationToken ct)
     {
-        string beforeIdentity = await GetCurrentLiveIdentityAsync(ct);
-        var beforeKey = GetLivePageChangeKey(beforeIdentity);
-        _log.Info($"[LIVE_VERIFY_BEFORE] source={source} key={beforeKey} identity={TrimIdentityForLog(beforeIdentity)}");
+        var originalBefore = await GetCurrentLiveIdentityAsync(ct);
+        _log.Info($"[LIVE_VERIFY_BEFORE] source={source} key={GetLivePageChangeKey(originalBefore)} identity={TrimIdentityForLog(originalBefore)} requestedCount={Math.Clamp(count, 1, 4)}");
 
-        await _chrome.PressKeyAsync("ArrowDown", Math.Clamp(count, 1, 4), MultiActionGapMs, ct);
-        _log.Info($"[LIVE_KEY_SENT] source={source} key=ArrowDown count={Math.Clamp(count, 1, 4)}");
-
-        // Chỉ chờ để tránh F5 khi TikTok vẫn chưa bắt đầu chuyển trang.
-        // Nếu thấy roomId/URL đổi thì F5 ngay. Nếu hết 5 giây vẫn chưa đọc được thay đổi,
-        // vẫn F5 như flow cũ; kết quả probe này KHÔNG bao giờ chặn transition.
-        var preReload = await WaitForPageChangeBeforeReloadAsync(source, beforeIdentity, ct);
-
-        await _chrome.ReloadAndWaitAsync(Math.Max(0, waitAfterReloadMs), 15000, ct);
-        _log.Info($"[LIVE_SWITCH_DOM_READY] source={source} preReloadChanged={preReload.Changed}");
-        await StopIfFatalTikTokRestrictionAsync($"sau chuyển LIVE: {source}", ct);
-
-        var afterIdentity = await GetCurrentLiveIdentityAsync(ct);
-        var afterKey = GetLivePageChangeKey(afterIdentity);
-        var postReloadChanged = !string.IsNullOrWhiteSpace(beforeKey)
-            && !string.IsNullOrWhiteSpace(afterKey)
-            && !string.Equals(beforeKey, afterKey, StringComparison.OrdinalIgnoreCase);
-
-        if (postReloadChanged)
+        // Không bắn ArrowDown x2/x3 liên tiếp nữa. Mỗi lần chỉ gửi 1 phím rồi quan sát.
+        // Nếu lần đầu không tác dụng, reconnect CDP + focus lại trang, mô phỏng đúng hiện tượng
+        // người dùng dừng/chạy lại tool thì phím xuống hoạt động trở lại.
+        for (int attempt = 1; attempt <= ArrowDownRecoveryAttempts; attempt++)
         {
-            _log.Info($"[LIVE_SWITCH_CONFIRMED] source={source} beforeKey={beforeKey} afterKey={afterKey} before={TrimIdentityForLog(beforeIdentity)} after={TrimIdentityForLog(afterIdentity)}");
-        }
-        else
-        {
-            // Không dùng identity sau F5 để chặn/retry nữa. InputGuard/Viewer/XPath ở vòng kế tiếp
-            // sẽ là nguồn xác nhận thực tế rằng trang mới đã sẵn sàng.
-            _log.Warn($"[LIVE_SWITCH_AFTER_RELOAD_UNVERIFIED] source={source} beforeKey={beforeKey} afterKey={afterKey} action=TIEP_TUC_KHONG_CHAN");
+            if (attempt == 2)
+            {
+                _log.Warn($"[LIVE_SWITCH_CDP_RECOVERY_START] source={source} reason=ArrowDown lần 1 không đổi LIVE; reconnect target hiện tại trước retry.");
+                await _chrome.ReconnectAsync(ct);
+                _log.Warn($"[LIVE_SWITCH_CDP_RECOVERY_OK] source={source} action=reconnect+refresh-target");
+            }
+
+            var beforeAttempt = await GetCurrentLiveIdentityAsync(ct);
+            var recoveryMode = attempt >= 2;
+            await _chrome.PressArrowDownNavigationAsync(1, 0, recoveryMode, ct);
+            _log.Info($"[LIVE_KEY_SENT] source={source} attempt={attempt}/{ArrowDownRecoveryAttempts} key=ArrowDown mode={(recoveryMode ? "recovery-keyDown" : "normal-rawKeyDown")}");
+
+            var changed = await WaitForPageChangeBeforeReloadAsync(source, beforeAttempt, ArrowDownAttemptWaitMs, attempt, ct);
+            if (changed.Changed)
+                return await ReloadAfterConfirmedArrowDownAsync(source, changed, waitAfterReloadMs, ct);
+
+            if (attempt < ArrowDownRecoveryAttempts)
+            {
+                _log.Warn($"[LIVE_SWITCH_ARROW_RETRY] source={source} attempt={attempt}/{ArrowDownRecoveryAttempts} result=no-change waitMs={ArrowDownRetryDelayMs}");
+                await Task.Delay(ArrowDownRetryDelayMs, ct);
+            }
         }
 
-        return new LiveSwitchVerification(true, beforeIdentity, afterIdentity, 1, preReload.ElapsedMs);
+        // Ba lần phím CDP đều không làm trang đổi: chỉ lúc này mới F5 đúng một lần để reset
+        // document/keyboard handler, sau đó reconnect và thử ArrowDown thêm một lần.
+        _log.Warn($"[LIVE_SWITCH_KEY_STALE_RESET] source={source} ArrowDown không tác dụng sau {ArrowDownRecoveryAttempts} lần; F5 một lần để reset trang rồi thử lại.");
+        await _chrome.ReloadAndWaitAsync(ArrowDownResetReloadWaitMs, 15000, ct);
+        await StopIfFatalTikTokRestrictionAsync($"sau reset phím LIVE: {source}", ct);
+        await _chrome.ReconnectAsync(ct);
+        _log.Warn($"[LIVE_SWITCH_KEY_STALE_RECONNECTED] source={source} target đã refresh sau F5 reset.");
+
+        var beforeFinal = await GetCurrentLiveIdentityAsync(ct);
+        await _chrome.PressArrowDownNavigationAsync(1, 0, recoveryMode: true, ct);
+        _log.Info($"[LIVE_KEY_SENT] source={source} attempt=post-reset key=ArrowDown mode=recovery-keyDown");
+        var finalChanged = await WaitForPageChangeBeforeReloadAsync(source, beforeFinal, ArrowDownPostResetAttemptWaitMs, ArrowDownRecoveryAttempts + 1, ct);
+        if (finalChanged.Changed)
+            return await ReloadAfterConfirmedArrowDownAsync(source, finalChanged, waitAfterReloadMs, ct);
+
+        ReportProblem("LIVE_SWITCH_KEY_UNRESPONSIVE", source,
+            "ArrowDown CDP vẫn không làm LIVE đổi sau reconnect + focus + F5 reset. Không F5 lặp cùng LIVE; Viewer/InputGuard vẫn khóa workflow và vòng sau sẽ thử lại.",
+            throttleSeconds: 10);
+        return new LiveSwitchVerification(false, originalBefore, finalChanged.AfterIdentity, ArrowDownRecoveryAttempts + 1, finalChanged.ElapsedMs);
     }
 
     async Task<LiveSwitchVerification> TryClickSwitchAsync(string source, string xpath, int count, CancellationToken ct)

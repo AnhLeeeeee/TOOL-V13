@@ -1,5 +1,6 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.IO.Pipes;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using ToolTikTokV12.Controls;
@@ -24,6 +25,7 @@ public sealed class ManagerForm : Form
         public bool Detached { get; set; }
         public bool Opening { get; set; }
         public DateTime LastStatusRefreshUtc { get; set; } = DateTime.MinValue;
+        public WorkerSnapshot? LastSnapshot { get; set; }
         public SemaphoreSlim CommandGate { get; } = new(1, 1);
     }
 
@@ -107,6 +109,10 @@ public sealed class ManagerForm : Form
     bool _refreshing;
     bool _closing;
     bool _profileRenameInProgress;
+    ChromeMonitorForm? _chromeMonitor;
+    const int WM_HOTKEY = 0x0312;
+    const int HOTKEY_CHROME_MONITOR_TOGGLE = 0x1348;
+    bool _chromeMonitorHotkeyRegistered;
 
     public ManagerForm()
     {
@@ -122,6 +128,7 @@ public sealed class ManagerForm : Form
         ReloadCatalog();
         EnsureAddTab();
         _refreshTimer.Tick += async (_, _) => await RefreshOpenProfilesAsync();
+        Shown += (_, _) => RegisterChromeMonitorHotkey();
         FormClosing += OnClosing;
     }
 
@@ -135,6 +142,7 @@ public sealed class ManagerForm : Form
         toolbar.Controls.Add(Button("Profile có sẵn", async (_, _) => { try { await AddExistingProfileAsync(); } catch (Exception ex) { ShowError(ex); } }));
         toolbar.Controls.Add(Button("Đổi tên", async (_, _) => { try { await RenameSelectedProfileAsync(); } catch (Exception ex) { ShowError(ex); } }));
         toolbar.Controls.Add(Button("Đồng bộ tên Chrome", (_, _) => ShowChromeNameSyncDialog()));
+        toolbar.Controls.Add(Button("Giám sát Chrome", (_, _) => ShowChromeMonitor(), UiButtonKind.Primary));
         toolbar.Controls.Add(Button("Xóa profile", (_, _) => ShowDeleteProfilesDialog(), UiButtonKind.Danger));
         toolbar.Controls.Add(Button("Chạy tất cả", async (_, _) => await StartAllAsync(), UiButtonKind.Primary));
         toolbar.Controls.Add(Button("Dừng tất cả", async (_, _) => await StopAllAsync(), UiButtonKind.Danger));
@@ -171,6 +179,7 @@ public sealed class ManagerForm : Form
                 "Mở profile" => (Color.FromArgb(232, 242, 255), Color.FromArgb(35, 91, 152)),
                 "+ Profile" => (Color.FromArgb(238, 246, 255), Color.FromArgb(35, 91, 152)),
                 "Profile có sẵn" or "Đổi tên" or "Đồng bộ tên Chrome" => (Color.FromArgb(242, 246, 251), Color.FromArgb(55, 76, 103)),
+                "Giám sát Chrome" => (Color.FromArgb(234, 244, 255), Color.FromArgb(31, 91, 158)),
                 "Xóa profile" or "Dừng tất cả" => (Color.FromArgb(255, 239, 239), Color.FromArgb(171, 62, 62)),
                 "Chạy tất cả" => (Color.FromArgb(234, 248, 238), Color.FromArgb(36, 119, 66)),
                 _ => (UiTheme.Card, Color.FromArgb(42, 57, 76))
@@ -615,7 +624,8 @@ public sealed class ManagerForm : Form
 
                 // V13.4.1: profile đang xem vẫn refresh 1 giây như cũ. Các tab nền
                 // chỉ refresh 5 giây/lần để giảm pipe/JSON/UI work khi chạy nhiều VM profile.
-                var interval = ReferenceEquals(ctx.Tab, selectedTab)
+                var monitorVisible = _chromeMonitor is not null && !_chromeMonitor.IsDisposed && _chromeMonitor.Visible;
+                var interval = ReferenceEquals(ctx.Tab, selectedTab) || monitorVisible
                     ? TimeSpan.FromSeconds(1)
                     : TimeSpan.FromSeconds(5);
                 if (now - ctx.LastStatusRefreshUtc < interval) continue;
@@ -630,6 +640,7 @@ public sealed class ManagerForm : Form
     {
         var s = await ReadStatusAsync(ctx);
         ctx.LastStatusRefreshUtc = DateTime.UtcNow;
+        ctx.LastSnapshot = s;
         var color = s.RunState == "RUNNING" ? Color.DarkGreen : s.RunState == "PAUSED" ? Color.DarkOrange : Color.DimGray;
         SetStatus(ctx, $"Worker {s.State} | {s.RunState} | Chrome {s.Chrome}", color);
         if (s.WindowHandle != 0 && ctx.WorkerWindow == IntPtr.Zero) ctx.WorkerWindow = new IntPtr(s.WindowHandle);
@@ -782,6 +793,11 @@ public sealed class ManagerForm : Form
         if (_closing) return;
         e.Cancel = true;
         _closing = true;
+        if (_chromeMonitorHotkeyRegistered)
+        {
+            try { UnregisterHotKey(Handle, HOTKEY_CHROME_MONITOR_TOGGLE); } catch { }
+            _chromeMonitorHotkeyRegistered = false;
+        }
         _refreshTimer.Stop();
         Enabled = false;
         foreach (var ctx in _contexts.Values.Where(c => c.Worker is not null && !c.Worker.HasExited).ToList())
@@ -2306,6 +2322,116 @@ public sealed class ManagerForm : Form
         ctx.Status.Text = text; ctx.Status.ForeColor = color;
     }
 
+    void RegisterChromeMonitorHotkey()
+    {
+        if (_chromeMonitorHotkeyRegistered || !IsHandleCreated) return;
+        _chromeMonitorHotkeyRegistered = RegisterHotKey(Handle, HOTKEY_CHROME_MONITOR_TOGGLE, 0, (uint)Keys.F8);
+        if (_chromeMonitorHotkeyRegistered)
+            _log.Info("[CHROME_MONITOR_HOTKEY] F8 registered");
+        else
+            _log.Warn("[CHROME_MONITOR_HOTKEY] Không thể đăng ký F8; có thể phím đang được ứng dụng khác sử dụng.");
+    }
+
+    void ToggleChromeMonitorFromHotkey()
+    {
+        if (_closing || IsDisposed || Disposing) return;
+
+        if (_chromeMonitor is null || _chromeMonitor.IsDisposed)
+        {
+            ShowChromeMonitor();
+            return;
+        }
+
+        // Nếu monitor đang là cửa sổ người dùng đang nhìn, F8 = ẩn.
+        // Nếu đang thao tác ở Chrome (monitor vẫn còn Visible nhưng nằm phía sau),
+        // F8 = đưa monitor trở lại ngay, tránh phải bấm hai lần.
+        var monitorIsForeground = GetForegroundWindow() == _chromeMonitor.Handle;
+        if (_chromeMonitor.Visible && monitorIsForeground)
+        {
+            _chromeMonitor.Hide();
+            return;
+        }
+
+        ShowChromeMonitor();
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WM_HOTKEY && m.WParam.ToInt32() == HOTKEY_CHROME_MONITOR_TOGGLE)
+        {
+            ToggleChromeMonitorFromHotkey();
+            return;
+        }
+        base.WndProc(ref m);
+    }
+
+    void ShowChromeMonitor()
+    {
+        if (_chromeMonitor is not null && !_chromeMonitor.IsDisposed)
+        {
+            if (!_chromeMonitor.Visible) _chromeMonitor.Show(this);
+            if (_chromeMonitor.WindowState == FormWindowState.Minimized) _chromeMonitor.WindowState = FormWindowState.Normal;
+            _chromeMonitor.BringToFront();
+            _chromeMonitor.Activate();
+            return;
+        }
+
+        _chromeMonitor = new ChromeMonitorForm(GetChromeMonitorProfiles, ActivateChromeFromMonitorAsync);
+        _chromeMonitor.FormClosed += (_, _) => _chromeMonitor = null;
+        _chromeMonitor.Show(this);
+    }
+
+    IReadOnlyList<ChromeMonitorProfileInfo> GetChromeMonitorProfiles()
+    {
+        return _contexts.Values
+            .Where(c => c.Tab is not null || c.LastSnapshot?.ChromeWindowHandle > 0)
+            .OrderBy(c => c.Profile.Name, NaturalProfileNameOrder)
+            .Select(c =>
+            {
+                var snapshot = c.LastSnapshot;
+                return new ChromeMonitorProfileInfo(
+                    c.Profile.Name,
+                    snapshot?.RunState ?? "STOPPED",
+                    snapshot?.Chrome ?? "DISCONNECTED",
+                    snapshot?.ChromeWindowHandle ?? 0,
+                    snapshot?.Viewer ?? -1,
+                    snapshot?.Step ?? 0,
+                    snapshot?.Rounds ?? 0,
+                    snapshot is { F5Enabled: true } ? snapshot.F5RemainingSec : -1,
+                    snapshot?.Detail ?? "",
+                    c.LastStatusRefreshUtc);
+            })
+            .ToList();
+    }
+
+    async Task ActivateChromeFromMonitorAsync(string profileName)
+    {
+        if (!_contexts.TryGetValue(profileName, out var ctx)) return;
+        try
+        {
+            if (ctx.Worker is null || ctx.Worker.HasExited)
+                await EnsureWorkerAsync(ctx);
+
+            try { await RefreshStatusAsync(ctx); } catch { }
+            var hwndValue = ctx.LastSnapshot?.ChromeWindowHandle ?? 0;
+            if (hwndValue <= 0)
+            {
+                await OpenChromeForProfileAsync(ctx);
+                await Task.Delay(300);
+                await RefreshStatusAsync(ctx);
+                hwndValue = ctx.LastSnapshot?.ChromeWindowHandle ?? 0;
+            }
+
+            if (hwndValue <= 0 || !ChromeMonitorWindowActions.RestoreMaximizeAndActivate(new IntPtr(hwndValue)))
+                throw new InvalidOperationException($"Không tìm thấy cửa sổ Chrome của profile “{profileName}” để phóng to.");
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"[CHROME_MONITOR_ACTIVATE] profile={profileName} failed={ex.Message}");
+            ShowError(ex);
+        }
+    }
+
     void ShowError(Exception ex)
     {
         _log.Error(ex.ToString());
@@ -2322,6 +2448,10 @@ public sealed class ManagerForm : Form
         return candidates.FirstOrDefault(File.Exists) ?? throw new FileNotFoundException("Không tìm thấy ToolTikTokWorkerV13.exe trong dist_v13.");
     }
 
+    [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+    [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+
     static string PipeName(string profileName) => "ToolTikTokV13_" + profileName;
     static string Quote(string value) => "\"" + value.Replace("\"", "\\\"") + "\"";
 
@@ -2335,5 +2465,11 @@ public sealed class ManagerForm : Form
         public int CdpPort { get; set; }
         public int Pid { get; set; }
         public long WindowHandle { get; set; }
+        public long ChromeWindowHandle { get; set; }
+        public int Viewer { get; set; } = -1;
+        public int Step { get; set; }
+        public long Rounds { get; set; }
+        public bool F5Enabled { get; set; }
+        public int F5RemainingSec { get; set; } = -1;
     }
 }

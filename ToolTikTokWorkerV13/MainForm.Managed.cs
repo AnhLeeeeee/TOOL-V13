@@ -73,6 +73,10 @@ public sealed partial class MainForm
         var profile = _managedMode && !string.IsNullOrWhiteSpace(_startupOptions.ProfileName)
             ? _startupOptions.ProfileName
             : CurrentProfileName;
+        var periodic = _engine.GetPeriodicF5Snapshot();
+        var f5RemainingSec = periodic.Enabled && periodic.DueAt != DateTime.MaxValue
+            ? Math.Max(0, (int)Math.Ceiling((periodic.DueAt - DateTime.Now).TotalSeconds))
+            : -1;
         return JsonSerializer.Serialize(new
         {
             Profile = profile,
@@ -82,7 +86,13 @@ public sealed partial class MainForm
             Chrome = _chrome.Connected ? "CONNECTED" : "DISCONNECTED",
             CdpPort = _settings.ChromePort,
             Pid = Environment.ProcessId,
-            WindowHandle = Interlocked.Read(ref _managedWindowHandleSnapshot)
+            WindowHandle = Interlocked.Read(ref _managedWindowHandleSnapshot),
+            ChromeWindowHandle = _chrome.GetManagedWindowHandleValue(),
+            Viewer = _engine.LastViewerValue,
+            Step = _engine.CurrentStep,
+            Rounds = _engine.Rounds,
+            F5Enabled = periodic.Enabled,
+            F5RemainingSec = f5RemainingSec
         });
     }
 

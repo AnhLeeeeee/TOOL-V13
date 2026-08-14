@@ -1144,40 +1144,102 @@ public sealed class ChromeController : IAsyncDisposable
         LogCdpDone("InsertText", $"xpath={TrimForLog(xpath)} | len={text.Length}");
     }
 
-    public async Task PressKeyAsync(string key, int count = 1, int gapMs = 600, CancellationToken ct = default)
+    public async Task PrepareKeyboardNavigationAsync(CancellationToken ct = default)
     {
-        LogCdpStart("PressKey", $"key={key} | count={count}");
-        if (key == "ArrowDown")
+        await BringToFrontAsync(ct);
+        try
         {
-            await BringToFrontAsync(ct);
-            try
-            {
-                await EvalAsync("""
+            var r = await EvalAsync("""
 (() => {
   try {
     const ae = document.activeElement;
-    if (ae && ae !== document.body && typeof ae.blur === 'function') ae.blur();
-    if (document.body && typeof document.body.focus === 'function') {
-      try { document.body.focus({ preventScroll: true }); } catch { document.body.focus(); }
+    if (ae && typeof ae.blur === 'function') ae.blur();
+    try { document.getSelection?.()?.removeAllRanges?.(); } catch (_) {}
+
+    // TikTok đôi lúc giữ keyboard focus trong chat/sidebar sau nhiều lần reload.
+    // Tạo một focus target tạm trên vùng chính để mô phỏng trạng thái giống khi người dùng
+    // bấm phím trực tiếp trên trang, nhưng không click chuột và không đổi layout.
+    const target = document.querySelector('main') || document.body || document.documentElement;
+    let restoreTabIndex = null;
+    let hadTabIndex = false;
+    if (target && target.nodeType === 1) {
+      hadTabIndex = target.hasAttribute('tabindex');
+      restoreTabIndex = target.getAttribute('tabindex');
+      if (!hadTabIndex) target.setAttribute('tabindex', '-1');
+      try { target.focus({ preventScroll: true }); } catch (_) { try { target.focus(); } catch (_) {} }
+      if (!hadTabIndex) target.removeAttribute('tabindex');
+      else if (restoreTabIndex !== null) target.setAttribute('tabindex', restoreTabIndex);
     }
-    if (document.documentElement && typeof document.documentElement.focus === 'function') {
-      try { document.documentElement.focus({ preventScroll: true }); } catch { document.documentElement.focus(); }
-    }
-    window.focus();
-    return true;
+    try { window.focus(); } catch (_) {}
+
+    const active = document.activeElement;
+    return active ? `${active.tagName || ''}#${active.id || ''}.${active.className || ''}` : '(none)';
   } catch (e) {
-    return false;
+    return 'focus-error:' + String(e?.message || e);
   }
 })()
 """, ct: ct);
-            }
-            catch { }
+            var active = r.TryGetProperty("value", out var v) ? v.GetString() ?? "" : "";
+            _log.Info($"[KEYBOARD_FOCUS_READY] active={TrimForLog(active, 140)} targetUrl={TrimForLog(Page?.Url ?? "", 140)}");
         }
-        string code = key switch { "ArrowDown" => "ArrowDown", "Enter" => "Enter", _ => key };
-        int vk = key switch { "ArrowDown" => 40, "Enter" => 13, _ => 0 };
+        catch (Exception ex)
+        {
+            _log.Warn("[KEYBOARD_FOCUS_PREP_FAILED] " + ex.Message);
+        }
+    }
+
+    public async Task PressArrowDownNavigationAsync(int count = 1, int gapMs = 600, bool recoveryMode = false, CancellationToken ct = default)
+    {
+        count = Math.Max(1, count);
+        LogCdpStart("PressArrowDownNavigation", $"count={count} | mode={(recoveryMode ? "recovery-keyDown" : "normal-rawKeyDown")}");
+        await PrepareKeyboardNavigationAsync(ct);
+
+        const string key = "ArrowDown";
+        const string code = "ArrowDown";
+        const int vk = 40;
+        var downType = recoveryMode ? "keyDown" : "rawKeyDown";
+
+        for (int i = 0; i < count; i++)
+        {
+            await Cdp.CallAsync("Input.dispatchKeyEvent", new
+            {
+                type = downType,
+                key,
+                code,
+                windowsVirtualKeyCode = vk,
+                nativeVirtualKeyCode = vk,
+                autoRepeat = false,
+                isKeypad = false
+            }, ct);
+            await Cdp.CallAsync("Input.dispatchKeyEvent", new
+            {
+                type = "keyUp",
+                key,
+                code,
+                windowsVirtualKeyCode = vk,
+                nativeVirtualKeyCode = vk,
+                autoRepeat = false,
+                isKeypad = false
+            }, ct);
+            if (i + 1 < count) await Task.Delay(gapMs, ct);
+        }
+        LogCdpDone("PressArrowDownNavigation", $"count={count} | mode={(recoveryMode ? "recovery-keyDown" : "normal-rawKeyDown")}");
+    }
+
+    public async Task PressKeyAsync(string key, int count = 1, int gapMs = 600, CancellationToken ct = default)
+    {
+        if (key == "ArrowDown")
+        {
+            await PressArrowDownNavigationAsync(count, gapMs, recoveryMode: false, ct);
+            return;
+        }
+
+        LogCdpStart("PressKey", $"key={key} | count={count}");
+        string code = key switch { "Enter" => "Enter", _ => key };
+        int vk = key switch { "Enter" => 13, _ => 0 };
         for (int i = 0; i < Math.Max(1, count); i++)
         {
-            await Cdp.CallAsync("Input.dispatchKeyEvent", new { type = key == "ArrowDown" ? "rawKeyDown" : "keyDown", key, code, windowsVirtualKeyCode = vk, nativeVirtualKeyCode = vk }, ct);
+            await Cdp.CallAsync("Input.dispatchKeyEvent", new { type = "keyDown", key, code, windowsVirtualKeyCode = vk, nativeVirtualKeyCode = vk }, ct);
             await Cdp.CallAsync("Input.dispatchKeyEvent", new { type = "keyUp", key, code, windowsVirtualKeyCode = vk, nativeVirtualKeyCode = vk }, ct);
             if (i + 1 < count) await Task.Delay(gapMs, ct);
         }
@@ -1299,6 +1361,14 @@ public sealed class ChromeController : IAsyncDisposable
             try { await EvalAsync("window.__ttv11PickerCleanup&&window.__ttv11PickerCleanup();true", ct: CancellationToken.None); } catch { }
         }
     }
+
+    /// <summary>
+    /// Trả HWND Chrome đang được worker quản lý cho Manager/DWM preview.
+    /// Chỉ dùng handle đã cache/khám phá trong lúc connect/launch, tuyệt đối không
+    /// spawn PowerShell ở đường status nóng.
+    /// </summary>
+    public long GetManagedWindowHandleValue()
+        => IsLiveWindowHandle(_managedWindowHandle) ? _managedWindowHandle.ToInt64() : 0L;
 
     public ChromeWindowState GetManagedWindowState(string profileDir, int port)
     {
