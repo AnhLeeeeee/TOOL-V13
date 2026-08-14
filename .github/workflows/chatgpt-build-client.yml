@@ -36,14 +36,11 @@ jobs:
           }
           finally { $archive.Dispose() }
 
-      - name: Fetch and overlay exact page recovery source
+      - name: Overlay exact page recovery source
         shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          $headers = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = 'application/vnd.github+json' }
-          $blob = Invoke-RestMethod -Uri 'https://api.github.com/repos/AnhLeeeeee/TOOL-V13/git/blobs/2b5cfc0cd18b0fc9b77ca7c9f1a4d1eb6f3d8f5f' -Headers $headers
-          $b64 = ($blob.content -replace '\s','')
+          $parts = @('.\.buildpatch\exact_src_00.txt','.\.buildpatch\exact_src_01_02.txt','.\.buildpatch\exact_src_03_04.txt','.\.buildpatch\exact_src_05_06.txt')
+          $b64 = ($parts | ForEach-Object { Get-Content -Raw $_ }) -join ''
           $zip = '.\page_recovery_exact_sources.zip'
           [IO.File]::WriteAllBytes($zip, [Convert]::FromBase64String($b64))
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
