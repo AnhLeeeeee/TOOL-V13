@@ -14,57 +14,29 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Rehydrate latest worker source
         shell: pwsh
         run: |
-          $parts = @(
-            '.\.builddelta\chunk_00.txt',
-            '.\.builddelta\chunk_01.txt',
-            '.\.builddelta\chunk_02.txt',
-            '.\.builddelta\chunk_03_04.txt',
-            '.\.builddelta\chunk_05_06.txt',
-            '.\.builddelta\chunk_07_08.txt',
-            '.\.builddelta\chunk_09_10.txt',
-            '.\.builddelta\chunk_11_12.txt',
-            '.\.builddelta\chunk_13_14.txt',
-            '.\.builddelta\chunk_15_16.txt'
-          )
+          $parts = @('.\.builddelta\chunk_00.txt','.\.builddelta\chunk_01.txt','.\.builddelta\chunk_02.txt','.\.builddelta\chunk_03_04.txt','.\.builddelta\chunk_05_06.txt','.\.builddelta\chunk_07_08.txt','.\.builddelta\chunk_09_10.txt','.\.builddelta\chunk_11_12.txt','.\.builddelta\chunk_13_14.txt','.\.builddelta\chunk_15_16.txt')
           $b64 = ($parts | ForEach-Object { Get-Content -Raw $_ }) -join ''
           $zip = '.\.builddelta\latest_delta_worker.zip'
           [IO.File]::WriteAllBytes($zip, [Convert]::FromBase64String($b64))
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $archive = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip))
-          try {
-            foreach ($entry in $archive.Entries) {
-              if ([string]::IsNullOrWhiteSpace($entry.Name)) { continue }
-              if ($entry.FullName -eq 'ToolTikTokManagerV13/ManagerForm.cs') { continue }
-              $dest = Join-Path (Get-Location) ($entry.FullName -replace '/', [IO.Path]::DirectorySeparatorChar)
-              $dir = Split-Path -Parent $dest
-              if ($dir) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-              [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $dest, $true)
-            }
-          }
-          finally { $archive.Dispose() }
-
+          try { foreach ($entry in $archive.Entries) { if ([string]::IsNullOrWhiteSpace($entry.Name)) { continue }; if ($entry.FullName -eq 'ToolTikTokManagerV13/ManagerForm.cs') { continue }; $dest = Join-Path (Get-Location) ($entry.FullName -replace '/', [IO.Path]::DirectorySeparatorChar); $dir = Split-Path -Parent $dest; if ($dir) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }; [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $dest, $true) } } finally { $archive.Dispose() }
       - name: Overlay exact page recovery source
         shell: pwsh
-        run: |
-          $zip = '.\.buildpatch\page_recovery_exact_sources.zip'
-          Expand-Archive -Path $zip -DestinationPath . -Force
-
+        run: Expand-Archive -Path .\.buildpatch\page_recovery_exact_sources.zip -DestinationPath . -Force
       - name: Setup .NET 8
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
-
       - name: Publish Worker
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path worker_publish | Out-Null
           dotnet publish .\ToolTikTokWorkerV13\ToolTikTokWorkerV13.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -p:PublishReadyToRun=false -p:PublishTrimmed=false -o .\worker_publish
           Get-ChildItem .\worker_publish -Recurse -Filter *.pdb | Remove-Item -Force -ErrorAction SilentlyContinue
-
       - name: Upload worker artifact
         uses: actions/upload-artifact@v4
         with:
