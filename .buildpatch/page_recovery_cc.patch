@@ -1,0 +1,196 @@
+--- a/V115Core/Services/ChromeController.cs
++++ b/V115Core/Services/ChromeController.cs
+@@ -16,6 +16,8 @@
+ 
+ public sealed class ChromeController : IAsyncDisposable
+ {
++    public sealed record PageHealthSnapshot(bool Healthy, bool CrashLike, string Reason, string Url);
++
+     sealed record ProfileOwner(int ProcessId, string CommandLine);
+ 
+     [StructLayout(LayoutKind.Sequential)]
+@@ -1246,6 +1248,184 @@
+         LogCdpDone("PressKey", $"key={key} | count={count}");
+     }
+ 
++    static bool LooksLikeRendererCrashText(string text)
++    {
++        if (string.IsNullOrWhiteSpace(text)) return false;
++        return text.Contains("out of memory", StringComparison.OrdinalIgnoreCase)
++            || text.Contains("aw, snap", StringComparison.OrdinalIgnoreCase)
++            || text.Contains("ôi, hỏng", StringComparison.OrdinalIgnoreCase)
++            || text.Contains("target crashed", StringComparison.OrdinalIgnoreCase)
++            || text.Contains("inspected target crashed", StringComparison.OrdinalIgnoreCase)
++            || text.Contains("renderer process", StringComparison.OrdinalIgnoreCase)
++            || text.Contains("render process gone", StringComparison.OrdinalIgnoreCase)
++            || text.Contains("tab crashed", StringComparison.OrdinalIgnoreCase);
++    }
++
++    static bool LooksLikeCrashUrl(string url)
++        => !string.IsNullOrWhiteSpace(url)
++           && (url.StartsWith("chrome-error://", StringComparison.OrdinalIgnoreCase)
++               || url.StartsWith("chrome://crash", StringComparison.OrdinalIgnoreCase));
++
++    public async Task<PageHealthSnapshot> ProbePageHealthAsync(CancellationToken ct = default)
++    {
++        var url = Page?.Url ?? "";
++
++        // /json là đường kiểm tra ngoài renderer. Nếu trang đã đổi sang chrome-error://
++        // thì phát hiện được ngay cả khi Runtime.evaluate không còn chạy.
++        try
++        {
++            if (_port > 0)
++            {
++                var pages = await GetPagesAsync(_port);
++                var listed = SelectTarget(pages, Page?.Id);
++                if (listed is not null)
++                {
++                    url = listed.Url;
++                    if (LooksLikeCrashUrl(listed.Url) || LooksLikeRendererCrashText(listed.Title))
++                        return new PageHealthSnapshot(false, true, "CRASH_PAGE_METADATA", listed.Url);
++                }
++            }
++        }
++        catch
++        {
++            // Browser HTTP endpoint có thể chập chờn đúng lúc renderer/document đổi.
++            // Tiếp tục thử qua session hiện tại trước khi kết luận crash.
++        }
++
++        if (!Connected)
++            return new PageHealthSnapshot(false, true, "CDP_DISCONNECTED", url);
++
++        try
++        {
++            var r = await EvalAsync("""
++(() => ({
++  href: String(location.href || ''),
++  title: String(document.title || ''),
++  ready: String(document.readyState || '')
++}))()
++""", ct: ct);
++            var v = r.GetProperty("value");
++            var href = v.TryGetProperty("href", out var hrefEl) ? hrefEl.GetString() ?? "" : "";
++            var title = v.TryGetProperty("title", out var titleEl) ? titleEl.GetString() ?? "" : "";
++            if (!string.IsNullOrWhiteSpace(href)) url = href;
++
++            if (LooksLikeCrashUrl(href) || LooksLikeRendererCrashText(title))
++                return new PageHealthSnapshot(false, true, "CRASH_PAGE_DOM", url);
++
++            return new PageHealthSnapshot(true, false, "OK", url);
++        }
++        catch (Exception ex)
++        {
++            var message = ex.ToString();
++            if (IsCdpSessionLost(ex) || LooksLikeRendererCrashText(message))
++                return new PageHealthSnapshot(false, true, "RENDERER_OR_TARGET_CRASHED", url);
++
++            if (IsTransientDocumentContextError(ex))
++                return new PageHealthSnapshot(false, false, "DOCUMENT_NAVIGATING", url);
++
++            return new PageHealthSnapshot(false, false, "PROBE_ERROR", url);
++        }
++    }
++
++    static bool IsSafeTikTokRecoveryUrl(string url)
++        => Uri.TryCreate(url, UriKind.Absolute, out var uri)
++           && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
++           && (uri.Host.Equals("tiktok.com", StringComparison.OrdinalIgnoreCase)
++               || uri.Host.EndsWith(".tiktok.com", StringComparison.OrdinalIgnoreCase));
++
++    public async Task NavigateAndWaitAsync(string url, int minWaitMs = 1200, int timeoutMs = 15000, CancellationToken ct = default)
++    {
++        if (!IsSafeTikTokRecoveryUrl(url))
++            throw new InvalidOperationException("URL phục hồi không phải TikTok hợp lệ.");
++
++        LogCdpStart("NavigateAndWait", TrimForLog(url));
++        await Cdp.CallAsync("Page.navigate", new { url }, ct);
++        await Task.Delay(Math.Max(0, minWaitMs), ct);
++
++        var started = Environment.TickCount64;
++        int stable = 0;
++        while (Environment.TickCount64 - started < timeoutMs)
++        {
++            try
++            {
++                var r = await EvalAsync("document.readyState", ct: ct);
++                var state = r.TryGetProperty("value", out var v) ? v.GetString() : "";
++                if (state is "interactive" or "complete") stable++; else stable = 0;
++                if (stable >= 3)
++                {
++                    await ApplyVmRuntimePolicyAsync(ct);
++                    LogCdpDone("NavigateAndWait", $"readyState={state}");
++                    return;
++                }
++            }
++            catch (Exception ex) when (IsTransientDocumentContextError(ex))
++            {
++                stable = 0;
++            }
++            await Task.Delay(250, ct);
++        }
++
++        throw new TimeoutException("Chrome chưa ổn định sau điều hướng phục hồi.");
++    }
++
++    public async Task RecoverCurrentPageAsync(string fallbackUrl, CancellationToken ct = default)
++    {
++        Exception? last = null;
++        var recoveryUrl = IsSafeTikTokRecoveryUrl(fallbackUrl)
++            ? fallbackUrl
++            : (IsSafeTikTokRecoveryUrl(Page?.Url ?? "") ? Page!.Url : TikTokUrl);
++
++        for (int attempt = 1; attempt <= 3; attempt++)
++        {
++            ct.ThrowIfCancellationRequested();
++            _log.Warn($"[PAGE_RECOVERY_ATTEMPT] attempt={attempt}/3 url={TrimForLog(recoveryUrl)}");
++
++            try
++            {
++                if (!Connected)
++                    await ReconnectAsync(ct);
++
++                await ReloadAndWaitAsync(1200, 15000, ct);
++                _log.Warn($"[PAGE_RECOVERY_RELOAD_OK] attempt={attempt}/3");
++                return;
++            }
++            catch (OperationCanceledException) { throw; }
++            catch (Exception ex)
++            {
++                last = ex;
++                _log.Warn($"[PAGE_RECOVERY_RELOAD_FAILED] attempt={attempt}/3 reason={ex.Message}");
++            }
++
++            try
++            {
++                await ReconnectAsync(ct);
++            }
++            catch (OperationCanceledException) { throw; }
++            catch (Exception ex)
++            {
++                last = ex;
++                _log.Warn($"[PAGE_RECOVERY_RECONNECT_FAILED] attempt={attempt}/3 reason={ex.Message}");
++            }
++
++            try
++            {
++                await NavigateAndWaitAsync(recoveryUrl, 1200, 15000, ct);
++                _log.Warn($"[PAGE_RECOVERY_NAVIGATE_OK] attempt={attempt}/3");
++                return;
++            }
++            catch (OperationCanceledException) { throw; }
++            catch (Exception ex)
++            {
++                last = ex;
++                _log.Warn($"[PAGE_RECOVERY_NAVIGATE_FAILED] attempt={attempt}/3 reason={ex.Message}");
++            }
++
++            await Task.Delay(500 * attempt, ct);
++        }
++
++        throw new InvalidOperationException("Không thể tự phục hồi trang Chrome sau 3 lần thử.", last);
++    }
++
+     public async Task ReloadAndWaitAsync(int minWaitMs = 1000, int timeoutMs = 15000, CancellationToken ct = default)
+     {
+         var perf = Stopwatch.StartNew();
