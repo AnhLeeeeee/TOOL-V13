@@ -1,7 +1,6 @@
 name: Build latest user V13 worker
 
 on:
-  workflow_dispatch:
   push:
     branches:
       - chatgpt-build-client-latest-user-20260814-src
@@ -13,7 +12,9 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Rehydrate latest worker source
         shell: pwsh
         run: |
@@ -21,17 +22,52 @@ jobs:
           $b64 = ($parts | ForEach-Object { Get-Content -Raw $_ }) -join ''
           $zip = '.\.builddelta\latest_delta_worker.zip'
           [IO.File]::WriteAllBytes($zip, [Convert]::FromBase64String($b64))
-          Expand-Archive -Path $zip -DestinationPath . -Force
-      - name: Overlay exact page recovery source
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip))
+          try {
+            foreach ($entry in $archive.Entries) {
+              if ([string]::IsNullOrWhiteSpace($entry.Name)) { continue }
+              if ($entry.FullName -eq 'ToolTikTokManagerV13/ManagerForm.cs') { continue }
+              $dest = Join-Path (Get-Location) ($entry.FullName -replace '/', [IO.Path]::DirectorySeparatorChar)
+              $dir = Split-Path -Parent $dest
+              if ($dir) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+              [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $dest, $true)
+            }
+          }
+          finally { $archive.Dispose() }
+
+      - name: Fetch and overlay exact page recovery source
         shell: pwsh
-        run: Expand-Archive -Path .\.buildpatch\page_recovery_exact_sources.zip -DestinationPath . -Force
-      - uses: actions/setup-dotnet@v4
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $headers = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = 'application/vnd.github+json' }
+          $blob = Invoke-RestMethod -Uri 'https://api.github.com/repos/AnhLeeeeee/TOOL-V13/git/blobs/2b5cfc0cd18b0fc9b77ca7c9f1a4d1eb6f3d8f5f' -Headers $headers
+          $b64 = ($blob.content -replace '\s','')
+          $zip = '.\page_recovery_exact_sources.zip'
+          [IO.File]::WriteAllBytes($zip, [Convert]::FromBase64String($b64))
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne '1cf267672aba3861f6c842e4bbde13d7870d6eb12e4d978acd5934398f620037') { throw "Exact source archive SHA256 mismatch: $hash" }
+          Expand-Archive -Path $zip -DestinationPath . -Force
+          if (-not (Select-String -Path .\V115Core\Services\AutomationEngine.cs -SimpleMatch 'PageMaintenanceReloadMinutes = 30')) { throw '30-minute maintenance source missing' }
+          if (-not (Select-String -Path .\V115Core\Services\ChromeController.cs -SimpleMatch 'RecoverCurrentPageAsync')) { throw 'page recovery source missing' }
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
+
       - name: Publish Worker
         shell: pwsh
-        run: dotnet publish .\ToolTikTokWorkerV13\ToolTikTokWorkerV13.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -p:PublishReadyToRun=false -p:PublishTrimmed=false -o .\worker_publish
-      - uses: actions/upload-artifact@v4
+        run: |
+          New-Item -ItemType Directory -Force -Path worker_publish | Out-Null
+          dotnet publish .\ToolTikTokWorkerV13\ToolTikTokWorkerV13.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -p:PublishReadyToRun=false -p:PublishTrimmed=false -o .\worker_publish
+          Get-ChildItem .\worker_publish -Recurse -Filter *.pdb | Remove-Item -Force -ErrorAction SilentlyContinue
+
+      - name: Upload worker artifact
+        uses: actions/upload-artifact@v4
         with:
           name: ToolTikTok_V13.4.1_PAGE_RECOVERY_30MIN_WORKER_WIN_X64
           path: worker_publish/**
+          if-no-files-found: error
+          compression-level: 6
