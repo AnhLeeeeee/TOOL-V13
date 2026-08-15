@@ -1,6 +1,9 @@
 name: Build V13.5 exact uploaded source
 
 on:
+  push:
+    branches:
+      - chatgpt-build-v13-5-20260815b
   workflow_dispatch:
 
 jobs:
