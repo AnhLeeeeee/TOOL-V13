@@ -1,0 +1,45 @@
+name: Build V13.5 exact uploaded source
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Extract exact V13.5 source
+        shell: pwsh
+        run: |
+          $src = Join-Path $env:RUNNER_TEMP 'v135src'
+          New-Item -ItemType Directory -Force -Path $src | Out-Null
+          Expand-Archive -LiteralPath '.buildsource/v135_source.zip' -DestinationPath $src -Force
+          "SRC=$src" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Build solution
+        shell: pwsh
+        run: dotnet build "$env:SRC/ToolTikTokV13.sln" -c Release
+      - name: Publish Worker and Manager
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'v135client'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          dotnet publish "$env:SRC/ToolTikTokWorkerV13/ToolTikTokWorkerV13.csproj" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -p:PublishReadyToRun=false -p:PublishTrimmed=false -o $out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet publish "$env:SRC/ToolTikTokManagerV13/ToolTikTokManagerV13.csproj" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -p:PublishReadyToRun=false -p:PublishTrimmed=false -o $out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem -Path $out -Recurse -Filter *.pdb | Remove-Item -Force
+          New-Item -ItemType Directory -Force -Path (Join-Path $out 'TikTokProfiles') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $out 'profiles') | Out-Null
+          '@echo off`r`ncd /d "%~dp0"`r`nstart "" ".\ToolTikTokManagerV13.exe"`r`n' | Set-Content -Path (Join-Path $out 'CHAY_TOOL_V13_5.bat') -Encoding ASCII
+          Copy-Item "$env:SRC/README_V13_5.txt" (Join-Path $out 'README_V13_5.txt') -Force
+          Compress-Archive -Path (Join-Path $out '*') -DestinationPath (Join-Path $env:RUNNER_TEMP 'ToolTikTok_V13.5_VM_CLIENT_WIN_X64.zip') -CompressionLevel Optimal -Force
+          "OUTZIP=$(Join-Path $env:RUNNER_TEMP 'ToolTikTok_V13.5_VM_CLIENT_WIN_X64.zip')" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Upload client
+        uses: actions/upload-artifact@v4
+        with:
+          name: ToolTikTok_V13.5_VM_CLIENT_WIN_X64
+          path: ${{ env.OUTZIP }}
+          if-no-files-found: error
