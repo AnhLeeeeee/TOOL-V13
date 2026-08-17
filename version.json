@@ -1,7 +1,7 @@
 {
-  "version": "13.5.1",
+  "version": "13.5.2",
   "setupUrl": "https://github.com/AnhLeeeeee/TOOL-V13/releases/latest/download/ToolTikTok_V13.5_Setup.exe",
-  "sha256": "6753718dcf589796c8a451b7245952b660936790c48349f45081f22a71e23643",
-  "notes": "Cập nhật View Chrome, Dashboard, Auto Update và sửa lỗi runtime.",
+  "sha256": "f7138876e97ed8aaf03ec0410681d73a1be977ca9bc41d8dcfdcb33c64084c95",
+  "notes": "Sửa giao diện cấu hình cập nhật.",
   "channel": "stable"
 }
