@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using System.Xml.XPath;
 using ToolTikTokV11.Models;
 using ToolTikTokV11.Utils;
@@ -51,11 +51,17 @@ public sealed partial class AutomationEngine
     const int ArrowDownResetReloadWaitMs = 1000;
     const int ArrowDownRetryDelayMs = 300;
     const int PriorityPauseMs = 5000;
+    // Bộ F5 cứu trang độc lập: không đổi LIVE. Bình thường reload trang hiện tại mỗi 30 phút;
+    // nếu renderer/tab crash (Aw, Snap!/Out of Memory/CDP target crashed) thì xử lý ngay.
+    const int PageMaintenanceReloadMinutes = 30;
+    const int PageHealthProbeIntervalMs = 2000;
+    const int PageRecoveryReloadWaitMs = 1200;
     const int OldLiveScanIntervalMs = 1500;
     const int OldLiveScanRetryMs = 2500;
     const int ViewerReadRetryCount = 5;
     const int ViewerReadRetryDelayMs = 350;
     const int ViewerGateRetryCooldownMs = 1000;
+    const int ViewerLowStreakFeedResetThreshold = 5;
     const string OldLiveDirectoryName = "live_cu_tam";
     const string OldLiveManifestFileName = "old_live_identity_manifest.json";
     const int RequiredXPathRecoveryMaxAttempts = 3;
@@ -92,6 +98,7 @@ public sealed partial class AutomationEngine
     int _step = 1; // V10: buocHienTai 1..8
     long _rounds;
     int _lastViewerValue = -1; // snapshot nhẹ cho Manager/Chrome Monitor
+    int _consecutiveLowViewerLives; // reset nguồn đề xuất sau N LIVE liên tiếp <= ngưỡng
     System.Diagnostics.Stopwatch? _loopPerf;
     long _loopPerfTotalMs;
     long _loopPerfCount;
@@ -102,6 +109,10 @@ public sealed partial class AutomationEngine
     bool _oldLiveManifestLoaded;
     DateTime _nextOldLiveScan = DateTime.MaxValue;
     DateTime _stopAt = DateTime.MaxValue;
+    DateTime _pageMaintenanceDue = DateTime.MaxValue;
+    DateTime _nextPageHealthProbe = DateTime.MinValue;
+    string _lastHealthyTikTokUrl = "";
+    bool _pageRecoveryExecuting;
     bool _periodicExecuting;
     PeriodicF5Snapshot _periodicSnapshot = new(false, false, false, DateTime.MaxValue);
     DateTime? _lastOldLiveSavedAt;
@@ -205,6 +216,7 @@ public sealed partial class AutomationEngine
         _step = 1;
         _rounds = 0;
         Volatile.Write(ref _lastViewerValue, -1);
+        _consecutiveLowViewerLives = 0;
         _loopPerf = System.Diagnostics.Stopwatch.StartNew();
         _loopPerfTotalMs = 0;
         _loopPerfCount = 0;
@@ -221,6 +233,9 @@ public sealed partial class AutomationEngine
         EnsureOldLivesReadyForRun();
         // Runtime không còn lập lịch quét ảnh vùng lỗi/STOP/ban acc.
 
+        _lastHealthyTikTokUrl = _chrome.Page?.Url ?? "";
+        _nextPageHealthProbe = now;
+        ResetPageMaintenanceDue("khởi động");
         ResetPeriodicDue("khởi động", cancelCandidate: true);
         SyncPeriodicSnapshot();
         _cts = new CancellationTokenSource();
@@ -288,6 +303,10 @@ public sealed partial class AutomationEngine
                         break;
                     }
 
+                    // Crash renderer phải được xử lý trước mọi DOM/XPath guard. Khi Chrome hiện
+                    // “Ôi, hỏng!/Out of Memory”, Runtime.evaluate có thể không còn hoạt động.
+                    if (await HandleImmediatePageCrashRecoveryAsync(ct)) continue;
+
                     // Stop guard DOM: trạng thái vi phạm/tính năng bị khóa là lỗi cấp tài khoản,
                     // không được coi như ô nhập bất thường rồi tiếp tục đổi LIVE.
                     await StopIfFatalTikTokRestrictionAsync("ranh giới vòng chính", ct);
@@ -301,6 +320,7 @@ public sealed partial class AutomationEngine
                     // xử lý ở ranh giới giữa các bước, không chen giữa click/dán/Enter.
                     if (await HandleOldLiveExpiryAndScanAsync(ct)) continue;
                     if (await HandlePeriodicCaptureAndF5Async(ct)) continue;
+                    if (await HandlePageMaintenanceReloadAsync(ct)) continue;
 
                     // Viewer không còn chạy theo chu kỳ thời gian. Nếu bật, Viewer Gate được
                     // kiểm tra ngay trong bước 1/5 trước mỗi Click. InputGuard vẫn giữ nguyên.
@@ -426,6 +446,12 @@ public sealed partial class AutomationEngine
         _log.Warn($"[RECOVERY_START] code={ex.Code} context={ex.Context} reason={ex.Message}");
         SetStatus("ĐANG TỰ PHỤC HỒI", $"{ex.Context}: {ex.Message}");
 
+        // Nếu exception thực chất đến từ renderer/tab crash (Out of Memory/Aw, Snap/target crashed),
+        // ưu tiên cứu đúng trang hiện tại. Không chuyển LIVE và không tăng bộ đếm lỗi trước khi
+        // reload/restart Chrome đã được thử.
+        if (await TryRecoverRendererCrashFromFailureAsync($"{ex.Code}/{ex.Context}", ex, ct))
+            return;
+
         // LIVE/XPath failures are part of normal TikTok churn.  Reconnect and mark
         // Chrome unavailable only when the CDP session/target has actually gone away.
         var cdpSessionLost = IsLikelyCdpIssue(ex);
@@ -454,6 +480,12 @@ public sealed partial class AutomationEngine
     async Task HandleUnexpectedAutomationExceptionAsync(Exception ex, CancellationToken ct)
     {
         _log.Error("Lỗi engine V13 đã được chặn để tránh chết LoopAsync: " + ex);
+
+        // Crash Chrome xảy ra giữa Click/Dán/Enter có thể ném exception trước khi vòng chính
+        // kịp chạy PAGE_HEALTH_PROBE. Chặn ngay tại đây để không AutoPause/SkipLive nhầm.
+        if (await TryRecoverRendererCrashFromFailureAsync("LoopAsync/unexpected", ex, ct))
+            return;
+
         if (IsLikelyRecoverableAutomationError(ex))
         {
             var wrapped = new RecoverableAutomationException("UNEXPECTED_RECOVERABLE", "LoopAsync", ex.Message, RecoveryDecision.SkipLive, ex);
@@ -471,6 +503,75 @@ public sealed partial class AutomationEngine
         || IsLikelyCdpIssue(ex);
 
     bool IsLikelyCdpIssue(Exception ex) => _chrome.IsCdpSessionLost(ex);
+
+    async Task<bool> TryRecoverRendererCrashFromFailureAsync(string context, Exception? cause, CancellationToken ct)
+    {
+        if (_pageRecoveryExecuting) return false;
+
+        ChromeController.PageHealthSnapshot health;
+        try
+        {
+            health = await _chrome.ProbePageHealthAsync(ct);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception probeEx)
+        {
+            var hinted = cause is not null && (_chrome.IsRendererCrashLike(cause) || _chrome.IsCdpSessionLost(cause));
+            if (!hinted) return false;
+            health = new ChromeController.PageHealthSnapshot(false, true,
+                "EXCEPTION_CRASH_HINT", _lastHealthyTikTokUrl);
+            _log.Warn($"[PAGE_CRASH_PROBE_FALLBACK] context={context} reason={probeEx.Message}");
+        }
+
+        var crashLike = health.CrashLike ||
+            (cause is not null && _chrome.IsRendererCrashLike(cause));
+        if (!crashLike) return false;
+
+        _pageRecoveryExecuting = true;
+        var resumeStep = PageRecoveryRestartStep;
+        _step = resumeStep;
+        var fallback = !string.IsNullOrWhiteSpace(_lastHealthyTikTokUrl)
+            ? _lastHealthyTikTokUrl
+            : health.Url;
+        SetStatus("RECOVERING_CHROME", $"{context}: Chrome/tab lỗi ({health.Reason}) → đang tự phục hồi.");
+        _log.Warn($"[PAGE_CRASH_FAILURE_INTERCEPT] context={context} reason={health.Reason} action=reload-then-restart restartStep={resumeStep}");
+
+        try
+        {
+            try
+            {
+                await _chrome.RecoverCurrentPageAsync(fallback, ct);
+                _log.Warn($"[PAGE_CRASH_FAILURE_RECOVERED] context={context} method=reload-or-navigate restartStep={resumeStep}");
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception recoverEx)
+            {
+                _log.Warn($"[PAGE_CRASH_PRIMARY_RECOVERY_FAILED] context={context} reason={recoverEx.Message} action=restart-managed-chrome");
+                await _chrome.RestartManagedChromeForRecoveryAsync(fallback, ct);
+                _log.Warn($"[PAGE_CRASH_FAILURE_RECOVERED] context={context} method=restart-managed-chrome restartStep={resumeStep}");
+            }
+
+            ResetPageMaintenanceDue("sau tự cứu renderer crash");
+            _nextPageHealthProbe = DateTime.Now.AddMilliseconds(PageHealthProbeIntervalMs);
+            ResetInputGuardConsecutive("sau tự cứu renderer crash");
+            ResetRecoveryFailures("renderer crash đã tự phục hồi");
+            SetStatus("ĐÃ CỨU TRANG", $"Chrome đã phục hồi; tiếp tục từ bước {resumeStep}/8.");
+            return true;
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception finalEx)
+        {
+            ReportProblem("PAGE_CRASH_HARD_RECOVERY_FAILED", "Chrome renderer",
+                $"{context}: reload/navigate/restart Chrome đều chưa phục hồi được: {finalEx.Message}",
+                error: true, throttleSeconds: 15);
+            _log.Error($"[PAGE_CRASH_HARD_RECOVERY_FAILED] context={context} {finalEx}");
+            return false;
+        }
+        finally
+        {
+            _pageRecoveryExecuting = false;
+        }
+    }
 
     async Task<bool> EnsureCdpRecoveredAsync(string context, CancellationToken ct)
     {
@@ -577,6 +678,13 @@ public sealed partial class AutomationEngine
         _log.Info($"{context}: kiểm tra XPath bắt buộc trước khi tiếp tục workflow.");
         if (await RequiredXPathExistsAsync(context, xpath, ct)) return;
 
+        // Nếu nhiều DOM/XPath biến mất vì tab vừa Out of Memory thì không được dùng luồng
+        // "đổi LIVE để tìm lại XPath" ngay. Cứu renderer trước, rồi kiểm tra lại đúng LIVE.
+        if (await TryRecoverRendererCrashFromFailureAsync($"XPath missing/{context}", null, ct))
+        {
+            if (await RequiredXPathExistsAsync(context, xpath, ct)) return;
+        }
+
         for (int attempt = 1; attempt <= RequiredXPathRecoveryMaxAttempts; attempt++)
         {
             _log.Warn($"[XPATH_RECOVERY_START] context={context} xpath={xpath} attempt={attempt}/{RequiredXPathRecoveryMaxAttempts}");
@@ -655,6 +763,15 @@ public sealed partial class AutomationEngine
     int CurrentRestartStep => _step <= 4 ? 1 : 5;
     string CurrentPointName => _step <= 4 ? "điểm 1" : "điểm 2";
 
+    void AdvanceContentAfterSuccessfulSend(string pointName)
+    {
+        if (_contents.Count == 0) return;
+        var used = _contentIndex + 1;
+        _contentIndex = (_contentIndex + 1) % _contents.Count;
+        _log.Info($"[CONTENT_ADVANCE] point={pointName} used={used}/{_contents.Count} next={_contentIndex + 1}/{_contents.Count}");
+        NotifyStateChanged();
+    }
+
     async Task ExecuteOneStepAsync(CancellationToken ct)
     {
         var stepAtStart = _step;
@@ -687,6 +804,7 @@ public sealed partial class AutomationEngine
                     SetStatus("BƯỚC 3/8", "Enter ô 1 • theo dõi phản hồi cấm bình luận");
                     await _chrome.PressKeyAsync("Enter", ct: ct);
                     if (await WatchPostEnterCommentRestrictionAsync("điểm 1", restartStep: 1, ct)) return;
+                    AdvanceContentAfterSuccessfulSend("điểm 1");
                     _step = 4;
                     break;
                 }
@@ -718,17 +836,16 @@ public sealed partial class AutomationEngine
                     SetStatus("BƯỚC 7/8", "Enter ô 2 • theo dõi phản hồi cấm bình luận");
                     await _chrome.PressKeyAsync("Enter", ct: ct);
                     if (await WatchPostEnterCommentRestrictionAsync("điểm 2", restartStep: 5, ct)) return;
+                    AdvanceContentAfterSuccessfulSend("điểm 2");
                     _step = 8;
                     break;
                 }
                 case 8:
                 {
-                    SetStatus("BƯỚC 8/8", "Hoàn tất vòng • chuẩn bị nội dung tiếp theo");
+                    SetStatus("BƯỚC 8/8", "Hoàn tất vòng • nội dung đã tăng sau từng lần gửi");
                     _rounds++;
-                    var used = _contentIndex + 1;
-                    _contentIndex = (_contentIndex + 1) % _contents.Count;
                     _step = 1;
-                    SetStatus("ĐANG CHẠY", $"Hoàn tất vòng {_rounds} với nội dung {used}/{_contents.Count}. Tiếp theo {_contentIndex + 1}/{_contents.Count}.");
+                    SetStatus("ĐANG CHẠY", $"Hoàn tất vòng {_rounds}. Nội dung tiếp theo {_contentIndex + 1}/{_contents.Count}.");
                     NotifyStateChanged();
                     await Task.Delay(NormalLoopDelay(), ct);
                     if (_loopPerf is not null)
@@ -756,10 +873,157 @@ public sealed partial class AutomationEngine
 
     void ShiftPeriodicClock(TimeSpan delta)
     {
-        if (delta <= TimeSpan.Zero || _s.PeriodicF5Minutes <= 0) return;
-        if (_periodicDue != DateTime.MaxValue) _periodicDue += delta;
-        if (_candidateCaptureAt != DateTime.MaxValue) _candidateCaptureAt += delta;
+        if (delta <= TimeSpan.Zero) return;
+        if (_s.PeriodicF5Minutes > 0)
+        {
+            if (_periodicDue != DateTime.MaxValue) _periodicDue += delta;
+            if (_candidateCaptureAt != DateTime.MaxValue) _candidateCaptureAt += delta;
+        }
+        if (_pageMaintenanceDue != DateTime.MaxValue) _pageMaintenanceDue += delta;
+        if (_nextPageHealthProbe != DateTime.MinValue) _nextPageHealthProbe += delta;
         SyncPeriodicSnapshot();
+    }
+
+    int PageRecoveryRestartStep => _step switch
+    {
+        1 or 2 or 3 => 1,
+        4 or 5 or 6 or 7 => 5,
+        _ => 1
+    };
+
+    void ResetPageMaintenanceDue(string reason)
+    {
+        _pageMaintenanceDue = DateTime.Now.AddMinutes(PageMaintenanceReloadMinutes);
+        _log.Info($"[PAGE_MAINTENANCE_SCHEDULED] minutes={PageMaintenanceReloadMinutes} due={_pageMaintenanceDue:HH:mm:ss} reason={reason}");
+    }
+
+    async Task<bool> HandleImmediatePageCrashRecoveryAsync(CancellationToken ct)
+    {
+        if (_pageRecoveryExecuting || DateTime.Now < _nextPageHealthProbe) return false;
+        _nextPageHealthProbe = DateTime.Now.AddMilliseconds(PageHealthProbeIntervalMs);
+
+        ChromeController.PageHealthSnapshot health;
+        try
+        {
+            health = await _chrome.ProbePageHealthAsync(ct);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _log.Warn($"[PAGE_HEALTH_PROBE_FAILED] reason={ex.Message}");
+            return false;
+        }
+
+        if (health.Healthy)
+        {
+            if (!string.IsNullOrWhiteSpace(health.Url) &&
+                health.Url.Contains("tiktok.com", StringComparison.OrdinalIgnoreCase))
+                _lastHealthyTikTokUrl = health.Url;
+            return false;
+        }
+
+        if (!health.CrashLike) return false;
+
+        _pageRecoveryExecuting = true;
+        var resumeStep = PageRecoveryRestartStep;
+        _step = resumeStep;
+        SetStatus("ĐANG CỨU TRANG", $"Phát hiện Chrome lỗi ({health.Reason}) → reload ngay.");
+        _log.Warn($"[PAGE_CRASH_DETECTED] reason={health.Reason} url={health.Url} action=RECOVER_NOW restartStep={resumeStep}");
+        try
+        {
+            var fallback = !string.IsNullOrWhiteSpace(_lastHealthyTikTokUrl)
+                ? _lastHealthyTikTokUrl
+                : health.Url;
+            await _chrome.RecoverCurrentPageAsync(fallback, ct);
+            ResetPageMaintenanceDue("vừa tự cứu trang crash");
+            _nextPageHealthProbe = DateTime.Now.AddMilliseconds(PageHealthProbeIntervalMs);
+            ResetInputGuardConsecutive("sau tự cứu trang crash");
+            _log.Warn($"[PAGE_CRASH_RECOVERED] restartStep={resumeStep} action=RECHECK_WORKFLOW");
+            SetStatus("ĐÃ CỨU TRANG", $"Chrome đã reload; tiếp tục từ bước {resumeStep}/8.");
+            return true;
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _log.Warn($"[PAGE_CRASH_RECOVERY_RELOAD_FAILED] reason={ex.Message} action=restart-managed-chrome");
+            try
+            {
+                var fallback = !string.IsNullOrWhiteSpace(_lastHealthyTikTokUrl)
+                    ? _lastHealthyTikTokUrl
+                    : health.Url;
+                await _chrome.RestartManagedChromeForRecoveryAsync(fallback, ct);
+                ResetPageMaintenanceDue("restart Chrome sau renderer crash");
+                _nextPageHealthProbe = DateTime.Now.AddMilliseconds(PageHealthProbeIntervalMs);
+                ResetInputGuardConsecutive("sau restart Chrome renderer crash");
+                ResetRecoveryFailures("restart Chrome renderer crash thành công");
+                _log.Warn($"[PAGE_CRASH_RECOVERED] restartStep={resumeStep} method=restart-managed-chrome action=RECHECK_WORKFLOW");
+                SetStatus("ĐÃ CỨU TRANG", $"Chrome đã được mở lại; tiếp tục từ bước {resumeStep}/8.");
+                return true;
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception restartEx)
+            {
+                ReportProblem("PAGE_CRASH_RECOVERY_FAILED", "Chrome renderer",
+                    "Reload và restart Chrome đều chưa tự phục hồi được: " + restartEx.Message,
+                    error: true, throttleSeconds: 10);
+                _log.Error($"[PAGE_CRASH_RECOVERY_FAILED] reload={ex.Message}; restart={restartEx}");
+                // Không Stop() ở đây. Vòng chính sẽ tiếp tục probe/retry; chỉ cơ chế chống
+                // lỗi liên tiếp hiện có mới tạm dừng nếu Chrome thực sự không thể phục hồi.
+                await Task.Delay(1000, ct);
+                return true;
+            }
+        }
+        finally
+        {
+            _pageRecoveryExecuting = false;
+        }
+    }
+
+    async Task<bool> HandlePageMaintenanceReloadAsync(CancellationToken ct)
+    {
+        if (_pageRecoveryExecuting || DateTime.Now < _pageMaintenanceDue) return false;
+
+        // Bước 4/8 chỉ đổi state nội bộ sau một lần gửi thành công. Cho nó hoàn tất trước,
+        // tránh reset về sai điểm và không bao giờ chen reload giữa Click/Dán/Enter.
+        if (_step is 4 or 8) return false;
+
+        _pageRecoveryExecuting = true;
+        var resumeStep = PageRecoveryRestartStep;
+        _step = resumeStep;
+        SetStatus("F5 BẢO TRÌ 30 PHÚT", $"Reload trang hiện tại • tiếp tục bước {resumeStep}/8.");
+        _log.Info($"[PAGE_MAINTENANCE_RELOAD_START] intervalMin={PageMaintenanceReloadMinutes} restartStep={resumeStep}");
+        try
+        {
+            try
+            {
+                await _chrome.ReloadAndWaitAsync(PageRecoveryReloadWaitMs, 15000, ct);
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"[PAGE_MAINTENANCE_RELOAD_FALLBACK] normalReloadFailed={ex.Message}");
+                await _chrome.RecoverCurrentPageAsync(_lastHealthyTikTokUrl, ct);
+            }
+
+            ResetPageMaintenanceDue("F5 bảo trì thành công");
+            _nextPageHealthProbe = DateTime.Now.AddMilliseconds(PageHealthProbeIntervalMs);
+            ResetInputGuardConsecutive("sau F5 bảo trì");
+            _log.Info($"[PAGE_MAINTENANCE_RELOAD_OK] restartStep={resumeStep}");
+            SetStatus("ĐANG CHẠY", $"F5 bảo trì xong • tiếp tục bước {resumeStep}/8.");
+            return true;
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            ReportProblem("PAGE_MAINTENANCE_RELOAD_FAILED", "F5 bảo trì",
+                "Reload định kỳ 30 phút thất bại: " + ex.Message,
+                error: true, throttleSeconds: 30);
+            _pageMaintenanceDue = DateTime.Now.AddMinutes(1);
+            return true;
+        }
+        finally
+        {
+            _pageRecoveryExecuting = false;
+        }
     }
 
     async Task<bool> HandlePeriodicCaptureAndF5Async(CancellationToken ct)
@@ -1089,6 +1353,7 @@ public sealed partial class AutomationEngine
         _log.Info($"[VIEWER_GATE_READ] source={source} value={value} threshold={_s.Viewer.Threshold} raw={raw}");
         if (value > _s.Viewer.Threshold)
         {
+            ResetLowViewerStreak($"Viewer đạt ngưỡng tại {source}");
             _log.Info($"[VIEWER_GATE_OK] source={source} value={value} > threshold={_s.Viewer.Threshold}");
             return true;
         }
@@ -1110,6 +1375,7 @@ public sealed partial class AutomationEngine
             _log.Info($"[VIEWER_GATE_CONFIRM_LOW] source={source} {lowCount}/{_s.Viewer.ConfirmLow} value={confirm} raw={rawConfirm}");
             if (confirm > _s.Viewer.Threshold)
             {
+                ResetLowViewerStreak($"Viewer đạt ngưỡng khi xác nhận tại {source}");
                 _log.Info($"[VIEWER_GATE_OK] source={source} xác nhận lại value={confirm} > threshold={_s.Viewer.Threshold}");
                 return true;
             }
@@ -1119,18 +1385,115 @@ public sealed partial class AutomationEngine
         return await FindAcceptableViewerLiveAsync(source, value, ct);
     }
 
+    bool IsActiveOldLiveRecommendation(TikTokRecommendedLiveCandidate candidate)
+    {
+        if (_activeOldLives.Count == 0) return false;
+        var username = (candidate.Username ?? "").Trim().TrimStart('@').ToLowerInvariant();
+        var href = (candidate.Href ?? "").Trim().TrimEnd('/').ToLowerInvariant();
+
+        foreach (var entry in _activeOldLives)
+        {
+            if (!string.IsNullOrWhiteSpace(username)
+                && string.Equals(entry.IdentityKey, "user:" + username, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            var oldHref = (entry.Href ?? "").Trim().TrimEnd('/').ToLowerInvariant();
+            if (!string.IsNullOrWhiteSpace(href)
+                && !string.IsNullOrWhiteSpace(oldHref)
+                && string.Equals(href, oldHref, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    async Task<bool> TryOpenBestRecommendedViewerLiveAsync(string source, CancellationToken ct)
+    {
+        if (!_s.Viewer.Enabled || !_running) return false;
+
+        try
+        {
+            var candidates = await _chrome.GetTikTokRecommendedLivesAsync(ct);
+            if (candidates.Count == 0)
+            {
+                _log.Info($"[VIEWER_RECOMMENDED_SCAN] source={source} found=0 result=fallback-current-switch-flow");
+                return false;
+            }
+
+            var parsed = candidates
+                .Select(c => new { Candidate = c, Viewer = ViewerCountParser.Parse(c.ViewerText, _log) })
+                .Where(x => x.Viewer >= 0)
+                .OrderByDescending(x => x.Viewer)
+                .ToList();
+
+            foreach (var item in parsed)
+            {
+                _log.Info($"[VIEWER_RECOMMENDED_CANDIDATE] source={source} user={item.Candidate.Username} viewer={item.Viewer} raw={item.Candidate.ViewerText} href={item.Candidate.Href}");
+            }
+
+            var best = parsed
+                .Where(x => x.Viewer > _s.Viewer.Threshold)
+                .Where(x => !IsActiveOldLiveRecommendation(x.Candidate))
+                .FirstOrDefault();
+
+            if (best is null)
+            {
+                var oldLiveSkipped = parsed.Count(x => x.Viewer > _s.Viewer.Threshold && IsActiveOldLiveRecommendation(x.Candidate));
+                _log.Info($"[VIEWER_RECOMMENDED_SCAN] source={source} found={parsed.Count} threshold={_s.Viewer.Threshold} suitable=0 oldLiveSkipped={oldLiveSkipped} result=fallback-current-switch-flow");
+                return false;
+            }
+
+            SetStatus("CHỌN LIVE ĐỀ XUẤT", $"{best.Candidate.Username} • {best.Viewer} người • > {_s.Viewer.Threshold}");
+            _log.Warn($"[VIEWER_RECOMMENDED_PICK] source={source} user={best.Candidate.Username} viewer={best.Viewer} threshold={_s.Viewer.Threshold} href={best.Candidate.Href} action=navigate-direct");
+
+            await _chrome.NavigateAndWaitAsync(best.Candidate.Href, Math.Max(900, _s.Viewer.WaitAfterF5Sec * 1000), 15000, ct);
+            await StopIfFatalTikTokRestrictionAsync($"sau chọn LIVE đề xuất: {source}", ct);
+            ResetPeriodicDue("Viewer recommended LIVE direct navigation", cancelCandidate: true);
+            ResetPageMaintenanceDue("Viewer recommended LIVE direct navigation");
+            ResetInputGuardConsecutive("sau chọn LIVE đề xuất");
+            Volatile.Write(ref _lastViewerValue, best.Viewer);
+            ResetLowViewerStreak($"đã chọn LIVE đề xuất {best.Viewer} người");
+
+            _log.Warn($"[VIEWER_RECOMMENDED_OPENED] source={source} user={best.Candidate.Username} sidebarViewer={best.Viewer} result=allow-workflow-without-enter-then-rescan");
+            return true;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"[VIEWER_RECOMMENDED_SCAN_ERROR] source={source} error={ex.Message}; fallback=logic-chuyen-live-hien-tai");
+            return false;
+        }
+    }
+
     async Task<bool> FindAcceptableViewerLiveAsync(string source, int? initialLow, CancellationToken ct)
     {
         var max = Math.Max(1, _s.Viewer.MaxF5);
         if (initialLow.HasValue)
+        {
             _log.Warn($"[VIEWER_GATE_LOW] source={source} value={initialLow.Value} <= threshold={_s.Viewer.Threshold}; tối đa {max} vòng ↓ + F5 để tìm LIVE đủ người.");
+            RecordLowViewerLive(source + " / LIVE hiện tại", initialLow.Value);
+            var resetResult = await MaybeResetLowViewerRecommendationFeedAsync(source + " / LIVE hiện tại", ct);
+            if (resetResult == true) return true;
+        }
         else
+        {
             _log.Warn($"[VIEWER_GATE_NO_VALUE] source={source}; tối đa {max} vòng ↓ + F5 để tìm LIVE có Viewer đọc được và > ngưỡng.");
+        }
+
+        // Ưu tiên cột “Nhà sáng tạo LIVE đề xuất” trước mọi lần chuyển bằng ArrowDown.
+        // Viewer của recommendation được đọc ngay trên sidebar; không cần vào LIVE rồi mới quét lại.
+        if (await TryOpenBestRecommendedViewerLiveAsync(source + " / trước chuyển LIVE", ct))
+            return true;
 
         for (int i = 1; i <= max && _running; i++)
         {
             await WaitIfPausedAsync(ct);
-            SetStatus("TÌM LIVE ĐỦ NGƯỜI", $"{source} • vòng {i}/{max}");
+            SetStatus("TÌM LIVE ĐỦ NGƯỜI", $"{source} • vòng {i}/{max} • LIVE thấp {_consecutiveLowViewerLives}/{ViewerLowStreakFeedResetThreshold}");
+
+            if (i > 1 && await TryOpenBestRecommendedViewerLiveAsync($"{source} / trước ArrowDown vòng {i}/{max}", ct))
+                return true;
 
             var transitioned = await TransitionAsync(
                 $"Viewer Gate {source} vòng {i}/{max}",
@@ -1160,9 +1523,14 @@ public sealed partial class AutomationEngine
             _log.Info($"[VIEWER_GATE_AFTER_SWITCH] source={source} vòng={i}/{max} value={value} threshold={_s.Viewer.Threshold} raw={raw}");
             if (value > _s.Viewer.Threshold)
             {
+                ResetLowViewerStreak($"đã tìm được LIVE đủ người ở vòng {i}/{max}");
                 _log.Info($"[VIEWER_GATE_RECOVERED] source={source} vòng={i}/{max} value={value} > threshold={_s.Viewer.Threshold}; cho phép workflow tiếp tục.");
                 return true;
             }
+
+            RecordLowViewerLive($"{source} / sau chuyển {i}/{max}", value);
+            var resetResult = await MaybeResetLowViewerRecommendationFeedAsync($"{source} / vòng {i}/{max}", ct);
+            if (resetResult == true) return true;
         }
 
         ReportProblem("VIEWER_GATE_NO_SAFE_LIVE", "Người xem",
@@ -1170,6 +1538,80 @@ public sealed partial class AutomationEngine
             throttleSeconds: 10);
         await Task.Delay(ViewerGateRetryCooldownMs, ct);
         return false;
+    }
+
+    void RecordLowViewerLive(string source, int value)
+    {
+        _consecutiveLowViewerLives++;
+        _log.Warn($"[VIEWER_LOW_STREAK] source={source} value={value} threshold={_s.Viewer.Threshold} streak={_consecutiveLowViewerLives}/{ViewerLowStreakFeedResetThreshold}");
+    }
+
+    void ResetLowViewerStreak(string reason)
+    {
+        if (_consecutiveLowViewerLives > 0)
+            _log.Info($"[VIEWER_LOW_STREAK_RESET] previous={_consecutiveLowViewerLives} reason={reason}");
+        _consecutiveLowViewerLives = 0;
+    }
+
+    async Task<bool?> MaybeResetLowViewerRecommendationFeedAsync(string source, CancellationToken ct)
+    {
+        if (_consecutiveLowViewerLives < ViewerLowStreakFeedResetThreshold)
+            return null;
+
+        var streak = _consecutiveLowViewerLives;
+
+        // Đủ 5 LIVE thấp: quét lại sidebar trước. Chỉ hard-reset /live khi sidebar
+        // không có LIVE đề xuất nào > ngưỡng (và không thuộc Live cũ active).
+        SetStatus("QUÉT LẠI LIVE ĐỀ XUẤT", $"{streak} LIVE thấp liên tiếp • tìm LIVE > {_s.Viewer.Threshold} trước khi reset");
+        _log.Warn($"[VIEWER_FEED_RESET_PRECHECK_RECOMMENDED] source={source} streak={streak} threshold={_s.Viewer.Threshold}");
+        if (await TryOpenBestRecommendedViewerLiveAsync(source + " / trước hard-reset", ct))
+            return true;
+
+        _consecutiveLowViewerLives = 0; // Hard-reset chỉ xảy ra sau khi sidebar không có LIVE phù hợp.
+        SetStatus("LÀM MỚI ĐỀ XUẤT LIVE", $"{streak} LIVE liên tiếp ≤ {_s.Viewer.Threshold} người → sidebar không phù hợp → tải lại /live");
+        _log.Warn($"[VIEWER_FEED_RESET_START] source={source} streak={streak} threshold={_s.Viewer.Threshold} action=navigate:/live reason=no-suitable-sidebar-live");
+
+        try
+        {
+            await _chrome.ResetTikTokLiveRecommendationFeedAsync(ct);
+            await StopIfFatalTikTokRestrictionAsync($"sau reset nguồn đề xuất Viewer: {source}", ct);
+            ResetPeriodicDue("Viewer low-streak hard reset /live", cancelCandidate: true);
+            ResetPageMaintenanceDue("Viewer low-streak hard reset /live");
+            ResetInputGuardConsecutive("sau reset nguồn đề xuất Viewer");
+
+            if (await TryOpenBestRecommendedViewerLiveAsync(source + " / sau reset /live", ct))
+                return true;
+
+            var (value, raw) = await ReadViewerWithRetryAsync(source + " / sau reset /live", ct);
+            if (value < 0)
+            {
+                _log.Warn($"[VIEWER_FEED_RESET_DONE] source={source} result=viewer-unreadable; sẽ tiếp tục chuyển LIVE bình thường.");
+                return false;
+            }
+
+            _log.Info($"[VIEWER_FEED_RESET_VIEWER] source={source} value={value} threshold={_s.Viewer.Threshold} raw={raw}");
+            if (value > _s.Viewer.Threshold)
+            {
+                ResetLowViewerStreak("LIVE đầu tiên sau reset /live đã đủ người");
+                _log.Warn($"[VIEWER_FEED_RESET_RECOVERED] source={source} value={value} > threshold={_s.Viewer.Threshold}; cho phép workflow tiếp tục.");
+                return true;
+            }
+
+            // LIVE đầu tiên của nguồn đề xuất mới vẫn thấp: bắt đầu một streak mới từ 1,
+            // không reset /live ngay lần nữa.
+            RecordLowViewerLive(source + " / LIVE đầu tiên sau reset /live", value);
+            _log.Warn($"[VIEWER_FEED_RESET_DONE] source={source} result=still-low value={value}; streak mới={_consecutiveLowViewerLives}/{ViewerLowStreakFeedResetThreshold}.");
+            return false;
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            ReportProblem("VIEWER_FEED_RESET_FAILED", "Người xem",
+                $"Đã có {streak} LIVE thấp liên tiếp nhưng chưa tải lại được /live: {ex.Message}. Sẽ tiếp tục tìm LIVE và chỉ thử hard-reset lại sau 5 LIVE thấp mới.",
+                error: IsLikelyCdpIssue(ex), throttleSeconds: 15);
+            _log.Warn($"[VIEWER_FEED_RESET_FAILED] source={source} reason={ex.Message}");
+            return false;
+        }
     }
 
     async Task<(int value, string raw)> ReadViewerAsync(CancellationToken ct)
@@ -1503,6 +1945,7 @@ public sealed partial class AutomationEngine
             }
 
             ResetPeriodicDue(source + " da xac nhan sang LIVE moi va F5 xong", cancelCandidate: !scheduledPeriodic);
+            ResetPageMaintenanceDue(source + " vừa F5 sau chuyển LIVE");
             completed = true;
             return true;
         }
@@ -1526,6 +1969,7 @@ public sealed partial class AutomationEngine
 
                 _log.Warn($"[RECOVERY_OK] transition={source} action=retry-after-cdp-reconnect");
                 ResetPeriodicDue(source + " da xac nhan sang LIVE moi sau retry reconnect", cancelCandidate: !scheduledPeriodic);
+                ResetPageMaintenanceDue(source + " vừa F5 sau retry chuyển LIVE");
                 completed = true;
                 return true;
             }

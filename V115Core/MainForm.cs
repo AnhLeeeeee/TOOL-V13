@@ -18,6 +18,7 @@ public sealed partial class MainForm : Form
     readonly TikTokProfileService _profileService;
     readonly ChromeController _chrome;
     readonly ToolTikTokV12.Services.ChromeProfileNameSyncService _chromeProfileNameSync = new();
+    readonly ToolTikTokV12.Services.TikTokAuthService _tiktokAuthService = new();
     readonly AutomationEngine _engine;
     readonly RuntimeStatsTracker _runtimeStats;
     AppSettings _settings;
@@ -75,6 +76,7 @@ public sealed partial class MainForm : Form
     Color _chromeStateColor = Color.DimGray;
     Color _chromePageStateColor = Color.DimGray;
     bool _chromeStatusPinned;
+    string _startupPreparationState = "IDLE";
     bool _wasChromeConnected;
     bool _shutdownStarted;
     bool _shutdownComplete;
@@ -108,8 +110,8 @@ public sealed partial class MainForm : Form
 
         var ctorSw = System.Diagnostics.Stopwatch.StartNew();
         Text = _managedMode
-            ? $"Tool TikTok V13.4.1 — XPath-only VM Worker — {_startupOptions.ProfileName}"
-            : "Tool TikTok V13.4.1 — XPath-only / DOM / VM Optimized";
+            ? $"Tool TikTok V13.5 — XPath-only VM Worker — {_startupOptions.ProfileName}"
+            : "Tool TikTok V13.5 — XPath-only / DOM / VM Optimized";
         AutoScaleMode = AutoScaleMode.Dpi;
         Font = new Font("Segoe UI", 9F);
         Width = 930; Height = 700; MinimumSize = new Size(760, 580); StartPosition = FormStartPosition.CenterScreen;
@@ -560,7 +562,7 @@ public sealed partial class MainForm : Form
 
     Control BuildChromeGroup()
     {
-        // V13.4.1: các nút Chrome/Profile trùng chức năng với Manager đã được bỏ khỏi tab.
+        // V13.5: các nút Chrome/Profile trùng chức năng với Manager đã được bỏ khỏi tab.
         // Chỉ giữ hai dòng trạng thái để theo dõi kết nối CDP/TikTok.
         var status = new TableLayoutPanel
         {
@@ -771,7 +773,7 @@ public sealed partial class MainForm : Form
         {
             AutoSize = true,
             MaximumSize = new Size(980, 0),
-            Text = "V13.4.1 không chụp/quét ảnh Live cũ. Tại mốc T-10s, tool đọc tài khoản LIVE trực tiếp từ XPath và lưu định danh (ưu tiên username/href) với TTL. " +
+            Text = "V13.5 không chụp/quét ảnh Live cũ. Tại mốc T-10s, tool đọc tài khoản LIVE trực tiếp từ XPath và lưu định danh (ưu tiên username/href) với TTL. " +
                    "Trong runtime, nếu tài khoản hiện tại trùng một entry Live cũ còn hiệu lực thì gọi nguyên flow chuyển LIVE + F5 như trước. " +
                    "Tên hiển thị chỉ để xem; so sánh ưu tiên định danh ổn định."
         });
@@ -849,7 +851,7 @@ public sealed partial class MainForm : Form
     {
         _xp1.Text = _settings.XPathPoint1; _xp2.Text = _settings.XPathPoint2; _xpPeriodic.Text = _settings.XPathPeriodicAction; _xpHover.Text = _settings.XPathHoverArea;
         _switchNeedsHover.Checked = _settings.SwitchNeedsHover; _useArrowDown.Checked = _settings.UseArrowDownForLiveSwitch; _hoverDelay.Value = Clamp(_settings.HoverDelayMs, _hoverDelay);
-        _settings.StrictXPathOnly = true; // V13.4.1: XPath/CDP-only is fixed; no UI toggle needed.
+        _settings.StrictXPathOnly = true; // V13.5: XPath/CDP-only is fixed; no UI toggle needed.
         _delayMin.Value = Clamp(_settings.DelayMinMs, _delayMin); _delayMax.Value = Clamp(_settings.DelayMaxMs, _delayMax); _loopMin.Value = Clamp(_settings.LoopMinMs, _loopMin); _loopMax.Value = Clamp(_settings.LoopMaxMs, _loopMax);
         SelectCombo(_periodicMin, _settings.PeriodicF5Minutes == 0 ? "Không dùng" : _settings.PeriodicF5Minutes.ToString()); _timerStop.Value = Clamp(_settings.TimerStopMinutes, _timerStop);
         SetContentsLines(_settingsService.LoadContents());
@@ -940,7 +942,7 @@ public sealed partial class MainForm : Form
             _settings.Viewer.WaitAfterF5Sec = (int)_viewerWait.Value; _settings.Viewer.MaxF5 = (int)_viewerMaxF5.Value;
             _settings.OldLive.Enabled = _oldEnabled.Checked; _settings.OldLive.IdentityXPath = _oldIdentityXp.Text.Trim(); _settings.OldLive.ActionXPath = _oldActionXp.Text.Trim();
             _settings.OldLive.KeepMinutes = int.TryParse(_oldKeep.Text, out var km) ? km : 10;
-            _settingsService.Save(_settings); _settingsService.SaveContents(_contents.Text); _log.Info("Đã lưu cấu hình V13.4.1 + XPath/InputGuard/VM mode vào auto_chrome.ini.");
+            _settingsService.Save(_settings); _settingsService.SaveContents(_contents.Text); _log.Info("Đã lưu cấu hình V13.5 + XPath/InputGuard/VM mode vào auto_chrome.ini.");
             UpdateContentCount();
             RefreshPeriodicCountdownLabel();
         }
@@ -1204,11 +1206,57 @@ public sealed partial class MainForm : Form
             SetChromeStatus("Trạng thái Chrome: 🟡 Đang mở Chrome...", Color.Goldenrod, "TikTok: —", Color.DimGray);
             await _chrome.LaunchAsync(_settings.ChromePort, _settings.ChromeProfileDir, SyncChromeProfileNameBeforeLaunch);
             await ConnectChromeAsync();
+            if (_chrome.Connected)
+                await PrepareTikTokProfileStartupAsync();
         }
         catch (Exception ex)
         {
             SetChromeStatus($"Trạng thái Chrome: 🔴 Lỗi mở Chrome: {ShortText(ex.Message, 90)}", Color.Firebrick, "TikTok: —", Color.DimGray);
             ShowUiProblem("CHROME_LAUNCH", "Chrome V13", ex);
+        }
+    }
+
+    async Task PrepareTikTokProfileStartupAsync()
+    {
+        try
+        {
+            _startupPreparationState = "PREPARING";
+            SetChromeStatus(
+                "Trạng thái Chrome: 🟡 Đang chuẩn bị TikTok...", Color.Goldenrod,
+                "TikTok: 🟡 Nếu có CAPTCHA, hãy xử lý trên Chrome — tool sẽ tự tiếp tục", Color.Goldenrod);
+            var auth = _tiktokAuthService.Load(_baseDir);
+            var result = await _chrome.PrepareTikTokStartupAsync(auth.Username, auth.Password, auth.TotpSecret, auth.AutoLogin);
+            _startupPreparationState = result.State;
+
+            switch (result.State)
+            {
+                case "READY":
+                    SetChromeStatus("Trạng thái Chrome: 🟢 Đã sẵn sàng", Color.DarkGreen, "TikTok: 🟢 LIVE đã mở", Color.DarkGreen);
+                    _log.Info("[TIKTOK_STARTUP_READY] " + result.Message);
+                    break;
+                case "CAPTCHA_REQUIRED":
+                    SetChromeStatus("Trạng thái Chrome: 🟠 Cần xử lý CAPTCHA", Color.DarkOrange, "TikTok: 🟠 CAPTCHA — xử lý thủ công", Color.DarkOrange);
+                    _log.Warn("[TIKTOK_STARTUP_CAPTCHA] " + result.Message);
+                    break;
+                case "TOTP_REQUIRED":
+                    SetChromeStatus("Trạng thái Chrome: 🟠 Thiếu secret 2FA", Color.DarkOrange, "TikTok: 🟠 Cần cấu hình 2FA", Color.DarkOrange);
+                    _log.Warn("[TIKTOK_STARTUP_TOTP_REQUIRED] " + result.Message);
+                    break;
+                case "LOGIN_REQUIRED":
+                    SetChromeStatus("Trạng thái Chrome: 🟠 Chưa có đăng nhập tự động", Color.DarkOrange, "TikTok: 🟠 Hãy đăng nhập/cấu hình tài khoản", Color.DarkOrange);
+                    _log.Warn("[TIKTOK_STARTUP_LOGIN_REQUIRED] " + result.Message);
+                    break;
+                default:
+                    SetChromeStatus("Trạng thái Chrome: 🟠 TikTok chưa sẵn sàng", Color.DarkOrange, $"TikTok: 🟠 {ShortText(result.Message, 90)}", Color.DarkOrange);
+                    _log.Warn($"[TIKTOK_STARTUP_{result.State}] {result.Message}");
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            _startupPreparationState = "ERROR";
+            SetChromeStatus("Trạng thái Chrome: 🟠 Lỗi chuẩn bị TikTok", Color.DarkOrange, $"TikTok: 🟠 {ShortText(ex.Message, 90)}", Color.DarkOrange);
+            _log.Error("[TIKTOK_STARTUP_ERROR] " + ex);
         }
     }
 
@@ -1540,6 +1588,41 @@ public sealed partial class MainForm : Form
         {
             SaveFromUi();
             await EnsureChromeAsync();
+
+            // V13.5: giữ nguyên LIVE hiện tại nếu các XPath thao tác chính đã có.
+            // Trước đây mỗi lần bấm Bắt đầu đều chạy PrepareTikTokProfileStartupAsync(),
+            // khiến profile đang đứng trong một LIVE hợp lệ vẫn bị điều hướng về /live
+            // và TikTok chọn sang một LIVE ngẫu nhiên khác.
+            var alreadyOnReadyLive = await IsCurrentLiveReadyForStartAsync();
+            if (alreadyOnReadyLive)
+            {
+                _startupPreparationState = "READY";
+                SetChromeStatus(
+                    "Trạng thái Chrome: 🟢 Đã sẵn sàng", Color.DarkGreen,
+                    "TikTok: 🟢 Giữ nguyên LIVE hiện tại", Color.DarkGreen);
+                _log.Info("[TIKTOK_STARTUP_KEEP_CURRENT_LIVE] coreXpathsPresent=true action=SKIP_NAVIGATE_LIVE");
+            }
+            else
+            {
+                // Chỉ khi chưa có XPath LIVE hiện tại mới thực hiện startup/login gate
+                // và điều hướng TikTok vào /live như logic cũ.
+                _log.Info("[TIKTOK_STARTUP_NEED_LIVE] coreXpathsPresent=false action=PREPARE_TIKTOK_LIVE");
+                await PrepareTikTokProfileStartupAsync();
+                if (!string.Equals(_startupPreparationState, "READY", StringComparison.OrdinalIgnoreCase))
+                {
+                    var detail = _startupPreparationState switch
+                    {
+                        "CAPTCHA_REQUIRED" => "TikTok vẫn đang yêu cầu CAPTCHA sau thời gian chờ. Hãy xử lý CAPTCHA trên Chrome rồi bấm Bắt đầu lại.",
+                        "TOTP_REQUIRED" => "TikTok đang yêu cầu 2FA nhưng profile chưa có secret TOTP.",
+                        "LOGIN_REQUIRED" => "Profile chưa đăng nhập và chưa cấu hình tài khoản/mật khẩu tự động.",
+                        _ => "TikTok chưa sẵn sàng: " + _startupPreparationState
+                    };
+                    AppendProblem("[TIKTOK_STARTUP_GATE] " + detail);
+                    MessageBox.Show(detail, "TikTok chưa sẵn sàng", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+            }
+
             if (!await ValidateCoreXpathsBeforeStartAsync()) return;
             _engine.Start(_settings, GetAutomationContents());
         }
@@ -1549,6 +1632,45 @@ public sealed partial class MainForm : Form
             _startStopCommandInFlight = false;
             UpdateRunControlButtons();
         }
+    }
+
+    async Task<bool> IsCurrentLiveReadyForStartAsync()
+    {
+        // Dùng chính XPath thao tác đã lưu của profile làm dấu hiệu "đang ở LIVE".
+        // Yêu cầu cả hai XPath chính cùng tồn tại vì Start/Automation cũng bắt buộc
+        // cả Điểm/ô nhập 1 và 2. Poll ngắn vài lần để tránh DOM vừa render bị hụt.
+        var xp1 = _settings.XPathPoint1?.Trim() ?? "";
+        var xp2 = _settings.XPathPoint2?.Trim() ?? "";
+        if (string.IsNullOrWhiteSpace(xp1) || string.IsNullOrWhiteSpace(xp2))
+        {
+            _log.Info("[TIKTOK_STARTUP_LIVE_PROBE] ready=false reason=core-xpath-empty");
+            return false;
+        }
+
+        const int attempts = 4;
+        for (var attempt = 1; attempt <= attempts; attempt++)
+        {
+            try
+            {
+                var point1Exists = await _chrome.XPathExistsAsync(xp1);
+                var point2Exists = string.Equals(xp1, xp2, StringComparison.Ordinal)
+                    ? point1Exists
+                    : await _chrome.XPathExistsAsync(xp2);
+
+                _log.Info($"[TIKTOK_STARTUP_LIVE_PROBE] attempt={attempt}/{attempts} point1={point1Exists} point2={point2Exists}");
+                if (point1Exists && point2Exists)
+                    return true;
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"[TIKTOK_STARTUP_LIVE_PROBE] attempt={attempt}/{attempts} error={ShortText(ex.Message, 120)}");
+            }
+
+            if (attempt < attempts)
+                await Task.Delay(350);
+        }
+
+        return false;
     }
 
     void AppendProblem(string message)

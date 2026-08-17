@@ -42,11 +42,38 @@ public sealed class ChromeProfileNameSyncService
         {
             profile["name"] = profileName;
             profile["using_default_name"] = false;
-            SaveJsonObject(preferencesPath, root);
         }
+
+        // V13 managed profiles should be ready to use in Vietnamese from the
+        // very first Chrome launch.  Write both Chromium language preference
+        // keys while the profile is guaranteed to be closed.  LaunchAsync also
+        // supplies --lang/--accept-lang as a runtime fallback.
+        var intl = root["intl"] as JsonObject;
+        if (intl is null)
+        {
+            intl = new JsonObject();
+            root["intl"] = intl;
+        }
+
+        const string preferredLanguages = "vi-VN,vi,en-US,en";
+        var currentAcceptLanguages = intl["accept_languages"]?.GetValue<string>();
+        var currentSelectedLanguages = intl["selected_languages"]?.GetValue<string>();
+        var languageUpdated = !string.Equals(currentAcceptLanguages, preferredLanguages, StringComparison.Ordinal)
+            || !string.Equals(currentSelectedLanguages, preferredLanguages, StringComparison.Ordinal);
+        if (languageUpdated)
+        {
+            intl["accept_languages"] = preferredLanguages;
+            intl["selected_languages"] = preferredLanguages;
+        }
+
+        if (updated || languageUpdated)
+            SaveJsonObject(preferencesPath, root);
+
         var localStateUpdated = UpdateLocalStateName(userDataDir, profileKey, profileName);
-        updated |= localStateUpdated;
-        return new SyncResult(updated, preferencesPath, updated ? "Đã đồng bộ tên hiển thị Chrome." : "Tên Chrome đã đồng bộ.");
+        updated |= localStateUpdated || languageUpdated;
+        return new SyncResult(updated, preferencesPath, updated
+            ? "Đã đồng bộ tên Chrome và ngôn ngữ mặc định tiếng Việt."
+            : "Tên Chrome và ngôn ngữ tiếng Việt đã đồng bộ.");
     }
 
     public static string ResolvePreferencesPath(string userDataDir, string? profileDirectory)

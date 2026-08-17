@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Text.Json;
@@ -12,10 +12,14 @@ public sealed record CdpPage(string Id, string Title, string Url, string WebSock
 public sealed record DomBox(double X, double Y, double Width, double Height);
 public sealed record CdpVersionInfo(string Browser, string WebSocketDebuggerUrl);
 public sealed record ManagedChromeCloseResult(bool WasRunning, bool Closed, IReadOnlyList<int> RemainingPids, bool CdpReady, string Method);
+public sealed record TikTokStartupResult(string State, string Message, bool LoggedIn, bool LiveOpened);
+public sealed record TikTokRecommendedLiveCandidate(string Href, string Username, string ViewerText, string Label);
 public enum ChromeWindowState { NotFound, Visible, Minimized }
 
 public sealed class ChromeController : IAsyncDisposable
 {
+    public sealed record PageHealthSnapshot(bool Healthy, bool CrashLike, string Reason, string Url);
+
     sealed record ProfileOwner(int ProcessId, string CommandLine);
 
     [StructLayout(LayoutKind.Sequential)]
@@ -70,6 +74,21 @@ public sealed class ChromeController : IAsyncDisposable
             || text.Contains("session not found", StringComparison.OrdinalIgnoreCase)
             || text.Contains("session closed", StringComparison.OrdinalIgnoreCase)
             || text.Contains("inspected target navigated or closed", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Nhận diện riêng lỗi renderer/tab crash (Aw, Snap!/Out of Memory/target crashed).
+    /// Dùng để AutomationEngine ưu tiên reload/restart Chrome thay vì coi đây là lỗi XPath
+    /// rồi chuyển LIVE hoặc tạm dừng tool.
+    /// </summary>
+    public bool IsRendererCrashLike(Exception ex)
+    {
+        var text = ex.ToString();
+        return LooksLikeRendererCrashText(text)
+            || text.Contains("Inspector.targetCrashed", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("Target.targetCrashed", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("renderer crashed", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("renderer process gone", StringComparison.OrdinalIgnoreCase);
     }
 
     static bool IsTransientDocumentContextError(Exception ex)
@@ -134,8 +153,9 @@ public sealed class ChromeController : IAsyncDisposable
             : "--disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding ";
         var args =
             $"--remote-debugging-port={port} --remote-allow-origins=* --user-data-dir=\"{profileDir}\" " +
-            "--no-first-run --no-default-browser-check " + backgroundFlags +
-            "--window-size=1600,1000 " + TikTokUrl;
+            "--no-first-run --no-default-browser-check " +
+            "--lang=vi --accept-lang=vi-VN,vi,en-US,en --start-maximized " + backgroundFlags +
+            TikTokUrl;
         var psi = new ProcessStartInfo(chrome, args)
         {
             UseShellExecute = true,
@@ -970,6 +990,657 @@ public sealed class ChromeController : IAsyncDisposable
         return r.TryGetProperty("value", out var v) ? (v.GetString() ?? "").Trim() : "";
     }
 
+    public async Task<IReadOnlyList<TikTokRecommendedLiveCandidate>> GetTikTokRecommendedLivesAsync(CancellationToken ct = default)
+    {
+        const string js = """
+(() => {
+  const visible = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    const s = getComputedStyle(el);
+    return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity || 1) > 0.05;
+  };
+  const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  const cleanLiveHref = (value) => {
+    if (!value) return '';
+    try {
+      const u = new URL(value, location.href);
+      if (!/tiktok\.com$/i.test(u.hostname) && !/\.tiktok\.com$/i.test(u.hostname)) return '';
+      if (!/^\/@[^/]+\/live\/?$/i.test(u.pathname)) return '';
+      u.search = '';
+      u.hash = '';
+      return u.toString().replace(/\/$/, '');
+    } catch { return ''; }
+  };
+  const currentHref = cleanLiveHref(location.href);
+  const headingTexts = ['nhà sáng tạo live đề xuất', 'recommended live creators', 'live creators recommended'];
+  const heading = Array.from(document.querySelectorAll('h1,h2,h3,h4,div,span,p'))
+    .filter(visible)
+    .find(el => {
+      const t = normalize(el.innerText || el.textContent).toLocaleLowerCase('vi-VN');
+      return t.length <= 90 && headingTexts.some(x => t.includes(x));
+    });
+
+  let scope = null;
+  if (heading) {
+    let n = heading;
+    for (let depth = 0; depth < 9 && n; depth++, n = n.parentElement) {
+      const links = Array.from(n.querySelectorAll('a[href]'))
+        .map(a => cleanLiveHref(a.href || a.getAttribute('href')))
+        .filter(Boolean);
+      const unique = new Set(links);
+      const r = n.getBoundingClientRect?.();
+      const leftish = !r || r.left < innerWidth * 0.42;
+      if (leftish && unique.size > 0 && unique.size <= 40) {
+        scope = n;
+        break;
+      }
+    }
+  }
+
+  const anchors = Array.from((scope || document).querySelectorAll('a[href]'));
+  const out = [];
+  const seen = new Set();
+  for (const a of anchors) {
+    if (!visible(a)) continue;
+    const href = cleanLiveHref(a.href || a.getAttribute('href'));
+    if (!href || href === currentHref || seen.has(href)) continue;
+
+    const ar = a.getBoundingClientRect();
+    if (!scope && ar.left > innerWidth * 0.36) continue;
+
+    let bestViewer = '';
+    let bestX = -1;
+    let bestLabel = normalize(a.innerText || a.textContent || a.getAttribute('aria-label') || '');
+    let node = a;
+    for (let up = 0; up < 6 && node; up++, node = node.parentElement) {
+      const nr = node.getBoundingClientRect?.();
+      if (nr && nr.height > 180) break;
+      const leaves = Array.from(node.querySelectorAll('span,div,strong,p'));
+      for (const el of leaves) {
+        if (!visible(el) || el.children.length > 0) continue;
+        const txt = normalize(el.innerText || el.textContent);
+        if (!/^[0-9]+(?:[\.,][0-9]+)?\s*[KMB]?$/i.test(txt)) continue;
+        const r = el.getBoundingClientRect();
+        const verticalNear = Math.abs((r.top + r.bottom) / 2 - (ar.top + ar.bottom) / 2) <= 55;
+        if (!verticalNear) continue;
+        if (r.left > bestX) {
+          bestX = r.left;
+          bestViewer = txt;
+        }
+      }
+      const text = normalize(node.innerText || node.textContent || '');
+      if (text.length > bestLabel.length && text.length < 180) bestLabel = text;
+    }
+
+    if (!bestViewer) continue;
+    const m = href.match(/\/@([^/]+)\/live$/i);
+    const username = m ? decodeURIComponent(m[1]) : '';
+    seen.add(href);
+    out.push({ href, username, viewerText: bestViewer, label: bestLabel });
+  }
+  return out;
+})()
+""";
+
+        var result = await EvalAsync(js, ct: ct);
+        if (!result.TryGetProperty("value", out var value) || value.ValueKind != JsonValueKind.Array)
+            return Array.Empty<TikTokRecommendedLiveCandidate>();
+
+        static string ReadString(JsonElement obj, string name)
+            => obj.TryGetProperty(name, out var p) && p.ValueKind == JsonValueKind.String ? (p.GetString() ?? "").Trim() : "";
+
+        var list = new List<TikTokRecommendedLiveCandidate>();
+        foreach (var item in value.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.Object) continue;
+            var href = ReadString(item, "href");
+            var viewerText = ReadString(item, "viewerText");
+            if (string.IsNullOrWhiteSpace(href) || string.IsNullOrWhiteSpace(viewerText)) continue;
+            list.Add(new TikTokRecommendedLiveCandidate(
+                href,
+                ReadString(item, "username"),
+                viewerText,
+                ReadString(item, "label")));
+        }
+        return list;
+    }
+
+    public async Task<TikTokStartupResult> PrepareTikTokStartupAsync(
+        string username,
+        string password,
+        string totpSecret,
+        bool autoLogin = true,
+        CancellationToken ct = default)
+    {
+        const string loginUrl = "https://www.tiktok.com/login/phone-or-email/email";
+
+        // Every managed profile opens at TikTok LIVE by default. Session-cookie
+        // detection is done through CDP so HttpOnly cookies are included.
+        try
+        {
+            if (await HasTikTokSessionCookieAsync(ct))
+            {
+                await OpenTikTokLiveReadyAsync(ct);
+                return new TikTokStartupResult("READY", "Đã đăng nhập; đã mở TikTok LIVE và xử lý màn 'Nhấp để xem LIVE' nếu có.", true, true);
+            }
+        }
+        catch (Exception ex) when (IsTransientDocumentContextError(ex)) { }
+
+        if (!autoLogin || string.IsNullOrWhiteSpace(username) || string.IsNullOrEmpty(password))
+        {
+            await OpenTikTokLiveReadyAsync(ct);
+            return new TikTokStartupResult("LOGIN_REQUIRED", "Profile chưa có phiên đăng nhập hoặc chưa lưu tài khoản/mật khẩu.", false, true);
+        }
+
+        _log.Info("[TIKTOK_LOGIN_START] auto=true usernameConfigured=true totpConfigured=" + (!string.IsNullOrWhiteSpace(totpSecret)));
+        await NavigateAndWaitAsync(loginUrl, 1000, 15000, ct);
+
+        var formReady = await WaitForLoginFormAsync(TimeSpan.FromSeconds(15), ct);
+        if (!formReady)
+        {
+            if (await DetectCaptchaAsync(ct))
+            {
+                _log.Warn("[TIKTOK_LOGIN_CAPTCHA_WAIT] phase=before-login-form manual_action_required=true action=WAIT_FOR_USER");
+                var solved = await WaitForCaptchaResolutionAsync(TimeSpan.FromMinutes(15), ct);
+                if (!solved)
+                    return new TikTokStartupResult("CAPTCHA_REQUIRED", "CAPTCHA vẫn chưa được xử lý sau thời gian chờ. Hãy xử lý trên Chrome rồi bấm Bắt đầu lại.", false, false);
+
+                // CAPTCHA may have completed an already-started login, may reveal
+                // the normal login form, or may go directly to 2FA. Do not
+                // navigate away here: keep the current TikTok authentication state.
+                if (await HasTikTokSessionCookieAsync(ct))
+                {
+                    await OpenTikTokLiveReadyAsync(ct);
+                    return new TikTokStartupResult("READY", "CAPTCHA đã xử lý; TikTok đã đăng nhập và LIVE đã mở.", true, true);
+                }
+
+                if (await DetectTotpChallengeAsync(ct))
+                {
+                    if (string.IsNullOrWhiteSpace(totpSecret))
+                        return new TikTokStartupResult("TOTP_REQUIRED", "TikTok yêu cầu mã 2FA nhưng profile chưa lưu secret TOTP.", false, false);
+
+                    await FillAndSubmitTotpAsync(totpSecret, ct);
+                    var afterTotp = await WaitForTikTokLoginCompletionAsync(totpSecret, TimeSpan.FromSeconds(45), ct);
+                    if (afterTotp is not null) return afterTotp;
+                }
+
+                formReady = await WaitForLoginFormAsync(TimeSpan.FromSeconds(15), ct);
+            }
+
+            if (!formReady)
+            {
+                if (await HasTikTokSessionCookieAsync(ct))
+                {
+                    await OpenTikTokLiveReadyAsync(ct);
+                    return new TikTokStartupResult("READY", "TikTok đã có phiên đăng nhập; đã mở LIVE.", true, true);
+                }
+                return new TikTokStartupResult("LOGIN_FORM_NOT_FOUND", "Không tìm thấy form đăng nhập TikTok sau khi chờ CAPTCHA/trang tải xong.", false, false);
+            }
+        }
+
+        // WaitForLoginFormAsync also notices a session cookie so the wait can
+        // finish quickly during redirects. Re-check here before touching the form.
+        if (await HasTikTokSessionCookieAsync(ct))
+        {
+            await OpenTikTokLiveReadyAsync(ct);
+            return new TikTokStartupResult("READY", "TikTok đã đăng nhập trong lúc chờ; đã mở LIVE.", true, true);
+        }
+
+        await FillTikTokLoginFormAsync(username, password, ct);
+        await ClickTikTokLoginSubmitAsync(ct);
+
+        var completion = await WaitForTikTokLoginCompletionAsync(totpSecret, TimeSpan.FromSeconds(45), ct);
+        if (completion is not null) return completion;
+
+        if (await HasTikTokSessionCookieAsync(ct))
+        {
+            await OpenTikTokLiveReadyAsync(ct);
+            return new TikTokStartupResult("READY", "Đăng nhập thành công; đã mở TikTok LIVE.", true, true);
+        }
+
+        return new TikTokStartupResult("LOGIN_FAILED", "Đăng nhập TikTok chưa thành công sau thời gian chờ.", false, false);
+    }
+
+    async Task<TikTokStartupResult?> WaitForTikTokLoginCompletionAsync(
+        string totpSecret,
+        TimeSpan activeLoginTimeout,
+        CancellationToken ct)
+    {
+        var loginDeadline = DateTime.UtcNow + activeLoginTimeout;
+        var totpTried = false;
+
+        while (DateTime.UtcNow < loginDeadline)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (await HasTikTokSessionCookieAsync(ct))
+            {
+                _log.Info("[TIKTOK_LOGIN_OK] sessionCookie=true");
+                await OpenTikTokLiveReadyAsync(ct);
+                return new TikTokStartupResult("READY", "Đăng nhập thành công; đã mở TikTok LIVE và xử lý màn 'Nhấp để xem LIVE' nếu có.", true, true);
+            }
+
+            if (await DetectCaptchaAsync(ct))
+            {
+                // Old behavior returned CAPTCHA_REQUIRED immediately, which made
+                // StartAsync exit. Keep this call alive while the user solves the
+                // CAPTCHA manually, then continue the SAME login flow so 2FA can
+                // be filled automatically afterwards.
+                _log.Warn("[TIKTOK_LOGIN_CAPTCHA_WAIT] phase=after-submit manual_action_required=true action=WAIT_FOR_USER");
+                var solved = await WaitForCaptchaResolutionAsync(TimeSpan.FromMinutes(15), ct);
+                if (!solved)
+                    return new TikTokStartupResult("CAPTCHA_REQUIRED", "CAPTCHA vẫn chưa được xử lý sau thời gian chờ. Hãy xử lý trên Chrome rồi bấm Bắt đầu lại.", false, false);
+
+                _log.Info("[TIKTOK_LOGIN_CAPTCHA_RESUMED] solved=true action=CONTINUE_LOGIN_FLOW");
+                // User time spent solving CAPTCHA must not consume the normal
+                // login timeout. Give the post-CAPTCHA/2FA flow a fresh window.
+                loginDeadline = DateTime.UtcNow.AddSeconds(60);
+                continue;
+            }
+
+            if (!totpTried && await DetectTotpChallengeAsync(ct))
+            {
+                if (string.IsNullOrWhiteSpace(totpSecret))
+                {
+                    _log.Warn("[TIKTOK_LOGIN_2FA] totpRequired=true secretConfigured=false");
+                    return new TikTokStartupResult("TOTP_REQUIRED", "TikTok yêu cầu mã 2FA nhưng profile chưa lưu secret TOTP.", false, false);
+                }
+
+                await FillAndSubmitTotpAsync(totpSecret, ct);
+                totpTried = true;
+                loginDeadline = DateTime.UtcNow.AddSeconds(45);
+                continue;
+            }
+
+            await Task.Delay(450, ct);
+        }
+
+        return null;
+    }
+
+    async Task<bool> WaitForCaptchaResolutionAsync(TimeSpan timeout, CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        var clearConfirmations = 0;
+        _log.Warn($"[TIKTOK_CAPTCHA_WAIT_START] timeoutSec={(int)timeout.TotalSeconds}");
+
+        while (DateTime.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            try
+            {
+                if (await HasTikTokSessionCookieAsync(ct))
+                {
+                    _log.Info("[TIKTOK_CAPTCHA_WAIT_DONE] reason=session-cookie");
+                    return true;
+                }
+
+                if (!await DetectCaptchaAsync(ct))
+                {
+                    // Require two consecutive clear reads so a transient iframe
+                    // re-render does not resume the login flow too early.
+                    clearConfirmations++;
+                    if (clearConfirmations >= 2)
+                    {
+                        _log.Info("[TIKTOK_CAPTCHA_WAIT_DONE] reason=captcha-cleared");
+                        return true;
+                    }
+                }
+                else
+                {
+                    clearConfirmations = 0;
+                }
+            }
+            catch (Exception ex) when (IsTransientDocumentContextError(ex))
+            {
+                clearConfirmations = 0;
+            }
+
+            await Task.Delay(700, ct);
+        }
+
+        _log.Warn("[TIKTOK_CAPTCHA_WAIT_TIMEOUT] captchaStillPresent=true");
+        return false;
+    }
+
+    async Task OpenTikTokLiveReadyAsync(CancellationToken ct)
+    {
+        const string liveUrl = "https://www.tiktok.com/live";
+        await NavigateAndWaitAsync(liveUrl, 900, 15000, ct);
+        await EnsureTikTokLivePlaybackStartedAsync(ct);
+    }
+
+    public async Task ResetTikTokLiveRecommendationFeedAsync(CancellationToken ct = default)
+    {
+        _log.Warn("[TIKTOK_LIVE_FEED_RESET] navigate=https://www.tiktok.com/live reason=viewer-low-streak");
+        await OpenTikTokLiveReadyAsync(ct);
+        _log.Warn("[TIKTOK_LIVE_FEED_RESET_DONE] /live đã sẵn sàng sau hard reset nguồn đề xuất.");
+    }
+
+    async Task EnsureTikTokLivePlaybackStartedAsync(CancellationToken ct)
+    {
+        // TikTok sometimes opens /live behind an interaction gate such as
+        // "Nhấp để xem LIVE". The old startup gate considered the URL itself
+        // READY, so automation started while the player was still blocked.
+        // Click the prompt through DOM/CDP only; never use Windows coordinates.
+        var deadline = DateTime.UtcNow.AddSeconds(12);
+        var clickCount = 0;
+        var noPromptReads = 0;
+
+        while (DateTime.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+            string state;
+            try
+            {
+                state = await TryClickTikTokLiveWatchPromptAsync(ct);
+            }
+            catch (Exception ex) when (IsTransientDocumentContextError(ex))
+            {
+                noPromptReads = 0;
+                await Task.Delay(350, ct);
+                continue;
+            }
+
+            if (state.StartsWith("CLICKED", StringComparison.Ordinal))
+            {
+                clickCount++;
+                noPromptReads = 0;
+                _log.Info($"[TIKTOK_LIVE_WATCH_PROMPT] action=CLICK_DOM count={clickCount} detail={TrimForLog(state, 120)}");
+                await Task.Delay(1100, ct);
+                continue;
+            }
+
+            noPromptReads++;
+            // After a successful click only two clear polls are needed. When the
+            // prompt was not seen yet, observe the page for ~3 seconds because the
+            // TikTok player/interaction overlay can render after document.readyState.
+            var neededClearReads = clickCount > 0 ? 2 : 6;
+            if (noPromptReads >= neededClearReads)
+            {
+                if (clickCount > 0)
+                    await Task.Delay(500, ct);
+                _log.Info($"[TIKTOK_LIVE_READY] watchPromptClicks={clickCount} stableClearReads={noPromptReads}");
+                return;
+            }
+
+            await Task.Delay(500, ct);
+        }
+
+        _log.Warn($"[TIKTOK_LIVE_WATCH_PROMPT_TIMEOUT] watchPromptClicks={clickCount}; tiếp tục vì prompt không còn click được/DOM đang thay đổi.");
+    }
+
+    async Task<string> TryClickTikTokLiveWatchPromptAsync(CancellationToken ct)
+    {
+        var r = await EvalAsync("""
+(() => {
+  const visible = e => {
+    if (!e) return false;
+    const r = e.getBoundingClientRect();
+    const s = getComputedStyle(e);
+    return r.width > 2 && r.height > 2 && s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity || 1) > 0.02;
+  };
+  const norm = x => String(x || '')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase().replace(/đ/g, 'd').replace(/\s+/g, ' ').trim();
+  const isWanted = text => {
+    const t = norm(text);
+    return t.includes('nhap de xem live')
+      || t.includes('nhap de xem livestream')
+      || t.includes('click to watch live')
+      || t.includes('tap to watch live')
+      || t.includes('click to view live');
+  };
+  const clickable = e => {
+    if (!e) return null;
+    return e.closest('button,[role="button"],a,[tabindex]') || e;
+  };
+  const nodes = [...document.querySelectorAll('button,[role="button"],a,div,span')]
+    .filter(visible)
+    .filter(e => isWanted(e.innerText || e.textContent || e.getAttribute('aria-label') || ''))
+    .sort((a,b) => (a.innerText || a.textContent || '').length - (b.innerText || b.textContent || '').length);
+  if (!nodes.length) return 'NOT_FOUND';
+  const source = nodes[0];
+  const target = clickable(source);
+  if (!target || !visible(target)) return 'NOT_CLICKABLE';
+  const label = norm(source.innerText || source.textContent || source.getAttribute('aria-label') || '').slice(0, 80);
+  target.scrollIntoView({block:'center', inline:'center'});
+  target.click();
+  return 'CLICKED:' + label;
+})()
+""", ct: ct);
+        return r.TryGetProperty("value", out var v) ? v.GetString() ?? "" : "";
+    }
+
+    async Task<bool> HasTikTokSessionCookieAsync(CancellationToken ct)
+    {
+        try
+        {
+            var result = await Cdp.CallAsync("Network.getAllCookies", new { }, ct);
+            if (!result.TryGetProperty("cookies", out var cookies) || cookies.ValueKind != JsonValueKind.Array) return false;
+            foreach (var cookie in cookies.EnumerateArray())
+            {
+                var domain = cookie.TryGetProperty("domain", out var d) ? d.GetString() ?? "" : "";
+                if (!domain.Contains("tiktok.com", StringComparison.OrdinalIgnoreCase)) continue;
+                var name = cookie.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
+                var value = cookie.TryGetProperty("value", out var v) ? v.GetString() ?? "" : "";
+                if (value.Length == 0) continue;
+                if (name.Equals("sessionid", StringComparison.OrdinalIgnoreCase)
+                    || name.Equals("sessionid_ss", StringComparison.OrdinalIgnoreCase)
+                    || name.Equals("sid_tt", StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+        catch { return false; }
+    }
+
+    async Task<bool> WaitForLoginFormAsync(TimeSpan timeout, CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+            var r = await EvalAsync("""
+(() => {
+  const visible = e => { if(!e) return false; const r=e.getBoundingClientRect(); const s=getComputedStyle(e); return r.width>1&&r.height>1&&s.display!=='none'&&s.visibility!=='hidden'; };
+  const u = document.querySelector('input[name="username"],input[autocomplete="username"],input[type="text"]');
+  const p = document.querySelector('input[type="password"],input[name="password"]');
+  return !!(u && p && visible(u) && visible(p));
+})()
+""", ct: ct);
+            if (r.TryGetProperty("value", out var value) && value.ValueKind == JsonValueKind.True) return true;
+            if (await HasTikTokSessionCookieAsync(ct)) return true;
+            await Task.Delay(300, ct);
+        }
+        return false;
+    }
+
+    async Task FillTikTokLoginFormAsync(string username, string password, CancellationToken ct)
+    {
+        var js = $$"""
+(() => {
+  const set = (el, value) => {
+    if(!el) return false;
+    el.focus();
+    const proto = el instanceof HTMLInputElement ? HTMLInputElement.prototype : Object.getPrototypeOf(el);
+    const desc = Object.getOwnPropertyDescriptor(proto,'value');
+    if(desc && desc.set) desc.set.call(el,value); else el.value=value;
+    el.dispatchEvent(new Event('input',{bubbles:true}));
+    el.dispatchEvent(new Event('change',{bubbles:true}));
+    el.dispatchEvent(new KeyboardEvent('keyup',{bubbles:true,key:'Unidentified'}));
+    return true;
+  };
+  const u = document.querySelector('input[name="username"],input[autocomplete="username"],input[type="text"]');
+  const p = document.querySelector('input[type="password"],input[name="password"]');
+  return set(u,{{JsString(username)}}) && set(p,{{JsString(password)}});
+})()
+""";
+        var r = await EvalAsync(js, ct: ct);
+        if (!r.TryGetProperty("value", out var v) || v.ValueKind != JsonValueKind.True)
+            throw new InvalidOperationException("Không điền được tài khoản/mật khẩu vào form TikTok.");
+        _log.Info("[TIKTOK_LOGIN_FORM_FILLED] username=true password=true");
+    }
+
+    async Task ClickTikTokLoginSubmitAsync(CancellationToken ct)
+    {
+        var r = await EvalAsync("""
+(() => {
+  const visible = e => { if(!e) return false; const r=e.getBoundingClientRect(); const s=getComputedStyle(e); return r.width>1&&r.height>1&&s.display!=='none'&&s.visibility!=='hidden'; };
+  const norm = x => String(x||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/đ/g,'d').trim();
+  const candidates = [...document.querySelectorAll('button[type="submit"],button,[role="button"]')].filter(visible);
+  const btn = candidates.find(e => e.matches('button[type="submit"]')) || candidates.find(e => ['log in','login','dang nhap'].includes(norm(e.innerText||e.textContent)));
+  if(!btn) return false; btn.click(); return true;
+})()
+""", ct: ct);
+        if (!r.TryGetProperty("value", out var v) || v.ValueKind != JsonValueKind.True)
+            throw new InvalidOperationException("Không tìm thấy nút Đăng nhập TikTok.");
+        _log.Info("[TIKTOK_LOGIN_SUBMIT] clicked=true");
+    }
+
+    async Task<bool> DetectCaptchaAsync(CancellationToken ct)
+    {
+        var r = await EvalAsync("""
+(() => {
+  const visible = e => {
+    if (!e) return false;
+    const r=e.getBoundingClientRect();
+    const s=getComputedStyle(e);
+    return r.width>2 && r.height>2 && s.display!=='none' && s.visibility!=='hidden' && Number(s.opacity||1)>0.02;
+  };
+  const norm = x => String(x||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/đ/g,'d');
+  const text = norm(document.body?.innerText||'');
+  const iframeCaptcha = [...document.querySelectorAll('iframe')].some(x => visible(x) && /captcha|verify|challenge/i.test(x.src||x.title||''));
+  const domCaptcha = [...document.querySelectorAll('[id*="captcha" i],[class*="captcha" i],[data-e2e*="captcha" i]')].some(visible);
+  const textCaptcha = text.includes('captcha') || text.includes('verify to continue') || text.includes('xac minh de tiep tuc') || text.includes('drag the puzzle') || text.includes('keo thanh truot');
+  return iframeCaptcha || domCaptcha || textCaptcha;
+})()
+""", ct: ct);
+        return r.TryGetProperty("value", out var v) && v.ValueKind == JsonValueKind.True;
+    }
+
+    async Task<bool> DetectTotpChallengeAsync(CancellationToken ct)
+    {
+        var r = await EvalAsync("""
+(() => {
+  const visible = e => {
+    if (!e) return false;
+    const r=e.getBoundingClientRect();
+    const s=getComputedStyle(e);
+    return r.width>1 && r.height>1 && s.display!=='none' && s.visibility!=='hidden' && Number(s.opacity||1)>0.02;
+  };
+  const norm = x => String(x||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/đ/g,'d').replace(/\s+/g,' ').trim();
+  const text = norm(document.body?.innerText||'');
+  const path = String(location.pathname||'').toLowerCase();
+  const onTotpUrl = path.includes('/login/2sv/totp') || path.includes('/2sv/totp');
+  const inputs = [...document.querySelectorAll('input')].filter(visible);
+  const codeInput = inputs.some(e => {
+    const attrs = norm((e.name||'')+' '+(e.id||'')+' '+(e.placeholder||'')+' '+(e.getAttribute('aria-label')||''));
+    const maxLen = Number(e.maxLength||0);
+    return /one-time-code/i.test(e.autocomplete||'')
+      || /code|otp|verify|verification/.test(attrs)
+      || attrs.includes('6 chu so')
+      || attrs.includes('6 digit')
+      || attrs.includes('nhap ma')
+      || (e.inputMode==='numeric' && (maxLen===0 || maxLen>=4))
+      || maxLen===6;
+  });
+  const marker = onTotpUrl
+    || text.includes('2-step verification')
+    || text.includes('two-step verification')
+    || text.includes('verification code')
+    || text.includes('authenticator')
+    || text.includes('xac minh 2 buoc')
+    || text.includes('ung dung xac thuc')
+    || text.includes('ma xac minh')
+    || text.includes('ma 2fa')
+    || text.includes('nhap ma gom 6 chu so');
+  return codeInput && marker;
+})()
+""", ct: ct);
+        var detected = r.TryGetProperty("value", out var v) && v.ValueKind == JsonValueKind.True;
+        if (detected) _log.Info("[TIKTOK_LOGIN_2FA_DETECTED] challenge=true");
+        return detected;
+    }
+
+    async Task FillAndSubmitTotpAsync(string totpSecret, CancellationToken ct)
+    {
+        var auth = new ToolTikTokV12.Services.TikTokAuthService();
+        var remaining = auth.GetTotpSecondsRemaining();
+        if (remaining <= 5)
+            await Task.Delay((remaining + 1) * 1000, ct);
+
+        var code = auth.GenerateTotp(totpSecret);
+
+        // Fill first. TikTok/React may enable the Continue button only after it
+        // has processed the input event, so do not click in the same JS turn.
+        var fillJs = $$"""
+(() => {
+  const visible = e => { if(!e) return false; const r=e.getBoundingClientRect(); const s=getComputedStyle(e); return r.width>1&&r.height>1&&s.display!=='none'&&s.visibility!=='hidden'; };
+  const norm=x=>String(x||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/đ/g,'d').replace(/\s+/g,' ').trim();
+  const inputs=[...document.querySelectorAll('input')].filter(visible);
+  const score=e=>{
+    const attrs=norm((e.name||'')+' '+(e.id||'')+' '+(e.placeholder||'')+' '+(e.getAttribute('aria-label')||''));
+    let n=0;
+    if(/one-time-code/i.test(e.autocomplete||'')) n+=100;
+    if(/code|otp|verify|verification/.test(attrs)) n+=60;
+    if(attrs.includes('6 chu so')||attrs.includes('6 digit')) n+=80;
+    if(attrs.includes('nhap ma')) n+=40;
+    if(Number(e.maxLength||0)===6) n+=50;
+    if(e.inputMode==='numeric') n+=30;
+    return n;
+  };
+  const input=inputs.map(e=>[e,score(e)]).sort((a,b)=>b[1]-a[1])[0]?.[0];
+  if(!input) return 'NO_INPUT';
+  input.focus();
+  const desc=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');
+  if(desc&&desc.set) desc.set.call(input,{{JsString(code)}}); else input.value={{JsString(code)}};
+  input.dispatchEvent(new Event('input',{bubbles:true}));
+  input.dispatchEvent(new Event('change',{bubbles:true}));
+  input.dispatchEvent(new Event('blur',{bubbles:true}));
+  return String(input.value||'')==={{JsString(code)}} ? 'FILLED' : 'VALUE_NOT_SET';
+})()
+""";
+        var fillResult = await EvalAsync(fillJs, ct: ct);
+        var fillState = fillResult.TryGetProperty("value", out var fv) ? fv.GetString() ?? "" : "";
+        if (fillState != "FILLED")
+            throw new InvalidOperationException("Không tự điền được mã 2FA TikTok: " + fillState);
+
+        _log.Info("[TIKTOK_LOGIN_2FA] totpFilled=true");
+
+        // Give the page time to enable/re-render the Continue button, then retry
+        // a few times because TikTok UI updates asynchronously.
+        for (var attempt = 1; attempt <= 8; attempt++)
+        {
+            await Task.Delay(attempt == 1 ? 350 : 250, ct);
+            var clickResult = await EvalAsync("""
+(() => {
+  const visible = e => { if(!e) return false; const r=e.getBoundingClientRect(); const s=getComputedStyle(e); return r.width>1&&r.height>1&&s.display!=='none'&&s.visibility!=='hidden'; };
+  const enabled = e => !e.disabled && String(e.getAttribute('aria-disabled')||'').toLowerCase()!=='true';
+  const norm=x=>String(x||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/đ/g,'d').replace(/\s+/g,' ').trim();
+  const buttons=[...document.querySelectorAll('button[type="submit"],button,[role="button"]')].filter(e=>visible(e)&&enabled(e));
+  const labels=['verify','confirm','continue','next','xac minh','tiep','tiep tuc','gui'];
+  const btn=buttons.find(e=>labels.includes(norm(e.innerText||e.textContent)))
+    || buttons.find(e=>e.matches('button[type="submit"]'));
+  if(!btn) return 'BUTTON_NOT_READY';
+  btn.click();
+  return 'CLICKED';
+})()
+""", ct: ct);
+            var clickState = clickResult.TryGetProperty("value", out var cv) ? cv.GetString() ?? "" : "";
+            if (clickState == "CLICKED")
+            {
+                _log.Info($"[TIKTOK_LOGIN_2FA] totpSubmitted=true attempt={attempt}");
+                return;
+            }
+        }
+
+        throw new InvalidOperationException("Đã điền mã 2FA nhưng nút Tiếp/Xác minh chưa sẵn sàng để bấm.");
+    }
+
     public async Task<bool> XPathExistsAsync(string xpath, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(xpath)) return false;
@@ -1244,6 +1915,218 @@ public sealed class ChromeController : IAsyncDisposable
             if (i + 1 < count) await Task.Delay(gapMs, ct);
         }
         LogCdpDone("PressKey", $"key={key} | count={count}");
+    }
+
+    static bool LooksLikeRendererCrashText(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return false;
+        return text.Contains("out of memory", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("aw, snap", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("ôi, hỏng", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("target crashed", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("inspected target crashed", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("renderer process", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("render process gone", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("tab crashed", StringComparison.OrdinalIgnoreCase);
+    }
+
+    static bool LooksLikeCrashUrl(string url)
+        => !string.IsNullOrWhiteSpace(url)
+           && (url.StartsWith("chrome-error://", StringComparison.OrdinalIgnoreCase)
+               || url.StartsWith("chrome://crash", StringComparison.OrdinalIgnoreCase));
+
+    public async Task<PageHealthSnapshot> ProbePageHealthAsync(CancellationToken ct = default)
+    {
+        var url = Page?.Url ?? "";
+
+        // /json là đường kiểm tra ngoài renderer. Nếu trang đã đổi sang chrome-error://
+        // thì phát hiện được ngay cả khi Runtime.evaluate không còn chạy.
+        try
+        {
+            if (_port > 0)
+            {
+                var pages = await GetPagesAsync(_port);
+                var listed = SelectTarget(pages, Page?.Id);
+                if (listed is not null)
+                {
+                    url = listed.Url;
+                    if (LooksLikeCrashUrl(listed.Url) || LooksLikeRendererCrashText(listed.Title))
+                        return new PageHealthSnapshot(false, true, "CRASH_PAGE_METADATA", listed.Url);
+                }
+            }
+        }
+        catch
+        {
+            // Browser HTTP endpoint có thể chập chờn đúng lúc renderer/document đổi.
+            // Tiếp tục thử qua session hiện tại trước khi kết luận crash.
+        }
+
+        if (!Connected)
+            return new PageHealthSnapshot(false, true, "CDP_DISCONNECTED", url);
+
+        try
+        {
+            var r = await EvalAsync("""
+(() => ({
+  href: String(location.href || ''),
+  title: String(document.title || ''),
+  ready: String(document.readyState || '')
+}))()
+""", ct: ct);
+            var v = r.GetProperty("value");
+            var href = v.TryGetProperty("href", out var hrefEl) ? hrefEl.GetString() ?? "" : "";
+            var title = v.TryGetProperty("title", out var titleEl) ? titleEl.GetString() ?? "" : "";
+            if (!string.IsNullOrWhiteSpace(href)) url = href;
+
+            if (LooksLikeCrashUrl(href) || LooksLikeRendererCrashText(title))
+                return new PageHealthSnapshot(false, true, "CRASH_PAGE_DOM", url);
+
+            return new PageHealthSnapshot(true, false, "OK", url);
+        }
+        catch (Exception ex)
+        {
+            var message = ex.ToString();
+            if (IsCdpSessionLost(ex) || LooksLikeRendererCrashText(message))
+                return new PageHealthSnapshot(false, true, "RENDERER_OR_TARGET_CRASHED", url);
+
+            if (IsTransientDocumentContextError(ex))
+                return new PageHealthSnapshot(false, false, "DOCUMENT_NAVIGATING", url);
+
+            return new PageHealthSnapshot(false, false, "PROBE_ERROR", url);
+        }
+    }
+
+    static bool IsSafeTikTokRecoveryUrl(string url)
+        => Uri.TryCreate(url, UriKind.Absolute, out var uri)
+           && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
+           && (uri.Host.Equals("tiktok.com", StringComparison.OrdinalIgnoreCase)
+               || uri.Host.EndsWith(".tiktok.com", StringComparison.OrdinalIgnoreCase));
+
+    public async Task NavigateAndWaitAsync(string url, int minWaitMs = 1200, int timeoutMs = 15000, CancellationToken ct = default)
+    {
+        if (!IsSafeTikTokRecoveryUrl(url))
+            throw new InvalidOperationException("URL phục hồi không phải TikTok hợp lệ.");
+
+        LogCdpStart("NavigateAndWait", TrimForLog(url));
+        await Cdp.CallAsync("Page.navigate", new { url }, ct);
+        await Task.Delay(Math.Max(0, minWaitMs), ct);
+
+        var started = Environment.TickCount64;
+        int stable = 0;
+        while (Environment.TickCount64 - started < timeoutMs)
+        {
+            try
+            {
+                var r = await EvalAsync("document.readyState", ct: ct);
+                var state = r.TryGetProperty("value", out var v) ? v.GetString() : "";
+                if (state is "interactive" or "complete") stable++; else stable = 0;
+                if (stable >= 3)
+                {
+                    await ApplyVmRuntimePolicyAsync(ct);
+                    LogCdpDone("NavigateAndWait", $"readyState={state}");
+                    return;
+                }
+            }
+            catch (Exception ex) when (IsTransientDocumentContextError(ex))
+            {
+                stable = 0;
+            }
+            await Task.Delay(250, ct);
+        }
+
+        throw new TimeoutException("Chrome chưa ổn định sau điều hướng phục hồi.");
+    }
+
+    public async Task RecoverCurrentPageAsync(string fallbackUrl, CancellationToken ct = default)
+    {
+        Exception? last = null;
+        var recoveryUrl = IsSafeTikTokRecoveryUrl(fallbackUrl)
+            ? fallbackUrl
+            : (IsSafeTikTokRecoveryUrl(Page?.Url ?? "") ? Page!.Url : TikTokUrl);
+
+        for (int attempt = 1; attempt <= 3; attempt++)
+        {
+            ct.ThrowIfCancellationRequested();
+            _log.Warn($"[PAGE_RECOVERY_ATTEMPT] attempt={attempt}/3 url={TrimForLog(recoveryUrl)}");
+
+            try
+            {
+                if (!Connected)
+                    await ReconnectAsync(ct);
+
+                await ReloadAndWaitAsync(1200, 15000, ct);
+                _log.Warn($"[PAGE_RECOVERY_RELOAD_OK] attempt={attempt}/3");
+                return;
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                last = ex;
+                _log.Warn($"[PAGE_RECOVERY_RELOAD_FAILED] attempt={attempt}/3 reason={ex.Message}");
+            }
+
+            try
+            {
+                await ReconnectAsync(ct);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                last = ex;
+                _log.Warn($"[PAGE_RECOVERY_RECONNECT_FAILED] attempt={attempt}/3 reason={ex.Message}");
+            }
+
+            try
+            {
+                await NavigateAndWaitAsync(recoveryUrl, 1200, 15000, ct);
+                _log.Warn($"[PAGE_RECOVERY_NAVIGATE_OK] attempt={attempt}/3");
+                return;
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                last = ex;
+                _log.Warn($"[PAGE_RECOVERY_NAVIGATE_FAILED] attempt={attempt}/3 reason={ex.Message}");
+            }
+
+            await Task.Delay(500 * attempt, ct);
+        }
+
+        throw new InvalidOperationException("Không thể tự phục hồi trang Chrome sau 3 lần thử.", last);
+    }
+
+    public async Task RestartManagedChromeForRecoveryAsync(string fallbackUrl, CancellationToken ct = default)
+    {
+        var profileDir = _managedProfileDir;
+        var port = _managedWindowPort > 0 ? _managedWindowPort : _port;
+        if (string.IsNullOrWhiteSpace(profileDir) || !Directory.Exists(profileDir))
+            throw new InvalidOperationException("Không có Chrome profile managed để restart phục hồi.");
+        if (port <= 0)
+            throw new InvalidOperationException("Không có cổng CDP managed để restart phục hồi.");
+
+        var recoveryUrl = IsSafeTikTokRecoveryUrl(fallbackUrl) ? fallbackUrl : TikTokUrl;
+        _log.Warn($"[PAGE_RECOVERY_CHROME_RESTART_START] port={port} profile={profileDir} url={TrimForLog(recoveryUrl)}");
+
+        try
+        {
+            await CloseManagedBrowserAsync(profileDir, port, manualRequest: true);
+        }
+        catch (Exception ex)
+        {
+            // LaunchAsync còn có bước đóng/kiểm tra owner lần nữa; không kết luận thất bại chỉ
+            // vì Browser.close của renderer crash không phản hồi.
+            _log.Warn($"[PAGE_RECOVERY_CHROME_CLOSE_WARN] {TrimForLog(ex.Message)}");
+        }
+
+        ct.ThrowIfCancellationRequested();
+        await LaunchAsync(port, profileDir);
+        ct.ThrowIfCancellationRequested();
+        await ConnectAsync(port);
+
+        if (IsSafeTikTokRecoveryUrl(recoveryUrl))
+            await NavigateAndWaitAsync(recoveryUrl, 1200, 20000, ct);
+
+        _log.Warn($"[PAGE_RECOVERY_CHROME_RESTART_OK] port={port} url={TrimForLog(recoveryUrl)}");
     }
 
     public async Task ReloadAndWaitAsync(int minWaitMs = 1000, int timeoutMs = 15000, CancellationToken ct = default)

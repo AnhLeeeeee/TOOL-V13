@@ -1,4 +1,4 @@
-﻿using System.Runtime.InteropServices;
+using System.Runtime.InteropServices;
 using System.Drawing.Drawing2D;
 using ToolTikTokV12.Controls;
 
@@ -76,7 +76,7 @@ internal sealed class ChromeMonitorForm : Form
         _getProfiles = getProfiles;
         _activateChrome = activateChrome;
 
-        Text = "Giám sát Chrome — V13.4.1";
+        Text = "Giám sát Chrome — V13.5";
         Width = 1240;
         Height = 820;
         MinimumSize = new Size(880, 600);

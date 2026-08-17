@@ -1,4 +1,5 @@
 ﻿using System.Diagnostics;
+using System.IO.Compression;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -24,6 +25,9 @@ public sealed class ManagerForm : Form
         public IntPtr WorkerWindow { get; set; }
         public bool Detached { get; set; }
         public bool Opening { get; set; }
+        public bool EmbedRecoveryInProgress { get; set; }
+        public DateTime LastEmbedRecoveryUtc { get; set; } = DateTime.MinValue;
+        public int ConsecutiveEmbedRecoveryFailures { get; set; }
         public DateTime LastStatusRefreshUtc { get; set; } = DateTime.MinValue;
         public WorkerSnapshot? LastSnapshot { get; set; }
         public SemaphoreSlim CommandGate { get; } = new(1, 1);
@@ -45,6 +49,7 @@ public sealed class ManagerForm : Form
     sealed record ChromeNameSyncRuntimeState(bool ChromeWasOpen, bool AutomationWasRunning);
     sealed record ProfileOpenSelection(bool IsMultiple, IReadOnlyList<ProfileContext> Contexts);
     sealed record BatchOpenResult(string ProfileName, bool Opened, bool Skipped, string? Error = null);
+    sealed record ProfileCreateRequest(string Name, string Username, string Password, string TotpSecret, bool AutoLogin, string? AccountPoolId);
 
     sealed class NaturalProfileNameComparer : IComparer<string>
     {
@@ -94,6 +99,8 @@ public sealed class ManagerForm : Form
     readonly string _baseDir = Path.GetFullPath(AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar));
     readonly TikTokProfileService _profileService;
     readonly ChromeProfileNameSyncService _chromeProfileNameSync = new();
+    readonly TikTokAuthService _tiktokAuthService = new();
+    readonly TikTokAccountPoolService _accountPoolService;
     readonly Logger _log;
     readonly Dictionary<string, ProfileContext> _contexts = new(StringComparer.OrdinalIgnoreCase);
     readonly TabControl _tabs = new() { Dock = DockStyle.Fill, DrawMode = TabDrawMode.OwnerDrawFixed, Padding = new Point(18, 6) };
@@ -118,8 +125,9 @@ public sealed class ManagerForm : Form
     {
         LegacyDataMigration.TryImportLegacyCatalog(_baseDir);
         _profileService = new TikTokProfileService(_baseDir);
+        _accountPoolService = new TikTokAccountPoolService(_baseDir);
         _log = new Logger(_baseDir, "manager", "manager-v13.log");
-        Text = "Tool TikTok Manager V13.4.1 — VM Optimized Multi Worker";
+        Text = "Tool TikTok Manager V13.5 — VM Optimized Multi Worker";
         Width = 1440;
         Height = 900;
         MinimumSize = new Size(1120, 720);
@@ -136,17 +144,53 @@ public sealed class ManagerForm : Form
     {
         BackColor = UiTheme.Canvas;
         Font = new Font("Segoe UI", 9F);
-        var toolbar = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(10, 8, 10, 8), WrapContents = true, BackColor = UiTheme.Card };
-        toolbar.Controls.Add(Button("Mở profile", (_, _) => OpenProfileChooser(), UiButtonKind.Primary));
-        toolbar.Controls.Add(Button("+ Profile", (_, _) => AddProfile(), UiButtonKind.Primary));
-        toolbar.Controls.Add(Button("Profile có sẵn", async (_, _) => { try { await AddExistingProfileAsync(); } catch (Exception ex) { ShowError(ex); } }));
-        toolbar.Controls.Add(Button("Đổi tên", async (_, _) => { try { await RenameSelectedProfileAsync(); } catch (Exception ex) { ShowError(ex); } }));
-        toolbar.Controls.Add(Button("Đồng bộ tên Chrome", (_, _) => ShowChromeNameSyncDialog()));
-        toolbar.Controls.Add(Button("Giám sát Chrome", (_, _) => ShowChromeMonitor(), UiButtonKind.Primary));
-        toolbar.Controls.Add(Button("Xóa profile", (_, _) => ShowDeleteProfilesDialog(), UiButtonKind.Danger));
-        toolbar.Controls.Add(Button("Chạy tất cả", async (_, _) => await StartAllAsync(), UiButtonKind.Primary));
-        toolbar.Controls.Add(Button("Dừng tất cả", async (_, _) => await StopAllAsync(), UiButtonKind.Danger));
-        toolbar.Controls.Add(_availability);
+
+        // Manager V13.5: cố định toolbar thành đúng 2 hàng để các nút không bị dồn/lệch
+        // theo độ rộng cửa sổ hoặc DPI của máy ảo.
+        var toolbarHost = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            ColumnCount = 1,
+            RowCount = 2,
+            Padding = new Padding(10, 6, 10, 6),
+            Margin = new Padding(0),
+            BackColor = UiTheme.Card
+        };
+        toolbarHost.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        toolbarHost.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        toolbarHost.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+        FlowLayoutPanel ToolbarRow() => new()
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            WrapContents = false,
+            AutoScroll = true,
+            FlowDirection = FlowDirection.LeftToRight,
+            Margin = new Padding(0),
+            Padding = new Padding(0),
+            BackColor = UiTheme.Card
+        };
+
+        var toolbarRow1 = ToolbarRow();
+        toolbarRow1.Controls.Add(Button("Mở profile", (_, _) => OpenProfileChooser(), UiButtonKind.Primary));
+        toolbarRow1.Controls.Add(Button("+ Profile", (_, _) => AddProfile(), UiButtonKind.Primary));
+        toolbarRow1.Controls.Add(Button("Kho tài khoản", (_, _) => ShowAccountPoolDialog(), UiButtonKind.Neutral));
+        toolbarRow1.Controls.Add(Button("Cấu hình mặc định", (_, _) => ShowDefaultConfigDialog(), UiButtonKind.Neutral));
+        toolbarRow1.Controls.Add(Button("Profile có sẵn", async (_, _) => { try { await AddExistingProfileAsync(); } catch (Exception ex) { ShowError(ex); } }));
+
+        var toolbarRow2 = ToolbarRow();
+        toolbarRow2.Controls.Add(Button("Đổi tên", async (_, _) => { try { await RenameSelectedProfileAsync(); } catch (Exception ex) { ShowError(ex); } }));
+        toolbarRow2.Controls.Add(Button("Đồng bộ tên Chrome", (_, _) => ShowChromeNameSyncDialog()));
+        toolbarRow2.Controls.Add(Button("Giám sát Chrome", (_, _) => ShowChromeMonitor(), UiButtonKind.Primary));
+        toolbarRow2.Controls.Add(Button("Xóa profile", (_, _) => ShowDeleteProfilesDialog(), UiButtonKind.Danger));
+        toolbarRow2.Controls.Add(Button("Chạy tất cả", async (_, _) => await StartAllAsync(), UiButtonKind.Primary));
+        toolbarRow2.Controls.Add(Button("Dừng tất cả", async (_, _) => await StopAllAsync(), UiButtonKind.Danger));
+        toolbarRow2.Controls.Add(_availability);
+
+        toolbarHost.Controls.Add(toolbarRow1, 0, 0);
+        toolbarHost.Controls.Add(toolbarRow2, 0, 1);
 
         _tabs.DrawItem += DrawTabs;
         _tabs.MouseDown += OnTabsMouseDown;
@@ -157,9 +201,10 @@ public sealed class ManagerForm : Form
             UpdateTitle();
         };
         Controls.Add(_tabs);
-        Controls.Add(toolbar);
+        Controls.Add(toolbarHost);
         UiTheme.Apply(this);
-        StyleToolbarButtons(toolbar);
+        StyleToolbarButtons(toolbarRow1);
+        StyleToolbarButtons(toolbarRow2);
     }
 
     Button Button(string text, EventHandler action, UiButtonKind kind = UiButtonKind.Neutral)
@@ -178,7 +223,7 @@ public sealed class ManagerForm : Form
             {
                 "Mở profile" => (Color.FromArgb(232, 242, 255), Color.FromArgb(35, 91, 152)),
                 "+ Profile" => (Color.FromArgb(238, 246, 255), Color.FromArgb(35, 91, 152)),
-                "Profile có sẵn" or "Đổi tên" or "Đồng bộ tên Chrome" => (Color.FromArgb(242, 246, 251), Color.FromArgb(55, 76, 103)),
+                "Profile có sẵn" or "Đổi tên" or "Đồng bộ tên Chrome" or "Kho tài khoản" or "Cấu hình mặc định" => (Color.FromArgb(242, 246, 251), Color.FromArgb(55, 76, 103)),
                 "Giám sát Chrome" => (Color.FromArgb(234, 244, 255), Color.FromArgb(31, 91, 158)),
                 "Xóa profile" or "Dừng tất cả" => (Color.FromArgb(255, 239, 239), Color.FromArgb(171, 62, 62)),
                 "Chạy tất cả" => (Color.FromArgb(234, 248, 238), Color.FromArgb(36, 119, 66)),
@@ -369,10 +414,14 @@ public sealed class ManagerForm : Form
         var status = new Label { AutoSize = true, Text = "Worker: đang khởi động", Margin = new Padding(8, 8, 12, 0) };
         var openChrome = Button("Mở Chrome", async (_, _) => { try { await OpenChromeForProfileAsync(ctx); } catch (Exception ex) { ShowError(ex); } }, UiButtonKind.Primary);
         var closeChrome = Button("Đóng Chrome", async (_, _) => { try { await CloseChromeForProfileAsync(ctx); } catch (Exception ex) { ShowError(ex); } }, UiButtonKind.Danger);
+        var viewChrome = Button("👁 View", async (_, _) => { try { await ViewChromeForProfileAsync(ctx); } catch (Exception ex) { ShowError(ex); } }, UiButtonKind.Neutral);
+        var account = Button("🔐 Tài khoản", (_, _) => ConfigureTikTokAccount(ctx));
         var detach = Button("Tách Worker", (_, _) => ToggleDetach(ctx));
         top.Controls.Add(profileHeader);
         top.Controls.Add(openChrome);
         top.Controls.Add(closeChrome);
+        top.Controls.Add(viewChrome);
+        top.Controls.Add(account);
         top.Controls.Add(status);
         top.Controls.Add(detach);
         var host = new Panel { Dock = DockStyle.Fill, BackColor = Color.White };
@@ -519,13 +568,68 @@ public sealed class ManagerForm : Form
     async Task OpenChromeForProfileAsync(ProfileContext ctx)
     {
         SetStatus(ctx, "Đang mở Chrome của profile này...", Color.DarkOrange);
-        var result = await SendCommandAsync(ctx, "launch", TimeSpan.FromSeconds(30));
+        var result = await SendCommandAsync(ctx, "launch", TimeSpan.FromSeconds(75));
+        if (string.Equals(result, "captcha_required", StringComparison.OrdinalIgnoreCase))
+        {
+            SetStatus(ctx, "Chrome đã mở — cần xử lý CAPTCHA trên TikTok.", Color.DarkOrange);
+            ModernDialog.ShowMessage(this, $"Profile {ctx.Profile.Name} đang gặp CAPTCHA. Hãy xử lý CAPTCHA trực tiếp trên Chrome; tool sẽ chờ và tự tiếp tục khi CAPTCHA biến mất.", "TikTok CAPTCHA", MessageBoxIcon.Warning);
+            return;
+        }
+        if (string.Equals(result, "totp_required", StringComparison.OrdinalIgnoreCase))
+        {
+            SetStatus(ctx, "Chrome đã mở — thiếu secret 2FA/TOTP.", Color.DarkOrange);
+            ModernDialog.ShowMessage(this, $"Profile {ctx.Profile.Name} cần 2FA nhưng chưa có secret TOTP. Hãy bấm ‘🔐 Tài khoản’ ngay trong profile này để cấu hình.", "TikTok 2FA", MessageBoxIcon.Warning);
+            return;
+        }
+        if (string.Equals(result, "login_required", StringComparison.OrdinalIgnoreCase))
+        {
+            SetStatus(ctx, "Chrome đã mở — chưa cấu hình tự đăng nhập.", Color.DarkOrange);
+            return;
+        }
         if (!string.Equals(result, "opened", StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException($"Không thể mở Chrome của profile “{ctx.Profile.Name}” (worker: {result}).");
+            throw new InvalidOperationException($"Chrome đã mở nhưng TikTok chưa sẵn sàng cho profile “{ctx.Profile.Name}” (worker: {result}).");
 
-        SetStatus(ctx, "Chrome của đúng profile đã kết nối.", Color.DarkGreen);
+        SetStatus(ctx, "Chrome đã kết nối — TikTok LIVE sẵn sàng.", Color.DarkGreen);
         _log.Info($"[CHROME_OPEN] profile={ctx.Profile.Name} profilePath={ctx.Profile.ProfilePath} port={ctx.Profile.CdpPort}");
         try { await RefreshStatusAsync(ctx); } catch (Exception ex) { _log.Warn($"[{ctx.Profile.Name}] refresh status sau mở Chrome: {ex.Message}"); }
+    }
+
+    async Task ViewChromeForProfileAsync(ProfileContext ctx)
+    {
+        try
+        {
+            // Refresh the exact profile snapshot so we never activate another Chrome window.
+            await RefreshStatusAsync(ctx);
+            var hwndValue = ctx.LastSnapshot?.ChromeWindowHandle ?? 0;
+            var chromeState = ctx.LastSnapshot?.Chrome ?? "DISCONNECTED";
+
+            if (hwndValue <= 0 || chromeState.Equals("DISCONNECTED", StringComparison.OrdinalIgnoreCase))
+            {
+                ModernDialog.ShowMessage(this,
+                    $"Chrome của profile “{ctx.Profile.Name}” chưa mở. Hãy bấm ‘Mở Chrome’ trước, sau đó dùng ‘👁 View’ để đưa đúng cửa sổ này lên trước.",
+                    "View Chrome", MessageBoxIcon.Information);
+                return;
+            }
+
+            var hwnd = new IntPtr(hwndValue);
+            if (!ChromeMonitorWindowActions.RestoreMaximizeAndActivate(hwnd))
+            {
+                // The handle can become stale after Chrome recreates its top-level window.
+                // Refresh once more before declaring failure.
+                await Task.Delay(120);
+                await RefreshStatusAsync(ctx);
+                hwndValue = ctx.LastSnapshot?.ChromeWindowHandle ?? 0;
+                if (hwndValue <= 0 || !ChromeMonitorWindowActions.RestoreMaximizeAndActivate(new IntPtr(hwndValue)))
+                    throw new InvalidOperationException($"Không đưa được cửa sổ Chrome của profile “{ctx.Profile.Name}” lên trước.");
+            }
+
+            _log.Info($"[CHROME_VIEW] profile={ctx.Profile.Name} hwnd={hwndValue} result=shown");
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"[CHROME_VIEW] profile={ctx.Profile.Name} result=failed message={ex.Message}");
+            throw;
+        }
     }
 
     async Task EnsureWorkerAsync(ProfileContext ctx)
@@ -571,21 +675,81 @@ public sealed class ManagerForm : Form
     async Task EmbedWorkerAsync(ProfileContext ctx)
     {
         if (ctx.Host is null) return;
-        for (var i = 0; i < 20; i++)
+        if (!await AttachWorkerWithRetryAsync(ctx, maxAttempts: 20, delayMs: 120, reason: "open"))
+            throw new InvalidOperationException("Không gắn được giao diện V13 vào tab sau nhiều lần thử.");
+    }
+
+    async Task<bool> AttachWorkerWithRetryAsync(ProfileContext ctx, int maxAttempts, int delayMs, string reason)
+    {
+        if (ctx.Host is null || ctx.Host.IsDisposed || ctx.Detached) return false;
+        if (ctx.EmbedRecoveryInProgress) return WorkerWindowEmbedder.IsAttachedTo(ctx.WorkerWindow, ctx.Host);
+
+        ctx.EmbedRecoveryInProgress = true;
+        try
         {
-            var snapshot = await ReadStatusAsync(ctx);
-            if (snapshot.WindowHandle != 0)
+            ctx.Host.CreateControl();
+            for (var attempt = 1; attempt <= Math.Max(1, maxAttempts); attempt++)
             {
-                ctx.WorkerWindow = new IntPtr(snapshot.WindowHandle);
-                break;
+                if (_closing || ctx.Host is null || ctx.Host.IsDisposed || ctx.Detached) return false;
+
+                try
+                {
+                    var snapshot = await ReadStatusAsync(ctx);
+                    if (snapshot.WindowHandle != 0) ctx.WorkerWindow = new IntPtr(snapshot.WindowHandle);
+                }
+                catch (Exception ex)
+                {
+                    if (attempt == 1 || attempt == maxAttempts)
+                        _log.Warn($"[WORKER_EMBED_STATUS_RETRY] profile={ctx.Profile.Name} reason={reason} attempt={attempt}/{maxAttempts} error={ex.Message}");
+                }
+
+                if (WorkerWindowEmbedder.IsValid(ctx.WorkerWindow))
+                {
+                    if (WorkerWindowEmbedder.IsAttachedTo(ctx.WorkerWindow, ctx.Host) || WorkerWindowEmbedder.Attach(ctx.WorkerWindow, ctx.Host))
+                    {
+                        ctx.Detached = false;
+                        ctx.ConsecutiveEmbedRecoveryFailures = 0;
+                        ctx.LastEmbedRecoveryUtc = DateTime.UtcNow;
+                        if (ctx.DetachButton is not null) ctx.DetachButton.Text = "Tách Worker";
+                        WorkerWindowEmbedder.Resize(ctx.WorkerWindow, ctx.Host.ClientSize);
+                        _log.Info($"[WORKER_EMBED_OK] profile={ctx.Profile.Name} reason={reason} attempt={attempt}/{maxAttempts} hwnd={ctx.WorkerWindow.ToInt64()}");
+                        return true;
+                    }
+                }
+
+                if (attempt < maxAttempts) await Task.Delay(Math.Max(50, delayMs));
             }
-            await Task.Delay(100);
+
+            ctx.ConsecutiveEmbedRecoveryFailures++;
+            ctx.LastEmbedRecoveryUtc = DateTime.UtcNow;
+            _log.Warn($"[WORKER_EMBED_FAILED] profile={ctx.Profile.Name} reason={reason} hwnd={ctx.WorkerWindow.ToInt64()} failures={ctx.ConsecutiveEmbedRecoveryFailures}");
+            return false;
         }
-        if (!WorkerWindowEmbedder.IsValid(ctx.WorkerWindow)) throw new InvalidOperationException("Không lấy được cửa sổ V13 worker.");
-        ctx.Host.CreateControl();
-        if (!WorkerWindowEmbedder.Attach(ctx.WorkerWindow, ctx.Host)) throw new InvalidOperationException("Không gắn được giao diện V13 vào tab.");
-        ctx.Detached = false;
-        if (ctx.DetachButton is not null) ctx.DetachButton.Text = "Tách Worker";
+        finally
+        {
+            ctx.EmbedRecoveryInProgress = false;
+        }
+    }
+
+    async Task RecoverWorkerEmbedIfNeededAsync(ProfileContext ctx)
+    {
+        if (ctx.Opening || ctx.Detached || ctx.Host is null || ctx.Host.IsDisposed) return;
+        if (ctx.Worker is null || ctx.Worker.HasExited) return;
+        if (WorkerWindowEmbedder.IsAttachedTo(ctx.WorkerWindow, ctx.Host)) return;
+        if (ctx.EmbedRecoveryInProgress) return;
+        if (DateTime.UtcNow - ctx.LastEmbedRecoveryUtc < TimeSpan.FromMilliseconds(750)) return;
+
+        _log.Warn($"[WORKER_EMBED_RECOVERY_START] profile={ctx.Profile.Name} hwnd={ctx.WorkerWindow.ToInt64()}");
+        var recovered = await AttachWorkerWithRetryAsync(ctx, maxAttempts: 6, delayMs: 150, reason: "auto_recovery");
+        if (recovered)
+        {
+            SetStatus(ctx, "Worker đã tự khôi phục giao diện trong tab.", Color.DarkGreen);
+            _log.Info($"[WORKER_EMBED_RECOVERY_OK] profile={ctx.Profile.Name}");
+        }
+        else
+        {
+            _log.Warn($"[WORKER_EMBED_RECOVERY_PENDING] profile={ctx.Profile.Name} sẽ thử lại ở vòng refresh sau");
+        }
     }
 
     void ToggleDetach(ProfileContext ctx)
@@ -620,9 +784,9 @@ public sealed class ManagerForm : Form
             var selectedTab = _tabs.SelectedTab;
             foreach (var ctx in _contexts.Values.Where(c => c.Tab is not null).ToList())
             {
-                if (ctx.Worker is null || ctx.Worker.HasExited) continue;
+                if (ctx.Worker is null || ctx.Worker.HasExited || ctx.Opening) continue;
 
-                // V13.4.1: profile đang xem vẫn refresh 1 giây như cũ. Các tab nền
+                // V13.5: profile đang xem vẫn refresh 1 giây như cũ. Các tab nền
                 // chỉ refresh 5 giây/lần để giảm pipe/JSON/UI work khi chạy nhiều VM profile.
                 var monitorVisible = _chromeMonitor is not null && !_chromeMonitor.IsDisposed && _chromeMonitor.Visible;
                 var interval = ReferenceEquals(ctx.Tab, selectedTab) || monitorVisible
@@ -630,7 +794,12 @@ public sealed class ManagerForm : Form
                     : TimeSpan.FromSeconds(5);
                 if (now - ctx.LastStatusRefreshUtc < interval) continue;
 
-                try { await RefreshStatusAsync(ctx); } catch { }
+                try
+                {
+                    await RefreshStatusAsync(ctx);
+                    await RecoverWorkerEmbedIfNeededAsync(ctx);
+                }
+                catch { }
             }
         }
         finally { _refreshing = false; }
@@ -643,7 +812,15 @@ public sealed class ManagerForm : Form
         ctx.LastSnapshot = s;
         var color = s.RunState == "RUNNING" ? Color.DarkGreen : s.RunState == "PAUSED" ? Color.DarkOrange : Color.DimGray;
         SetStatus(ctx, $"Worker {s.State} | {s.RunState} | Chrome {s.Chrome}", color);
-        if (s.WindowHandle != 0 && ctx.WorkerWindow == IntPtr.Zero) ctx.WorkerWindow = new IntPtr(s.WindowHandle);
+        if (s.WindowHandle != 0)
+        {
+            var reported = new IntPtr(s.WindowHandle);
+            if (ctx.WorkerWindow != reported)
+            {
+                _log.Info($"[WORKER_WINDOW_HANDLE_CHANGED] profile={ctx.Profile.Name} old={ctx.WorkerWindow.ToInt64()} new={reported.ToInt64()}");
+                ctx.WorkerWindow = reported;
+            }
+        }
     }
 
     async Task<WorkerSnapshot> ReadStatusAsync(ProfileContext ctx)
@@ -813,18 +990,29 @@ public sealed class ManagerForm : Form
     void AddProfile()
     {
         var catalog = _profileService.Load();
-        var name = ShowAddProfileDialog(catalog);
-        if (name is null) return;
+        var request = ShowAddProfileDialog(catalog);
+        if (request is null) return;
+        var name = request.Name;
 
         TikTokProfileEntry? entry = null;
         try
         {
             entry = _profileService.CreateManagedProfile(name);
             _chromeProfileNameSync.SyncBeforeLaunch(entry.ProfilePath, entry.Name);
+            var dataRoot = _profileService.ResolveDataRoot(entry);
+            Directory.CreateDirectory(dataRoot);
+            ApplyManagerDefaultConfigToNewProfile(dataRoot);
+            if (!string.IsNullOrWhiteSpace(request.Username) || !string.IsNullOrEmpty(request.Password) || !string.IsNullOrWhiteSpace(request.TotpSecret))
+                _tiktokAuthService.Save(dataRoot, request.Username, request.Password, request.TotpSecret, request.AutoLogin);
             catalog.Profiles.Add(entry);
             catalog.SelectedProfile = entry.Name;
             _profileService.EnsurePorts(catalog.Profiles);
             _profileService.SaveWithBackup(catalog);
+            if (!string.IsNullOrWhiteSpace(request.AccountPoolId))
+            {
+                try { _accountPoolService.Assign(request.AccountPoolId, entry.Name); }
+                catch (Exception assignEx) { _log.Warn($"[ACCOUNT_POOL_ASSIGN_FAILED] profile={entry.Name} {assignEx.Message}"); }
+            }
         }
         catch (Exception ex)
         {
@@ -835,7 +1023,7 @@ public sealed class ManagerForm : Form
             var detail = $"Không thể tạo profile {name}: {ex.Message}";
             if (!string.IsNullOrWhiteSpace(rollbackError)) detail += "\n\nKhông thể dọn dữ liệu tạo dở: " + rollbackError;
             _log.Error("[PROFILE_CREATE] name=" + name + " " + ex);
-            MessageBox.Show(this, detail, "Thêm profile TikTok", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            ModernDialog.ShowMessage(this, detail, "Thêm profile TikTok", MessageBoxIcon.Error);
             return;
         }
 
@@ -843,24 +1031,43 @@ public sealed class ManagerForm : Form
         {
             ReloadCatalog();
             _log.Info($"[PROFILE_CREATED] name={entry.Name} profilePath={entry.ProfilePath}");
-            MessageBox.Show(this, $"Đã tạo profile {entry.Name} thành công", "Thêm profile TikTok", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            ModernDialog.ShowMessage(this, $"Đã tạo profile {entry.Name} thành công.", "Thêm profile TikTok", MessageBoxIcon.Information);
         }
         catch (Exception ex)
         {
             _log.Error("[PROFILE_CREATE] profile created but UI refresh failed: " + ex);
-            MessageBox.Show(this, $"Đã tạo profile {entry.Name}, nhưng không thể cập nhật giao diện: {ex.Message}", "Thêm profile TikTok", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            ModernDialog.ShowMessage(this, $"Đã tạo profile {entry.Name}, nhưng không thể cập nhật giao diện: {ex.Message}", "Thêm profile TikTok", MessageBoxIcon.Warning);
         }
     }
 
-    string? ShowAddProfileDialog(TikTokProfileCatalog catalog)
+    string ManagerDefaultConfigRoot => Path.Combine(_baseDir, "manager_default_config");
+    string ManagerDefaultIniPath => Path.Combine(ManagerDefaultConfigRoot, "auto_chrome.ini");
+    string ManagerDefaultContentPath => Path.Combine(ManagerDefaultConfigRoot, "auto_chrome_noidung.txt");
+
+    void ApplyManagerDefaultConfigToNewProfile(string dataRoot)
     {
+        if (!File.Exists(ManagerDefaultIniPath)) return;
+        Directory.CreateDirectory(dataRoot);
+        File.Copy(ManagerDefaultIniPath, Path.Combine(dataRoot, "auto_chrome.ini"), overwrite: true);
+        var targetContent = Path.Combine(dataRoot, "auto_chrome_noidung.txt");
+        if (File.Exists(ManagerDefaultContentPath))
+            File.Copy(ManagerDefaultContentPath, targetContent, overwrite: true);
+        else if (File.Exists(targetContent))
+            File.Delete(targetContent);
+        _log.Info($"[DEFAULT_CONFIG_APPLIED] dataRoot={dataRoot}");
+    }
+
+    void ShowDefaultConfigDialog()
+    {
+        var catalog = _profileService.Load();
         using var form = new Form
         {
-            Text = "Thêm profile TikTok",
-            Width = 470,
-            Height = 270,
+            Text = "Cấu hình mặc định — V13.5",
+            Width = 680,
+            Height = 540,
+            MinimumSize = new Size(640, 500),
             StartPosition = FormStartPosition.CenterParent,
-            FormBorderStyle = FormBorderStyle.FixedDialog,
+            FormBorderStyle = FormBorderStyle.Sizable,
             MinimizeBox = false,
             MaximizeBox = false,
             ShowInTaskbar = false,
@@ -868,94 +1075,1150 @@ public sealed class ManagerForm : Form
             Font = new Font("Segoe UI", 10F)
         };
         ModernDialog.Apply(form);
-        var root = new TableLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            ColumnCount = 1,
-            RowCount = 4,
-            Padding = new Padding(16),
-            Margin = new Padding(0)
-        };
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
-        var label = new Label
+        // Footer luôn cố định để không bị khuất khi Windows dùng DPI/Scale lớn.
+        var footer = new Panel
         {
-            Text = "Tên profile mới",
-            AutoSize = true,
-            Font = new Font("Segoe UI", 10F, FontStyle.Bold),
-            Margin = new Padding(0, 0, 0, 8)
+            Dock = DockStyle.Bottom,
+            Height = 62,
+            Padding = new Padding(18, 10, 18, 10),
+            BackColor = UiTheme.Canvas
         };
-        ModernDialog.StylePrimaryLabel(label);
-        var nameBox = new TextBox
+        var footerFlow = new FlowLayoutPanel
         {
-            Dock = DockStyle.Top,
-            Font = new Font("Segoe UI", 11F),
-            MinimumSize = new Size(0, 36),
-            Margin = new Padding(0)
-        };
-        ModernDialog.StyleTextInput(nameBox);
-        var create = new Button
-        {
-            Text = "Tạo profile",
-            Size = new Size(132, 42),
-            Font = new Font("Segoe UI", 10F, FontStyle.Bold),
-            BackColor = Color.FromArgb(232, 242, 255),
-            ForeColor = Color.FromArgb(35, 91, 152),
-            FlatStyle = FlatStyle.Flat
-        };
-        create.FlatAppearance.BorderColor = Color.FromArgb(130, 173, 220);
-        var cancel = new Button
-        {
-            Text = "Hủy",
-            DialogResult = DialogResult.Cancel,
-            Size = new Size(104, 42),
-            Font = new Font("Segoe UI", 10F),
-            BackColor = Color.FromArgb(247, 249, 252),
-            ForeColor = Color.FromArgb(55, 76, 103),
-            FlatStyle = FlatStyle.Flat
-        };
-        cancel.FlatAppearance.BorderColor = Color.FromArgb(190, 201, 214);
-        ModernDialog.StylePrimaryButton(create);
-        ModernDialog.StyleSecondaryButton(cancel);
-        var buttons = new FlowLayoutPanel
-        {
-            AutoSize = true,
             Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.RightToLeft,
-            Padding = new Padding(0, 12, 0, 0),
+            WrapContents = false,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty
+        };
+        var close = new Button { Text = "Đóng", DialogResult = DialogResult.Cancel, Size = new Size(110, 40) };
+        ModernDialog.StyleSecondaryButton(close);
+        footerFlow.Controls.Add(close);
+        footer.Controls.Add(footerFlow);
+
+        var viewport = new Panel
+        {
+            Dock = DockStyle.Fill,
+            AutoScroll = true,
+            BackColor = UiTheme.Canvas,
+            Padding = new Padding(18, 16, 18, 12)
+        };
+        var content = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            ColumnCount = 1,
+            RowCount = 12,
+            BackColor = UiTheme.Canvas,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty
+        };
+        content.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        for (var i = 0; i < content.RowCount; i++)
+            content.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+        var title = new Label
+        {
+            Text = "Cấu hình dùng cho profile tạo mới",
+            AutoSize = true,
+            Font = new Font("Segoe UI", 11F, FontStyle.Bold),
+            Margin = new Padding(0, 0, 0, 8)
+        };
+        ModernDialog.StylePrimaryLabel(title);
+
+        var note = new Label
+        {
+            Text = "Chỉ sao chép cấu hình Tool (auto_chrome.ini + nội dung dán), không sao chép tài khoản, mật khẩu, 2FA hay dữ liệu Chrome. Profile đã tồn tại không bị thay đổi.",
+            AutoSize = true,
+            MaximumSize = new Size(610, 0),
+            Margin = new Padding(0, 0, 0, 12)
+        };
+        var status = new Label
+        {
+            AutoSize = true,
+            MaximumSize = new Size(610, 0),
+            Margin = new Padding(0, 0, 0, 16)
+        };
+
+        // ZIP là cách nhập chính, luôn hiển thị ngay phía trên.
+        var zipTitle = new Label
+        {
+            Text = "Nhập cấu hình từ file ZIP",
+            AutoSize = true,
+            Font = new Font("Segoe UI", 10F, FontStyle.Bold),
+            Margin = new Padding(0, 0, 0, 4)
+        };
+        var zipNote = new Label
+        {
+            Text = "Chọn ZIP đã xuất từ Tool/profile. Tool tự tìm auto_chrome.ini và auto_chrome_noidung.txt dù chúng nằm trong thư mục con của ZIP.",
+            AutoSize = true,
+            MaximumSize = new Size(610, 0),
+            Margin = new Padding(0, 0, 0, 8)
+        };
+        var zipActions = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            Dock = DockStyle.Top,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = true,
+            Margin = new Padding(0, 0, 0, 18)
+        };
+        var importZip = new Button { Text = "Nhập từ ZIP...", Size = new Size(180, 42), Margin = new Padding(0, 0, 8, 4) };
+        ModernDialog.StylePrimaryButton(importZip);
+        zipActions.Controls.Add(importZip);
+
+        var separator = new Label
+        {
+            AutoSize = false,
+            Height = 1,
+            Dock = DockStyle.Top,
+            BackColor = Color.FromArgb(210, 218, 228),
+            Margin = new Padding(0, 0, 0, 16)
+        };
+
+        var sourceLabel = new Label
+        {
+            Text = "Hoặc lấy cấu hình từ profile đã có",
+            AutoSize = true,
+            Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
+            Margin = new Padding(0, 0, 0, 5)
+        };
+        var profileBox = new ComboBox
+        {
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Dock = DockStyle.Top,
+            Font = new Font("Segoe UI", 10F),
+            Margin = new Padding(0, 0, 0, 9)
+        };
+        var profiles = catalog.Profiles.OrderBy(p => p.Name, NaturalProfileNameOrder).ToList();
+        foreach (var profile in profiles) profileBox.Items.Add(profile.Name);
+        var preferredName = SelectedContext()?.Profile.Name;
+        if (string.IsNullOrWhiteSpace(preferredName)) preferredName = catalog.SelectedProfile;
+        ModernDialog.StyleSelectionInput(profileBox);
+        if (profileBox.Items.Count > 0)
+        {
+            var preferredIndex = profiles.FindIndex(p => p.Name.Equals(preferredName, StringComparison.OrdinalIgnoreCase));
+            profileBox.SelectedIndex = preferredIndex >= 0 ? preferredIndex : 0;
+        }
+
+        var profileActions = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            Dock = DockStyle.Top,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = true,
+            Margin = new Padding(0, 0, 0, 16)
+        };
+        var useProfile = new Button { Text = "Dùng profile này làm mặc định", Size = new Size(230, 42), Margin = new Padding(0, 0, 8, 4) };
+        ModernDialog.StyleSecondaryButton(useProfile);
+        profileActions.Controls.Add(useProfile);
+
+        var clear = new Button { Text = "Bỏ cấu hình mặc định riêng", Size = new Size(220, 42), Margin = new Padding(0, 0, 8, 4) };
+        ModernDialog.StyleSecondaryButton(clear);
+        profileActions.Controls.Add(clear);
+
+        void RefreshStatus()
+        {
+            if (File.Exists(ManagerDefaultIniPath))
+            {
+                var contentState = File.Exists(ManagerDefaultContentPath) ? "có nội dung dán" : "không có nội dung dán";
+                status.Text = $"Đang dùng cấu hình mặc định riêng ({contentState}). Profile tạo mới sẽ tự nhận cấu hình này.";
+                status.ForeColor = Color.DarkGreen;
+                clear.Enabled = true;
+            }
+            else
+            {
+                status.Text = "Chưa đặt cấu hình mặc định riêng. Profile mới sẽ dùng defaults gốc đi kèm Tool.";
+                status.ForeColor = Color.DimGray;
+                clear.Enabled = false;
+            }
+        }
+
+        importZip.Click += (_, _) =>
+        {
+            using var picker = new OpenFileDialog
+            {
+                Title = "Chọn ZIP cấu hình V13",
+                Filter = "Gói cấu hình (*.zip)|*.zip|Tất cả file (*.*)|*.*",
+                CheckFileExists = true,
+                Multiselect = false
+            };
+            if (picker.ShowDialog(form) != DialogResult.OK) return;
+            try
+            {
+                ImportManagerDefaultConfigZip(picker.FileName);
+                RefreshStatus();
+                ModernDialog.ShowMessage(form,
+                    $"Đã nhập cấu hình mặc định từ:\n{Path.GetFileName(picker.FileName)}\n\nCác profile tạo mới sẽ tự nhận cấu hình này.",
+                    "Cấu hình mặc định", MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                _log.Error("[DEFAULT_CONFIG_IMPORT] " + ex);
+                ModernDialog.ShowMessage(form, ex.Message, "Không nhập được cấu hình", MessageBoxIcon.Warning);
+            }
+        };
+
+        useProfile.Click += (_, _) =>
+        {
+            if (profileBox.SelectedItem is not string profileName) return;
+            var profile = profiles.FirstOrDefault(p => p.Name.Equals(profileName, StringComparison.OrdinalIgnoreCase));
+            if (profile is null) return;
+            try
+            {
+                var sourceRoot = _profileService.ResolveDataRoot(profile);
+                var sourceIni = Path.Combine(sourceRoot, "auto_chrome.ini");
+                var sourceContent = Path.Combine(sourceRoot, "auto_chrome_noidung.txt");
+                if (!File.Exists(sourceIni))
+                    throw new FileNotFoundException($"Profile {profile.Name} chưa có auto_chrome.ini. Hãy mở profile, chỉnh cấu hình và bấm Lưu trước.", sourceIni);
+                BackupManagerDefaultConfig();
+                Directory.CreateDirectory(ManagerDefaultConfigRoot);
+                File.Copy(sourceIni, ManagerDefaultIniPath, overwrite: true);
+                if (File.Exists(sourceContent)) File.Copy(sourceContent, ManagerDefaultContentPath, overwrite: true);
+                else if (File.Exists(ManagerDefaultContentPath)) File.Delete(ManagerDefaultContentPath);
+                _log.Info($"[DEFAULT_CONFIG_SET_FROM_PROFILE] profile={profile.Name} source={sourceRoot}");
+                RefreshStatus();
+                ModernDialog.ShowMessage(form, $"Đã lấy cấu hình của {profile.Name} làm mặc định. Các profile tạo từ bây giờ sẽ tự nhận cấu hình này.", "Cấu hình mặc định", MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                _log.Error("[DEFAULT_CONFIG_SET_FROM_PROFILE] " + ex);
+                ModernDialog.ShowMessage(form, ex.Message, "Không đặt được cấu hình mặc định", MessageBoxIcon.Warning);
+            }
+        };
+
+        clear.Click += (_, _) =>
+        {
+            var confirm = ModernDialog.ShowConfirm(form,
+                "Bỏ cấu hình mặc định riêng? Profile mới sau đó sẽ quay về dùng defaults gốc đi kèm Tool. Các profile đã tạo không thay đổi.",
+                "Cấu hình mặc định");
+            if (confirm != DialogResult.Yes) return;
+            try
+            {
+                BackupManagerDefaultConfig();
+                if (Directory.Exists(ManagerDefaultConfigRoot)) Directory.Delete(ManagerDefaultConfigRoot, recursive: true);
+                _log.Info("[DEFAULT_CONFIG_CLEARED]");
+                RefreshStatus();
+            }
+            catch (Exception ex)
+            {
+                ModernDialog.ShowMessage(form, ex.Message, "Không bỏ được cấu hình mặc định", MessageBoxIcon.Warning);
+            }
+        };
+
+        content.Controls.Add(title, 0, 0);
+        content.Controls.Add(note, 0, 1);
+        content.Controls.Add(status, 0, 2);
+        content.Controls.Add(zipTitle, 0, 3);
+        content.Controls.Add(zipNote, 0, 4);
+        content.Controls.Add(zipActions, 0, 5);
+        content.Controls.Add(separator, 0, 6);
+        content.Controls.Add(sourceLabel, 0, 7);
+        content.Controls.Add(profileBox, 0, 8);
+        content.Controls.Add(profileActions, 0, 9);
+
+        viewport.Controls.Add(content);
+        form.Controls.Add(viewport);
+        form.Controls.Add(footer);
+        form.CancelButton = close;
+        RefreshStatus();
+        form.ShowDialog(this);
+    }
+
+    void BackupManagerDefaultConfig()
+    {
+        if (!File.Exists(ManagerDefaultIniPath) && !File.Exists(ManagerDefaultContentPath)) return;
+        var backupRoot = Path.Combine(_baseDir, "default_config_backups", DateTime.Now.ToString("yyyyMMdd_HHmmss_fff"));
+        Directory.CreateDirectory(backupRoot);
+        if (File.Exists(ManagerDefaultIniPath)) File.Copy(ManagerDefaultIniPath, Path.Combine(backupRoot, "auto_chrome.ini"), true);
+        if (File.Exists(ManagerDefaultContentPath)) File.Copy(ManagerDefaultContentPath, Path.Combine(backupRoot, "auto_chrome_noidung.txt"), true);
+        try
+        {
+            var root = new DirectoryInfo(Path.Combine(_baseDir, "default_config_backups"));
+            foreach (var dir in root.GetDirectories().OrderByDescending(d => d.CreationTimeUtc).Skip(5))
+                try { dir.Delete(true); } catch { }
+        }
+        catch { }
+    }
+
+    void ImportManagerDefaultConfigZip(string zipPath)
+    {
+        if (!File.Exists(zipPath)) throw new FileNotFoundException("Không tìm thấy file ZIP cấu hình.", zipPath);
+        using var archive = ZipFile.OpenRead(zipPath);
+        var iniEntry = archive.Entries.FirstOrDefault(e => e.FullName.Replace('\\', '/').EndsWith("auto_chrome.ini", StringComparison.OrdinalIgnoreCase));
+        if (iniEntry is null) throw new InvalidDataException("ZIP không có auto_chrome.ini nên không phải gói cấu hình Tool hợp lệ.");
+        var contentEntry = archive.Entries.FirstOrDefault(e => e.FullName.Replace('\\', '/').EndsWith("auto_chrome_noidung.txt", StringComparison.OrdinalIgnoreCase));
+
+        BackupManagerDefaultConfig();
+        Directory.CreateDirectory(ManagerDefaultConfigRoot);
+        iniEntry.ExtractToFile(ManagerDefaultIniPath, overwrite: true);
+        if (contentEntry is not null) contentEntry.ExtractToFile(ManagerDefaultContentPath, overwrite: true);
+        else if (File.Exists(ManagerDefaultContentPath)) File.Delete(ManagerDefaultContentPath);
+        _log.Info($"[DEFAULT_CONFIG_IMPORTED] zip={zipPath}");
+    }
+
+    ProfileCreateRequest? ShowAddProfileDialog(TikTokProfileCatalog catalog)
+    {
+        using var form = new Form
+        {
+            Text = "Thêm profile TikTok — V13.5",
+            Width = 620,
+            Height = 690,
+            MinimumSize = new Size(580, 590),
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.Sizable,
+            MinimizeBox = false,
+            MaximizeBox = false,
+            ShowInTaskbar = false,
+            AutoScaleMode = AutoScaleMode.Dpi,
+            Font = new Font("Segoe UI", 10F)
+        };
+        ModernDialog.Apply(form, fixedDialog: false);
+
+        var poolItems = _accountPoolService.Load();
+
+        Label L(string text, bool bold = false)
+        {
+            var label = new Label
+            {
+                Text = text,
+                AutoSize = true,
+                MaximumSize = new Size(535, 0),
+                Margin = new Padding(0, 8, 0, 5),
+                Font = new Font("Segoe UI", 10F, bold ? FontStyle.Bold : FontStyle.Regular)
+            };
+            ModernDialog.StylePrimaryLabel(label);
+            if (!bold) label.Font = new Font("Segoe UI", 10F, FontStyle.Regular);
+            return label;
+        }
+
+        TextBox T(bool password = false)
+        {
+            var box = new TextBox
+            {
+                Dock = DockStyle.Top,
+                Font = new Font("Segoe UI", 11F),
+                MinimumSize = new Size(0, 36),
+                Margin = new Padding(0)
+            };
+            if (password) box.UseSystemPasswordChar = true;
+            ModernDialog.StyleTextInput(box);
+            return box;
+        }
+
+        var nameBox = T();
+        var usernameBox = T();
+        var passwordBox = T(password: true);
+        var totpBox = T(password: true);
+        TikTokAccountPoolItem? selectedPoolAccount = null;
+        var selectedAccountSummary = new Label
+        {
+            Text = "Chưa chọn tài khoản từ kho — sẽ nhập thủ công.",
+            AutoSize = false,
+            Dock = DockStyle.Top,
+            Height = 42,
+            Padding = new Padding(10, 9, 10, 7),
+            BorderStyle = BorderStyle.FixedSingle,
+            ForeColor = Color.DimGray,
+            BackColor = Color.White,
+            AutoEllipsis = true,
+            Margin = new Padding(0, 0, 0, 6)
+        };
+        var choosePoolAccount = new Button
+        {
+            Text = "Chọn tài khoản từ kho...",
+            AutoSize = true,
+            Height = 38,
+            Margin = new Padding(0, 0, 8, 0)
+        };
+        var manualAccount = new Button
+        {
+            Text = "Nhập thủ công",
+            AutoSize = true,
+            Height = 38,
             Margin = new Padding(0)
+        };
+        ModernDialog.StylePrimaryButton(choosePoolAccount);
+        ModernDialog.StyleSecondaryButton(manualAccount);
+        var accountButtons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Margin = new Padding(0, 0, 0, 5),
+            Padding = new Padding(0)
+        };
+        accountButtons.Controls.Add(choosePoolAccount);
+        accountButtons.Controls.Add(manualAccount);
+
+        void ApplyPoolAccount(TikTokAccountPoolItem item)
+        {
+            selectedPoolAccount = item;
+            usernameBox.Text = item.Username;
+            passwordBox.Text = item.Password;
+            totpBox.Text = item.TotpSecret;
+            var assigned = string.IsNullOrWhiteSpace(item.AssignedProfile) ? "Chưa gán" : item.AssignedProfile;
+            selectedAccountSummary.Text = $"Dòng {item.SourceRow}: {item.Username}    |    Profile đã gán: {assigned}";
+            selectedAccountSummary.ForeColor = string.IsNullOrWhiteSpace(item.AssignedProfile)
+                ? Color.FromArgb(35, 91, 152)
+                : Color.FromArgb(174, 94, 24);
+        }
+
+        choosePoolAccount.Click += (_, _) =>
+        {
+            var item = ShowAccountPoolPicker(form, includeAssigned: true);
+            if (item is not null) ApplyPoolAccount(item);
+        };
+        manualAccount.Click += (_, _) =>
+        {
+            selectedPoolAccount = null;
+            selectedAccountSummary.Text = "Nhập thủ công — tài khoản này sẽ không gắn với một dòng trong Kho tài khoản.";
+            selectedAccountSummary.ForeColor = Color.DimGray;
+            usernameBox.Focus();
+        };
+        var showSecrets = new CheckBox
+        {
+            Text = "Hiện mật khẩu và secret 2FA",
+            AutoSize = true,
+            Margin = new Padding(0, 8, 0, 0)
+        };
+        showSecrets.CheckedChanged += (_, _) =>
+        {
+            passwordBox.UseSystemPasswordChar = !showSecrets.Checked;
+            totpBox.UseSystemPasswordChar = !showSecrets.Checked;
+        };
+        var autoLogin = new CheckBox
+        {
+            Text = "Tự đăng nhập khi Chrome profile chưa có phiên TikTok",
+            Checked = true,
+            AutoSize = true,
+            Margin = new Padding(0, 10, 0, 4)
+        };
+        var note = new Label
+        {
+            AutoSize = true,
+            MaximumSize = new Size(535, 0),
+            Margin = new Padding(0, 6, 0, 6),
+            ForeColor = Color.DimGray,
+            Text = "Có thể để trống phần đăng nhập và cấu hình sau trong từng profile. Mật khẩu + secret 2FA được mã hóa bằng Windows DPAPI. Nếu TikTok yêu cầu CAPTCHA, tool sẽ chờ bạn xử lý xong rồi tự tiếp tục đăng nhập."
+        };
+
+        var contentHost = new Panel
+        {
+            Dock = DockStyle.Fill,
+            AutoScroll = true,
+            Padding = new Padding(18, 12, 18, 8),
+            BackColor = ModernDialog.Canvas
+        };
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            ColumnCount = 1,
+            Margin = new Padding(0),
+            Padding = new Padding(0)
+        };
+        root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+
+        var row = 0;
+        root.Controls.Add(L("Tên profile mới", true), 0, row++); root.Controls.Add(nameBox, 0, row++);
+        root.Controls.Add(L("Chọn tài khoản từ kho", true), 0, row++);
+        root.Controls.Add(accountButtons, 0, row++);
+        root.Controls.Add(selectedAccountSummary, 0, row++);
+        root.Controls.Add(L("Tài khoản TikTok (username / email / số điện thoại)"), 0, row++); root.Controls.Add(usernameBox, 0, row++);
+        root.Controls.Add(L("Mật khẩu TikTok"), 0, row++); root.Controls.Add(passwordBox, 0, row++);
+        root.Controls.Add(L("Secret 2FA/TOTP (không phải mã 6 số; có thể để trống)"), 0, row++); root.Controls.Add(totpBox, 0, row++);
+        root.Controls.Add(showSecrets, 0, row++);
+        root.Controls.Add(autoLogin, 0, row++);
+        root.Controls.Add(note, 0, row++);
+        contentHost.Controls.Add(root);
+
+        var create = new Button { Text = "Tạo profile", Size = new Size(132, 42) };
+        var cancel = new Button { Text = "Hủy", DialogResult = DialogResult.Cancel, Size = new Size(104, 42) };
+        ModernDialog.StylePrimaryButton(create);
+        ModernDialog.StyleSecondaryButton(cancel);
+        var footer = new Panel
+        {
+            Dock = DockStyle.Bottom,
+            Height = 72,
+            Padding = new Padding(18, 14, 18, 16),
+            BackColor = ModernDialog.Canvas
+        };
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.RightToLeft,
+            WrapContents = false,
+            Margin = new Padding(0),
+            Padding = new Padding(0)
         };
         buttons.Controls.Add(cancel);
         buttons.Controls.Add(create);
-        root.Controls.Add(label, 0, 0);
-        root.Controls.Add(nameBox, 0, 1);
-        root.Controls.Add(new Panel { Dock = DockStyle.Fill, Margin = new Padding(0) }, 0, 2);
-        root.Controls.Add(buttons, 0, 3);
-        form.Controls.Add(root);
+        footer.Controls.Add(buttons);
+
+        form.Controls.Add(contentHost);
+        form.Controls.Add(footer);
         form.AcceptButton = create;
         form.CancelButton = cancel;
 
-        string? validatedName = null;
+        ProfileCreateRequest? request = null;
         create.Click += (_, _) =>
         {
             try
             {
-                validatedName = ValidateNewProfileName(nameBox.Text, catalog);
+                var name = ValidateNewProfileName(nameBox.Text, catalog);
+                var username = usernameBox.Text.Trim();
+                var password = passwordBox.Text;
+                var totp = TikTokAuthService.NormalizeTotpSecret(totpBox.Text);
+                if ((username.Length == 0) != (password.Length == 0))
+                    throw new InvalidOperationException("Nếu dùng tự đăng nhập, hãy nhập đủ tài khoản và mật khẩu.");
+                var selectedPoolId = selectedPoolAccount?.Id;
+                request = new ProfileCreateRequest(name, username, password, totp, autoLogin.Checked, selectedPoolId);
                 form.DialogResult = DialogResult.OK;
                 form.Close();
             }
             catch (Exception ex)
             {
-                MessageBox.Show(form, ex.Message, "Tên profile không hợp lệ", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                nameBox.Focus();
-                nameBox.SelectAll();
+                ModernDialog.ShowMessage(form, ex.Message, "Thông tin profile chưa hợp lệ", MessageBoxIcon.Warning);
             }
         };
-        form.Shown += (_, _) => nameBox.Focus();
-        return form.ShowDialog(this) == DialogResult.OK ? validatedName : null;
+        form.Shown += (_, _) =>
+        {
+            ModernDialog.FitToWorkingArea(form);
+            nameBox.Focus();
+        };
+        return form.ShowDialog(this) == DialogResult.OK ? request : null;
+    }
+
+
+    void ShowAccountPoolDialog()
+    {
+        using var form = new Form
+        {
+            Text = "Kho tài khoản TikTok — V13.5",
+            Width = 1080,
+            Height = 650,
+            MinimumSize = new Size(800, 520),
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.Sizable,
+            MinimizeBox = false,
+            MaximizeBox = true,
+            ShowInTaskbar = false,
+            AutoScaleMode = AutoScaleMode.Dpi,
+            Font = new Font("Segoe UI", 10F)
+        };
+        ModernDialog.Apply(form, fixedDialog: false);
+
+        var sourceInfo = new Label
+        {
+            Dock = DockStyle.Top,
+            Height = 76,
+            Padding = new Padding(18, 9, 18, 6),
+            AutoEllipsis = true,
+            ForeColor = Color.DimGray,
+            BackColor = ModernDialog.Canvas
+        };
+
+        var grid = new DataGridView
+        {
+            Dock = DockStyle.Fill,
+            ReadOnly = true,
+            AllowUserToAddRows = false,
+            AllowUserToDeleteRows = false,
+            AllowUserToResizeRows = false,
+            MultiSelect = false,
+            SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+            AutoGenerateColumns = false,
+            RowHeadersVisible = false,
+            BackgroundColor = ModernDialog.Canvas,
+            BorderStyle = BorderStyle.None,
+            AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill
+        };
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "row", HeaderText = "Dòng Excel", FillWeight = 18 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "user", HeaderText = "Tài khoản", FillWeight = 42 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "pass", HeaderText = "Mật khẩu", FillWeight = 18 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "totp", HeaderText = "2FA", FillWeight = 16 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "note", HeaderText = "Ghi chú", FillWeight = 34 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "assigned", HeaderText = "Profile đã gán", FillWeight = 28 });
+
+        List<TikTokAccountPoolItem> items = new();
+        void RefreshGrid()
+        {
+            items = _accountPoolService.Load().OrderBy(x => x.SourceRow).ThenBy(x => x.Username, StringComparer.OrdinalIgnoreCase).ToList();
+            grid.Rows.Clear();
+            foreach (var item in items)
+            {
+                var index = grid.Rows.Add(item.SourceRow, item.Username,
+                    string.IsNullOrEmpty(item.Password) ? "" : "••••••",
+                    string.IsNullOrWhiteSpace(item.TotpSecret) ? "" : "••••••",
+                    item.Note,
+                    item.AssignedProfile);
+                grid.Rows[index].Tag = item.Id;
+            }
+            if (grid.Rows.Count > 0) grid.Rows[0].Selected = true;
+
+            var currentFile = _accountPoolService.CurrentSourcePath;
+            sourceInfo.Text = string.IsNullOrWhiteSpace(currentFile)
+                ? "Chưa chọn file Excel. Bấm Mở Excel để chọn nguồn.\nA = Tài khoản, B = Mật khẩu, C = 2FA, D = Ghi chú; E trở đi bỏ qua."
+                : $"File đang dùng: {currentFile}\nKho phản ánh đúng file này. Mở file khác sẽ thay toàn bộ danh sách hiện tại; Sửa/Thêm/Xóa trong Kho sẽ ghi ngược vào file này.";
+            sourceInfo.Tag = currentFile;
+        }
+
+        TikTokAccountPoolItem? SelectedItem()
+        {
+            if (grid.SelectedRows.Count == 0) return null;
+            var id = grid.SelectedRows[0].Tag as string;
+            return items.FirstOrDefault(x => x.Id == id);
+        }
+
+        var openExcel = new Button { Text = "Mở Excel", AutoSize = true, Height = 36 };
+        var reload = new Button { Text = "Tải lại", AutoSize = true, Height = 36 };
+        var add = new Button { Text = "+ Thêm dòng", AutoSize = true, Height = 36 };
+        var edit = new Button { Text = "Sửa", AutoSize = true, Height = 36 };
+        var release = new Button { Text = "Bỏ gán profile", AutoSize = true, Height = 36 };
+        var delete = new Button { Text = "Xóa dòng", AutoSize = true, Height = 36 };
+        var close = new Button { Text = "Đóng", DialogResult = DialogResult.Cancel, AutoSize = true, Height = 36 };
+        ModernDialog.StylePrimaryButton(openExcel);
+        ModernDialog.StyleSecondaryButton(reload);
+        ModernDialog.StylePrimaryButton(add);
+        ModernDialog.StyleSecondaryButton(edit);
+        ModernDialog.StyleSecondaryButton(release);
+        ModernDialog.StyleSecondaryButton(delete);
+        ModernDialog.StyleSecondaryButton(close);
+
+        openExcel.Click += (_, _) =>
+        {
+            using var picker = new OpenFileDialog
+            {
+                Title = "Mở file tài khoản",
+                Filter = "Excel (*.xlsx)|*.xlsx|CSV (*.csv)|*.csv|Text (*.txt)|*.txt|Tất cả file|*.*",
+                Multiselect = false,
+                CheckFileExists = true
+            };
+            var currentPath = _accountPoolService.CurrentSourcePath;
+            if (!string.IsNullOrWhiteSpace(currentPath) && File.Exists(currentPath))
+            {
+                picker.InitialDirectory = Path.GetDirectoryName(currentPath);
+                picker.FileName = Path.GetFileName(currentPath);
+            }
+            if (picker.ShowDialog(form) != DialogResult.OK) return;
+            try
+            {
+                var result = _accountPoolService.ImportExcel(picker.FileName);
+                RefreshGrid();
+                ModernDialog.ShowMessage(form,
+                    $"Đã mở file Excel mới và nạp lại toàn bộ Kho tài khoản.\n\nSố tài khoản hiện tại: {result.Added}\nDữ liệu của file cũ đã được loại khỏi giao diện.",
+                    "Mở Excel", MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                ModernDialog.ShowMessage(form, ex.Message, "Không mở được Excel", MessageBoxIcon.Warning);
+            }
+        };
+
+        reload.Click += (_, _) =>
+        {
+            try
+            {
+                var currentPath = _accountPoolService.CurrentSourcePath;
+                if (string.IsNullOrWhiteSpace(currentPath))
+                {
+                    ModernDialog.ShowMessage(form, "Chưa có file Excel đang dùng. Hãy bấm Mở Excel trước.", "Tải lại Excel", MessageBoxIcon.Information);
+                    return;
+                }
+                _accountPoolService.ReloadCurrentExcel();
+                RefreshGrid();
+            }
+            catch (Exception ex)
+            {
+                ModernDialog.ShowMessage(form, ex.Message, "Không tải lại được Excel", MessageBoxIcon.Warning);
+            }
+        };
+
+        add.Click += (_, _) =>
+        {
+            var sourceRow = items.Count == 0 ? 2 : Math.Max(2, items.Max(x => x.SourceRow) + 1);
+            var created = ShowAccountPoolItemEditor(form, null, sourceRow);
+            if (created is null) return;
+            try
+            {
+                _accountPoolService.Upsert(created);
+                RefreshGrid();
+            }
+            catch (Exception ex)
+            {
+                ModernDialog.ShowMessage(form, ex.Message, "Không lưu được vào Excel", MessageBoxIcon.Warning);
+            }
+        };
+
+        edit.Click += (_, _) =>
+        {
+            var current = SelectedItem();
+            if (current is null) return;
+            var updated = ShowAccountPoolItemEditor(form, current, current.SourceRow);
+            if (updated is null) return;
+            try
+            {
+                _accountPoolService.Upsert(updated);
+                RefreshGrid();
+            }
+            catch (Exception ex)
+            {
+                ModernDialog.ShowMessage(form, ex.Message, "Không lưu được vào Excel", MessageBoxIcon.Warning);
+            }
+        };
+
+        release.Click += (_, _) =>
+        {
+            var current = SelectedItem();
+            if (current is null || string.IsNullOrWhiteSpace(current.AssignedProfile)) return;
+            _accountPoolService.ReleaseAccount(current.Id);
+            RefreshGrid();
+        };
+
+        delete.Click += (_, _) =>
+        {
+            var current = SelectedItem();
+            if (current is null) return;
+            if (ModernDialog.ShowConfirm(form,
+                    $"Xóa tài khoản {current.Username} khỏi Kho và xóa dữ liệu A-D ở dòng {current.SourceRow} trong file Excel đang dùng?\nThông tin đăng nhập đã lưu trong profile hiện tại sẽ không bị xóa.",
+                    "Xóa tài khoản") != DialogResult.Yes) return;
+            try
+            {
+                _accountPoolService.Delete(current.Id);
+                RefreshGrid();
+            }
+            catch (Exception ex)
+            {
+                ModernDialog.ShowMessage(form, ex.Message, "Không xóa được trong Excel", MessageBoxIcon.Warning);
+            }
+        };
+        grid.CellDoubleClick += (_, _) => edit.PerformClick();
+
+        var footer = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Bottom,
+            Height = 62,
+            Padding = new Padding(14, 10, 14, 10),
+            WrapContents = false,
+            FlowDirection = FlowDirection.LeftToRight,
+            BackColor = ModernDialog.Canvas
+        };
+        footer.Controls.Add(openExcel);
+        footer.Controls.Add(reload);
+        footer.Controls.Add(add);
+        footer.Controls.Add(edit);
+        footer.Controls.Add(release);
+        footer.Controls.Add(delete);
+        footer.Controls.Add(close);
+
+        form.Controls.Add(grid);
+        form.Controls.Add(sourceInfo);
+        form.Controls.Add(footer);
+        form.CancelButton = close;
+        form.Shown += (_, _) =>
+        {
+            ModernDialog.FitToWorkingArea(form);
+            try
+            {
+                var currentPath = _accountPoolService.CurrentSourcePath;
+                if (!string.IsNullOrWhiteSpace(currentPath) && File.Exists(currentPath))
+                    _accountPoolService.ReloadCurrentExcel();
+            }
+            catch
+            {
+                // Nếu file nguồn tạm thời không đọc được, vẫn giữ cache hiện tại để người dùng có thể đổi file khác.
+            }
+            RefreshGrid();
+        };
+        form.ShowDialog(this);
+    }
+
+    TikTokAccountPoolItem? ShowAccountPoolItemEditor(IWin32Window owner, TikTokAccountPoolItem? current, int sourceRow)
+    {
+        using var form = new Form
+        {
+            Text = current is null ? "Thêm tài khoản TikTok" : "Sửa tài khoản TikTok",
+            Width = 560,
+            Height = 520,
+            MinimumSize = new Size(520, 450),
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.Sizable,
+            MinimizeBox = false,
+            MaximizeBox = false,
+            ShowInTaskbar = false,
+            AutoScaleMode = AutoScaleMode.Dpi,
+            Font = new Font("Segoe UI", 10F)
+        };
+        ModernDialog.Apply(form, fixedDialog: false);
+
+        TextBox Box(string value, bool secret = false)
+        {
+            var box = new TextBox { Text = value, Dock = DockStyle.Top, Font = new Font("Segoe UI", 11F), MinimumSize = new Size(0, 36), UseSystemPasswordChar = secret };
+            ModernDialog.StyleTextInput(box);
+            return box;
+        }
+        Label LabelFor(string text)
+        {
+            var label = new Label { Text = text, AutoSize = true, Margin = new Padding(0, 10, 0, 5) };
+            ModernDialog.StylePrimaryLabel(label);
+            return label;
+        }
+
+        var user = Box(current?.Username ?? "");
+        var pass = Box(current?.Password ?? "", true);
+        var totp = Box(current?.TotpSecret ?? "", true);
+        var noteBox = new TextBox
+        {
+            Text = current?.Note ?? "",
+            Dock = DockStyle.Top,
+            Font = new Font("Segoe UI", 10.5F),
+            Multiline = true,
+            ScrollBars = ScrollBars.Vertical,
+            MinimumSize = new Size(0, 72)
+        };
+        ModernDialog.StyleTextInput(noteBox);
+        var show = new CheckBox { Text = "Hiện mật khẩu và secret 2FA", AutoSize = true, Margin = new Padding(0, 10, 0, 0) };
+        show.CheckedChanged += (_, _) => { pass.UseSystemPasswordChar = !show.Checked; totp.UseSystemPasswordChar = !show.Checked; };
+        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, Padding = new Padding(18, 12, 18, 8), AutoScroll = true };
+        root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        var row = 0;
+        root.Controls.Add(LabelFor("Tài khoản / Email / Số điện thoại"), 0, row++); root.Controls.Add(user, 0, row++);
+        root.Controls.Add(LabelFor("Mật khẩu"), 0, row++); root.Controls.Add(pass, 0, row++);
+        root.Controls.Add(LabelFor("Secret 2FA/TOTP"), 0, row++); root.Controls.Add(totp, 0, row++);
+        root.Controls.Add(LabelFor("Ghi chú"), 0, row++); root.Controls.Add(noteBox, 0, row++);
+        root.Controls.Add(show, 0, row++);
+
+        var save = new Button { Text = "Lưu", Size = new Size(110, 40) };
+        var cancel = new Button { Text = "Hủy", DialogResult = DialogResult.Cancel, Size = new Size(100, 40) };
+        ModernDialog.StylePrimaryButton(save);
+        ModernDialog.StyleSecondaryButton(cancel);
+        var footer = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 64, Padding = new Padding(12), FlowDirection = FlowDirection.RightToLeft, WrapContents = false };
+        footer.Controls.Add(cancel); footer.Controls.Add(save);
+        form.Controls.Add(root); form.Controls.Add(footer);
+        form.AcceptButton = save; form.CancelButton = cancel;
+
+        TikTokAccountPoolItem? result = null;
+        save.Click += (_, _) =>
+        {
+            try
+            {
+                var username = user.Text.Trim();
+                if (username.Length == 0) throw new InvalidOperationException("Tài khoản không được để trống.");
+                result = new TikTokAccountPoolItem(
+                    current?.Id ?? Guid.NewGuid().ToString("N"),
+                    username,
+                    pass.Text,
+                    TikTokAuthService.NormalizeTotpSecret(totp.Text),
+                    noteBox.Text.Trim(),
+                    current?.AssignedProfile ?? "",
+                    sourceRow);
+                form.DialogResult = DialogResult.OK;
+                form.Close();
+            }
+            catch (Exception ex)
+            {
+                ModernDialog.ShowMessage(form, ex.Message, "Thông tin chưa hợp lệ", MessageBoxIcon.Warning);
+            }
+        };
+        form.Shown += (_, _) => { ModernDialog.FitToWorkingArea(form); user.Focus(); };
+        return form.ShowDialog(owner) == DialogResult.OK ? result : null;
+    }
+
+    TikTokAccountPoolItem? ShowAccountPoolPicker(IWin32Window owner, string? currentProfile = null, bool includeAssigned = false)
+    {
+        var items = _accountPoolService.Load()
+            .Where(x => includeAssigned || !x.IsAssigned || x.AssignedProfile.Equals(currentProfile ?? "", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(x => x.SourceRow).ThenBy(x => x.Username, StringComparer.OrdinalIgnoreCase).ToList();
+        if (items.Count == 0)
+        {
+            ModernDialog.ShowMessage(owner, "Kho tài khoản chưa có dòng phù hợp. Hãy nhập Excel trong mục Kho tài khoản.", "Chọn tài khoản", MessageBoxIcon.Information);
+            return null;
+        }
+
+        using var form = new Form
+        {
+            Text = "Chọn tài khoản từ kho",
+            Width = 760,
+            Height = 520,
+            MinimumSize = new Size(620, 420),
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.Sizable,
+            MinimizeBox = false,
+            MaximizeBox = false,
+            ShowInTaskbar = false,
+            AutoScaleMode = AutoScaleMode.Dpi,
+            Font = new Font("Segoe UI", 10F)
+        };
+        ModernDialog.Apply(form, fixedDialog: false);
+
+        var hint = new Label
+        {
+            Dock = DockStyle.Top,
+            Height = 50,
+            Padding = new Padding(14, 9, 14, 6),
+            Text = includeAssigned
+                ? "Cột ‘Profile đã gán’ cho biết tài khoản đang thuộc profile nào. Bạn vẫn có thể chọn lại một dòng đã gán nếu thực sự muốn dùng lại."
+                : "Chọn một tài khoản chưa dùng (hoặc tài khoản đang gán cho profile hiện tại).",
+            ForeColor = Color.DimGray,
+            BackColor = ModernDialog.Canvas,
+            AutoEllipsis = true
+        };
+
+        var grid = new DataGridView
+        {
+            Dock = DockStyle.Fill,
+            ReadOnly = true,
+            AllowUserToAddRows = false,
+            AllowUserToDeleteRows = false,
+            AllowUserToResizeRows = false,
+            MultiSelect = false,
+            SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+            AutoGenerateColumns = false,
+            RowHeadersVisible = false,
+            BackgroundColor = ModernDialog.Canvas,
+            BorderStyle = BorderStyle.FixedSingle,
+            AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill
+        };
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "row", HeaderText = "Dòng Excel", FillWeight = 20 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "user", HeaderText = "Tài khoản", FillWeight = 58 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "assigned", HeaderText = "Profile đã gán", FillWeight = 38 });
+        foreach (var item in items)
+        {
+            var index = grid.Rows.Add(item.SourceRow, item.Username, string.IsNullOrWhiteSpace(item.AssignedProfile) ? "—" : item.AssignedProfile);
+            grid.Rows[index].Tag = item.Id;
+            if (item.IsAssigned && !item.AssignedProfile.Equals(currentProfile ?? "", StringComparison.OrdinalIgnoreCase))
+                grid.Rows[index].DefaultCellStyle.ForeColor = Color.FromArgb(174, 94, 24);
+        }
+        if (grid.Rows.Count > 0)
+        {
+            grid.ClearSelection();
+            grid.Rows[0].Selected = true;
+            grid.CurrentCell = grid.Rows[0].Cells[1];
+        }
+
+        TikTokAccountPoolItem? SelectedItem()
+        {
+            if (grid.SelectedRows.Count == 0) return null;
+            var id = grid.SelectedRows[0].Tag as string;
+            return items.FirstOrDefault(x => x.Id == id);
+        }
+
+        var choose = new Button { Text = "Chọn", Size = new Size(110, 40) };
+        var cancel = new Button { Text = "Hủy", DialogResult = DialogResult.Cancel, Size = new Size(100, 40) };
+        ModernDialog.StylePrimaryButton(choose);
+        ModernDialog.StyleSecondaryButton(cancel);
+        var footer = new Panel { Dock = DockStyle.Bottom, Height = 68, Padding = new Padding(14, 12, 14, 14), BackColor = ModernDialog.Canvas };
+        var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, WrapContents = false, Margin = new Padding(0) };
+        buttons.Controls.Add(cancel);
+        buttons.Controls.Add(choose);
+        footer.Controls.Add(buttons);
+
+        form.Controls.Add(grid);
+        form.Controls.Add(footer);
+        form.Controls.Add(hint);
+        form.AcceptButton = choose;
+        form.CancelButton = cancel;
+        choose.Click += (_, _) =>
+        {
+            if (SelectedItem() is null) return;
+            form.DialogResult = DialogResult.OK;
+            form.Close();
+        };
+        grid.CellDoubleClick += (_, e) => { if (e.RowIndex >= 0) choose.PerformClick(); };
+        form.Shown += (_, _) => { ModernDialog.FitToWorkingArea(form); grid.Focus(); };
+        return form.ShowDialog(owner) == DialogResult.OK ? SelectedItem() : null;
+    }
+
+    void ConfigureTikTokAccount(ProfileContext profileContext)
+    {
+        var dataRoot = _profileService.ResolveDataRoot(profileContext.Profile);
+        Directory.CreateDirectory(dataRoot);
+        TikTokAuthMaterial current;
+        try { current = _tiktokAuthService.Load(dataRoot); }
+        catch { current = new TikTokAuthMaterial("", "", "", true); }
+        string? pendingPoolId = null;
+
+        using var form = new Form
+        {
+            Text = $"Tài khoản TikTok — {profileContext.Profile.Name}",
+            Width = 600,
+            Height = 600,
+            MinimumSize = new Size(560, 520),
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.Sizable,
+            MinimizeBox = false,
+            MaximizeBox = false,
+            ShowInTaskbar = false,
+            AutoScaleMode = AutoScaleMode.Dpi,
+            Font = new Font("Segoe UI", 10F)
+        };
+        ModernDialog.Apply(form, fixedDialog: false);
+
+        TextBox Box(string value, bool secret = false)
+        {
+            var box = new TextBox
+            {
+                Text = value,
+                Dock = DockStyle.Top,
+                Font = new Font("Segoe UI", 11F),
+                MinimumSize = new Size(0, 36),
+                UseSystemPasswordChar = secret,
+                Margin = new Padding(0)
+            };
+            ModernDialog.StyleTextInput(box);
+            return box;
+        }
+
+        Label FieldLabel(string text)
+        {
+            var label = new Label
+            {
+                Text = text,
+                AutoSize = true,
+                MaximumSize = new Size(510, 0),
+                Margin = new Padding(0, 10, 0, 5)
+            };
+            ModernDialog.StylePrimaryLabel(label);
+            return label;
+        }
+
+        var user = Box(current.Username);
+        var pass = Box(current.Password, true);
+        var totp = Box(current.TotpSecret, true);
+        var showSecrets = new CheckBox
+        {
+            Text = "Hiện mật khẩu và secret 2FA",
+            AutoSize = true,
+            Margin = new Padding(0, 9, 0, 0)
+        };
+        showSecrets.CheckedChanged += (_, _) =>
+        {
+            pass.UseSystemPasswordChar = !showSecrets.Checked;
+            totp.UseSystemPasswordChar = !showSecrets.Checked;
+        };
+        var auto = new CheckBox
+        {
+            Text = "Tự đăng nhập khi mất phiên TikTok",
+            Checked = current.AutoLogin,
+            AutoSize = true,
+            Margin = new Padding(0, 10, 0, 4)
+        };
+        var note = new Label
+        {
+            Text = "Thay đổi ở đây chỉ cập nhật thông tin đăng nhập của profile này; không đổi thư mục Chrome, XPath, nội dung dán hoặc các thiết lập khác. Secret 2FA là khóa Base32/otpauth, không phải mã 6 số. Khi CAPTCHA xuất hiện, tool chờ bạn xử lý xong rồi tự tiếp tục.",
+            AutoSize = true,
+            MaximumSize = new Size(510, 0),
+            ForeColor = Color.DimGray,
+            Margin = new Padding(0, 8, 0, 8)
+        };
+
+        var contentHost = new Panel
+        {
+            Dock = DockStyle.Fill,
+            AutoScroll = true,
+            Padding = new Padding(18, 10, 18, 8),
+            BackColor = ModernDialog.Canvas
+        };
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            ColumnCount = 1,
+            Margin = new Padding(0),
+            Padding = new Padding(0)
+        };
+        root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        var row = 0;
+        root.Controls.Add(FieldLabel("Tài khoản / Email / Số điện thoại"), 0, row++); root.Controls.Add(user, 0, row++);
+        root.Controls.Add(FieldLabel("Mật khẩu TikTok"), 0, row++); root.Controls.Add(pass, 0, row++);
+        root.Controls.Add(FieldLabel("Secret 2FA/TOTP"), 0, row++); root.Controls.Add(totp, 0, row++);
+        root.Controls.Add(showSecrets, 0, row++);
+        root.Controls.Add(auto, 0, row++);
+        root.Controls.Add(note, 0, row++);
+        contentHost.Controls.Add(root);
+
+        var choosePool = new Button { Text = "Chọn từ kho", Size = new Size(124, 42) };
+        var save = new Button { Text = "Lưu thay đổi", Size = new Size(132, 42) };
+        var clear = new Button { Text = "Xóa đăng nhập", Size = new Size(130, 42) };
+        var cancel = new Button { Text = "Hủy", DialogResult = DialogResult.Cancel, Size = new Size(100, 42) };
+        ModernDialog.StylePrimaryButton(save);
+        ModernDialog.StyleSecondaryButton(choosePool);
+        ModernDialog.StyleSecondaryButton(clear);
+        ModernDialog.StyleSecondaryButton(cancel);
+        var footer = new Panel
+        {
+            Dock = DockStyle.Bottom,
+            Height = 72,
+            Padding = new Padding(18, 14, 18, 16),
+            BackColor = ModernDialog.Canvas
+        };
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.RightToLeft,
+            WrapContents = false,
+            Margin = new Padding(0),
+            Padding = new Padding(0)
+        };
+        buttons.Controls.Add(cancel);
+        buttons.Controls.Add(save);
+        buttons.Controls.Add(clear);
+        buttons.Controls.Add(choosePool);
+        footer.Controls.Add(buttons);
+
+        form.Controls.Add(contentHost);
+        form.Controls.Add(footer);
+        form.AcceptButton = save;
+        form.CancelButton = cancel;
+
+        choosePool.Click += (_, _) =>
+        {
+            var selected = ShowAccountPoolPicker(form, profileContext.Profile.Name);
+            if (selected is null) return;
+            pendingPoolId = selected.Id;
+            user.Text = selected.Username;
+            pass.Text = selected.Password;
+            totp.Text = selected.TotpSecret;
+        };
+
+        save.Click += (_, _) =>
+        {
+            try
+            {
+                if ((user.Text.Trim().Length == 0) != (pass.Text.Length == 0))
+                    throw new InvalidOperationException("Hãy nhập đủ tài khoản và mật khẩu.");
+                _tiktokAuthService.Save(dataRoot, user.Text.Trim(), pass.Text, totp.Text, auto.Checked);
+                if (!string.IsNullOrWhiteSpace(pendingPoolId))
+                    _accountPoolService.Assign(pendingPoolId, profileContext.Profile.Name);
+                _log.Info($"[TIKTOK_AUTH_SAVED] profile={profileContext.Profile.Name} usernameConfigured={user.Text.Trim().Length > 0} totpConfigured={totp.Text.Trim().Length > 0}");
+                form.DialogResult = DialogResult.OK;
+                form.Close();
+            }
+            catch (Exception ex)
+            {
+                ModernDialog.ShowMessage(form, ex.Message, "Không lưu được", MessageBoxIcon.Warning);
+            }
+        };
+        clear.Click += (_, _) =>
+        {
+            _tiktokAuthService.Delete(dataRoot);
+            _accountPoolService.ReleaseByProfile(profileContext.Profile.Name);
+            pendingPoolId = null;
+            user.Clear();
+            pass.Clear();
+            totp.Clear();
+            auto.Checked = true;
+            ModernDialog.ShowMessage(form, $"Đã xóa thông tin đăng nhập đã lưu của profile {profileContext.Profile.Name}.", "Tài khoản TikTok", MessageBoxIcon.Information);
+        };
+        form.Shown += (_, _) => ModernDialog.FitToWorkingArea(form);
+        form.ShowDialog(this);
     }
 
     string ValidateNewProfileName(string rawName, TikTokProfileCatalog catalog)
@@ -1133,6 +2396,8 @@ public sealed class ManagerForm : Form
             if (!string.IsNullOrWhiteSpace(reopenError))
                 _log.Error($"[PROFILE_RENAME_RESTORE_FAILED] profile={verifiedRename!.Name} {reopenError}");
             _log.Info($"[PROFILE_RENAMED] oldName={oldName} newName={verifiedRename!.Name} profilePath={verifiedRename.ProfilePath} dataRoot={verifiedRename.DataRoot} cdpPort={verifiedRename.CdpPort}");
+            try { _accountPoolService.RenameAssignedProfile(oldName, verifiedRename.Name); }
+            catch (Exception poolEx) { _log.Warn($"[ACCOUNT_POOL_RENAME_ASSIGNMENT_FAILED] {poolEx.Message}"); }
 
             var success = $"Đã đổi tên {oldName} → {verifiedRename.Name}";
             if (!string.IsNullOrWhiteSpace(syncError)) success += "\n\nTên Chrome chưa đồng bộ: " + syncError;
@@ -1800,6 +3065,8 @@ public sealed class ManagerForm : Form
 
                 _profileService.RemoveFromCatalog(catalog, plan.Profile.Name);
                 _profileService.SaveWithBackup(catalog);
+                try { _accountPoolService.ReleaseByProfile(plan.Profile.Name); }
+                catch (Exception poolEx) { _log.Warn($"[ACCOUNT_POOL_RELEASE_FAILED] profile={plan.Profile.Name} {poolEx.Message}"); }
                 deleted.Add(plan);
                 _log.Warn($"[PROFILE_DELETED] name={plan.Profile.Name} profilePath={plan.ChromeProfilePath} dataRoot={plan.DataRoot}");
             }
@@ -2006,145 +3273,187 @@ public sealed class ManagerForm : Form
     ProfileOpenSelection? ChooseProfiles(IReadOnlyList<ProfileContext> contexts, string title)
     {
         var allItems = contexts.Select(context => new OpenProfileListItem { Context = context }).ToList();
+        var chooserColumns = Math.Max(1, (allItems.Count + 9) / 10);
         using var form = new Form
         {
             Text = title,
-            Width = 460,
-            Height = 600,
+            Width = Math.Clamp(chooserColumns * 178 + 70, 500, 1120),
+            Height = 565,
+            MinimumSize = new Size(500, 440),
             StartPosition = FormStartPosition.CenterParent,
-            FormBorderStyle = FormBorderStyle.FixedDialog,
+            FormBorderStyle = FormBorderStyle.Sizable,
             MinimizeBox = false,
             MaximizeBox = false,
-            Font = new Font("Segoe UI", 10F)
-        };
-        ModernDialog.Apply(form);
-        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 5, Padding = new Padding(14) };
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        var label = new Label { Text = "Chọn profile cần mở", AutoSize = true, Font = new Font("Segoe UI", 10F, FontStyle.Bold), Margin = new Padding(0, 0, 0, 8) };
-        var search = new TextBox { Dock = DockStyle.Top, PlaceholderText = "Tìm profile...", Font = new Font("Segoe UI", 11F), Margin = new Padding(0, 0, 0, 10) };
-        ModernDialog.StylePrimaryLabel(label);
-        ModernDialog.StyleTextInput(search);
-        var multiSelect = new CheckBox
-        {
-            Text = "Chọn nhiều profile",
-            AutoSize = true,
+            ShowInTaskbar = false,
+            AutoScaleMode = AutoScaleMode.Dpi,
             Font = new Font("Segoe UI", 10F),
+            KeyPreview = true
+        };
+        ModernDialog.Apply(form, fixedDialog: false);
+
+        var outer = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 3,
+            Padding = new Padding(14, 12, 14, 10),
+            Margin = new Padding(0),
+            BackColor = ModernDialog.Canvas
+        };
+        outer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        outer.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        outer.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        outer.RowStyles.Add(new RowStyle(SizeType.Absolute, 64));
+
+        var header = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            ColumnCount = 1,
+            RowCount = 3,
             Margin = new Padding(0, 0, 0, 8)
         };
-        var listHost = new Panel { Dock = DockStyle.Fill, Margin = new Padding(0) };
-        var singleList = new ListBox
+        var label = new Label { Text = "Chọn profile cần mở", AutoSize = true, Font = new Font("Segoe UI", 10F, FontStyle.Bold), Margin = new Padding(0, 0, 0, 8) };
+        var search = new TextBox { Dock = DockStyle.Top, PlaceholderText = "Tìm profile...", Font = new Font("Segoe UI", 11F), Margin = new Padding(0, 0, 0, 8) };
+        var multiSelect = new CheckBox { Text = "Chọn nhiều profile", AutoSize = true, Font = new Font("Segoe UI", 10F), Margin = new Padding(0, 0, 0, 2) };
+        ModernDialog.StylePrimaryLabel(label);
+        ModernDialog.StyleTextInput(search);
+        header.Controls.Add(label, 0, 0);
+        header.Controls.Add(search, 0, 1);
+        header.Controls.Add(multiSelect, 0, 2);
+
+        var viewport = new Panel
         {
             Dock = DockStyle.Fill,
-            IntegralHeight = false,
-            Font = new Font("Segoe UI", 11F),
-            ItemHeight = 34,
+            AutoScroll = true,
             BorderStyle = BorderStyle.FixedSingle,
-            HorizontalScrollbar = true,
-            SelectionMode = SelectionMode.One,
+            BackColor = Color.White,
             Margin = new Padding(0)
         };
-        var multiList = new CheckedListBox
+        var profileGrid = new TableLayoutPanel
         {
-            Dock = DockStyle.Fill,
-            IntegralHeight = false,
-            CheckOnClick = true,
-            Font = new Font("Segoe UI", 11F),
-            ItemHeight = 34,
-            BorderStyle = BorderStyle.FixedSingle,
-            HorizontalScrollbar = true,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            ColumnCount = 1,
+            RowCount = 10,
+            Padding = new Padding(6),
             Margin = new Padding(0),
-            Visible = false
+            BackColor = Color.White
         };
-        ModernDialog.StyleSelectionList(singleList);
-        ModernDialog.StyleSelectionList(multiList);
-        listHost.Controls.Add(multiList);
-        listHost.Controls.Add(singleList);
+        viewport.Controls.Add(profileGrid);
 
-        var open = new Button { Text = "Mở profile", Size = new Size(132, 42), Font = new Font("Segoe UI", 10F, FontStyle.Bold), BackColor = Color.FromArgb(232, 242, 255), ForeColor = Color.FromArgb(35, 91, 152), FlatStyle = FlatStyle.Flat };
-        open.FlatAppearance.BorderColor = Color.FromArgb(130, 173, 220);
-        var cancel = new Button { Text = "Hủy", DialogResult = DialogResult.Cancel, Size = new Size(104, 42), Font = new Font("Segoe UI", 10F), FlatStyle = FlatStyle.Flat };
+        var open = new Button { Text = "Mở profile", Size = new Size(132, 42) };
+        var cancel = new Button { Text = "Hủy", DialogResult = DialogResult.Cancel, Size = new Size(104, 42) };
         ModernDialog.StylePrimaryButton(open);
         ModernDialog.StyleSecondaryButton(cancel);
-        var flow = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(0, 10, 0, 0) };
-        flow.Controls.Add(cancel);
-        flow.Controls.Add(open);
-        root.Controls.Add(label, 0, 0);
-        root.Controls.Add(search, 0, 1);
-        root.Controls.Add(multiSelect, 0, 2);
-        root.Controls.Add(listHost, 0, 3);
-        root.Controls.Add(flow, 0, 4);
-        form.Controls.Add(root);
+        var footer = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.RightToLeft,
+            WrapContents = false,
+            Padding = new Padding(0, 10, 0, 0),
+            Margin = new Padding(0)
+        };
+        footer.Controls.Add(cancel);
+        footer.Controls.Add(open);
+
+        outer.Controls.Add(header, 0, 0);
+        outer.Controls.Add(viewport, 0, 1);
+        outer.Controls.Add(footer, 0, 2);
+        form.Controls.Add(outer);
         form.AcceptButton = open;
         form.CancelButton = cancel;
 
         var checkedContexts = new HashSet<ProfileContext>();
-        ProfileContext? preferredSingleContext = null;
+        ProfileContext? selectedSingleContext = allItems.FirstOrDefault()?.Context;
         ProfileOpenSelection? selection = null;
-        var rebuildingChecks = false;
 
-        void CaptureVisibleChecks()
+        void RebuildProfiles()
         {
-            for (var index = 0; index < multiList.Items.Count; index++)
-            {
-                if (multiList.Items[index] is not OpenProfileListItem item) continue;
-                if (multiList.GetItemChecked(index)) checkedContexts.Add(item.Context);
-                else checkedContexts.Remove(item.Context);
-            }
-        }
-
-        void ApplyFilter(bool captureVisibleChecks = true)
-        {
-            if (captureVisibleChecks) CaptureVisibleChecks();
-            if (singleList.SelectedItem is OpenProfileListItem selectedItem)
-                preferredSingleContext = selectedItem.Context;
             var keyword = search.Text.Trim();
             var filtered = string.IsNullOrEmpty(keyword)
                 ? allItems
                 : allItems.Where(item => item.Context.Profile.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase)).ToList();
 
-            singleList.BeginUpdate();
-            multiList.BeginUpdate();
-            try
-            {
-                singleList.Items.Clear();
-                singleList.Items.AddRange(filtered.Cast<object>().ToArray());
-                var selectedIndex = preferredSingleContext is null ? -1 : filtered.FindIndex(item => ReferenceEquals(item.Context, preferredSingleContext));
-                singleList.SelectedIndex = selectedIndex >= 0 ? selectedIndex : singleList.Items.Count > 0 ? 0 : -1;
+            if (!multiSelect.Checked && selectedSingleContext is not null && !filtered.Any(x => ReferenceEquals(x.Context, selectedSingleContext)))
+                selectedSingleContext = filtered.FirstOrDefault()?.Context;
 
-                rebuildingChecks = true;
-                multiList.Items.Clear();
-                foreach (var item in filtered)
+            profileGrid.SuspendLayout();
+            profileGrid.Controls.Clear();
+            profileGrid.ColumnStyles.Clear();
+            profileGrid.RowStyles.Clear();
+            profileGrid.RowCount = 10;
+            for (var r = 0; r < 10; r++) profileGrid.RowStyles.Add(new RowStyle(SizeType.Absolute, 32F));
+            var columns = Math.Max(1, (filtered.Count + 9) / 10);
+            profileGrid.ColumnCount = columns;
+            for (var c = 0; c < columns; c++) profileGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 170F));
+
+            for (var i = 0; i < filtered.Count; i++)
+            {
+                var item = filtered[i];
+                var col = i / 10;
+                var row = i % 10;
+                if (multiSelect.Checked)
                 {
-                    var index = multiList.Items.Add(item);
-                    multiList.SetItemChecked(index, checkedContexts.Contains(item.Context));
+                    var check = new CheckBox
+                    {
+                        Text = item.Context.Profile.Name,
+                        Tag = item.Context,
+                        Checked = checkedContexts.Contains(item.Context),
+                        AutoSize = false,
+                        Width = 164,
+                        Height = 30,
+                        Margin = new Padding(2, 1, 2, 1),
+                        Padding = new Padding(2, 0, 0, 0),
+                        Font = new Font("Segoe UI", 10.5F),
+                        BackColor = Color.White
+                    };
+                    check.CheckedChanged += (_, _) =>
+                    {
+                        if (check.Checked) checkedContexts.Add(item.Context);
+                        else checkedContexts.Remove(item.Context);
+                        open.Enabled = checkedContexts.Count > 0;
+                    };
+                    profileGrid.Controls.Add(check, col, row);
+                }
+                else
+                {
+                    var radio = new RadioButton
+                    {
+                        Text = item.Context.Profile.Name,
+                        Tag = item.Context,
+                        Checked = ReferenceEquals(item.Context, selectedSingleContext),
+                        AutoSize = false,
+                        Width = 164,
+                        Height = 30,
+                        Margin = new Padding(2, 1, 2, 1),
+                        Padding = new Padding(2, 0, 0, 0),
+                        Font = new Font("Segoe UI", 10.5F),
+                        BackColor = Color.White
+                    };
+                    radio.CheckedChanged += (_, _) =>
+                    {
+                        if (!radio.Checked) return;
+                        selectedSingleContext = item.Context;
+                        open.Enabled = true;
+                    };
+                    radio.MouseDoubleClick += (_, _) => { selectedSingleContext = item.Context; open.PerformClick(); };
+                    profileGrid.Controls.Add(radio, col, row);
                 }
             }
-            finally
-            {
-                rebuildingChecks = false;
-                multiList.EndUpdate();
-                singleList.EndUpdate();
-            }
-
-            singleList.Visible = !multiSelect.Checked;
-            multiList.Visible = multiSelect.Checked;
-            if (multiSelect.Checked) multiList.BringToFront();
-            else singleList.BringToFront();
-            open.Enabled = multiSelect.Checked ? allItems.Count > 0 : singleList.SelectedIndex >= 0;
+            profileGrid.ResumeLayout(true);
+            profileGrid.Location = new Point(0, 0);
+            open.Enabled = multiSelect.Checked ? checkedContexts.Count > 0 : selectedSingleContext is not null && filtered.Any(x => ReferenceEquals(x.Context, selectedSingleContext));
         }
 
         void OpenSelectedProfiles()
         {
             if (multiSelect.Checked)
             {
-                CaptureVisibleChecks();
                 if (checkedContexts.Count == 0)
                 {
-                    MessageBox.Show(form, "Vui lòng chọn ít nhất một profile.", "Mở profile", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    ModernDialog.ShowMessage(form, "Vui lòng chọn ít nhất một profile.", "Mở profile", MessageBoxIcon.Information);
                     return;
                 }
                 selection = new ProfileOpenSelection(
@@ -2153,94 +3462,39 @@ public sealed class ManagerForm : Form
             }
             else
             {
-                if (singleList.SelectedItem is not OpenProfileListItem item) return;
-                selection = new ProfileOpenSelection(IsMultiple: false, Contexts: [item.Context]);
+                if (selectedSingleContext is null) return;
+                selection = new ProfileOpenSelection(IsMultiple: false, Contexts: [selectedSingleContext]);
             }
             form.DialogResult = DialogResult.OK;
             form.Close();
         }
 
-        search.TextChanged += (_, _) => ApplyFilter();
-        singleList.SelectedIndexChanged += (_, _) =>
-        {
-            if (singleList.SelectedItem is OpenProfileListItem item) preferredSingleContext = item.Context;
-            if (!multiSelect.Checked) open.Enabled = singleList.SelectedIndex >= 0;
-        };
-        multiList.ItemCheck += (_, e) =>
-        {
-            if (rebuildingChecks || e.Index < 0 || e.Index >= multiList.Items.Count || multiList.Items[e.Index] is not OpenProfileListItem item) return;
-            if (e.NewValue == CheckState.Checked) checkedContexts.Add(item.Context);
-            else checkedContexts.Remove(item.Context);
-        };
+        search.TextChanged += (_, _) => RebuildProfiles();
         multiSelect.CheckedChanged += (_, _) =>
         {
-            if (multiSelect.Checked && singleList.SelectedItem is OpenProfileListItem item)
-                checkedContexts.Add(item.Context);
-            if (!multiSelect.Checked)
-            {
-                CaptureVisibleChecks();
-                preferredSingleContext = allItems.FirstOrDefault(item => checkedContexts.Contains(item.Context))?.Context ?? preferredSingleContext;
-            }
-            ApplyFilter(captureVisibleChecks: false);
-            if (multiSelect.Checked) multiList.Focus();
-            else singleList.Focus();
-        };
-        form.Shown += (_, _) => singleList.Focus();
-
-        void HandleListKeyDown(KeyEventArgs e)
-        {
-            if (e.KeyCode == Keys.Enter)
-            {
-                e.Handled = true;
-                e.SuppressKeyPress = true;
-                OpenSelectedProfiles();
-            }
-            else if (e.KeyCode == Keys.Escape)
-            {
-                e.Handled = true;
-                e.SuppressKeyPress = true;
-                form.DialogResult = DialogResult.Cancel;
-                form.Close();
-            }
-        }
-
-        singleList.KeyDown += (_, e) => HandleListKeyDown(e);
-        multiList.KeyDown += (_, e) => HandleListKeyDown(e);
-        search.KeyDown += (_, e) =>
-        {
-            if (e.KeyCode is Keys.Up or Keys.Down)
-            {
-                var activeList = multiSelect.Checked ? (ListBox)multiList : singleList;
-                if (activeList.Items.Count > 0)
-                {
-                    activeList.Focus();
-                    var next = Math.Clamp(activeList.SelectedIndex + (e.KeyCode == Keys.Up ? -1 : 1), 0, activeList.Items.Count - 1);
-                    activeList.SelectedIndex = next;
-                }
-                e.Handled = true;
-                e.SuppressKeyPress = true;
-            }
-            else if (e.KeyCode == Keys.Enter)
-            {
-                e.Handled = true;
-                e.SuppressKeyPress = true;
-                OpenSelectedProfiles();
-            }
-            else if (e.KeyCode == Keys.Escape)
-            {
-                e.Handled = true;
-                e.SuppressKeyPress = true;
-                form.DialogResult = DialogResult.Cancel;
-                form.Close();
-            }
-        };
-        singleList.MouseDoubleClick += (_, e) =>
-        {
-            if (singleList.IndexFromPoint(e.Location) == ListBox.NoMatches) return;
-            OpenSelectedProfiles();
+            // Chế độ chọn nhiều luôn bắt đầu trống; không lấy profile đang chọn ở chế độ đơn.
+            if (multiSelect.Checked) checkedContexts.Clear();
+            RebuildProfiles();
+            viewport.Focus();
         };
         open.Click += (_, _) => OpenSelectedProfiles();
-        ApplyFilter(captureVisibleChecks: false);
+        form.KeyDown += (_, e) =>
+        {
+            if (e.KeyCode == Keys.Escape)
+            {
+                e.Handled = true;
+                form.DialogResult = DialogResult.Cancel;
+                form.Close();
+            }
+        };
+        form.Shown += (_, _) =>
+        {
+            ModernDialog.FitToWorkingArea(form);
+            RebuildProfiles();
+            search.Focus();
+        };
+
+        RebuildProfiles();
         return form.ShowDialog(this) == DialogResult.OK ? selection : null;
     }
 
@@ -2265,7 +3519,7 @@ public sealed class ManagerForm : Form
     void UpdateTitle()
     {
         var selected = SelectedContext();
-        Text = selected is null ? "Tool TikTok Manager V13.4.1 — VM Optimized Multi Worker" : $"Tool TikTok Manager V13.4.1 — {selected.Profile.Name}";
+        Text = selected is null ? "Tool TikTok Manager V13.5 — VM Optimized Multi Worker" : $"Tool TikTok Manager V13.5 — {selected.Profile.Name}";
         RefreshSelectedProfilePresentation();
     }
 
@@ -2471,5 +3725,6 @@ public sealed class ManagerForm : Form
         public long Rounds { get; set; }
         public bool F5Enabled { get; set; }
         public int F5RemainingSec { get; set; } = -1;
+        public string TikTokStartupState { get; set; } = "";
     }
 }

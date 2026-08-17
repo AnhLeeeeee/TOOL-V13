@@ -49,7 +49,17 @@ public sealed partial class MainForm
                     return "stopped";
                 case "launch":
                     await LaunchChromeAsync();
-                    return _chrome.Connected ? "opened" : "not_opened";
+                    if (!_chrome.Connected) return "not_opened";
+                    return _startupPreparationState switch
+                    {
+                        "CAPTCHA_REQUIRED" => "captcha_required",
+                        "TOTP_REQUIRED" => "totp_required",
+                        "LOGIN_REQUIRED" => "login_required",
+                        "LOGIN_FAILED" => "login_failed",
+                        "LOGIN_FORM_NOT_FOUND" => "login_form_not_found",
+                        "ERROR" => "startup_error",
+                        _ => "opened"
+                    };
                 case "connect":
                     await ConnectChromeAsync();
                     return _chrome.Connected ? "connected" : "disconnected";
@@ -93,6 +103,7 @@ public sealed partial class MainForm
             Rounds = _engine.Rounds,
             F5Enabled = periodic.Enabled,
             F5RemainingSec = f5RemainingSec
+            ,TikTokStartupState = _startupPreparationState
         });
     }
 

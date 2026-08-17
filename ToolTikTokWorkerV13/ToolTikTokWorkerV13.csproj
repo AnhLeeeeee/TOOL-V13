@@ -10,9 +10,9 @@
     <AssemblyName>ToolTikTokWorkerV13</AssemblyName>
     <RootNamespace>ToolTikTokV11</RootNamespace>
     <Product>Tool TikTok V13 - DOM Input Guard Worker</Product>
-    <Version>13.4.1</Version>
-    <FileVersion>13.4.1.0</FileVersion>
-    <AssemblyVersion>13.4.1.0</AssemblyVersion>
+    <Version>13.5</Version>
+    <FileVersion>13.5.0.0</FileVersion>
+    <AssemblyVersion>13.5.0.0</AssemblyVersion>
     <ApplicationManifest>..\V115Core\app.manifest</ApplicationManifest>
     <OutputPath>..\dist_v13\</OutputPath>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
@@ -26,6 +26,7 @@
     <Compile Include="..\V115Core\Services\*.cs" Link="V115Core\Services\%(Filename)%(Extension)" />
     <Compile Include="..\V115Core\Utils\*.cs" Link="V115Core\Utils\%(Filename)%(Extension)" />
     <Compile Include="..\ManagerShared\Services\ChromeProfileNameSyncService.cs" Link="Shared\ChromeProfileNameSyncService.cs" />
+    <Compile Include="..\ManagerShared\Services\TikTokAuthService.cs" Link="Shared\TikTokAuthService.cs" />
     <Compile Include="..\ManagerShared\Controls\*.cs" Link="Shared\Controls\%(Filename)%(Extension)" />
   </ItemGroup>
 
