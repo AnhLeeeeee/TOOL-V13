@@ -1,0 +1,105 @@
+@echo off
+setlocal EnableExtensions EnableDelayedExpansion
+chcp 65001 >nul
+cd /d "%~dp0"
+
+echo ============================================================
+echo   TAO BAN CAP NHAT TOOL TIKTOK - TU DONG THEO VERSION
+echo ============================================================
+echo.
+
+set "CURRENT_VERSION="
+if exist "VERSION.txt" set /p CURRENT_VERSION=<"VERSION.txt"
+
+echo Phien ban hien tai: %CURRENT_VERSION%
+set "NEW_VERSION="
+set /p "NEW_VERSION=Nhap phien ban muon tao (Enter = %CURRENT_VERSION%): "
+if not defined NEW_VERSION set "NEW_VERSION=%CURRENT_VERSION%"
+
+if not defined NEW_VERSION (
+    echo.
+    echo [LOI] Chua co version. Hay nhap theo dang 13.5.6
+    pause
+    exit /b 1
+)
+
+set "CHECK_VERSION=%NEW_VERSION%"
+powershell -NoProfile -Command "if ($env:CHECK_VERSION -match '^\d+\.\d+\.\d+$') { exit 0 } else { exit 1 }"
+if errorlevel 1 (
+    echo.
+    echo [LOI] Version khong hop le: %NEW_VERSION%
+    echo Phai co dang X.Y.Z, vi du 13.5.6
+    pause
+    exit /b 1
+)
+
+>"VERSION.txt" echo %NEW_VERSION%
+echo.
+echo [OK] VERSION.txt = %NEW_VERSION%
+echo.
+
+echo ============================================================
+echo [1/2] TAO BAN PUBLISH / ZIP
+ echo ============================================================
+call ".\TAO_BAN_CAI_V13_5.bat"
+if errorlevel 1 (
+    echo.
+    echo [LOI] TAO_BAN_CAI_V13_5.bat that bai.
+    pause
+    exit /b 1
+)
+
+echo.
+echo ============================================================
+echo [2/2] TAO SETUP
+ echo ============================================================
+call ".\TAO_SETUP_V13_5_AUTO_FIND_INNO.bat"
+if errorlevel 1 (
+    echo.
+    echo [LOI] TAO_SETUP_V13_5_AUTO_FIND_INNO.bat that bai.
+    pause
+    exit /b 1
+)
+
+set "RELEASE_DIR=%CD%\RELEASE_OUTPUT\V%NEW_VERSION%"
+if not exist "%RELEASE_DIR%" mkdir "%RELEASE_DIR%"
+
+if not exist "SETUP_OUTPUT\ToolTikTok_V13.5_Setup.exe" (
+    echo [LOI] Khong tim thay file Setup sau khi build.
+    pause
+    exit /b 1
+)
+
+if not exist "ToolTikTok_V13.5_VM_CLIENT_WIN_X64.zip" (
+    echo [LOI] Khong tim thay file ZIP may khach sau khi build.
+    pause
+    exit /b 1
+)
+
+copy /y "SETUP_OUTPUT\ToolTikTok_V13.5_Setup.exe" "%RELEASE_DIR%\ToolTikTok_V13.5_Setup.exe" >nul
+copy /y "ToolTikTok_V13.5_VM_CLIENT_WIN_X64.zip" "%RELEASE_DIR%\ToolTikTok_V%NEW_VERSION%_VM_CLIENT_WIN_X64.zip" >nul
+copy /y "version.json" "%RELEASE_DIR%\version.json" >nul
+copy /y "VERSION.txt" "%RELEASE_DIR%\VERSION.txt" >nul
+
+for /f "usebackq delims=" %%H in (`powershell -NoProfile -Command "(Get-FileHash -LiteralPath '%RELEASE_DIR%\ToolTikTok_V13.5_Setup.exe' -Algorithm SHA256).Hash.ToLowerInvariant()"`) do set "SETUP_SHA=%%H"
+
+echo.
+echo ============================================================
+echo   HOAN TAT BAN CAP NHAT V%NEW_VERSION%
+echo ============================================================
+echo Thu muc ban cap nhat:
+echo %RELEASE_DIR%
+echo.
+echo FILE UPLOAD LEN GITHUB RELEASE:
+echo %RELEASE_DIR%\ToolTikTok_V13.5_Setup.exe
+echo.
+echo Tag GitHub:   v%NEW_VERSION%
+echo Release:      Tool TikTok V%NEW_VERSION%
+echo SHA256:       %SETUP_SHA%
+echo.
+echo File ZIP may khach:
+echo %RELEASE_DIR%\ToolTikTok_V%NEW_VERSION%_VM_CLIENT_WIN_X64.zip
+echo ============================================================
+echo.
+pause
+exit /b 0
