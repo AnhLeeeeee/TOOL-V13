@@ -10,7 +10,7 @@ namespace ToolTikTokManagerV13;
 
 public sealed partial class ManagerForm
 {
-    const string ManagerDisplayVersion = "13.5.1";
+    const string ManagerDisplayVersion = "13.5.2";
     const string UpdateSettingsFileName = "manager_update.json";
 
     sealed class DashboardMarker { }
@@ -101,7 +101,7 @@ public sealed partial class ManagerForm
         var title = new Label
         {
             AutoSize = true,
-            Text = "TỔNG QUAN HỆ THỐNG — V13.5.1",
+            Text = $"TỔNG QUAN HỆ THỐNG — V{ManagerDisplayVersion}",
             Font = new Font("Segoe UI", 13F, FontStyle.Bold),
             ForeColor = Color.FromArgb(37, 77, 122),
             Location = new Point(12, 8)
@@ -516,10 +516,10 @@ public sealed partial class ManagerForm
         var settings = LoadUpdateSettings();
         using var form = new Form
         {
-            Text = "Cấu hình cập nhật — V13.5.1",
-            Width = 700,
-            Height = 300,
-            MinimumSize = new Size(620, 280),
+            Text = $"Cấu hình cập nhật — V{ManagerDisplayVersion}",
+            Width = 760,
+            Height = 390,
+            MinimumSize = new Size(680, 350),
             StartPosition = FormStartPosition.CenterParent,
             FormBorderStyle = FormBorderStyle.FixedDialog,
             MinimizeBox = false,
@@ -533,9 +533,10 @@ public sealed partial class ManagerForm
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 6,
-            Padding = new Padding(16)
+            RowCount = 7,
+            Padding = new Padding(18)
         };
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -546,7 +547,7 @@ public sealed partial class ManagerForm
         var intro = new Label
         {
             AutoSize = true,
-            MaximumSize = new Size(640, 0),
+            MaximumSize = new Size(700, 0),
             Text = "Nhập URL manifest cập nhật. Nếu để trống, chức năng kiểm tra cập nhật sẽ tắt. Phần cách tạo manifest/đưa Setup lên mạng sẽ cấu hình sau.",
             Margin = new Padding(0, 0, 0, 10)
         };
@@ -556,7 +557,7 @@ public sealed partial class ManagerForm
         var url = new TextBox { Dock = DockStyle.Top, Text = settings.ManifestUrl };
         ModernDialog.StyleTextInput(url);
 
-        var options = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, WrapContents = false };
+        var options = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, WrapContents = true };
         var channelLabel = new Label { Text = "Kênh:", AutoSize = true, Margin = new Padding(0, 8, 6, 0) };
         var channel = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 130 };
         channel.Items.AddRange(new object[] { "stable", "test" });
@@ -572,7 +573,8 @@ public sealed partial class ManagerForm
             AutoSize = true,
             ForeColor = Color.DimGray,
             Text = "Manifest dự kiến: version + setupUrl + sha256 + notes + channel.",
-            Margin = new Padding(0, 8, 0, 0)
+            MaximumSize = new Size(700, 0),
+            Margin = new Padding(0, 10, 0, 8)
         };
 
         var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, FlowDirection = FlowDirection.RightToLeft, WrapContents = false };
@@ -588,10 +590,12 @@ public sealed partial class ManagerForm
         root.Controls.Add(url, 0, 2);
         root.Controls.Add(options, 0, 3);
         root.Controls.Add(hint, 0, 4);
-        root.Controls.Add(buttons, 0, 5);
+        root.Controls.Add(new Panel { Dock = DockStyle.Fill }, 0, 5);
+        root.Controls.Add(buttons, 0, 6);
         form.Controls.Add(root);
         form.AcceptButton = save;
         form.CancelButton = cancel;
+        form.Shown += (_, _) => ModernDialog.FitToWorkingArea(form);
 
         if (form.ShowDialog(this) != DialogResult.OK) return;
         settings.ManifestUrl = url.Text.Trim();
@@ -658,7 +662,7 @@ public sealed partial class ManagerForm
                 _dashboardUpdateStatus.ForeColor = Color.DarkOrange;
             }
             using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
-            client.DefaultRequestHeaders.UserAgent.ParseAdd("ToolTikTokManager/13.5.1");
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("ToolTikTokManager/13.5");
             var json = await client.GetStringAsync(manifestUri);
             var manifest = JsonSerializer.Deserialize<UpdateManifest>(json, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
             if (manifest is null || string.IsNullOrWhiteSpace(manifest.Version) || string.IsNullOrWhiteSpace(manifest.SetupUrl))
@@ -735,7 +739,7 @@ public sealed partial class ManagerForm
             if (File.Exists(temp)) File.Delete(temp);
 
             using var client = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
-            client.DefaultRequestHeaders.UserAgent.ParseAdd("ToolTikTokManager/13.5.1");
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("ToolTikTokManager/13.5");
             using var response = await client.GetAsync(setupUri, HttpCompletionOption.ResponseHeadersRead);
             response.EnsureSuccessStatusCode();
             var total = response.Content.Headers.ContentLength;

@@ -1,5 +1,5 @@
 ﻿#define MyAppName "Tool TikTok"
-#define MyAppVersion "13.5.1"
+#define MyAppVersion "13.5.2"
 #define MyAppPublisher "Tool TikTok"
 #define MyAppExeName "ToolTikTokManagerV13.exe"
 
