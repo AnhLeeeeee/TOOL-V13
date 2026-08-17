@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 
 namespace ToolTikTokV11;
 
@@ -65,6 +65,18 @@ public sealed partial class MainForm
                     return _chrome.Connected ? "connected" : "disconnected";
                 case "close_chrome":
                     return await CloseChromeAsync();
+                case "view_chrome":
+                {
+                    var profilePath = _startupOptions.ProfilePath;
+                    if (string.IsNullOrWhiteSpace(profilePath)) return "window_not_found";
+                    if (!_chrome.Connected) return "not_connected";
+
+                    // Chỉ refresh/dò HWND theo yêu cầu. TUYỆT ĐỐI không restore,
+                    // minimize, maximize hay đổi foreground ở Worker. Manager sẽ
+                    // dùng lại chính xác logic View cũ để điều khiển cửa sổ.
+                    var hwnd = _chrome.RefreshManagedWindowHandle(profilePath, _settings.ChromePort);
+                    return hwnd > 0 ? "hwnd:" + hwnd : "window_not_found";
+                }
                 case "show":
                     if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
                     Show();

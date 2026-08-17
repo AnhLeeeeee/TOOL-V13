@@ -2253,6 +2253,39 @@ public sealed class ChromeController : IAsyncDisposable
     public long GetManagedWindowHandleValue()
         => IsLiveWindowHandle(_managedWindowHandle) ? _managedWindowHandle.ToInt64() : 0L;
 
+    /// <summary>
+    /// Dò lại HWND Chrome theo đúng profile + CDP port khi người dùng bấm View.
+    /// Hàm này chỉ cập nhật cache HWND/PID, không thay đổi trạng thái cửa sổ.
+    /// Không gọi ở đường status polling vì việc dò process có thể tốn thời gian.
+    /// </summary>
+    public long RefreshManagedWindowHandle(string profileDir, int port)
+    {
+        if (string.IsNullOrWhiteSpace(profileDir)) return 0L;
+
+        var normalized = Path.GetFullPath(profileDir);
+        _managedProfileDir = normalized;
+        _managedWindowPort = port;
+
+        // Khi Chrome được Start tự mở hoặc Chrome tự tạo lại browser process,
+        // PID cache cũ có thể không còn chứa PID sở hữu top-level window.
+        // Chỉ refresh danh sách PID khi người dùng thực sự bấm View.
+        var refreshedPids = FindChromeProcessIds(normalized, port);
+        if (refreshedPids.Count > 0)
+        {
+            _managedPids.Clear();
+            foreach (var pid in refreshedPids)
+                _managedPids.Add(pid);
+        }
+
+        _managedWindowHandle = DiscoverManagedWindowHandle();
+        var value = IsLiveWindowHandle(_managedWindowHandle)
+            ? _managedWindowHandle.ToInt64()
+            : 0L;
+
+        _log.Info($"[CHROME_VIEW_HANDLE_REFRESH] port={port} pids={_managedPids.Count} hwnd={value}");
+        return value;
+    }
+
     public ChromeWindowState GetManagedWindowState(string profileDir, int port)
     {
         if (!IsManagedContext(profileDir, port)) return ChromeWindowState.NotFound;

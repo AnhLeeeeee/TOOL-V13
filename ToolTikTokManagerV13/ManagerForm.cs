@@ -11,7 +11,7 @@ using ToolTikTokV12.Utils;
 
 namespace ToolTikTokManagerV13;
 
-public sealed class ManagerForm : Form
+public sealed partial class ManagerForm : Form
 {
     sealed class ProfileContext
     {
@@ -135,6 +135,7 @@ public sealed class ManagerForm : Form
         BuildLayout();
         ReloadCatalog();
         EnsureAddTab();
+        InitializeDashboardAndUpdater();
         _refreshTimer.Tick += async (_, _) => await RefreshOpenProfilesAsync();
         Shown += (_, _) => RegisterChromeMonitorHotkey();
         FormClosing += OnClosing;
@@ -303,8 +304,10 @@ public sealed class ManagerForm : Form
         if (page.IsDisposed) return;
 
         var selectedIndex = GetSafeSelectedIndex(tabCount);
-        var closeable = !IsAddTab(page);
-        var active = closeable && selectedIndex >= 0 && e.Index == selectedIndex;
+        // Chỉ tab profile mới có nút đóng. Tab Tổng quan vẫn được tô trạng thái active, tab + thì không.
+        var closeable = page.Tag is ProfileContext;
+        var selectable = !IsAddTab(page);
+        var active = selectable && selectedIndex >= 0 && e.Index == selectedIndex;
         var background = active ? ActiveProfileColor : InactiveTabColor;
         var foreground = active ? Color.White : SystemColors.ControlText;
         using (var backgroundBrush = new SolidBrush(background))
@@ -598,37 +601,72 @@ public sealed class ManagerForm : Form
     {
         try
         {
-            // Refresh the exact profile snapshot so we never activate another Chrome window.
-            await RefreshStatusAsync(ctx);
-            var hwndValue = ctx.LastSnapshot?.ChromeWindowHandle ?? 0;
-            var chromeState = ctx.LastSnapshot?.Chrome ?? "DISCONNECTED";
+            // Giữ nguyên hành vi View cũ: Manager mới là nơi restore + maximize +
+            // đưa Chrome lên foreground. Worker chỉ được dùng để dò/refresh HWND
+            // khi status chưa có handle (thường xảy ra khi Chrome được Start tự mở).
+            try { await RefreshStatusAsync(ctx); } catch { }
 
-            if (hwndValue <= 0 || chromeState.Equals("DISCONNECTED", StringComparison.OrdinalIgnoreCase))
+            var chromeState = ctx.LastSnapshot?.Chrome ?? "DISCONNECTED";
+            if (chromeState.Equals("DISCONNECTED", StringComparison.OrdinalIgnoreCase))
             {
                 ModernDialog.ShowMessage(this,
-                    $"Chrome của profile “{ctx.Profile.Name}” chưa mở. Hãy bấm ‘Mở Chrome’ trước, sau đó dùng ‘👁 View’ để đưa đúng cửa sổ này lên trước.",
+                    $"Chrome của profile “{ctx.Profile.Name}” chưa kết nối. Hãy mở/chạy profile trước rồi dùng ‘👁 View’.",
                     "View Chrome", MessageBoxIcon.Information);
                 return;
             }
 
-            var hwnd = new IntPtr(hwndValue);
-            if (!ChromeMonitorWindowActions.RestoreMaximizeAndActivate(hwnd))
+            long hwndValue = ctx.LastSnapshot?.ChromeWindowHandle ?? 0;
+
+            async Task<long> RefreshChromeHwndOnDemandAsync()
             {
-                // The handle can become stale after Chrome recreates its top-level window.
-                // Refresh once more before declaring failure.
-                await Task.Delay(120);
-                await RefreshStatusAsync(ctx);
-                hwndValue = ctx.LastSnapshot?.ChromeWindowHandle ?? 0;
-                if (hwndValue <= 0 || !ChromeMonitorWindowActions.RestoreMaximizeAndActivate(new IntPtr(hwndValue)))
+                await EnsureWorkerAsync(ctx);
+                var result = await SendCommandAsync(ctx, "view_chrome", TimeSpan.FromSeconds(12));
+                if (result.StartsWith("hwnd:", StringComparison.OrdinalIgnoreCase)
+                    && long.TryParse(result.AsSpan(5), out var parsed)
+                    && parsed > 0)
+                {
+                    try { await RefreshStatusAsync(ctx); } catch { }
+                    return parsed;
+                }
+
+                if (string.Equals(result, "not_connected", StringComparison.OrdinalIgnoreCase))
+                    return 0;
+
+                _log.Warn($"[CHROME_VIEW_HANDLE_REFRESH] profile={ctx.Profile.Name} result={result}");
+                return 0;
+            }
+
+            // Trường hợp Chrome do nút Bắt đầu tự mở: CDP đã CONNECTED nhưng
+            // status có thể chưa cache HWND. Chỉ lúc người dùng bấm View mới dò lại.
+            if (hwndValue <= 0)
+                hwndValue = await RefreshChromeHwndOnDemandAsync();
+
+            if (hwndValue <= 0)
+            {
+                ModernDialog.ShowMessage(this,
+                    $"Chrome của profile “{ctx.Profile.Name}” đang kết nối nhưng chưa tìm thấy cửa sổ hiển thị. Hãy thử bấm ‘👁 View’ lại sau một chút.",
+                    "View Chrome", MessageBoxIcon.Information);
+                return;
+            }
+
+            // Đây chính là hành vi View cũ đã hoạt động tốt:
+            // restore -> maximize -> foreground.
+            if (!ChromeMonitorWindowActions.RestoreMaximizeAndActivate(new IntPtr(hwndValue)))
+            {
+                // Chrome có thể vừa tạo lại top-level window; refresh HWND đúng 1 lần
+                // rồi vẫn dùng hàm View cũ để đưa cửa sổ lên trước.
+                hwndValue = await RefreshChromeHwndOnDemandAsync();
+                if (hwndValue <= 0
+                    || !ChromeMonitorWindowActions.RestoreMaximizeAndActivate(new IntPtr(hwndValue)))
                     throw new InvalidOperationException($"Không đưa được cửa sổ Chrome của profile “{ctx.Profile.Name}” lên trước.");
             }
 
-            _log.Info($"[CHROME_VIEW] profile={ctx.Profile.Name} hwnd={hwndValue} result=shown");
+            _log.Info($"[CHROME_VIEW] profile={ctx.Profile.Name} hwnd={hwndValue} result=restored_maximized_foreground");
         }
         catch (Exception ex)
         {
             _log.Warn($"[CHROME_VIEW] profile={ctx.Profile.Name} result=failed message={ex.Message}");
-            throw;
+            ShowError(ex);
         }
     }
 
