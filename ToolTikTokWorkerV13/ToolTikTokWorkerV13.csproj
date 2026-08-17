@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
@@ -10,9 +10,9 @@
     <AssemblyName>ToolTikTokWorkerV13</AssemblyName>
     <RootNamespace>ToolTikTokV11</RootNamespace>
     <Product>Tool TikTok V13 - DOM Input Guard Worker</Product>
-    <Version>13.5</Version>
-    <FileVersion>13.5.0.0</FileVersion>
-    <AssemblyVersion>13.5.0.0</AssemblyVersion>
+    <Version>13.5.4</Version>
+    <FileVersion>13.5.4.0</FileVersion>
+    <AssemblyVersion>13.5.4.0</AssemblyVersion>
     <ApplicationManifest>..\V115Core\app.manifest</ApplicationManifest>
     <OutputPath>..\dist_v13\</OutputPath>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>

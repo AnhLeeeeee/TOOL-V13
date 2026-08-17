@@ -14,6 +14,7 @@ public sealed record CdpVersionInfo(string Browser, string WebSocketDebuggerUrl)
 public sealed record ManagedChromeCloseResult(bool WasRunning, bool Closed, IReadOnlyList<int> RemainingPids, bool CdpReady, string Method);
 public sealed record TikTokStartupResult(string State, string Message, bool LoggedIn, bool LiveOpened);
 public sealed record TikTokRecommendedLiveCandidate(string Href, string Username, string ViewerText, string Label);
+public sealed record TikTokProfileIdentityUpdateResult(bool NameChanged, bool AvatarChanged, bool BioChanged, bool NameCooldown, bool AlreadyConfigured, bool Skipped, string Message);
 public enum ChromeWindowState { NotFound, Visible, Minimized }
 
 public sealed class ChromeController : IAsyncDisposable
@@ -908,6 +909,751 @@ public sealed class ChromeController : IAsyncDisposable
         {
             _log.Warn("[VM_VIDEO_POLICY] Không áp dụng được video policy: " + ex.Message);
         }
+    }
+
+
+    public async Task<TikTokProfileIdentityUpdateResult> UpdateTikTokProfileIdentityAsync(
+        string? username,
+        string? displayName,
+        string? avatarPath,
+        string? bio,
+        bool skipAllIfNameCooldown = false,
+        IReadOnlyCollection<string>? knownDisplayNames = null,
+        bool verifyExistingState = false,
+        CancellationToken ct = default)
+    {
+        username = (username ?? "").Trim();
+        displayName = (displayName ?? "").Trim();
+        avatarPath = (avatarPath ?? "").Trim();
+        bio = (bio ?? "").Trim();
+        if (bio.Length > 80) bio = bio[..80];
+        if (displayName.Length == 0 && avatarPath.Length == 0 && bio.Length == 0)
+            throw new InvalidOperationException("Không có tên, ảnh hoặc tiểu sử nào được yêu cầu cập nhật.");
+        if (avatarPath.Length > 0)
+        {
+            avatarPath = Path.GetFullPath(avatarPath);
+            if (!File.Exists(avatarPath)) throw new FileNotFoundException("Không tìm thấy file avatar.", avatarPath);
+        }
+        if (!Connected) throw new InvalidOperationException("Chrome chưa kết nối CDP.");
+
+        var originalUrl = Page?.Url ?? "";
+        var knownNames = (knownDisplayNames ?? Array.Empty<string>())
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => Regex.Replace(x.Trim(), @"\s+", " "))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (displayName.Length > 0 && !knownNames.Contains(displayName, StringComparer.OrdinalIgnoreCase)) knownNames.Add(displayName);
+        _log.Info($"[TIKTOK_IDENTITY_UPDATE_START] name={(displayName.Length > 0 ? "yes" : "no")} avatar={(avatarPath.Length > 0 ? Path.GetFileName(avatarPath) : "no")} bio={(bio.Length > 0 ? "yes" : "no")} cooldownCheck=disabled verifyExisting={verifyExistingState} knownNames={knownNames.Count}");
+
+        async Task<JsonElement> Eval(string js) => await EvalAsync(js, ct: ct);
+        static bool IsTrue(JsonElement result)
+            => result.TryGetProperty("value", out var value) && value.ValueKind == JsonValueKind.True;
+        static string ReadString(JsonElement result)
+            => result.TryGetProperty("value", out var value) && value.ValueKind == JsonValueKind.String ? (value.GetString() ?? "") : "";
+
+        async Task<bool> WaitBoolAsync(string js, int timeoutMs = 12000, int delayMs = 250)
+        {
+            var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+            while (DateTime.UtcNow < deadline)
+            {
+                ct.ThrowIfCancellationRequested();
+                try { if (IsTrue(await Eval(js))) return true; } catch (Exception ex) when (IsTransientDocumentContextError(ex)) { }
+                await Task.Delay(delayMs, ct);
+            }
+            return false;
+        }
+
+        // 1) Ưu tiên dựng URL trang cá nhân trực tiếp từ Username đã lưu của profile.
+        //    Ví dụ "trnh.tnhh.mai82" -> https://www.tiktok.com/@trnh.tnhh.mai82
+        //    Nếu Username trống/không giống handle TikTok hoặc điều hướng trực tiếp thất bại,
+        //    mới fallback sang link Hồ sơ/Profile trong DOM như logic cũ.
+        string NormalizeTikTokHandle(string raw)
+        {
+            raw = (raw ?? "").Trim();
+            if (raw.StartsWith("https://www.tiktok.com/@", StringComparison.OrdinalIgnoreCase))
+            {
+                var marker = raw.IndexOf("/@", StringComparison.OrdinalIgnoreCase);
+                raw = marker >= 0 ? raw[(marker + 2)..] : raw;
+                var cut = raw.IndexOfAny(new[] { '/', '?', '#' });
+                if (cut >= 0) raw = raw[..cut];
+            }
+            raw = raw.Trim().TrimStart('@');
+            if (raw.Length == 0 || raw.Length > 64) return "";
+            // Tránh nhầm email/số điện thoại với @username TikTok.
+            if (raw.Contains('@') || raw.Any(char.IsWhiteSpace)) return "";
+            if (!raw.All(ch => char.IsLetterOrDigit(ch) || ch is '.' or '_')) return "";
+            return raw;
+        }
+
+        async Task<string> FindProfileHrefFromDomAsync()
+        {
+            var result = await Eval("""
+(() => {
+  const clean = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const candidates = [
+    document.querySelector('a[data-e2e="nav-profile"]'),
+    document.querySelector('[data-e2e="nav-profile"] a'),
+    ...document.querySelectorAll('a[href*="/@"]')
+  ].filter(Boolean);
+  for (const a of candidates) {
+    const href = a.href || a.getAttribute?.('href') || '';
+    const text = clean(`${a.innerText || a.textContent || ''} ${a.getAttribute?.('aria-label') || ''} ${a.getAttribute?.('data-e2e') || ''}`);
+    if (!href || !href.includes('/@')) continue;
+    if (a.matches?.('[data-e2e="nav-profile"]') || a.closest?.('[data-e2e="nav-profile"]') || text === 'profile' || text === 'hồ sơ' || text.includes('nav-profile')) return href;
+  }
+  return '';
+})()
+""");
+            return ReadString(result);
+        }
+
+        var profileHref = "";
+        var directHandle = NormalizeTikTokHandle(username);
+        var usedDirectProfileHref = false;
+        if (!string.IsNullOrWhiteSpace(directHandle))
+        {
+            profileHref = "https://www.tiktok.com/@" + Uri.EscapeDataString(directHandle);
+            try
+            {
+                _log.Info($"[TIKTOK_IDENTITY_PROFILE_DIRECT] username={directHandle} href={profileHref}");
+                await NavigateAndWaitAsync(profileHref, 900, 18000, ct);
+                usedDirectProfileHref = true;
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"[TIKTOK_IDENTITY_PROFILE_DIRECT_FAILED] username={directHandle} message={ex.Message}");
+                profileHref = "";
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(profileHref))
+        {
+            profileHref = await FindProfileHrefFromDomAsync();
+            if (string.IsNullOrWhiteSpace(profileHref))
+                throw new InvalidOperationException("Không xác định được trang Hồ sơ TikTok. Username của profile đang trống/không hợp lệ và cũng không tìm thấy link Hồ sơ/Profile trong DOM.");
+
+            _log.Info($"[TIKTOK_IDENTITY_PROFILE_DOM_FALLBACK] href={profileHref}");
+            await NavigateAndWaitAsync(profileHref, 900, 18000, ct);
+        }
+
+        // 2) Mở Edit profile / Chỉnh sửa hồ sơ.
+        async Task<bool> TryClickEditProfileAsync(int timeoutMs = 10000)
+            => await WaitBoolAsync("""
+(() => {
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const direct = document.querySelector('[data-e2e="edit-profile-entrance"], button[data-e2e*="edit-profile"], [role="button"][data-e2e*="edit-profile"]');
+  if (direct) { direct.click(); return true; }
+  const all = [...document.querySelectorAll('button,[role="button"],a')];
+  const hit = all.find(el => {
+    const t = norm(`${el.innerText || el.textContent || ''} ${el.getAttribute('aria-label') || ''}`);
+    return t === 'edit profile' || t === 'chỉnh sửa hồ sơ' || t === 'sửa hồ sơ' || t === 'edit';
+  });
+  if (!hit) return false;
+  hit.click();
+  return true;
+})()
+""", timeoutMs, 350);
+
+        var editClicked = await TryClickEditProfileAsync();
+        if (!editClicked && usedDirectProfileHref)
+        {
+            // Nếu Username cũ/sai, thử lấy link Hồ sơ thật từ sidebar trước khi báo lỗi.
+            var domProfileHref = await FindProfileHrefFromDomAsync();
+            if (!string.IsNullOrWhiteSpace(domProfileHref)
+                && !string.Equals(domProfileHref.TrimEnd('/'), profileHref.TrimEnd('/'), StringComparison.OrdinalIgnoreCase))
+            {
+                _log.Warn($"[TIKTOK_IDENTITY_PROFILE_DIRECT_NO_EDIT] fallback={domProfileHref}");
+                profileHref = domProfileHref;
+                await NavigateAndWaitAsync(profileHref, 900, 18000, ct);
+                editClicked = await TryClickEditProfileAsync(8000);
+            }
+        }
+        if (!editClicked)
+            throw new InvalidOperationException($"Không tìm thấy nút Chỉnh sửa hồ sơ / Edit profile trên trang {profileHref}. Hãy kiểm tra Username đã lưu có đúng @ TikTok của profile này không.");
+
+        var editorReady = await WaitBoolAsync("""
+(() => {
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const dialogs = [...document.querySelectorAll('[role="dialog"],div[aria-modal="true"]')];
+  const scope = dialogs.at(-1) || document;
+  const text = norm(scope.innerText || scope.textContent || '');
+  return !!scope.querySelector('input,textarea,button') && (text.includes('edit profile') || text.includes('chỉnh sửa hồ sơ') || text.includes('username') || text.includes('tên người dùng') || text.includes('name') || text.includes('tên'));
+})()
+""", 12000, 300);
+        if (!editorReady) throw new InvalidOperationException("Đã bấm Chỉnh sửa hồ sơ nhưng không thấy form chỉnh sửa TikTok.");
+
+        var nameChanged = false;
+        var avatarChanged = false;
+        var bioChanged = false;
+
+        // Không tự xác minh/đoán hạn đổi biệt danh 7 ngày.
+        // DONE Excel và bước xác nhận trạng thái đã thiết lập sẵn vẫn được giữ nguyên.
+        // Nếu TikTok thực tế không cho đổi tên, luồng sẽ dựa trên kết quả thao tác/Lưu thực tế.
+
+        // XÁC NHẬN TRẠNG THÁI THỰC TẾ TRƯỚC KHI ĐỔI. Chỉ dùng cho Auto Identity.
+        // Đây là lớp bảo vệ DONE Excel: nếu trạng thái TikTok đã phù hợp thì không đổi lại và cho phép ghi DONE.
+        if (verifyExistingState)
+        {
+            var snapshotJson = ReadString(await Eval("""
+(() => {
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const visible = el => {
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    return r.width > 2 && r.height > 2 && cs.display !== 'none' && cs.visibility !== 'hidden';
+  };
+  const dialogs = [...document.querySelectorAll('[role="dialog"],div[aria-modal="true"]')].filter(visible);
+  const scope = dialogs.find(d => {
+    const t = norm(d.innerText || d.textContent || '');
+    return (t.includes('sửa hồ sơ') || t.includes('chỉnh sửa hồ sơ') || t.includes('edit profile'))
+        && (t.includes('tiktok id') || t.includes('username') || t.includes('tên') || t.includes('name'));
+  }) || dialogs.at(-1) || document;
+
+  const nearbyText = el => {
+    const parts = [];
+    let n = el.parentElement;
+    for (let i = 0; i < 4 && n && n !== scope; i++, n = n.parentElement)
+      parts.push(norm(n.innerText || n.textContent || ''));
+    return parts.join(' ');
+  };
+
+  const textInputs = [...scope.querySelectorAll('input')].filter(el => {
+    if (!visible(el) || el.disabled || el.readOnly) return false;
+    const type = (el.type || '').toLowerCase();
+    return type === '' || type === 'text';
+  });
+  const scoredNames = textInputs.map(el => {
+    const attrs = norm(`${el.name || ''} ${el.id || ''} ${el.placeholder || ''} ${el.getAttribute('aria-label') || ''} ${el.getAttribute('data-e2e') || ''}`);
+    const near = nearbyText(el);
+    let score = 0;
+    if (/nickname|display.?name|edit.?name/.test(attrs)) score += 120;
+    if (/biệt danh|nickname|display name/.test(near)) score += 100;
+    if (/(^|\s)tên(\s|$)/.test(near) || /(^|\s)name(\s|$)/.test(near)) score += 60;
+    if (/username|user.?name|tiktok.?id|unique.?id|tên người dùng/.test(attrs + ' ' + near)) score -= 300;
+    return [el, score];
+  }).sort((a,b) => b[1] - a[1]);
+  const nameInput = scoredNames.find(x => x[1] > 0)?.[0] || (textInputs.length === 1 ? textInputs[0] : null);
+  const currentName = nameInput ? String(nameInput.value || '').trim() : '';
+
+  const areas = [...scope.querySelectorAll('textarea')].filter(el => visible(el) && !el.disabled && !el.readOnly);
+  let bioArea = null;
+  let bestBio = -999;
+  for (const el of areas) {
+    const attrs = norm(`${el.name || ''} ${el.id || ''} ${el.placeholder || ''} ${el.getAttribute('aria-label') || ''} ${el.getAttribute('data-e2e') || ''}`);
+    const near = nearbyText(el);
+    let score = 0;
+    if (/bio|biography|signature|tiểu sử/.test(attrs)) score += 120;
+    if (/bio|biography|tiểu sử/.test(near)) score += 100;
+    if (score > bestBio) { bestBio = score; bioArea = el; }
+  }
+  const currentBio = bioArea ? String(bioArea.value || '').trim() : '';
+
+  const imgs = [...scope.querySelectorAll('img')].filter(el => {
+    if (!visible(el)) return false;
+    const r = el.getBoundingClientRect();
+    return r.width >= 42 && r.height >= 42;
+  });
+  let avatar = null;
+  let bestAvatar = -999;
+  for (const img of imgs) {
+    let n = img.parentElement;
+    let near = '';
+    for (let i = 0; i < 5 && n && n !== scope; i++, n = n.parentElement) near += ' ' + norm(n.innerText || n.textContent || '');
+    const r = img.getBoundingClientRect();
+    let score = Math.min(r.width, r.height);
+    if (/ảnh hồ sơ|ảnh đại diện|profile photo|avatar/.test(near)) score += 300;
+    if (score > bestAvatar) { bestAvatar = score; avatar = img; }
+  }
+  const avatarSrc = avatar ? String(avatar.currentSrc || avatar.src || '') : '';
+  const avatarMeta = norm(`${avatarSrc} ${avatar?.alt || ''} ${avatar?.getAttribute?.('data-e2e') || ''}`);
+  const avatarLooksDefault = !avatarSrc
+    || /default[-_ ]?avatar|avatar[-_ ]?default|default[-_ ]?profile|placeholder|no[-_ ]?avatar|anonymous|user[-_ ]?default/.test(avatarMeta)
+    || avatarSrc.startsWith('data:image/svg+xml');
+
+  return JSON.stringify({ currentName, currentBio, avatarSrc, avatarFound: !!avatarSrc, avatarLooksDefault });
+})()
+"""));
+
+            try
+            {
+                using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(snapshotJson) ? "{}" : snapshotJson);
+                var root = doc.RootElement;
+                var currentName = root.TryGetProperty("currentName", out var n) ? (n.GetString() ?? "") : "";
+                var currentBio = root.TryGetProperty("currentBio", out var b) ? (b.GetString() ?? "") : "";
+                var avatarFound = root.TryGetProperty("avatarFound", out var af) && af.ValueKind == JsonValueKind.True;
+                var avatarLooksDefault = root.TryGetProperty("avatarLooksDefault", out var ad) && ad.ValueKind == JsonValueKind.True;
+
+                static string NormText(string value) => Regex.Replace((value ?? "").Trim(), @"\s+", " ");
+                var nameOk = displayName.Length == 0
+                    || knownNames.Any(x => string.Equals(NormText(x), NormText(currentName), StringComparison.OrdinalIgnoreCase));
+                var avatarOk = avatarPath.Length == 0 || (avatarFound && !avatarLooksDefault);
+                var bioOk = bio.Length == 0 || string.Equals(NormText(currentBio), NormText(bio), StringComparison.Ordinal);
+                var hasAnyCheck = displayName.Length > 0 || avatarPath.Length > 0 || bio.Length > 0;
+
+                _log.Info($"[TIKTOK_IDENTITY_EXISTING_CHECK] currentName={currentName} nameOk={nameOk} avatarFound={avatarFound} avatarDefault={avatarLooksDefault} avatarOk={avatarOk} bioOk={bioOk}");
+
+                if (hasAnyCheck && nameOk && avatarOk && bioOk)
+                {
+                    try
+                    {
+                        if (!string.IsNullOrWhiteSpace(originalUrl)
+                            && originalUrl.StartsWith("https://www.tiktok.com/", StringComparison.OrdinalIgnoreCase))
+                            await NavigateAndWaitAsync(originalUrl, 700, 12000, ct);
+                    }
+                    catch { }
+                    _log.Info("[TIKTOK_IDENTITY_ALREADY_CONFIGURED] trạng thái TikTok đã phù hợp; không đổi lại, cho phép Manager ghi DONE.");
+                    return new TikTokProfileIdentityUpdateResult(
+                        false, false, false, false, true, true,
+                        "Đã thiết lập sẵn trên TikTok: tên/ảnh/tiểu sử đang phù hợp. Không đổi lại; ghi DONE vào Excel.");
+                }
+            }
+            catch (Exception ex)
+            {
+                // Xác nhận trạng thái chỉ là lớp bảo vệ trước khi đổi. Nếu DOM TikTok thay đổi và
+                // không đọc được đủ dữ liệu, KHÔNG tự ghi DONE; tiếp tục luồng cập nhật bình thường.
+                _log.Warn("[TIKTOK_IDENTITY_EXISTING_CHECK_FAILED] " + ex.Message);
+            }
+        }
+
+        // Tên và ảnh là hai phần độc lập. Ưu tiên sửa Tên ngay khi form vừa mở
+        // (đây là thời điểm DOM ổn định nhất), sau đó mới xử lý avatar.
+        // Sau khi popup ảnh đóng sẽ kiểm tra lại Tên; nếu TikTok re-render làm mất giá trị
+        // thì đặt lại một lần nữa trước khi bấm Lưu.
+        async Task<bool> SetDisplayNameAsync()
+        {
+            if (displayName.Length == 0) return true;
+            var setNameJs = $$"""
+(() => {
+  const wanted = {{JsString(displayName)}};
+  const handle = {{JsString(directHandle)}};
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const visible = el => {
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    return r.width > 2 && r.height > 2 && cs.display !== 'none' && cs.visibility !== 'hidden';
+  };
+
+  const inputs = [...document.querySelectorAll('input')].filter(el => {
+    if (!visible(el) || el.disabled || el.readOnly) return false;
+    const type = (el.type || '').toLowerCase();
+    return type === '' || type === 'text';
+  });
+
+  // Tuyệt đối không chọn ô TikTok ID/username. Nếu giá trị đang bằng @username đã lưu, bỏ qua.
+  const candidates = inputs.filter(el => {
+    const attrs = norm(`${el.name || ''} ${el.id || ''} ${el.placeholder || ''} ${el.getAttribute('aria-label') || ''} ${el.getAttribute('data-e2e') || ''}`);
+    const value = norm(el.value || '');
+    if (/username|user.?name|tiktok.?id|unique.?id|tên người dùng/.test(attrs)) return false;
+    if (handle && (value === norm(handle) || value === norm('@' + handle))) return false;
+    return true;
+  });
+
+  const nearbyText = el => {
+    const parts = [];
+    const parent = el.parentElement;
+    if (parent) {
+      for (const child of [...parent.children]) {
+        if (child === el || child.contains?.(el)) continue;
+        const t = norm(child.innerText || child.textContent || '');
+        if (t && t.length <= 100) parts.push(t);
+      }
+    }
+    let prev = parent?.previousElementSibling;
+    for (let i = 0; i < 3 && prev; i++, prev = prev.previousElementSibling) {
+      const t = norm(prev.innerText || prev.textContent || '');
+      if (t && t.length <= 100) parts.push(t);
+    }
+    return parts.join(' ');
+  };
+
+  let target = null;
+  const scored = candidates.map(el => {
+    const attrs = norm(`${el.name || ''} ${el.id || ''} ${el.placeholder || ''} ${el.getAttribute('aria-label') || ''} ${el.getAttribute('data-e2e') || ''}`);
+    const near = nearbyText(el);
+    let score = 0;
+    if (/nickname|display.?name|edit.?name/.test(attrs)) score += 120;
+    if (/^tên$|^name$|biệt danh|nickname|display name/.test(near)) score += 100;
+    if (/(^|\s)tên(\s|$)/.test(near) || /(^|\s)name(\s|$)/.test(near)) score += 60;
+    if (/username|tiktok.?id|tên người dùng/.test(near)) score -= 300;
+    return [el, score];
+  }).sort((a,b) => b[1] - a[1]);
+
+  target = scored.find(x => x[1] > 0)?.[0] || null;
+  // Trên giao diện TikTok hiện tại TikTok ID là readonly, nên nếu chỉ còn một input editable
+  // thì đó chính là ô Tên. Đây cũng là fallback an toàn nhất.
+  if (!target && candidates.length === 1) target = candidates[0];
+  if (!target) return false;
+
+  target.focus();
+  try {
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+    if (setter) setter.call(target, wanted); else target.value = wanted;
+  } catch (_) { target.value = wanted; }
+  target.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: wanted }));
+  target.dispatchEvent(new Event('change', { bubbles: true }));
+  try { target.blur(); } catch (_) {}
+  return String(target.value || '') === wanted;
+})()
+""";
+            return IsTrue(await Eval(setNameJs));
+        }
+
+        if (displayName.Length > 0)
+        {
+            if (!await SetDisplayNameAsync())
+                throw new InvalidOperationException("Không tìm thấy hoặc không sửa được ô Tên trong form Sửa hồ sơ. Tool không thay TikTok ID.");
+            nameChanged = true;
+            _log.Info($"[TIKTOK_IDENTITY_NAME_SET] phase=before-avatar length={displayName.Length}");
+            await Task.Delay(350, ct);
+        }
+
+        // Luồng: Sửa hồ sơ -> Sửa tên (nếu có) -> Thay ảnh -> Đăng ký ảnh ->
+        // kiểm tra lại tên -> Lưu -> Xác nhận biệt danh (nếu có).
+        if (avatarPath.Length > 0)
+        {
+            // Xử lý ảnh sau khi Tên đã được đặt (nếu có).
+            var hasFileInput = IsTrue(await Eval("""(() => !!document.querySelector('input[type="file"]'))()"""));
+            if (!hasFileInput)
+            {
+                await Eval("""
+(() => {
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const visible = el => {
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    return r.width > 2 && r.height > 2 && cs.display !== 'none' && cs.visibility !== 'hidden';
+  };
+  const all = [...document.querySelectorAll('button,[role="button"],label')].filter(visible);
+  const byText = all.find(el => {
+    const t = norm(`${el.innerText || el.textContent || ''} ${el.getAttribute('aria-label') || ''} ${el.getAttribute('data-e2e') || ''}`);
+    return /change photo|edit photo|profile photo|avatar|đổi ảnh|thay ảnh|ảnh đại diện|chỉnh sửa ảnh/.test(t);
+  });
+  const byImage = all.find(el => el.querySelector?.('img'));
+  const hit = byText || byImage;
+  if (!hit) return false;
+  hit.click();
+  return true;
+})()
+""");
+                if (!await WaitBoolAsync("""(() => !!document.querySelector('input[type="file"]'))()""", 7000, 250))
+                    throw new InvalidOperationException("Không tìm thấy ô chọn file ảnh đại diện sau khi mở phần Avatar.");
+            }
+
+            var fileEval = await Cdp.CallAsync("Runtime.evaluate", new
+            {
+                expression = "(()=>document.querySelector('input[type=\\\"file\\\"][accept*=\\\"image\\\"]') || document.querySelector('input[type=\\\"file\\\"]'))()",
+                awaitPromise = false,
+                returnByValue = false,
+                userGesture = true
+            }, ct);
+            if (!fileEval.TryGetProperty("result", out var fileResult)
+                || !fileResult.TryGetProperty("objectId", out var objectIdElement)
+                || string.IsNullOrWhiteSpace(objectIdElement.GetString()))
+                throw new InvalidOperationException("Không lấy được DOM object của input file avatar.");
+
+            await Cdp.CallAsync("DOM.setFileInputFiles", new
+            {
+                files = new[] { avatarPath },
+                objectId = objectIdElement.GetString()
+            }, ct);
+
+            avatarChanged = true;
+            _log.Info($"[TIKTOK_IDENTITY_AVATAR_FILE_SET] file={Path.GetFileName(avatarPath)}");
+            await Task.Delay(700, ct);
+
+            // 2) POPUP CHỈNH SỬA ẢNH -> BẮT BUỘC BẤM "ĐĂNG KÝ".
+            var cropApplyFound = await WaitBoolAsync("""
+(() => {
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const visible = el => {
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    return r.width > 2 && r.height > 2 && cs.display !== 'none' && cs.visibility !== 'hidden';
+  };
+  const buttons = [...document.querySelectorAll('button,[role="button"]')].filter(visible);
+  for (const b of buttons) {
+    const bt = norm(b.innerText || b.textContent || b.getAttribute('aria-label') || '');
+    if (!(bt === 'đăng ký' || bt === 'apply' || bt === 'áp dụng' || bt === 'done' || bt === 'xong')) continue;
+    let n = b;
+    for (let i = 0; i < 9 && n; i++, n = n.parentElement) {
+      const t = norm(n.innerText || n.textContent || '');
+      if ((t.includes('chỉnh sửa ảnh') || t.includes('edit photo') || t.includes('edit image'))
+          && (t.includes('thu phóng') || t.includes('zoom') || t.includes('hủy') || t.includes('cancel'))) {
+        return true;
+      }
+    }
+  }
+  return false;
+})()
+""", 10000, 250);
+
+            if (!cropApplyFound)
+                throw new InvalidOperationException("Sau khi chọn ảnh không tìm thấy popup Chỉnh sửa ảnh / nút Đăng ký.");
+
+            var cropApplied = IsTrue(await Eval("""
+(() => {
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const visible = el => {
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    return r.width > 2 && r.height > 2 && cs.display !== 'none' && cs.visibility !== 'hidden';
+  };
+  const buttons = [...document.querySelectorAll('button,[role="button"]')].filter(visible);
+  for (const b of buttons) {
+    const bt = norm(b.innerText || b.textContent || b.getAttribute('aria-label') || '');
+    if (!(bt === 'đăng ký' || bt === 'apply' || bt === 'áp dụng' || bt === 'done' || bt === 'xong')) continue;
+    let n = b;
+    for (let i = 0; i < 9 && n; i++, n = n.parentElement) {
+      const t = norm(n.innerText || n.textContent || '');
+      if ((t.includes('chỉnh sửa ảnh') || t.includes('edit photo') || t.includes('edit image'))
+          && (t.includes('thu phóng') || t.includes('zoom') || t.includes('hủy') || t.includes('cancel'))) {
+        b.click();
+        return true;
+      }
+    }
+  }
+  return false;
+})()
+"""));
+            if (!cropApplied)
+                throw new InvalidOperationException("Đã thấy Chỉnh sửa ảnh nhưng không bấm được nút Đăng ký.");
+
+            _log.Info("[TIKTOK_IDENTITY_AVATAR_APPLY_CLICKED] action=Đăng ký/Apply");
+
+            var cropClosed = await WaitBoolAsync("""
+(() => {
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const visible = el => {
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    return r.width > 2 && r.height > 2 && cs.display !== 'none' && cs.visibility !== 'hidden';
+  };
+  const buttons = [...document.querySelectorAll('button,[role="button"]')].filter(visible);
+  for (const b of buttons) {
+    const bt = norm(b.innerText || b.textContent || b.getAttribute('aria-label') || '');
+    if (!(bt === 'đăng ký' || bt === 'apply' || bt === 'áp dụng' || bt === 'done' || bt === 'xong')) continue;
+    let n = b;
+    for (let i = 0; i < 9 && n; i++, n = n.parentElement) {
+      const t = norm(n.innerText || n.textContent || '');
+      if ((t.includes('chỉnh sửa ảnh') || t.includes('edit photo') || t.includes('edit image'))
+          && (t.includes('thu phóng') || t.includes('zoom') || t.includes('hủy') || t.includes('cancel'))) {
+        return false;
+      }
+    }
+  }
+  return true;
+})()
+""", 12000, 250);
+            if (!cropClosed)
+                throw new InvalidOperationException("Đã bấm Đăng ký ảnh nhưng popup Chỉnh sửa ảnh chưa đóng.");
+
+            await Task.Delay(500, ct);
+        }
+
+        if (displayName.Length > 0 && avatarChanged)
+        {
+            // Upload/crop avatar có thể khiến TikTok re-render form. Kiểm tra lại giá trị Tên;
+            // nếu bị mất thì đặt lại, nhưng không bắt buộc ảnh phải được xử lý trước tên.
+            var nameStillSet = IsTrue(await Eval($$"""
+(() => {
+  const wanted = {{JsString(displayName)}};
+  const handle = {{JsString(directHandle)}};
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const visible = el => { const r = el.getBoundingClientRect(); const cs = getComputedStyle(el); return r.width > 2 && r.height > 2 && cs.display !== 'none' && cs.visibility !== 'hidden'; };
+  const inputs = [...document.querySelectorAll('input')].filter(el => visible(el) && !el.disabled && !el.readOnly && ['', 'text'].includes((el.type || '').toLowerCase()));
+  return inputs.some(el => {
+    const attrs = norm(`${el.name || ''} ${el.id || ''} ${el.placeholder || ''} ${el.getAttribute('aria-label') || ''}`);
+    const value = norm(el.value || '');
+    if (/username|user.?name|tiktok.?id|unique.?id|tên người dùng/.test(attrs)) return false;
+    if (handle && (value === norm(handle) || value === norm('@' + handle))) return false;
+    return String(el.value || '') === wanted;
+  });
+})()
+"""));
+            if (!nameStillSet)
+            {
+                if (!await SetDisplayNameAsync())
+                    throw new InvalidOperationException("Ảnh đã cập nhật nhưng TikTok làm mới form và không thể đặt lại ô Tên. Tool không thay TikTok ID.");
+                _log.Info($"[TIKTOK_IDENTITY_NAME_SET] phase=after-avatar-reapply length={displayName.Length}");
+                await Task.Delay(350, ct);
+            }
+            else
+            {
+                _log.Info("[TIKTOK_IDENTITY_NAME_PRESERVED_AFTER_AVATAR]");
+            }
+        }
+
+        if (bio.Length > 0)
+        {
+            var bioSet = IsTrue(await Eval($$"""
+(() => {
+  const wanted = {{JsString(bio)}};
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const visible = el => {
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    return r.width > 2 && r.height > 2 && cs.display !== 'none' && cs.visibility !== 'hidden';
+  };
+  const areas = [...document.querySelectorAll('textarea')].filter(el => visible(el) && !el.disabled && !el.readOnly);
+  if (!areas.length) return false;
+  const score = el => {
+    const attrs = norm(`${el.name || ''} ${el.id || ''} ${el.placeholder || ''} ${el.getAttribute('aria-label') || ''} ${el.getAttribute('data-e2e') || ''}`);
+    let near = '';
+    let n = el.parentElement;
+    for (let i = 0; i < 4 && n; i++, n = n.parentElement) near += ' ' + norm(n.innerText || n.textContent || '');
+    let s = 0;
+    if (/bio|biography|signature|tiểu sử/.test(attrs)) s += 120;
+    if (/tiểu sử|bio|biography/.test(near)) s += 100;
+    return s;
+  };
+  const target = areas.map(el => [el, score(el)]).sort((a,b) => b[1]-a[1])[0]?.[0] || null;
+  if (!target) return false;
+  target.focus();
+  try {
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+    if (setter) setter.call(target, wanted); else target.value = wanted;
+  } catch (_) { target.value = wanted; }
+  target.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: wanted }));
+  target.dispatchEvent(new Event('change', { bubbles: true }));
+  try { target.blur(); } catch (_) {}
+  return String(target.value || '') === wanted;
+})()
+"""));
+            if (!bioSet)
+                throw new InvalidOperationException("Không tìm thấy hoặc không sửa được ô Tiểu sử/Bio trong form Sửa hồ sơ.");
+            bioChanged = true;
+            _log.Info($"[TIKTOK_IDENTITY_BIO_SET] length={bio.Length}");
+            await Task.Delay(300, ct);
+        }
+
+        // 4) BẤM LƯU TRONG FORM "SỬA HỒ SƠ".
+        var profileSaved = await WaitBoolAsync("""
+(() => {
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const visible = el => {
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    return r.width > 2 && r.height > 2 && cs.display !== 'none' && cs.visibility !== 'hidden';
+  };
+  const buttons = [...document.querySelectorAll('button,[role="button"]')].filter(visible);
+  for (const b of buttons) {
+    if (b.disabled || b.getAttribute('aria-disabled') === 'true') continue;
+    const bt = norm(b.innerText || b.textContent || b.getAttribute('aria-label') || '');
+    if (!(bt === 'lưu' || bt === 'save' || bt === 'save changes' || bt === 'lưu thay đổi')) continue;
+    let n = b;
+    for (let i = 0; i < 10 && n; i++, n = n.parentElement) {
+      const t = norm(n.innerText || n.textContent || '');
+      if ((t.includes('sửa hồ sơ') || t.includes('chỉnh sửa hồ sơ') || t.includes('edit profile'))
+          && (t.includes('tiktok id') || t.includes('tiểu sử') || t.includes('bio') || t.includes('profile photo') || t.includes('ảnh hồ sơ'))) {
+        b.click();
+        return true;
+      }
+    }
+  }
+  return false;
+})()
+""", 12000, 300);
+        if (!profileSaved)
+            throw new InvalidOperationException("Không tìm thấy nút Lưu/Save đang khả dụng trong form Sửa hồ sơ.");
+
+        _log.Info("[TIKTOK_IDENTITY_PROFILE_SAVE_CLICKED]");
+
+        // 5) SAU LƯU: bấm Xác nhận ở popup "Đặt biệt danh?" nếu có.
+        var saveConfirmPresent = await WaitBoolAsync("""
+(() => {
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const visible = el => {
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    return r.width > 2 && r.height > 2 && cs.display !== 'none' && cs.visibility !== 'hidden';
+  };
+  const buttons = [...document.querySelectorAll('button,[role="button"]')].filter(visible);
+  for (const b of buttons) {
+    const bt = norm(b.innerText || b.textContent || b.getAttribute('aria-label') || '');
+    if (!(bt === 'xác nhận' || bt === 'confirm' || bt === 'lưu' || bt === 'save')) continue;
+    let n = b;
+    for (let i = 0; i < 9 && n; i++, n = n.parentElement) {
+      const t = norm(n.innerText || n.textContent || '');
+      if (t.includes('đặt biệt danh')
+          || t.includes('biệt danh 7 ngày')
+          || t.includes('7 ngày 1 lần')
+          || t.includes('set nickname')
+          || t.includes('nickname')
+          || t.includes('lưu hồ sơ')
+          || t.includes('save profile')) {
+        return true;
+      }
+    }
+  }
+  return false;
+})()
+""", 5000, 200);
+
+        if (nameChanged && !saveConfirmPresent)
+        {
+            throw new InvalidOperationException("Đã bấm Lưu sau khi đổi tên nhưng không thấy bảng Xác nhận / Đặt biệt danh của TikTok.");
+        }
+
+        if (saveConfirmPresent)
+        {
+            var finalSaved = IsTrue(await Eval("""
+(() => {
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const visible = el => {
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    return r.width > 2 && r.height > 2 && cs.display !== 'none' && cs.visibility !== 'hidden';
+  };
+  const buttons = [...document.querySelectorAll('button,[role="button"]')].filter(visible);
+  for (const b of buttons) {
+    if (b.disabled || b.getAttribute('aria-disabled') === 'true') continue;
+    const bt = norm(b.innerText || b.textContent || b.getAttribute('aria-label') || '');
+    if (!(bt === 'xác nhận' || bt === 'confirm' || bt === 'lưu' || bt === 'save')) continue;
+    let n = b;
+    for (let i = 0; i < 9 && n; i++, n = n.parentElement) {
+      const t = norm(n.innerText || n.textContent || '');
+      if (t.includes('đặt biệt danh')
+          || t.includes('biệt danh 7 ngày')
+          || t.includes('7 ngày 1 lần')
+          || t.includes('set nickname')
+          || t.includes('nickname')
+          || t.includes('lưu hồ sơ')
+          || t.includes('save profile')) {
+        b.click();
+        return true;
+      }
+    }
+  }
+  return false;
+})()
+"""));
+            if (!finalSaved)
+            {
+                throw new InvalidOperationException("Đã mở bảng xác nhận sau khi Lưu nhưng không bấm được nút Xác nhận/Confirm.");
+            }
+
+            _log.Info("[TIKTOK_IDENTITY_FINAL_CONFIRM_CLICKED] action=Xác nhận/Confirm");
+            await Task.Delay(700, ct);
+        }
+
+        await Task.Delay(1800, ct);
+        _log.Info($"[TIKTOK_IDENTITY_UPDATE_SAVED] name={nameChanged} avatar={avatarChanged} bio={bioChanged} cooldown=false finalConfirm={saveConfirmPresent}");
+
+        // Trả người dùng về trang trước đó nếu trước khi cập nhật đang ở TikTok.
+        if (!string.IsNullOrWhiteSpace(originalUrl)
+            && originalUrl.StartsWith("https://www.tiktok.com/", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(originalUrl.TrimEnd('/'), profileHref.TrimEnd('/'), StringComparison.OrdinalIgnoreCase))
+        {
+            try { await NavigateAndWaitAsync(originalUrl, 900, 15000, ct); }
+            catch (Exception ex) { _log.Warn("[TIKTOK_IDENTITY_RETURN_URL] " + ex.Message); }
+        }
+
+        var pieces = new List<string>();
+        if (nameChanged) pieces.Add("tên");
+        if (avatarChanged) pieces.Add("ảnh");
+        if (bioChanged) pieces.Add("tiểu sử");
+        var message = pieces.Count > 0 ? string.Join(" + ", pieces) : "Không có thay đổi";
+        return new TikTokProfileIdentityUpdateResult(nameChanged, avatarChanged, bioChanged, false, false, false, "Đã xử lý: " + message);
     }
 
     public async Task BringToFrontAsync(CancellationToken ct = default)

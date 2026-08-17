@@ -1,4 +1,5 @@
-﻿using System.Text.Json;
+﻿using System.Text;
+using System.Text.Json;
 
 namespace ToolTikTokV11;
 
@@ -19,9 +20,23 @@ public sealed partial class MainForm
         base.OnHandleDestroyed(e);
     }
 
+    sealed class ManagedIdentityUpdateRequest
+    {
+        public string Username { get; set; } = "";
+        public string DisplayName { get; set; } = "";
+        public string AvatarPath { get; set; } = "";
+        public string Bio { get; set; } = "";
+        public bool SkipIfNameCooldown { get; set; }
+        public string[] KnownDisplayNames { get; set; } = Array.Empty<string>();
+        public bool VerifyExistingState { get; set; }
+    }
+
     public Task<string> HandleManagedCommandAsync(string rawCommand)
     {
-        var command = (rawCommand ?? "").Trim().ToLowerInvariant();
+        var raw = (rawCommand ?? "").Trim();
+        var separator = raw.IndexOf('|');
+        var command = (separator >= 0 ? raw[..separator] : raw).Trim().ToLowerInvariant();
+        var commandPayload = separator >= 0 ? raw[(separator + 1)..] : "";
         if (command == "ping") return Task.FromResult("pong");
         if (IsDisposed || Disposing) return Task.FromResult("disposed");
 
@@ -65,6 +80,49 @@ public sealed partial class MainForm
                     return _chrome.Connected ? "connected" : "disconnected";
                 case "close_chrome":
                     return await CloseChromeAsync();
+                case "update_tiktok_identity":
+                {
+                    try
+                    {
+                        if (string.IsNullOrWhiteSpace(commandPayload))
+                            throw new InvalidOperationException("Thiếu payload đổi tên/ảnh TikTok.");
+                        var json = Encoding.UTF8.GetString(Convert.FromBase64String(commandPayload));
+                        var request = JsonSerializer.Deserialize<ManagedIdentityUpdateRequest>(
+                            json,
+                            new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+                            ?? throw new InvalidOperationException("Payload đổi tên/ảnh TikTok không hợp lệ.");
+                        var result = await _chrome.UpdateTikTokProfileIdentityAsync(
+                            request.Username, request.DisplayName, request.AvatarPath, request.Bio,
+                            request.SkipIfNameCooldown, request.KnownDisplayNames, request.VerifyExistingState);
+                        return JsonSerializer.Serialize(new
+                        {
+                            ok = true,
+                            nameChanged = result.NameChanged,
+                            avatarChanged = result.AvatarChanged,
+                            bioChanged = result.BioChanged,
+                            nameCooldown = result.NameCooldown,
+                            alreadyConfigured = result.AlreadyConfigured,
+                            skipped = result.Skipped,
+                            message = result.Message,
+                            error = ""
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        return JsonSerializer.Serialize(new
+                        {
+                            ok = false,
+                            nameChanged = false,
+                            avatarChanged = false,
+                            bioChanged = false,
+                            nameCooldown = false,
+                            alreadyConfigured = false,
+                            skipped = false,
+                            message = "",
+                            error = ex.Message
+                        });
+                    }
+                }
                 case "view_chrome":
                 {
                     var profilePath = _startupOptions.ProfilePath;

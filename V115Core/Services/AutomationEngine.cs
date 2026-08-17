@@ -1649,7 +1649,7 @@ public sealed partial class AutomationEngine
     }
 
     enum TransitionAction { ArrowDown, ClickXPath }
-    sealed record LiveSwitchVerification(bool Changed, string BeforeIdentity, string AfterIdentity, int Attempt, long ElapsedMs);
+    sealed record LiveSwitchVerification(bool Changed, string BeforeIdentity, string AfterIdentity, int Attempt, long ElapsedMs, bool PageRecovered = false);
 
     static string TrimIdentityForLog(string identity, int max = 220)
     {
@@ -1760,8 +1760,100 @@ public sealed partial class AutomationEngine
         return new LiveSwitchVerification(true, changed.BeforeIdentity, afterIdentity, changed.Attempt, changed.ElapsedMs);
     }
 
+    async Task<bool> TryRecoverRendererCrashAfterArrowDownNoChangeAsync(string source, int resumeStep, CancellationToken ct)
+    {
+        if (_pageRecoveryExecuting) return false;
+
+        ChromeController.PageHealthSnapshot health;
+        try
+        {
+            _log.Warn($"[LIVE_SWITCH_PAGE_CRASH_CHECK] source={source} reason=ArrowDown vẫn không đổi sau CDP reconnect");
+            health = await _chrome.ProbePageHealthAsync(ct);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _log.Warn($"[LIVE_SWITCH_PAGE_CRASH_CHECK_FAILED] source={source} reason={ex.Message}");
+            return false;
+        }
+
+        if (!health.CrashLike)
+        {
+            _log.Info($"[LIVE_SWITCH_PAGE_CRASH_NOT_FOUND] source={source} health={health.Reason}");
+            return false;
+        }
+
+        _pageRecoveryExecuting = true;
+        var fallback = !string.IsNullOrWhiteSpace(_lastHealthyTikTokUrl)
+            ? _lastHealthyTikTokUrl
+            : health.Url;
+        _step = resumeStep;
+        SetStatus("ĐANG CỨU TRANG", $"{source}: phát hiện {health.Reason} → reload/restart Chrome nếu cần.");
+        _log.Warn($"[LIVE_SWITCH_PAGE_CRASH_DETECTED] source={source} reason={health.Reason} url={health.Url} resumeStep={resumeStep}");
+
+        try
+        {
+            var needRestart = false;
+            try
+            {
+                _log.Warn($"[LIVE_SWITCH_PAGE_CRASH_RELOAD_START] source={source} fallback={fallback}");
+                await _chrome.RecoverCurrentPageAsync(fallback, ct);
+
+                var afterReload = await _chrome.ProbePageHealthAsync(ct);
+                if (!afterReload.Healthy || afterReload.CrashLike)
+                {
+                    needRestart = true;
+                    _log.Warn($"[LIVE_SWITCH_PAGE_CRASH_RELOAD_STILL_BAD] source={source} health={afterReload.Reason} url={afterReload.Url} action=restart-managed-chrome");
+                }
+                else
+                {
+                    _log.Warn($"[LIVE_SWITCH_PAGE_CRASH_RELOAD_OK] source={source} health={afterReload.Reason}");
+                }
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                needRestart = true;
+                _log.Warn($"[LIVE_SWITCH_PAGE_CRASH_RELOAD_FAILED] source={source} reason={ex.Message} action=restart-managed-chrome");
+            }
+
+            if (needRestart)
+            {
+                await _chrome.RestartManagedChromeForRecoveryAsync(fallback, ct);
+                var afterRestart = await _chrome.ProbePageHealthAsync(ct);
+                if (!afterRestart.Healthy || afterRestart.CrashLike)
+                    throw new InvalidOperationException($"Chrome đã restart nhưng trang vẫn chưa khỏe: {afterRestart.Reason}");
+
+                _log.Warn($"[LIVE_SWITCH_PAGE_CRASH_RESTART_OK] source={source} health={afterRestart.Reason}");
+            }
+
+            _step = resumeStep;
+            ResetPageMaintenanceDue("sau tự cứu OOM trong ArrowDown");
+            _nextPageHealthProbe = DateTime.Now.AddMilliseconds(PageHealthProbeIntervalMs);
+            ResetInputGuardConsecutive("sau tự cứu OOM trong ArrowDown");
+            ResetRecoveryFailures("OOM trong ArrowDown đã tự phục hồi");
+            SetStatus("ĐÃ CỨU TRANG", $"Chrome đã phục hồi; tiếp tục lại bước {resumeStep}/8.");
+            _log.Warn($"[LIVE_SWITCH_PAGE_CRASH_RECOVERY_DONE] source={source} resumeStep={resumeStep} action=resume-same-step");
+            return true;
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            ReportProblem("LIVE_SWITCH_PAGE_CRASH_RECOVERY_FAILED", source,
+                "Đã phát hiện renderer/Out of Memory nhưng reload và restart Chrome vẫn chưa phục hồi được: " + ex.Message,
+                error: true, throttleSeconds: 15);
+            _log.Error($"[LIVE_SWITCH_PAGE_CRASH_RECOVERY_FAILED] source={source} {ex}");
+            return false;
+        }
+        finally
+        {
+            _pageRecoveryExecuting = false;
+        }
+    }
+
     async Task<LiveSwitchVerification> TryArrowDownSwitchAsync(string source, int count, int waitAfterReloadMs, CancellationToken ct)
     {
+        var resumeStep = _step;
         var originalBefore = await GetCurrentLiveIdentityAsync(ct);
         _log.Info($"[LIVE_VERIFY_BEFORE] source={source} key={GetLivePageChangeKey(originalBefore)} identity={TrimIdentityForLog(originalBefore)} requestedCount={Math.Clamp(count, 1, 4)}");
 
@@ -1786,6 +1878,13 @@ public sealed partial class AutomationEngine
             if (changed.Changed)
                 return await ReloadAfterConfirmedArrowDownAsync(source, changed, waitAfterReloadMs, ct);
 
+            // Tầng tự cứu nặng hơn: sau khi đã reconnect CDP mà ArrowDown vẫn không làm LIVE đổi,
+            // kiểm tra renderer crash/OOM ngay thay vì tiếp tục kẹt trong chuỗi timeout.
+            if (attempt >= 2 && await TryRecoverRendererCrashAfterArrowDownNoChangeAsync(source, resumeStep, ct))
+            {
+                return new LiveSwitchVerification(false, originalBefore, beforeAttempt, attempt, changed.ElapsedMs, PageRecovered: true);
+            }
+
             if (attempt < ArrowDownRecoveryAttempts)
             {
                 _log.Warn($"[LIVE_SWITCH_ARROW_RETRY] source={source} attempt={attempt}/{ArrowDownRecoveryAttempts} result=no-change waitMs={ArrowDownRetryDelayMs}");
@@ -1793,8 +1892,12 @@ public sealed partial class AutomationEngine
             }
         }
 
-        // Ba lần phím CDP đều không làm trang đổi: chỉ lúc này mới F5 đúng một lần để reset
-        // document/keyboard handler, sau đó reconnect và thử ArrowDown thêm một lần.
+        // Ba lần phím CDP đều không làm trang đổi. Trước F5 reset bàn phím, kiểm tra crash thêm
+        // một lần để không dùng Page.reload kiểu reset trên renderer đã Out of Memory.
+        if (await TryRecoverRendererCrashAfterArrowDownNoChangeAsync(source + " / trước F5 reset", resumeStep, ct))
+            return new LiveSwitchVerification(false, originalBefore, originalBefore, ArrowDownRecoveryAttempts, 0, PageRecovered: true);
+
+        // Không phải crash/OOM: giữ nguyên logic cũ, F5 đúng một lần để reset document/keyboard handler.
         _log.Warn($"[LIVE_SWITCH_KEY_STALE_RESET] source={source} ArrowDown không tác dụng sau {ArrowDownRecoveryAttempts} lần; F5 một lần để reset trang rồi thử lại.");
         await _chrome.ReloadAndWaitAsync(ArrowDownResetReloadWaitMs, 15000, ct);
         await StopIfFatalTikTokRestrictionAsync($"sau reset phím LIVE: {source}", ct);
@@ -1940,6 +2043,13 @@ public sealed partial class AutomationEngine
             LiveSwitchVerification verify = await ExecuteTransitionAttemptAsync(source, action, xpath, count, waitAfterReloadMs, ct);
             if (!verify.Changed)
             {
+                if (verify.PageRecovered)
+                {
+                    _log.Warn($"[LIVE_SWITCH_RECOVERY_RESUME] source={source} pageRecovered=true step={_step} action=return-to-main-loop");
+                    SetStatus("ĐÃ CỨU TRANG", $"{source}: Chrome đã phục hồi; quay lại đúng bước {_step}/8 để kiểm tra lại.");
+                    return false;
+                }
+
                 ReportProblem("LIVE_SWITCH_FAILED", source, "Đã retry chuyển LIVE nhưng chưa xác nhận LIVE mới; đây là lỗi recoverable, sẽ bỏ qua/retry ở vòng kế tiếp.", throttleSeconds: 10);
                 return false;
             }
@@ -1963,6 +2073,13 @@ public sealed partial class AutomationEngine
                 LiveSwitchVerification verify = await ExecuteTransitionAttemptAsync(source + " retry", action, xpath, count, waitAfterReloadMs, ct);
                 if (!verify.Changed)
                 {
+                    if (verify.PageRecovered)
+                    {
+                        _log.Warn($"[LIVE_SWITCH_RECOVERY_RESUME] source={source} pageRecovered=true step={_step} action=return-to-main-loop-after-retry");
+                        SetStatus("ĐÃ CỨU TRANG", $"{source}: Chrome đã phục hồi; quay lại đúng bước {_step}/8 để kiểm tra lại.");
+                        return false;
+                    }
+
                     ReportProblem("LIVE_SWITCH_FAILED", source, "Đã retry chuyển LIVE nhưng chưa xác nhận LIVE mới; sẽ tiếp tục cơ chế bỏ qua LIVE lỗi.", throttleSeconds: 10);
                     return false;
                 }

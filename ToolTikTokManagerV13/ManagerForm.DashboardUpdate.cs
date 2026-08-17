@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Net.Http;
 using System.Linq;
 using System.Security.Cryptography;
@@ -10,7 +10,7 @@ namespace ToolTikTokManagerV13;
 
 public sealed partial class ManagerForm
 {
-    const string ManagerDisplayVersion = "13.5.2";
+    const string ManagerDisplayVersion = "13.5.4";
     const string UpdateSettingsFileName = "manager_update.json";
 
     sealed class DashboardMarker { }
@@ -38,6 +38,7 @@ public sealed partial class ManagerForm
     Label? _dashboardSummary;
     Label? _dashboardUpdateStatus;
     Button? _dashboardUpdateButton;
+    CheckBox? _dashboardShowAllProfilesToggle;
     UpdateManifest? _latestUpdate;
     bool _updateCheckInProgress;
     bool _updateDownloadInProgress;
@@ -114,8 +115,39 @@ public sealed partial class ManagerForm
             ForeColor = Color.FromArgb(42, 57, 76),
             Location = new Point(14, 39)
         };
+        _dashboardShowAllProfilesToggle = new CheckBox
+        {
+            Appearance = Appearance.Button,
+            AutoSize = false,
+            Width = 170,
+            Height = 32,
+            Text = "Hồ sơ đang mở",
+            TextAlign = ContentAlignment.MiddleCenter,
+            FlatStyle = FlatStyle.Flat,
+            Checked = false,
+            Cursor = Cursors.Hand,
+            TabStop = false
+        };
+        _dashboardShowAllProfilesToggle.FlatAppearance.BorderSize = 1;
+        _dashboardShowAllProfilesToggle.CheckedChanged += (_, _) =>
+        {
+            UpdateDashboardProfileFilterToggleStyle();
+            RefreshDashboard();
+        };
+
+        void LayoutDashboardFilterToggle()
+        {
+            if (_dashboardShowAllProfilesToggle is null || _dashboardShowAllProfilesToggle.IsDisposed) return;
+            _dashboardShowAllProfilesToggle.Left = Math.Max(420, header.ClientSize.Width - _dashboardShowAllProfilesToggle.Width - 12);
+            _dashboardShowAllProfilesToggle.Top = 19;
+        }
+
         header.Controls.Add(title);
         header.Controls.Add(_dashboardSummary);
+        header.Controls.Add(_dashboardShowAllProfilesToggle);
+        header.Resize += (_, _) => LayoutDashboardFilterToggle();
+        LayoutDashboardFilterToggle();
+        UpdateDashboardProfileFilterToggleStyle();
 
         var updatePanel = BuildUpdatePanel();
         _dashboardGrid = BuildDashboardGrid();
@@ -327,6 +359,24 @@ public sealed partial class ManagerForm
         return flow;
     }
 
+    void UpdateDashboardProfileFilterToggleStyle()
+    {
+        var toggle = _dashboardShowAllProfilesToggle;
+        if (toggle is null || toggle.IsDisposed) return;
+
+        var showAll = toggle.Checked;
+        toggle.Text = showAll ? "Tất cả hồ sơ" : "Hồ sơ đang mở";
+        toggle.BackColor = showAll ? Color.FromArgb(37, 99, 176) : Color.White;
+        toggle.ForeColor = showAll ? Color.White : Color.FromArgb(37, 77, 122);
+        toggle.FlatAppearance.BorderColor = showAll ? Color.FromArgb(37, 99, 176) : Color.FromArgb(93, 128, 170);
+    }
+
+    static bool IsDashboardProfileOpen(ProfileContext ctx)
+    {
+        var tab = ctx.Tab;
+        return tab is not null && !tab.IsDisposed && tab.Parent is not null;
+    }
+
     ProfileContext? DashboardSelectedContext()
     {
         var grid = _dashboardGrid;
@@ -350,7 +400,11 @@ public sealed partial class ManagerForm
         }
 
         var selectedName = DashboardSelectedContext()?.Profile.Name;
-        var contexts = _contexts.Values.OrderBy(c => c.Profile.Name, NaturalProfileNameOrder).ToList();
+        var allContexts = _contexts.Values.OrderBy(c => c.Profile.Name, NaturalProfileNameOrder).ToList();
+        var showAllProfiles = _dashboardShowAllProfilesToggle?.Checked == true;
+        var contexts = showAllProfiles
+            ? allContexts
+            : allContexts.Where(IsDashboardProfileOpen).ToList();
         var running = 0;
         var paused = 0;
         var recovering = 0;
@@ -431,7 +485,10 @@ public sealed partial class ManagerForm
         if (_dashboardSummary is not null && !_dashboardSummary.IsDisposed)
         {
             var avg = viewerCount == 0 ? "—" : FormatDashboardViewer((int)Math.Round((double)viewerTotal / viewerCount));
-            _dashboardSummary.Text = $"Profiles: {contexts.Count}   |   🟢 Running: {running}   |   🟠 Paused: {paused}   |   🟡 Recovering: {recovering}   |   ⚪ Khác/Dừng: {stopped}   |   Viewer TB: {avg}";
+            var profileCountText = showAllProfiles
+                ? $"Profiles: {allContexts.Count}"
+                : $"Profiles đang mở: {contexts.Count}/{allContexts.Count}";
+            _dashboardSummary.Text = $"{profileCountText}   |   🟢 Running: {running}   |   🟠 Paused: {paused}   |   🟡 Recovering: {recovering}   |   ⚪ Khác/Dừng: {stopped}   |   Viewer TB: {avg}";
         }
     }
 

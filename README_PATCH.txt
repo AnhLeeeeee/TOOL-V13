@@ -1,18 +1,16 @@
-PATCH V13.5.2 - FIX DIALOG CAU HINH CAP NHAT / DPI
+PATCH V13.5.4 - Dashboard chỉ hiện profile đang mở / gạt hiện tất cả
 
-Thay doi:
-- Sua hop Cấu hình cập nhật bi cat/khuat chu o DPI/Windows Server.
-- Tang kich thuoc dialog, hang ghi chu auto-size, co spacer rieng, options co the wrap.
-- Fit dialog vao Working Area khi hien thi.
-- Tieu de Dashboard/dialog lay version dong tu ManagerDisplayVersion.
-- Tang ManagerDisplayVersion len 13.5.2.
-- Tang Inno Setup AppVersion len 13.5.2.
-- GIU NGUYEN OutputBaseFilename=ToolTikTok_V13.5_Setup de link GitHub latest/download khong doi.
-- Khong sua logic LIVE, Worker, Excel, View Chrome, OOM recovery.
+Thay đổi:
+- Mặc định tab Tổng quan chỉ hiển thị các profile đang mở trong Manager.
+- Nút gạt ở góc phải header:
+  + Hồ sơ đang mở: chỉ hiện profile có tab đang mở.
+  + Tất cả hồ sơ: hiện toàn bộ profile trong catalog như trước.
+- Summary ở chế độ mặc định hiển thị "Profiles đang mở: x/y".
+- Chỉ lọc giao diện Dashboard; không dừng, đóng, mở hoặc thay đổi Worker/Chrome.
 
-Ap dung:
-1) Giai nen vao thu muc goc source V13.5 va Replace.
-2) Build/test.
-3) Chay TAO_BAN_CAI_V13_5.bat.
-4) Chay TAO_SETUP_V13_5_AUTO_FIND_INNO.bat.
-5) Phat hanh Release v13.5.2 va cap nhat version.json SAU CUNG.
+File thay đổi:
+ToolTikTokManagerV13/ManagerForm.DashboardUpdate.cs
+
+Cách áp dụng:
+Giải nén nội dung ZIP trực tiếp vào thư mục source V13.5.4 và chọn Replace.
+Sau đó build lại bằng TAO_BAN_CAI_V13_5.bat.

@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
@@ -58,6 +58,49 @@ public sealed class TikTokAccountPoolService
 
     public string CatalogPath => _path;
     public string CurrentSourcePath => LoadStoredCatalog().SourceFilePath ?? "";
+
+    public HashSet<string> GetIdentityDoneUsernames()
+    {
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var path = CurrentSourcePath;
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) return result;
+        var rows = ReadSourceRows(path);
+        for (var i = 1; i < rows.Count; i++)
+        {
+            var row = rows[i];
+            var user = row.Count > 0 ? (row[0] ?? "").Trim() : "";
+            var done = row.Count > 5 ? (row[5] ?? "").Trim() : "";
+            if (user.Length == 0) continue;
+            if (done.Equals("DONE", StringComparison.OrdinalIgnoreCase)
+                || done.Equals("YES", StringComparison.OrdinalIgnoreCase)
+                || done.Equals("TRUE", StringComparison.OrdinalIgnoreCase)
+                || done == "1")
+                result.Add(user);
+        }
+        return result;
+    }
+
+    public bool IsIdentityDone(string username)
+        => GetIdentityDoneUsernames().Contains((username ?? "").Trim());
+
+    public void MarkIdentityDone(string username)
+    {
+        username = (username ?? "").Trim();
+        if (username.Length == 0) throw new InvalidOperationException("Username trống; không thể ghi DONE.");
+        var path = CurrentSourcePath;
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+            throw new InvalidOperationException("Kho tài khoản chưa có file Excel nguồn; không thể ghi DONE bền vững.");
+        var rows = ReadSourceRows(path);
+        for (var i = 1; i < rows.Count; i++)
+        {
+            var row = rows[i];
+            var user = row.Count > 0 ? (row[0] ?? "").Trim() : "";
+            if (!user.Equals(username, StringComparison.OrdinalIgnoreCase)) continue;
+            SetIdentityDoneCell(path, i + 1, "DONE");
+            return;
+        }
+        throw new InvalidOperationException($"Không tìm thấy tài khoản {username} trong file Excel đang dùng để ghi DONE.");
+    }
 
     public List<TikTokAccountPoolItem> Load()
     {
@@ -295,8 +338,8 @@ public sealed class TikTokAccountPoolService
     {
         if (!File.Exists(path)) throw new FileNotFoundException("File Excel đang dùng không còn tồn tại.", path);
         var ext = Path.GetExtension(path).ToLowerInvariant();
-        if (ext == ".xlsx") UpdateXlsxRow(path, sourceRow, "", "", "", "", "");
-        else if (ext is ".csv" or ".txt") UpdateDelimitedRow(path, sourceRow, "", "", "", "", "");
+        if (ext == ".xlsx") { UpdateXlsxRow(path, sourceRow, "", "", "", "", ""); SetIdentityDoneCell(path, sourceRow, ""); }
+        else if (ext is ".csv" or ".txt") { UpdateDelimitedRow(path, sourceRow, "", "", "", "", ""); SetIdentityDoneCell(path, sourceRow, ""); }
         else throw new InvalidOperationException("Chỉ hỗ trợ file .xlsx, .csv hoặc .txt.");
     }
 
@@ -306,15 +349,16 @@ public sealed class TikTokAccountPoolService
         var separator = lines.Take(5).SelectMany(x => new[] { ',', ';', '\t' }.Select(c => (c, count: x.Count(ch => ch == c))))
             .GroupBy(x => x.c).Select(g => (c: g.Key, score: g.Sum(x => x.count))).OrderByDescending(x => x.score).FirstOrDefault().c;
         if (separator == '\0') separator = ',';
-        if (lines.Count == 0) lines.Add("Tài khoản" + separator + "Mật khẩu" + separator + "2FA" + separator + "Ghi chú" + separator + "Profile đã gán");
+        if (lines.Count == 0) lines.Add("Tài khoản" + separator + "Mật khẩu" + separator + "2FA" + separator + "Ghi chú" + separator + "Profile đã gán" + separator + "Tên/ảnh DONE");
         var header = SplitDelimited(lines[0], separator);
-        while (header.Count < 5) header.Add("");
+        while (header.Count < 6) header.Add("");
         header[4] = "Profile đã gán";
+        header[5] = "Tên/ảnh DONE";
         lines[0] = string.Join(separator, header.Select(x => EscapeDelimited(x, separator)));
 
         while (lines.Count < sourceRow) lines.Add("");
         var cells = SplitDelimited(lines[sourceRow - 1], separator);
-        while (cells.Count < 5) cells.Add("");
+        while (cells.Count < 6) cells.Add("");
         cells[0] = username; cells[1] = password; cells[2] = totp; cells[3] = note; cells[4] = assignedProfile;
         lines[sourceRow - 1] = string.Join(separator, cells.Select(x => EscapeDelimited(x, separator)));
         AtomicWrite(path, string.Join(Environment.NewLine, lines));
@@ -409,10 +453,9 @@ public sealed class TikTokAccountPoolService
         var result = new List<TikTokAccountPoolItem>();
         if (rows.Count == 0) return result;
 
-        // V13.5: Kho tài khoản dùng cố định 5 cột đầu của file:
-        // A = tài khoản, B = mật khẩu, C = secret 2FA/TOTP, D = ghi chú,
-        // E = Profile đã gán. Cột E được Tool tự ghi để giữ trạng thái qua cài mới/cập nhật.
-        // Các cột F trở đi bị bỏ qua. Dòng đầu tiên có dữ liệu được xem là tiêu đề.
+        // V13.5+: Kho tài khoản dùng A-E như cũ; cột F được dành riêng cho trạng thái
+        // đổi Tên/ảnh tự động (DONE). A = tài khoản, B = mật khẩu, C = 2FA,
+        // D = ghi chú, E = Profile đã gán, F = Tên/ảnh DONE.
         var firstNonEmpty = rows.FindIndex(r => r.Any(c => !string.IsNullOrWhiteSpace(c)));
         if (firstNonEmpty < 0) return result;
 
@@ -500,15 +543,16 @@ public sealed class TikTokAccountPoolService
         if (lines.Count == 0) lines.Add("");
 
         var header = SplitDelimited(lines[0], separator);
-        while (header.Count < 5) header.Add("");
+        while (header.Count < 6) header.Add("");
         header[4] = "Profile đã gán";
+        header[5] = "Tên/ảnh DONE";
         lines[0] = string.Join(separator, header.Select(x => EscapeDelimited(x, separator)));
 
         foreach (var item in items)
         {
             while (lines.Count < item.SourceRow) lines.Add("");
             var cells = SplitDelimited(lines[item.SourceRow - 1], separator);
-            while (cells.Count < 5) cells.Add("");
+            while (cells.Count < 6) cells.Add("");
             cells[4] = item.AssignedProfile ?? "";
             lines[item.SourceRow - 1] = string.Join(separator, cells.Select(x => EscapeDelimited(x, separator)));
         }
@@ -573,6 +617,63 @@ public sealed class TikTokAccountPoolService
         }
     }
 
+    static void SetIdentityDoneCell(string path, int sourceRow, string value)
+    {
+        var ext = Path.GetExtension(path).ToLowerInvariant();
+        if (ext is ".csv" or ".txt")
+        {
+            var lines = File.ReadAllLines(path, Encoding.UTF8).ToList();
+            var separator = lines.Take(5).SelectMany(x => new[] { ',', ';', '\t' }.Select(c => (c, count: x.Count(ch => ch == c))))
+                .GroupBy(x => x.c).Select(g => (c: g.Key, score: g.Sum(x => x.count))).OrderByDescending(x => x.score).FirstOrDefault().c;
+            if (separator == '\0') separator = ',';
+            if (lines.Count == 0) lines.Add("");
+            var header = SplitDelimited(lines[0], separator);
+            while (header.Count < 6) header.Add("");
+            header[4] = "Profile đã gán";
+            header[5] = "Tên/ảnh DONE";
+            lines[0] = string.Join(separator, header.Select(x => EscapeDelimited(x, separator)));
+            while (lines.Count < sourceRow) lines.Add("");
+            var cells = SplitDelimited(lines[sourceRow - 1], separator);
+            while (cells.Count < 6) cells.Add("");
+            cells[5] = value ?? "";
+            lines[sourceRow - 1] = string.Join(separator, cells.Select(x => EscapeDelimited(x, separator)));
+            AtomicWrite(path, string.Join(Environment.NewLine, lines));
+            return;
+        }
+        if (ext != ".xlsx") throw new InvalidOperationException("Chỉ hỗ trợ file .xlsx, .csv hoặc .txt.");
+
+        using var source = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var memory = new MemoryStream();
+        source.CopyTo(memory);
+        memory.Position = 0;
+        string sheetName;
+        XDocument sheetDoc;
+        using (var zip = new ZipArchive(memory, ZipArchiveMode.Update, leaveOpen: true))
+        {
+            var sheetEntry = ResolveFirstSheet(zip) ?? throw new InvalidOperationException("File Excel không có worksheet.");
+            sheetName = sheetEntry.FullName;
+            using (var stream = sheetEntry.Open()) sheetDoc = XDocument.Load(stream);
+            sheetEntry.Delete();
+            XNamespace ns = sheetDoc.Root?.Name.Namespace ?? "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+            var sheetData = sheetDoc.Descendants(ns + "sheetData").FirstOrDefault()
+                ?? throw new InvalidOperationException("Worksheet không có sheetData.");
+            EnsureAssignmentHeader(sheetData, ns);
+            var row = sheetData.Elements(ns + "row").FirstOrDefault(r => int.TryParse(r.Attribute("r")?.Value, out var n) && n == sourceRow);
+            if (row is null) { row = new XElement(ns + "row", new XAttribute("r", sourceRow)); sheetData.Add(row); }
+            SetInlineCell(row, ns, "F" + sourceRow, value ?? "");
+            var orderedCells = row.Elements(ns + "c").OrderBy(c => ColumnIndex(c.Attribute("r")?.Value ?? "A1")).ToList();
+            row.Elements(ns + "c").Remove();
+            row.Add(orderedCells);
+            var newEntry = zip.CreateEntry(sheetName, CompressionLevel.Optimal);
+            using var outStream = newEntry.Open();
+            sheetDoc.Save(outStream);
+        }
+        memory.Position = 0;
+        var temp = path + ".tooltmp";
+        using (var output = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None)) memory.CopyTo(output);
+        ReplaceFileFromTemp(temp, path);
+    }
+
     static void EnsureAssignmentHeader(XElement sheetData, XNamespace ns)
     {
         var headerRow = sheetData.Elements(ns + "row")
@@ -583,6 +684,7 @@ public sealed class TikTokAccountPoolService
             sheetData.AddFirst(headerRow);
         }
         SetInlineCell(headerRow, ns, "E1", "Profile đã gán");
+        SetInlineCell(headerRow, ns, "F1", "Tên/ảnh DONE");
         var orderedCells = headerRow.Elements(ns + "c").OrderBy(c => ColumnIndex(c.Attribute("r")?.Value ?? "A1")).ToList();
         headerRow.Elements(ns + "c").Remove();
         headerRow.Add(orderedCells);
@@ -639,15 +741,15 @@ public sealed class TikTokAccountPoolService
             var excelRow = int.TryParse(row.Attribute("r")?.Value, out var parsedRow) && parsedRow > 0
                 ? parsedRow
                 : rows.Count + 1;
-            while (rows.Count < excelRow - 1) rows.Add(new List<string> { "", "", "", "", "" });
+            while (rows.Count < excelRow - 1) rows.Add(new List<string> { "", "", "", "", "", "" });
 
-            // Chỉ lấy A/B/C/D/E; E = Profile đã gán. Mọi cột từ F trở đi không cần đọc.
-            var values = new string[5];
+            // Đọc A-F; F = trạng thái DONE của luồng Tên/ảnh tự động.
+            var values = new string[6];
             foreach (var cell in row.Elements(ns + "c"))
             {
                 var reference = cell.Attribute("r")?.Value ?? "A1";
                 var col = ColumnIndex(reference);
-                if (col < 0 || col > 4) continue;
+                if (col < 0 || col > 5) continue;
 
                 var type = cell.Attribute("t")?.Value ?? "";
                 var raw = cell.Element(ns + "v")?.Value ?? "";

@@ -137,6 +137,7 @@ public sealed partial class ManagerForm : Form
         EnsureAddTab();
         InitializeDashboardAndUpdater();
         _refreshTimer.Tick += async (_, _) => await RefreshOpenProfilesAsync();
+        InitializeIdentityAutoFlow();
         Shown += (_, _) => RegisterChromeMonitorHotkey();
         FormClosing += OnClosing;
     }
@@ -179,6 +180,7 @@ public sealed partial class ManagerForm : Form
         toolbarRow1.Controls.Add(Button("+ Profile", (_, _) => AddProfile(), UiButtonKind.Primary));
         toolbarRow1.Controls.Add(Button("Kho tài khoản", (_, _) => ShowAccountPoolDialog(), UiButtonKind.Neutral));
         toolbarRow1.Controls.Add(Button("Cấu hình mặc định", (_, _) => ShowDefaultConfigDialog(), UiButtonKind.Neutral));
+        toolbarRow1.Controls.Add(Button("Tên & ảnh TikTok", (_, _) => ShowTikTokIdentityDialog(), UiButtonKind.Neutral));
         toolbarRow1.Controls.Add(Button("Profile có sẵn", async (_, _) => { try { await AddExistingProfileAsync(); } catch (Exception ex) { ShowError(ex); } }));
 
         var toolbarRow2 = ToolbarRow();
@@ -224,7 +226,7 @@ public sealed partial class ManagerForm : Form
             {
                 "Mở profile" => (Color.FromArgb(232, 242, 255), Color.FromArgb(35, 91, 152)),
                 "+ Profile" => (Color.FromArgb(238, 246, 255), Color.FromArgb(35, 91, 152)),
-                "Profile có sẵn" or "Đổi tên" or "Đồng bộ tên Chrome" or "Kho tài khoản" or "Cấu hình mặc định" => (Color.FromArgb(242, 246, 251), Color.FromArgb(55, 76, 103)),
+                "Profile có sẵn" or "Đổi tên" or "Đồng bộ tên Chrome" or "Kho tài khoản" or "Cấu hình mặc định" or "Tên & ảnh TikTok" => (Color.FromArgb(242, 246, 251), Color.FromArgb(55, 76, 103)),
                 "Giám sát Chrome" => (Color.FromArgb(234, 244, 255), Color.FromArgb(31, 91, 158)),
                 "Xóa profile" or "Dừng tất cả" => (Color.FromArgb(255, 239, 239), Color.FromArgb(171, 62, 62)),
                 "Chạy tất cả" => (Color.FromArgb(234, 248, 238), Color.FromArgb(36, 119, 66)),
@@ -1683,26 +1685,29 @@ public sealed partial class ManagerForm : Form
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "totp", HeaderText = "2FA", FillWeight = 16 });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "note", HeaderText = "Ghi chú", FillWeight = 34 });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "assigned", HeaderText = "Profile đã gán", FillWeight = 28 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "identity", HeaderText = "Tên/ảnh", FillWeight = 18 });
 
         List<TikTokAccountPoolItem> items = new();
         void RefreshGrid()
         {
             items = _accountPoolService.Load().OrderBy(x => x.SourceRow).ThenBy(x => x.Username, StringComparer.OrdinalIgnoreCase).ToList();
             grid.Rows.Clear();
+            var doneUsers = _accountPoolService.GetIdentityDoneUsernames();
             foreach (var item in items)
             {
                 var index = grid.Rows.Add(item.SourceRow, item.Username,
                     string.IsNullOrEmpty(item.Password) ? "" : "••••••",
                     string.IsNullOrWhiteSpace(item.TotpSecret) ? "" : "••••••",
                     item.Note,
-                    item.AssignedProfile);
+                    item.AssignedProfile,
+                    doneUsers.Contains(item.Username) ? "DONE" : "—");
                 grid.Rows[index].Tag = item.Id;
             }
             if (grid.Rows.Count > 0) grid.Rows[0].Selected = true;
 
             var currentFile = _accountPoolService.CurrentSourcePath;
             sourceInfo.Text = string.IsNullOrWhiteSpace(currentFile)
-                ? "Chưa chọn file Excel. Bấm Mở Excel để chọn nguồn.\nA = Tài khoản, B = Mật khẩu, C = 2FA, D = Ghi chú; E trở đi bỏ qua."
+                ? "Chưa chọn file Excel. Bấm Mở Excel để chọn nguồn.\nA = Tài khoản, B = Mật khẩu, C = 2FA, D = Ghi chú, E = Profile đã gán, F = Tên/ảnh DONE."
                 : $"File đang dùng: {currentFile}\nKho phản ánh đúng file này. Mở file khác sẽ thay toàn bộ danh sách hiện tại; Sửa/Thêm/Xóa trong Kho sẽ ghi ngược vào file này.";
             sourceInfo.Tag = currentFile;
         }
