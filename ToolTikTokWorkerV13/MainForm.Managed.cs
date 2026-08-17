@@ -80,6 +80,19 @@ public sealed partial class MainForm
                     return _chrome.Connected ? "connected" : "disconnected";
                 case "close_chrome":
                     return await CloseChromeAsync();
+                case "identity_ready":
+                {
+                    if (!_chrome.Connected) return "not_connected";
+                    try
+                    {
+                        return await _chrome.IsTikTokSessionActiveAsync() ? "ready" : "not_logged_in";
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.Warn("[TIKTOK_IDENTITY_READY_PROBE] " + ex.Message);
+                        return "probe_error";
+                    }
+                }
                 case "update_tiktok_identity":
                 {
                     try
@@ -91,6 +104,8 @@ public sealed partial class MainForm
                             json,
                             new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
                             ?? throw new InvalidOperationException("Payload đổi tên/ảnh TikTok không hợp lệ.");
+                        if (!await _chrome.IsTikTokSessionActiveAsync())
+                            throw new InvalidOperationException("TikTok chưa đăng nhập. Hãy đăng nhập tài khoản trên Chrome rồi cập nhật tên/ảnh lại; thao tác này không tự vào LIVE.");
                         var result = await _chrome.UpdateTikTokProfileIdentityAsync(
                             request.Username, request.DisplayName, request.AvatarPath, request.Bio,
                             request.SkipIfNameCooldown, request.KnownDisplayNames, request.VerifyExistingState);
@@ -129,11 +144,15 @@ public sealed partial class MainForm
                     if (string.IsNullOrWhiteSpace(profilePath)) return "window_not_found";
                     if (!_chrome.Connected) return "not_connected";
 
-                    // Chỉ refresh/dò HWND theo yêu cầu. TUYỆT ĐỐI không restore,
-                    // minimize, maximize hay đổi foreground ở Worker. Manager sẽ
-                    // dùng lại chính xác logic View cũ để điều khiển cửa sổ.
-                    var hwnd = _chrome.RefreshManagedWindowHandle(profilePath, _settings.ChromePort);
-                    return hwnd > 0 ? "hwnd:" + hwnd : "window_not_found";
+                    // Resolve PID/HWND theo đúng CDP port + profile path và retry
+                    // EnumWindows tại Worker. Không restore, restart hoặc đổi
+                    // foreground ở đây; Manager vẫn là nơi điều khiển cửa sổ.
+                    var resolution = await _chrome.ResolveManagedWindowAsync(
+                        profilePath,
+                        _settings.ChromePort,
+                        windowAttempts: 8,
+                        retryDelayMs: 250);
+                    return JsonSerializer.Serialize(resolution);
                 }
                 case "show":
                     if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;

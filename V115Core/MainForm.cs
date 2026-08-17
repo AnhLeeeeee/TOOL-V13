@@ -1,4 +1,5 @@
-﻿using System.Runtime.InteropServices;
+﻿using ToolTikTokV12.Utils;
+using System.Runtime.InteropServices;
 using System.Collections.Concurrent;
 using System.Text;
 using ToolTikTokV12.Controls;
@@ -110,8 +111,8 @@ public sealed partial class MainForm : Form
 
         var ctorSw = System.Diagnostics.Stopwatch.StartNew();
         Text = _managedMode
-            ? $"Tool TikTok V13.5 — XPath-only VM Worker — {_startupOptions.ProfileName}"
-            : "Tool TikTok V13.5 — XPath-only / DOM / VM Optimized";
+            ? $"Tool TikTok {AppVersionInfo.Display} — XPath-only VM Worker — {_startupOptions.ProfileName}"
+            : $"Tool TikTok {AppVersionInfo.Display} — XPath-only / DOM / VM Optimized";
         AutoScaleMode = AutoScaleMode.Dpi;
         Font = new Font("Segoe UI", 9F);
         Width = 930; Height = 700; MinimumSize = new Size(760, 580); StartPosition = FormStartPosition.CenterScreen;
@@ -773,7 +774,7 @@ public sealed partial class MainForm : Form
         {
             AutoSize = true,
             MaximumSize = new Size(980, 0),
-            Text = "V13.5 không chụp/quét ảnh Live cũ. Tại mốc T-10s, tool đọc tài khoản LIVE trực tiếp từ XPath và lưu định danh (ưu tiên username/href) với TTL. " +
+            Text = $"{AppVersionInfo.Display} không chụp/quét ảnh Live cũ. Tại mốc T-10s, tool đọc tài khoản LIVE trực tiếp từ XPath và lưu định danh (ưu tiên username/href) với TTL. " +
                    "Trong runtime, nếu tài khoản hiện tại trùng một entry Live cũ còn hiệu lực thì gọi nguyên flow chuyển LIVE + F5 như trước. " +
                    "Tên hiển thị chỉ để xem; so sánh ưu tiên định danh ổn định."
         });
@@ -942,7 +943,7 @@ public sealed partial class MainForm : Form
             _settings.Viewer.WaitAfterF5Sec = (int)_viewerWait.Value; _settings.Viewer.MaxF5 = (int)_viewerMaxF5.Value;
             _settings.OldLive.Enabled = _oldEnabled.Checked; _settings.OldLive.IdentityXPath = _oldIdentityXp.Text.Trim(); _settings.OldLive.ActionXPath = _oldActionXp.Text.Trim();
             _settings.OldLive.KeepMinutes = int.TryParse(_oldKeep.Text, out var km) ? km : 10;
-            _settingsService.Save(_settings); _settingsService.SaveContents(_contents.Text); _log.Info("Đã lưu cấu hình V13.5 + XPath/InputGuard/VM mode vào auto_chrome.ini.");
+            _settingsService.Save(_settings); _settingsService.SaveContents(_contents.Text); _log.Info($"Đã lưu cấu hình {AppVersionInfo.Display} + XPath/InputGuard/VM mode vào auto_chrome.ini.");
             UpdateContentCount();
             RefreshPeriodicCountdownLabel();
         }
@@ -1207,7 +1208,13 @@ public sealed partial class MainForm : Form
             await _chrome.LaunchAsync(_settings.ChromePort, _settings.ChromeProfileDir, SyncChromeProfileNameBeforeLaunch);
             await ConnectChromeAsync();
             if (_chrome.Connected)
-                await PrepareTikTokProfileStartupAsync();
+            {
+                // Mở Chrome vẫn chạy gate đăng nhập TikTok như bản gốc để profile mới
+                // có thể tự nhập tài khoản/mật khẩu/2FA. Khác biệt duy nhất: sau khi
+                // đăng nhập thành công chỉ về trang chủ, KHÔNG điều hướng sang LIVE.
+                // LIVE chỉ được chuẩn bị trong StartAsync() khi người dùng bấm Bắt đầu.
+                await PrepareTikTokProfileStartupAsync(openLiveWhenReady: false);
+            }
         }
         catch (Exception ex)
         {
@@ -1216,7 +1223,7 @@ public sealed partial class MainForm : Form
         }
     }
 
-    async Task PrepareTikTokProfileStartupAsync()
+    async Task PrepareTikTokProfileStartupAsync(bool openLiveWhenReady = true)
     {
         try
         {
@@ -1225,13 +1232,21 @@ public sealed partial class MainForm : Form
                 "Trạng thái Chrome: 🟡 Đang chuẩn bị TikTok...", Color.Goldenrod,
                 "TikTok: 🟡 Nếu có CAPTCHA, hãy xử lý trên Chrome — tool sẽ tự tiếp tục", Color.Goldenrod);
             var auth = _tiktokAuthService.Load(_baseDir);
-            var result = await _chrome.PrepareTikTokStartupAsync(auth.Username, auth.Password, auth.TotpSecret, auth.AutoLogin);
+            var result = await _chrome.PrepareTikTokStartupAsync(
+                auth.Username, auth.Password, auth.TotpSecret, auth.AutoLogin, openLiveWhenReady);
             _startupPreparationState = result.State;
 
             switch (result.State)
             {
                 case "READY":
-                    SetChromeStatus("Trạng thái Chrome: 🟢 Đã sẵn sàng", Color.DarkGreen, "TikTok: 🟢 LIVE đã mở", Color.DarkGreen);
+                    if (result.LiveOpened)
+                    {
+                        SetChromeStatus("Trạng thái Chrome: 🟢 Đã sẵn sàng", Color.DarkGreen, "TikTok: 🟢 LIVE đã mở", Color.DarkGreen);
+                    }
+                    else
+                    {
+                        SetChromeStatus("Trạng thái Chrome: 🟢 Đã kết nối", Color.DarkGreen, "TikTok: 🟢 Đã đăng nhập — trang chủ, chưa vào LIVE", Color.DarkGreen);
+                    }
                     _log.Info("[TIKTOK_STARTUP_READY] " + result.Message);
                     break;
                 case "CAPTCHA_REQUIRED":

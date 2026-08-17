@@ -1,10 +1,15 @@
-@echo off
+﻿@echo off
 setlocal EnableExtensions
 cd /d "%~dp0"
 
 set "OUT=%CD%\publish_v13_5_vm"
 set "ZIP=%CD%\ToolTikTok_V13.5_VM_CLIENT_WIN_X64.zip"
 set "TMPZIP=%TEMP%\ToolTikTok_V13.5_VM_CLIENT_WIN_X64_%RANDOM%_%RANDOM%.zip"
+
+if not exist "VERSION.txt" goto :versionfail
+set /p APP_VERSION=<"VERSION.txt"
+powershell -NoProfile -ExecutionPolicy Bypass -File ".\SYNC_VERSION.ps1"
+if errorlevel 1 goto :versionfail
 
 if exist "%OUT%" rmdir /s /q "%OUT%"
 if exist "%OUT%" (
@@ -37,7 +42,7 @@ mkdir "%OUT%"
 if errorlevel 1 goto :fail
 
 echo ========================================
-echo TAO BAN MAY AO TOOL TIKTOK V13.5
+echo TAO BAN MAY AO TOOL TIKTOK V%APP_VERSION%
 echo XPath-only - KHONG CAN TESSERACT
 echo ========================================
 echo.
@@ -57,7 +62,7 @@ for /r "%OUT%" %%F in (*.pdb) do del /q "%%F" >nul 2>&1
 >>"%OUT%\CHAY_TOOL_V13_5.bat" echo cd /d "%%~dp0"
 >>"%OUT%\CHAY_TOOL_V13_5.bat" echo start "" ".\ToolTikTokManagerV13.exe"
 
-> "%OUT%\README_MAY_AO.txt" echo TOOL TIKTOK V13.5 VM CLIENT
+> "%OUT%\README_MAY_AO.txt" echo TOOL TIKTOK V%APP_VERSION% VM CLIENT
 >>"%OUT%\README_MAY_AO.txt" echo - Khong can cai .NET 8.
 >>"%OUT%\README_MAY_AO.txt" echo - Khong can cai Tesseract/OCR.
 >>"%OUT%\README_MAY_AO.txt" echo - Can Google Chrome.
@@ -99,6 +104,15 @@ echo ========================================
 echo.
 pause
 exit /b 0
+
+:versionfail
+echo.
+echo ========================================
+echo LOI: VERSION KHONG HOP LE HOAC KHONG DONG BO DUOC
+echo Kiem tra VERSION.txt va SYNC_VERSION.ps1
+echo ========================================
+pause
+exit /b 1
 
 :zipfail
 if exist "%TMPZIP%" del /f /q "%TMPZIP%" >nul 2>&1

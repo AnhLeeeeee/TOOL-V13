@@ -1,5 +1,7 @@
 ﻿#define MyAppName "Tool TikTok"
-#define MyAppVersion "13.5.4"
+#ifndef MyAppVersion
+  #error "MyAppVersion chua duoc truyen vao. Hay chay TAO_SETUP_V13_5_AUTO_FIND_INNO.bat."
+#endif
 #define MyAppPublisher "Tool TikTok"
 #define MyAppExeName "ToolTikTokManagerV13.exe"
 

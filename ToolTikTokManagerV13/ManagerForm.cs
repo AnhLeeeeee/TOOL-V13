@@ -29,7 +29,13 @@ public sealed partial class ManagerForm : Form
         public DateTime LastEmbedRecoveryUtc { get; set; } = DateTime.MinValue;
         public int ConsecutiveEmbedRecoveryFailures { get; set; }
         public DateTime LastStatusRefreshUtc { get; set; } = DateTime.MinValue;
+        public DateTime LastStatusPollAttemptUtc { get; set; } = DateTime.MinValue;
         public WorkerSnapshot? LastSnapshot { get; set; }
+        public string LastConfirmedRuntimeState { get; set; } = RuntimeStateUnknown;
+        public DateTime LastConfirmedRuntimeStateUtc { get; set; } = DateTime.MinValue;
+        public bool RuntimeRecoveryInProgress { get; set; }
+        public int ConsecutiveStatusPollFailures { get; set; }
+        public string LastStatusPollFailure { get; set; } = "";
         public SemaphoreSlim CommandGate { get; } = new(1, 1);
     }
 
@@ -127,7 +133,7 @@ public sealed partial class ManagerForm : Form
         _profileService = new TikTokProfileService(_baseDir);
         _accountPoolService = new TikTokAccountPoolService(_baseDir);
         _log = new Logger(_baseDir, "manager", "manager-v13.log");
-        Text = "Tool TikTok Manager V13.5 — VM Optimized Multi Worker";
+        Text = $"Tool TikTok Manager {AppVersionInfo.Display} — VM Optimized Multi Worker";
         Width = 1440;
         Height = 900;
         MinimumSize = new Size(1120, 720);
@@ -592,9 +598,9 @@ public sealed partial class ManagerForm : Form
             return;
         }
         if (!string.Equals(result, "opened", StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException($"Chrome đã mở nhưng TikTok chưa sẵn sàng cho profile “{ctx.Profile.Name}” (worker: {result}).");
+            throw new InvalidOperationException($"Chrome chưa mở/kết nối thành công cho profile “{ctx.Profile.Name}” (worker: {result}).");
 
-        SetStatus(ctx, "Chrome đã kết nối — TikTok LIVE sẵn sàng.", Color.DarkGreen);
+        SetStatus(ctx, "Chrome đã kết nối — TikTok trang chủ, chưa vào LIVE.", Color.DarkGreen);
         _log.Info($"[CHROME_OPEN] profile={ctx.Profile.Name} profilePath={ctx.Profile.ProfilePath} port={ctx.Profile.CdpPort}");
         try { await RefreshStatusAsync(ctx); } catch (Exception ex) { _log.Warn($"[{ctx.Profile.Name}] refresh status sau mở Chrome: {ex.Message}"); }
     }
@@ -603,71 +609,100 @@ public sealed partial class ManagerForm : Form
     {
         try
         {
-            // Giữ nguyên hành vi View cũ: Manager mới là nơi restore + maximize +
-            // đưa Chrome lên foreground. Worker chỉ được dùng để dò/refresh HWND
-            // khi status chưa có handle (thường xảy ra khi Chrome được Start tự mở).
             try { await RefreshStatusAsync(ctx); } catch { }
 
             var chromeState = ctx.LastSnapshot?.Chrome ?? "DISCONNECTED";
             if (chromeState.Equals("DISCONNECTED", StringComparison.OrdinalIgnoreCase))
             {
+                _log.Warn($"[VIEW_FAIL] profile={ctx.Profile.Name} cdpPort={ctx.Profile.CdpPort} reason=cdp_disconnected");
                 ModernDialog.ShowMessage(this,
                     $"Chrome của profile “{ctx.Profile.Name}” chưa kết nối. Hãy mở/chạy profile trước rồi dùng ‘👁 View’.",
                     "View Chrome", MessageBoxIcon.Information);
                 return;
             }
 
-            long hwndValue = ctx.LastSnapshot?.ChromeWindowHandle ?? 0;
+            var cachedHwndValue = ctx.LastSnapshot?.ChromeWindowHandle ?? 0;
+            var cachedHwnd = cachedHwndValue > 0 ? new IntPtr(cachedHwndValue) : IntPtr.Zero;
+            var cachedPid = ChromeMonitorWindowActions.GetProcessId(cachedHwnd);
 
-            async Task<long> RefreshChromeHwndOnDemandAsync()
+            if (ChromeMonitorWindowActions.IsValid(cachedHwnd)
+                && ChromeMonitorWindowActions.RestoreMaximizeAndActivate(cachedHwnd))
             {
-                await EnsureWorkerAsync(ctx);
-                var result = await SendCommandAsync(ctx, "view_chrome", TimeSpan.FromSeconds(12));
-                if (result.StartsWith("hwnd:", StringComparison.OrdinalIgnoreCase)
-                    && long.TryParse(result.AsSpan(5), out var parsed)
-                    && parsed > 0)
-                {
-                    try { await RefreshStatusAsync(ctx); } catch { }
-                    return parsed;
-                }
-
-                if (string.Equals(result, "not_connected", StringComparison.OrdinalIgnoreCase))
-                    return 0;
-
-                _log.Warn($"[CHROME_VIEW_HANDLE_REFRESH] profile={ctx.Profile.Name} result={result}");
-                return 0;
+                _log.Info($"[VIEW] profile={ctx.Profile.Name} cdpPort={ctx.Profile.CdpPort} cachedPid={cachedPid} resolvedPid={cachedPid} hwnd={cachedHwndValue} source=status_cache");
+                return;
             }
 
-            // Trường hợp Chrome do nút Bắt đầu tự mở: CDP đã CONNECTED nhưng
-            // status có thể chưa cache HWND. Chỉ lúc người dùng bấm View mới dò lại.
-            if (hwndValue <= 0)
-                hwndValue = await RefreshChromeHwndOnDemandAsync();
-
-            if (hwndValue <= 0)
+            async Task<ChromeViewResolutionReply> ResolveChromeWindowOnDemandAsync()
             {
+                await EnsureWorkerAsync(ctx);
+                var result = await SendCommandAsync(ctx, "view_chrome", TimeSpan.FromSeconds(15));
+                if (result.StartsWith("{", StringComparison.Ordinal))
+                {
+                    try
+                    {
+                        return JsonSerializer.Deserialize<ChromeViewResolutionReply>(
+                            result,
+                            new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+                            ?? new ChromeViewResolutionReply { Reason = "invalid_worker_response" };
+                    }
+                    catch (JsonException ex)
+                    {
+                        return new ChromeViewResolutionReply { Reason = "invalid_worker_json:" + ex.Message };
+                    }
+                }
+
+                // Tương thích Worker cũ đang chạy trong lúc Manager vừa được cập nhật.
+                if (result.StartsWith("hwnd:", StringComparison.OrdinalIgnoreCase)
+                    && long.TryParse(result.AsSpan(5), out var legacyHwnd)
+                    && legacyHwnd > 0)
+                {
+                    var hwnd = new IntPtr(legacyHwnd);
+                    return new ChromeViewResolutionReply
+                    {
+                        CachedPid = cachedPid,
+                        ResolvedPid = ChromeMonitorWindowActions.GetProcessId(hwnd),
+                        WindowHandle = legacyHwnd,
+                        Reason = "legacy_worker"
+                    };
+                }
+
+                return new ChromeViewResolutionReply { CachedPid = cachedPid, Reason = result };
+            }
+
+            var resolution = await ResolveChromeWindowOnDemandAsync();
+            var resolvedHwnd = resolution.WindowHandle > 0 ? new IntPtr(resolution.WindowHandle) : IntPtr.Zero;
+            var activated = ChromeMonitorWindowActions.RestoreMaximizeAndActivate(resolvedHwnd);
+
+            // Handle có thể biến mất đúng lúc Worker vừa resolve xong. Resolve lại
+            // một lần nữa; mỗi lệnh Worker đã tự EnumWindows 8 lần × 250 ms.
+            if (!activated && resolution.WindowHandle > 0)
+            {
+                await Task.Delay(250);
+                resolution = await ResolveChromeWindowOnDemandAsync();
+                resolvedHwnd = resolution.WindowHandle > 0 ? new IntPtr(resolution.WindowHandle) : IntPtr.Zero;
+                activated = ChromeMonitorWindowActions.RestoreMaximizeAndActivate(resolvedHwnd);
+            }
+
+            var effectiveCachedPid = resolution.CachedPid > 0 ? resolution.CachedPid : cachedPid;
+            var resolvedPid = resolution.ResolvedPid > 0
+                ? resolution.ResolvedPid
+                : ChromeMonitorWindowActions.GetProcessId(resolvedHwnd);
+            if (!activated)
+            {
+                var reason = string.IsNullOrWhiteSpace(resolution.Reason) ? "window_not_found" : resolution.Reason;
+                _log.Warn($"[VIEW_FAIL] profile={ctx.Profile.Name} cdpPort={ctx.Profile.CdpPort} cachedPid={effectiveCachedPid} resolvedPid={resolvedPid} hwnd={resolution.WindowHandle} reason={reason}");
                 ModernDialog.ShowMessage(this,
-                    $"Chrome của profile “{ctx.Profile.Name}” đang kết nối nhưng chưa tìm thấy cửa sổ hiển thị. Hãy thử bấm ‘👁 View’ lại sau một chút.",
+                    $"Chrome của profile “{ctx.Profile.Name}” vẫn kết nối nhưng Manager không tìm thấy cửa sổ Chrome đúng profile sau khi tự dò lại.",
                     "View Chrome", MessageBoxIcon.Information);
                 return;
             }
 
-            // Đây chính là hành vi View cũ đã hoạt động tốt:
-            // restore -> maximize -> foreground.
-            if (!ChromeMonitorWindowActions.RestoreMaximizeAndActivate(new IntPtr(hwndValue)))
-            {
-                // Chrome có thể vừa tạo lại top-level window; refresh HWND đúng 1 lần
-                // rồi vẫn dùng hàm View cũ để đưa cửa sổ lên trước.
-                hwndValue = await RefreshChromeHwndOnDemandAsync();
-                if (hwndValue <= 0
-                    || !ChromeMonitorWindowActions.RestoreMaximizeAndActivate(new IntPtr(hwndValue)))
-                    throw new InvalidOperationException($"Không đưa được cửa sổ Chrome của profile “{ctx.Profile.Name}” lên trước.");
-            }
-
-            _log.Info($"[CHROME_VIEW] profile={ctx.Profile.Name} hwnd={hwndValue} result=restored_maximized_foreground");
+            try { await RefreshStatusAsync(ctx); } catch { }
+            _log.Info($"[VIEW] profile={ctx.Profile.Name} cdpPort={ctx.Profile.CdpPort} cachedPid={effectiveCachedPid} resolvedPid={resolvedPid} hwnd={resolution.WindowHandle} source={resolution.Reason}");
         }
         catch (Exception ex)
         {
-            _log.Warn($"[CHROME_VIEW] profile={ctx.Profile.Name} result=failed message={ex.Message}");
+            _log.Warn($"[VIEW_FAIL] profile={ctx.Profile.Name} cdpPort={ctx.Profile.CdpPort} reason={ex.Message}");
             ShowError(ex);
         }
     }
@@ -694,7 +729,7 @@ public sealed partial class ManagerForm : Form
         ctx.Worker = process;
         ctx.WorkerWindow = IntPtr.Zero;
         ctx.Detached = false;
-        process.Exited += (_, _) => BeginInvoke(new Action(() => SetStatus(ctx, $"Worker đã thoát ({process.ExitCode})", Color.Firebrick)));
+        process.Exited += (_, _) => OnWorkerProcessExited(ctx, process);
         SetStatus(ctx, $"Worker PID {process.Id} — chờ pipe", Color.DarkOrange);
         var end = DateTime.UtcNow.AddSeconds(10);
         while (DateTime.UtcNow < end)
@@ -824,7 +859,13 @@ public sealed partial class ManagerForm : Form
             var selectedTab = _tabs.SelectedTab;
             foreach (var ctx in _contexts.Values.Where(c => c.Tab is not null).ToList())
             {
-                if (ctx.Worker is null || ctx.Worker.HasExited || ctx.Opening) continue;
+                if (ctx.Opening) continue;
+                if (ctx.Worker is null) continue;
+                if (IsWorkerProcessExited(ctx))
+                {
+                    ConfirmRuntimeState(ctx, RuntimeStateStopped, "worker_process_exited");
+                    continue;
+                }
 
                 // V13.5: profile đang xem vẫn refresh 1 giây như cũ. Các tab nền
                 // chỉ refresh 5 giây/lần để giảm pipe/JSON/UI work khi chạy nhiều VM profile.
@@ -832,14 +873,15 @@ public sealed partial class ManagerForm : Form
                 var interval = ReferenceEquals(ctx.Tab, selectedTab) || monitorVisible
                     ? TimeSpan.FromSeconds(1)
                     : TimeSpan.FromSeconds(5);
-                if (now - ctx.LastStatusRefreshUtc < interval) continue;
+                if (now - ctx.LastStatusPollAttemptUtc < interval) continue;
 
                 try
                 {
+                    ctx.LastStatusPollAttemptUtc = DateTime.UtcNow;
                     await RefreshStatusAsync(ctx);
                     await RecoverWorkerEmbedIfNeededAsync(ctx);
                 }
-                catch { }
+                catch (Exception ex) { HandleStatusPollFailure(ctx, ex, "RefreshOpenProfilesAsync"); }
             }
         }
         finally { _refreshing = false; }
@@ -850,8 +892,12 @@ public sealed partial class ManagerForm : Form
         var s = await ReadStatusAsync(ctx);
         ctx.LastStatusRefreshUtc = DateTime.UtcNow;
         ctx.LastSnapshot = s;
-        var color = s.RunState == "RUNNING" ? Color.DarkGreen : s.RunState == "PAUSED" ? Color.DarkOrange : Color.DimGray;
-        SetStatus(ctx, $"Worker {s.State} | {s.RunState} | Chrome {s.Chrome}", color);
+        ctx.ConsecutiveStatusPollFailures = 0;
+        ctx.LastStatusPollFailure = "";
+        ApplyWorkerSnapshotRuntimeState(ctx, s);
+        var effectiveRunState = GetEffectiveRuntimeState(ctx);
+        var color = GetRuntimeStateColor(effectiveRunState);
+        SetStatus(ctx, $"Worker {s.State} | {effectiveRunState} | Chrome {s.Chrome}", color);
         if (s.WindowHandle != 0)
         {
             var reported = new IntPtr(s.WindowHandle);
@@ -867,8 +913,10 @@ public sealed partial class ManagerForm : Form
     {
         var raw = await SendCommandAsync(ctx, "status", TimeSpan.FromSeconds(2));
         var snapshot = JsonSerializer.Deserialize<WorkerSnapshot>(raw, WorkerSnapshotJson) ?? new WorkerSnapshot();
-        if (!snapshot.Profile.Equals(ctx.Profile.Name, StringComparison.OrdinalIgnoreCase) || snapshot.CdpPort != ctx.Profile.CdpPort)
+        if (!string.Equals(snapshot.Profile, ctx.Profile.Name, StringComparison.OrdinalIgnoreCase) || snapshot.CdpPort != ctx.Profile.CdpPort)
             throw new InvalidOperationException($"[WORKER_PROFILE_MISMATCH] Expected profile={ctx.Profile.Name}, CDP={ctx.Profile.CdpPort}; worker reported profile={snapshot.Profile}, CDP={snapshot.CdpPort}.");
+        if (!IsWorkerReportedRuntimeState(snapshot.RunState))
+            throw new InvalidDataException($"[WORKER_STATUS_INVALID] Profile={ctx.Profile.Name}; missing/invalid RunState='{snapshot.RunState}'.");
         return snapshot;
     }
 
@@ -879,29 +927,20 @@ public sealed partial class ManagerForm : Form
         {
             var effectiveTimeout = timeout ?? TimeSpan.FromSeconds(15);
 
-            // Status is polled every second for every open profile.  A healthy
-            // worker does not need a separate ping pipe before the status pipe.
-            // Send status directly; only on failure do the old health/restart
-            // path and one idempotent retry.  Non-idempotent commands retain
-            // the original ping-before-send behavior.
+            // Status polling is observational only. A timeout/missing snapshot
+            // must never replace/restart a live Worker and turn a transient IPC
+            // failure into a fresh Worker's legitimate STOPPED snapshot.
             if (command.Equals("status", StringComparison.OrdinalIgnoreCase))
             {
                 if (ctx.Worker is null || ctx.Worker.HasExited)
-                    await EnsureWorkerAsync(ctx);
-
-                try
-                {
-                    return await SendPipeAsync(ctx.Profile.Name, command, effectiveTimeout);
-                }
-                catch when (!_closing)
-                {
-                    await EnsureWorkerAsync(ctx);
-                    return await SendPipeAsync(ctx.Profile.Name, command, effectiveTimeout);
-                }
+                    throw new InvalidOperationException($"Worker process is not running for profile '{ctx.Profile.Name}'.");
+                return await SendPipeAsync(ctx.Profile.Name, command, effectiveTimeout);
             }
 
             await EnsureWorkerAsyncIfCommandNeedsIt(ctx, command);
-            return await SendPipeAsync(ctx.Profile.Name, command, effectiveTimeout);
+            var response = await SendPipeAsync(ctx.Profile.Name, command, effectiveTimeout);
+            ApplyCommandRuntimeConfirmation(ctx, command, response);
+            return response;
         }
         finally { ctx.CommandGate.Release(); }
     }
@@ -1016,6 +1055,15 @@ public sealed partial class ManagerForm : Form
             _chromeMonitorHotkeyRegistered = false;
         }
         _refreshTimer.Stop();
+
+        // Chrome Monitor is intentionally an independent top-level window (not owned by Manager)
+        // so the Manager can be brought in front of it. Close it explicitly when Manager exits.
+        if (_chromeMonitor is not null && !_chromeMonitor.IsDisposed)
+        {
+            try { _chromeMonitor.Close(); } catch { }
+            _chromeMonitor = null;
+        }
+
         Enabled = false;
         foreach (var ctx in _contexts.Values.Where(c => c.Worker is not null && !c.Worker.HasExited).ToList())
         {
@@ -1102,7 +1150,7 @@ public sealed partial class ManagerForm : Form
         var catalog = _profileService.Load();
         using var form = new Form
         {
-            Text = "Cấu hình mặc định — V13.5",
+            Text = $"Cấu hình mặc định — {AppVersionInfo.Display}",
             Width = 680,
             Height = 540,
             MinimumSize = new Size(640, 500),
@@ -1403,7 +1451,7 @@ public sealed partial class ManagerForm : Form
     {
         using var form = new Form
         {
-            Text = "Thêm profile TikTok — V13.5",
+            Text = $"Thêm profile TikTok — {AppVersionInfo.Display}",
             Width = 620,
             Height = 690,
             MinimumSize = new Size(580, 590),
@@ -1640,7 +1688,7 @@ public sealed partial class ManagerForm : Form
     {
         using var form = new Form
         {
-            Text = "Kho tài khoản TikTok — V13.5",
+            Text = $"Kho tài khoản TikTok — {AppVersionInfo.Display}",
             Width = 1080,
             Height = 650,
             MinimumSize = new Size(800, 520),
@@ -1666,6 +1714,7 @@ public sealed partial class ManagerForm : Form
 
         var grid = new DataGridView
         {
+            Name = "AccountPoolGrid",
             Dock = DockStyle.Fill,
             ReadOnly = true,
             AllowUserToAddRows = false,
@@ -1686,6 +1735,7 @@ public sealed partial class ManagerForm : Form
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "note", HeaderText = "Ghi chú", FillWeight = 34 });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "assigned", HeaderText = "Profile đã gán", FillWeight = 28 });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "identity", HeaderText = "Tên/ảnh", FillWeight = 18 });
+        LogGridSchema(grid, "AccountPoolGrid", "row", "user", "pass", "totp", "note", "assigned", "identity");
 
         List<TikTokAccountPoolItem> items = new();
         void RefreshGrid()
@@ -2015,6 +2065,7 @@ public sealed partial class ManagerForm : Form
 
         var grid = new DataGridView
         {
+            Name = "AvailableAccountGrid",
             Dock = DockStyle.Fill,
             ReadOnly = true,
             AllowUserToAddRows = false,
@@ -2031,6 +2082,7 @@ public sealed partial class ManagerForm : Form
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "row", HeaderText = "Dòng Excel", FillWeight = 20 });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "user", HeaderText = "Tài khoản", FillWeight = 58 });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "assigned", HeaderText = "Profile đã gán", FillWeight = 38 });
+        LogGridSchema(grid, "AvailableAccountGrid", "row", "user", "assigned");
         foreach (var item in items)
         {
             var index = grid.Rows.Add(item.SourceRow, item.Username, string.IsNullOrWhiteSpace(item.AssignedProfile) ? "—" : item.AssignedProfile);
@@ -3562,7 +3614,7 @@ public sealed partial class ManagerForm : Form
     void UpdateTitle()
     {
         var selected = SelectedContext();
-        Text = selected is null ? "Tool TikTok Manager V13.5 — VM Optimized Multi Worker" : $"Tool TikTok Manager V13.5 — {selected.Profile.Name}";
+        Text = selected is null ? $"Tool TikTok Manager {AppVersionInfo.Display} — VM Optimized Multi Worker" : $"Tool TikTok Manager {AppVersionInfo.Display} — {selected.Profile.Name}";
         RefreshSelectedProfilePresentation();
     }
 
@@ -3666,7 +3718,9 @@ public sealed partial class ManagerForm : Form
     {
         if (_chromeMonitor is not null && !_chromeMonitor.IsDisposed)
         {
-            if (!_chromeMonitor.Visible) _chromeMonitor.Show(this);
+            // Deliberately show without an owner. An owned WinForms window is always kept
+            // above its owner, which prevented the Manager from covering the monitor.
+            if (!_chromeMonitor.Visible) _chromeMonitor.Show();
             if (_chromeMonitor.WindowState == FormWindowState.Minimized) _chromeMonitor.WindowState = FormWindowState.Normal;
             _chromeMonitor.BringToFront();
             _chromeMonitor.Activate();
@@ -3675,7 +3729,7 @@ public sealed partial class ManagerForm : Form
 
         _chromeMonitor = new ChromeMonitorForm(GetChromeMonitorProfiles, ActivateChromeFromMonitorAsync);
         _chromeMonitor.FormClosed += (_, _) => _chromeMonitor = null;
-        _chromeMonitor.Show(this);
+        _chromeMonitor.Show();
     }
 
     IReadOnlyList<ChromeMonitorProfileInfo> GetChromeMonitorProfiles()
@@ -3688,7 +3742,7 @@ public sealed partial class ManagerForm : Form
                 var snapshot = c.LastSnapshot;
                 return new ChromeMonitorProfileInfo(
                     c.Profile.Name,
-                    snapshot?.RunState ?? "STOPPED",
+                    GetEffectiveRuntimeState(c),
                     snapshot?.Chrome ?? "DISCONNECTED",
                     snapshot?.ChromeWindowHandle ?? 0,
                     snapshot?.Viewer ?? -1,
@@ -3704,29 +3758,9 @@ public sealed partial class ManagerForm : Form
     async Task ActivateChromeFromMonitorAsync(string profileName)
     {
         if (!_contexts.TryGetValue(profileName, out var ctx)) return;
-        try
-        {
-            if (ctx.Worker is null || ctx.Worker.HasExited)
-                await EnsureWorkerAsync(ctx);
-
-            try { await RefreshStatusAsync(ctx); } catch { }
-            var hwndValue = ctx.LastSnapshot?.ChromeWindowHandle ?? 0;
-            if (hwndValue <= 0)
-            {
-                await OpenChromeForProfileAsync(ctx);
-                await Task.Delay(300);
-                await RefreshStatusAsync(ctx);
-                hwndValue = ctx.LastSnapshot?.ChromeWindowHandle ?? 0;
-            }
-
-            if (hwndValue <= 0 || !ChromeMonitorWindowActions.RestoreMaximizeAndActivate(new IntPtr(hwndValue)))
-                throw new InvalidOperationException($"Không tìm thấy cửa sổ Chrome của profile “{profileName}” để phóng to.");
-        }
-        catch (Exception ex)
-        {
-            _log.Warn($"[CHROME_MONITOR_ACTIVATE] profile={profileName} failed={ex.Message}");
-            ShowError(ex);
-        }
+        // Dùng chung resolver của nút View. Không launch/restart Chrome chỉ vì
+        // snapshot của monitor chưa có HWND hoặc đang giữ handle cũ.
+        await ViewChromeForProfileAsync(ctx);
     }
 
     void ShowError(Exception ex)
@@ -3769,5 +3803,13 @@ public sealed partial class ManagerForm : Form
         public bool F5Enabled { get; set; }
         public int F5RemainingSec { get; set; } = -1;
         public string TikTokStartupState { get; set; } = "";
+    }
+
+    sealed class ChromeViewResolutionReply
+    {
+        public int CachedPid { get; set; }
+        public int ResolvedPid { get; set; }
+        public long WindowHandle { get; set; }
+        public string Reason { get; set; } = "";
     }
 }

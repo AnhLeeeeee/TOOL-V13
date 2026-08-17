@@ -4,11 +4,16 @@ using System.Text;
 namespace ToolTikTokV12.Utils;
 
 /// <summary>
-/// Logger Manager có giới hạn dung lượng để tránh thư mục logs phình trên VM.
-/// File đang ghi rotate ở 1 MB; toàn bộ log Manager tối đa 4 MB và tối đa 6 giờ.
+/// Logger Manager tối ưu cho VM.
+/// - Mỗi scope log chỉ giữ tối đa 500 dòng gần nhất trên ổ đĩa.
+/// - Chia log thành các segment tối đa 50 dòng để không phải rewrite file sau mỗi dòng mới.
+/// - Ghi theo buffer để giảm I/O đồng bộ.
+/// - Vẫn giữ cleanup theo tuổi/dung lượng làm lớp bảo vệ bổ sung.
 /// </summary>
 public sealed class Logger : IDisposable
 {
+    const int MaxSegmentLines = 50;
+    const int MaxSavedLines = 500;
     const long MaxActiveLogBytes = 1L * 1024 * 1024;
     const long MaxTotalLogBytes = 4L * 1024 * 1024;
     static readonly TimeSpan MaxLogAge = TimeSpan.FromHours(6);
@@ -25,6 +30,7 @@ public sealed class Logger : IDisposable
     FileStream? _writerStream;
     string _activePath = "";
     long _activeBytes;
+    int _activeLineCount;
     bool _disposed;
 
     public event Action<string>? LineWritten;
@@ -37,6 +43,7 @@ public sealed class Logger : IDisposable
         Directory.CreateDirectory(_dir);
 
         CleanupExpiredAndOversizeLogs(_logRoot);
+        TrimDirectoryToLatestLines(_dir, MaxSavedLines);
         _flushTimer = new System.Threading.Timer(_ => FlushBuffered(), null, BufferedFlushInterval, BufferedFlushInterval);
         ScheduleLogCleanup();
         AppDomain.CurrentDomain.ProcessExit += (_, _) => Dispose();
@@ -59,7 +66,7 @@ public sealed class Logger : IDisposable
             var path = Path.Combine(_dir, fileName);
             EnsureWriter(path);
 
-            if (_activeBytes + incomingBytes > MaxActiveLogBytes)
+            if (_activeLineCount >= MaxSegmentLines || _activeBytes + incomingBytes > MaxActiveLogBytes)
             {
                 RotateActive(path);
                 EnsureWriter(path);
@@ -67,6 +74,7 @@ public sealed class Logger : IDisposable
 
             _writer!.WriteLine(line);
             _activeBytes += incomingBytes;
+            _activeLineCount++;
             if (level.Equals("ERROR", StringComparison.OrdinalIgnoreCase))
                 _writer.Flush();
         }
@@ -79,6 +87,11 @@ public sealed class Logger : IDisposable
         if (_writer is not null && path.Equals(_activePath, StringComparison.OrdinalIgnoreCase)) return;
 
         CloseWriterNoThrow();
+
+        // Khi sang file/ngày mới, dành sẵn chỗ cho một segment mới để tổng log không vượt 500 dòng.
+        if (!File.Exists(path))
+            TrimDirectoryToLatestLines(_dir, MaxSavedLines - MaxSegmentLines);
+
         _writerStream = new FileStream(
             path,
             FileMode.Append,
@@ -87,6 +100,7 @@ public sealed class Logger : IDisposable
             16 * 1024,
             FileOptions.SequentialScan);
         _activeBytes = _writerStream.Length;
+        _activeLineCount = SafeCountLines(path);
         _writer = new StreamWriter(_writerStream, new UTF8Encoding(true), 16 * 1024, leaveOpen: false)
         {
             AutoFlush = false
@@ -106,11 +120,78 @@ public sealed class Logger : IDisposable
             var baseName = Path.GetFileNameWithoutExtension(activePath);
             var archive = Path.Combine(directory, $"{baseName}-{DateTime.Now:yyyyMMdd_HHmmss_fff}.log");
             File.Move(activePath, archive);
+
+            // Giữ tối đa 450 dòng cũ; segment đang bắt đầu có thể thêm tối đa 50 dòng.
+            TrimDirectoryToLatestLines(_dir, MaxSavedLines - MaxSegmentLines);
             CleanupExpiredAndOversizeLogs(_logRoot);
         }
         catch (FileNotFoundException) { }
         catch (IOException) { }
         catch (UnauthorizedAccessException) { }
+    }
+
+    static int SafeCountLines(string path)
+    {
+        try
+        {
+            if (!File.Exists(path)) return 0;
+            var count = 0;
+            foreach (var _ in File.ReadLines(path)) count++;
+            return count;
+        }
+        catch (IOException) { return 0; }
+        catch (UnauthorizedAccessException) { return 0; }
+    }
+
+    static void TrimDirectoryToLatestLines(string directory, int maxLines)
+    {
+        if (maxLines < 0 || !Directory.Exists(directory)) return;
+
+        List<FileInfo> files;
+        try
+        {
+            files = new DirectoryInfo(directory)
+                .GetFiles("*.log", SearchOption.TopDirectoryOnly)
+                .Where(f => (f.Attributes & FileAttributes.ReparsePoint) == 0)
+                .OrderByDescending(f => f.LastWriteTimeUtc)
+                .ThenByDescending(f => f.Name, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+        catch (IOException) { return; }
+        catch (UnauthorizedAccessException) { return; }
+
+        var remaining = maxLines;
+        foreach (var file in files)
+        {
+            string[] lines;
+            try { lines = File.ReadAllLines(file.FullName); }
+            catch (IOException) { continue; }
+            catch (UnauthorizedAccessException) { continue; }
+
+            if (remaining <= 0)
+            {
+                try { file.Delete(); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+                continue;
+            }
+
+            if (lines.Length <= remaining)
+            {
+                remaining -= lines.Length;
+                continue;
+            }
+
+            // File giao ranh chỉ giữ phần mới nhất cần thiết, các file cũ hơn sẽ bị xóa.
+            try
+            {
+                var kept = lines[^remaining..];
+                var temp = file.FullName + ".trim.tmp";
+                File.WriteAllLines(temp, kept, new UTF8Encoding(true));
+                File.Move(temp, file.FullName, true);
+                remaining = 0;
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
     }
 
     void FlushBuffered()
@@ -132,6 +213,7 @@ public sealed class Logger : IDisposable
         _writerStream = null;
         _activePath = "";
         _activeBytes = 0;
+        _activeLineCount = 0;
     }
 
     void ThrowIfDisposed()

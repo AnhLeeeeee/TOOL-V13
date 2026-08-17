@@ -1,6 +1,7 @@
 ﻿using System.Diagnostics;
 using System.Net.Http;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using ToolTikTokV11.Utils;
@@ -12,6 +13,7 @@ public sealed record CdpPage(string Id, string Title, string Url, string WebSock
 public sealed record DomBox(double X, double Y, double Width, double Height);
 public sealed record CdpVersionInfo(string Browser, string WebSocketDebuggerUrl);
 public sealed record ManagedChromeCloseResult(bool WasRunning, bool Closed, IReadOnlyList<int> RemainingPids, bool CdpReady, string Method);
+public sealed record ManagedChromeWindowResolution(int CachedPid, int ResolvedPid, long WindowHandle, string Reason);
 public sealed record TikTokStartupResult(string State, string Message, bool LoggedIn, bool LiveOpened);
 public sealed record TikTokRecommendedLiveCandidate(string Href, string Username, string ViewerText, string Label);
 public sealed record TikTokProfileIdentityUpdateResult(bool NameChanged, bool AvatarChanged, bool BioChanged, bool NameCooldown, bool AlreadyConfigured, bool Skipped, string Message);
@@ -305,7 +307,8 @@ public sealed class ChromeController : IAsyncDisposable
     {
         var normalized = Path.GetFullPath(profileDir);
         return FindChromeProcessesUsingProfile(normalized)
-            .Where(x => x.CommandLine.IndexOf($"--remote-debugging-port={port}", StringComparison.OrdinalIgnoreCase) >= 0)
+            .Where(x => CommandLineUsesProfile(x.CommandLine, normalized)
+                && CommandLineUsesRemoteDebuggingPort(x.CommandLine, port))
             .Select(x => x.ProcessId)
             .Distinct()
             .ToList();
@@ -332,12 +335,31 @@ public sealed class ChromeController : IAsyncDisposable
         var sw = Stopwatch.StartNew();
         _managedProfileDir = Path.GetFullPath(profileDir);
         _managedWindowPort = port;
-        if (_managedPids.Count == 0)
-            foreach (var pid in FindChromeProcessIds(_managedProfileDir, port))
-                _managedPids.Add(pid);
+        var listenerPid = TryGetListeningProcessId(port);
+        var processCacheChanged = false;
+        if (listenerPid is > 0)
+        {
+            if (_managedPids.Count != 1 || !_managedPids.Contains(listenerPid.Value))
+            {
+                _managedPids.Clear();
+                _managedPids.Add(listenerPid.Value);
+                processCacheChanged = true;
+            }
+        }
+        else if (_managedPids.Count == 0 || !_managedPids.Any(IsProcessRunning))
+        {
+            var refreshedPids = FindChromeProcessIds(_managedProfileDir, port);
+            _managedPids.Clear();
+            foreach (var pid in refreshedPids) _managedPids.Add(pid);
+            processCacheChanged = true;
+        }
+
+        if (processCacheChanged) _managedWindowHandle = IntPtr.Zero;
         if (!IsLiveWindowHandle(_managedWindowHandle))
             _managedWindowHandle = DiscoverManagedWindowHandle();
         sw.Stop();
+        if (processCacheChanged)
+            _log.Info($"[CHROME_WINDOW_CACHE_REFRESH] port={port} listenerPid={(listenerPid?.ToString() ?? "-")} pids={string.Join(',', _managedPids)} hwnd={GetManagedWindowHandleValue()}");
         _log.Info($"[PERF] Chrome window discovery: {sw.ElapsedMilliseconds} ms");
     }
 
@@ -618,6 +640,14 @@ public sealed class ChromeController : IAsyncDisposable
             : match.Groups["bare"].Value;
         try { return !string.IsNullOrWhiteSpace(raw) && NormalizeProfilePath(raw).Equals(target, StringComparison.OrdinalIgnoreCase); }
         catch { return false; }
+    }
+
+    static bool CommandLineUsesRemoteDebuggingPort(string commandLine, int port)
+    {
+        var match = Regex.Match(commandLine ?? "", "--remote-debugging-port(?:=|\\s+)(?<port>\\d+)", RegexOptions.IgnoreCase);
+        return match.Success
+            && int.TryParse(match.Groups["port"].Value, out var parsed)
+            && parsed == port;
     }
 
     static string NormalizeProfilePath(string profileDir)
@@ -943,7 +973,7 @@ public sealed class ChromeController : IAsyncDisposable
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
         if (displayName.Length > 0 && !knownNames.Contains(displayName, StringComparer.OrdinalIgnoreCase)) knownNames.Add(displayName);
-        _log.Info($"[TIKTOK_IDENTITY_UPDATE_START] name={(displayName.Length > 0 ? "yes" : "no")} avatar={(avatarPath.Length > 0 ? Path.GetFileName(avatarPath) : "no")} bio={(bio.Length > 0 ? "yes" : "no")} cooldownCheck=disabled verifyExisting={verifyExistingState} knownNames={knownNames.Count}");
+        _log.Info($"[TIKTOK_IDENTITY_UPDATE_START] name={(displayName.Length > 0 ? "yes" : "no")} avatar={(avatarPath.Length > 0 ? Path.GetFileName(avatarPath) : "no")} bio={(bio.Length > 0 ? "yes" : "no")} cooldownCheck={skipAllIfNameCooldown} verifyExisting={verifyExistingState} knownNames={knownNames.Count}");
 
         async Task<JsonElement> Eval(string js) => await EvalAsync(js, ct: ct);
         static bool IsTrue(JsonElement result)
@@ -1036,6 +1066,163 @@ public sealed class ChromeController : IAsyncDisposable
             await NavigateAndWaitAsync(profileHref, 900, 18000, ct);
         }
 
+        // 1.5) Với Auto Identity, xác nhận trạng thái ngay trên TRANG HỒ SƠ trước.
+        // Mục tiêu: tài khoản đã được đổi tên/ảnh từ lần trước nhưng Excel chưa có DONE
+        // thì chỉ đọc DOM profile page, ghi DONE rồi quay lại trang ban đầu; KHÔNG mở
+        // popup "Sửa hồ sơ" chỉ để kiểm tra. Nếu dữ liệu trên profile page không đủ chắc
+        // chắn hoặc chưa khớp, luồng mới tiếp tục xuống bước Edit profile để cập nhật thật.
+        if (verifyExistingState)
+        {
+            try
+            {
+                var profileSnapshotJson = ReadString(await Eval($$"""
+(() => {
+  const wantedHandle = {{JsString(directHandle)}}.toLowerCase();
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+  const normLower = s => norm(s).toLowerCase();
+  const visible = el => {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    return r.width > 2 && r.height > 2 && cs.display !== 'none' && cs.visibility !== 'hidden';
+  };
+
+  const firstText = selectors => {
+    for (const selector of selectors) {
+      const el = document.querySelector(selector);
+      if (!visible(el)) continue;
+      const text = norm(el.innerText || el.textContent || '');
+      if (text) return text;
+    }
+    return '';
+  };
+
+  // TikTok thường đặt nickname ở user-subtitle. Có thêm fallback heading nhưng
+  // loại @username/handle để không nhầm TikTok ID thành tên hiển thị.
+  let currentName = firstText([
+    '[data-e2e="user-subtitle"]',
+    '[data-e2e="user-nickname"]',
+    '[data-e2e="profile-nickname"]',
+    '[data-e2e*="nickname"]'
+  ]);
+  if (!currentName) {
+    const headings = [...document.querySelectorAll('main h1, main h2, h1[data-e2e*="user"], h2[data-e2e*="user"]')]
+      .filter(visible)
+      .map(el => norm(el.innerText || el.textContent || ''))
+      .filter(t => t && t.length <= 100)
+      .filter(t => {
+        const low = t.toLowerCase().replace(/^@/, '');
+        return !wantedHandle || (low !== wantedHandle && low !== '@' + wantedHandle);
+      });
+    currentName = headings[0] || '';
+  }
+
+  let currentBio = firstText([
+    '[data-e2e="user-bio"]',
+    '[data-e2e="profile-bio"]',
+    '[data-e2e*="bio"]'
+  ]);
+
+  const avatarCandidates = [
+    document.querySelector('img[data-e2e="user-avatar"]'),
+    document.querySelector('[data-e2e="user-avatar"] img'),
+    document.querySelector('[data-e2e*="avatar"] img'),
+    ...document.querySelectorAll('main img')
+  ].filter((el, i, arr) => el && arr.indexOf(el) === i && visible(el));
+
+  let avatar = null;
+  for (const img of avatarCandidates) {
+    const r = img.getBoundingClientRect();
+    if (r.width < 42 || r.height < 42) continue;
+    const meta = normLower(`${img.currentSrc || img.src || ''} ${img.alt || ''} ${img.getAttribute('data-e2e') || ''}`);
+    const explicitAvatar = !!img.closest?.('[data-e2e*="avatar"]') || /avatar|profile photo|ảnh đại diện|ảnh hồ sơ/.test(meta);
+    const looksLikeHeaderAvatar = r.width <= 180 && r.height <= 180
+      && Math.abs(r.width - r.height) <= Math.max(12, Math.min(r.width, r.height) * 0.22)
+      && r.top >= 0 && r.top < 520;
+    if (!explicitAvatar && !looksLikeHeaderAvatar) continue;
+    let score = Math.min(r.width, r.height);
+    if (explicitAvatar) score += 500;
+    if (looksLikeHeaderAvatar) score += 100;
+    if (!avatar || score > avatar.score) avatar = { el: img, score };
+  }
+
+  const avatarSrc = avatar ? String(avatar.el.currentSrc || avatar.el.src || '') : '';
+  const avatarMeta = normLower(`${avatarSrc} ${avatar?.el?.alt || ''} ${avatar?.el?.getAttribute?.('data-e2e') || ''}`);
+  const avatarLooksDefault = !avatarSrc
+    || /default[-_ ]?avatar|avatar[-_ ]?default|default[-_ ]?profile|placeholder|no[-_ ]?avatar|anonymous|user[-_ ]?default/.test(avatarMeta)
+    || avatarSrc.startsWith('data:image/svg+xml');
+
+  return JSON.stringify({
+    currentName,
+    currentBio,
+    nameFound: !!currentName,
+    bioFound: !!currentBio,
+    avatarSrc,
+    avatarFound: !!avatarSrc,
+    avatarLooksDefault
+  });
+})()
+"""));
+
+                using var profileDoc = JsonDocument.Parse(string.IsNullOrWhiteSpace(profileSnapshotJson) ? "{}" : profileSnapshotJson);
+                var profileRoot = profileDoc.RootElement;
+                var currentProfileName = profileRoot.TryGetProperty("currentName", out var pn) ? (pn.GetString() ?? "") : "";
+                var currentProfileBio = profileRoot.TryGetProperty("currentBio", out var pb) ? (pb.GetString() ?? "") : "";
+                var profileNameFound = profileRoot.TryGetProperty("nameFound", out var pnf) && pnf.ValueKind == JsonValueKind.True;
+                var profileBioFound = profileRoot.TryGetProperty("bioFound", out var pbf) && pbf.ValueKind == JsonValueKind.True;
+                var profileAvatarFound = profileRoot.TryGetProperty("avatarFound", out var paf) && paf.ValueKind == JsonValueKind.True;
+                var profileAvatarDefault = profileRoot.TryGetProperty("avatarLooksDefault", out var pad) && pad.ValueKind == JsonValueKind.True;
+
+                static string NormProfileText(string value) => Regex.Replace((value ?? "").Trim(), @"\s+", " ");
+                var profileNameOk = displayName.Length == 0
+                    || (profileNameFound && knownNames.Any(x => string.Equals(NormProfileText(x), NormProfileText(currentProfileName), StringComparison.OrdinalIgnoreCase)));
+                var profileAvatarOk = avatarPath.Length == 0 || (profileAvatarFound && !profileAvatarDefault);
+                var profileBioOk = bio.Length == 0
+                    || (profileBioFound && string.Equals(NormProfileText(currentProfileBio), NormProfileText(bio), StringComparison.Ordinal));
+                var hasProfileCheck = displayName.Length > 0 || avatarPath.Length > 0 || bio.Length > 0;
+
+                _log.Info($"[TIKTOK_IDENTITY_PROFILE_CHECK] currentName={currentProfileName} nameFound={profileNameFound} nameOk={profileNameOk} avatarFound={profileAvatarFound} avatarDefault={profileAvatarDefault} avatarOk={profileAvatarOk} bioFound={profileBioFound} bioOk={profileBioOk}");
+
+                // Auto Identity V13.5: TÊN là điều kiện xác nhận chính.
+                // Chỉ cần tên đang hiển thị trùng một tên trong danh sách cấu hình thì coi như
+                // tài khoản đã được setup, ghi DONE và tuyệt đối không mở form Sửa hồ sơ nữa.
+                // Ảnh/tiểu sử không còn được dùng để chặn fast-path này theo yêu cầu vận hành.
+                var skipByMatchedName = displayName.Length > 0 && profileNameOk;
+
+                // Nếu người dùng tắt cập nhật tên hoàn toàn thì vẫn giữ cách xác nhận cũ cho
+                // riêng ảnh/tiểu sử, để không làm mất chức năng của cấu hình avatar/bio-only.
+                var skipByOtherConfiguredState = displayName.Length == 0
+                    && hasProfileCheck && profileAvatarOk && profileBioOk;
+
+                if (skipByMatchedName || skipByOtherConfiguredState)
+                {
+                    try
+                    {
+                        if (!string.IsNullOrWhiteSpace(originalUrl)
+                            && originalUrl.StartsWith("https://www.tiktok.com/", StringComparison.OrdinalIgnoreCase))
+                            await NavigateAndWaitAsync(originalUrl, 700, 12000, ct);
+                    }
+                    catch { }
+                    if (skipByMatchedName)
+                        _log.Info($"[TIKTOK_IDENTITY_NAME_ALREADY_MATCHED] currentName={currentProfileName}; trùng danh sách tên cấu hình, bỏ qua toàn bộ Sửa hồ sơ và cho phép Manager ghi DONE.");
+                    else
+                        _log.Info("[TIKTOK_IDENTITY_PROFILE_ALREADY_CONFIGURED] profile page đã đủ điều kiện; không mở Edit profile, cho phép Manager ghi DONE.");
+
+                    return new TikTokProfileIdentityUpdateResult(
+                        false, false, false, false, true, true,
+                        skipByMatchedName
+                            ? $"Tên TikTok hiện tại đã trùng danh sách cấu hình ({currentProfileName}). Bỏ qua Sửa hồ sơ; ghi DONE vào Excel."
+                            : "Đã thiết lập sẵn trên TikTok. Tool xác nhận trực tiếp từ trang hồ sơ, không mở Sửa hồ sơ; ghi DONE vào Excel.");
+                }
+            }
+            catch (Exception ex)
+            {
+                // Đây chỉ là fast-path không xâm lấn. Nếu TikTok đổi DOM hoặc dữ liệu
+                // profile page không đọc chắc chắn được, tiếp tục dùng Edit profile như cũ.
+                _log.Warn("[TIKTOK_IDENTITY_PROFILE_CHECK_FAILED] " + ex.Message);
+            }
+        }
+
         // 2) Mở Edit profile / Chỉnh sửa hồ sơ.
         async Task<bool> TryClickEditProfileAsync(int timeoutMs = 10000)
             => await WaitBoolAsync("""
@@ -1082,13 +1269,58 @@ public sealed class ChromeController : IAsyncDisposable
 """, 12000, 300);
         if (!editorReady) throw new InvalidOperationException("Đã bấm Chỉnh sửa hồ sơ nhưng không thấy form chỉnh sửa TikTok.");
 
+        // Điều kiện bỏ qua thứ hai: TikTok đang hiện lịch khóa đổi biệt danh.
+        // Chỉ cần có câu "Bạn có thể tiếp tục thay đổi biệt danh sau ..." (hoặc bản tiếng Anh)
+        // thì KHÔNG chạm vào bất kỳ ô Tên/Ảnh/Tiểu sử nào. Trả NameCooldown để Manager
+        // bỏ qua profile trong phiên hiện tại nhưng KHÔNG ghi DONE vào Excel.
+        if (verifyExistingState && skipAllIfNameCooldown)
+        {
+            var hasNicknameCooldownHint = false;
+            try
+            {
+                hasNicknameCooldownHint = IsTrue(await Eval("""
+(() => {
+  const fold = s => (s || '')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/đ/g, 'd').replace(/Đ/g, 'D')
+    .replace(/\s+/g, ' ').trim().toLowerCase();
+  const dialogs = [...document.querySelectorAll('[role="dialog"],div[aria-modal="true"]')];
+  const scope = dialogs.at(-1) || document;
+  const text = fold(scope.innerText || scope.textContent || '');
+  return text.includes('ban co the tiep tuc thay doi biet danh sau')
+      || text.includes('you can continue to change your nickname after')
+      || text.includes('you can change your nickname again after');
+})()
+"""));
+            }
+            catch (Exception ex)
+            {
+                _log.Warn("[TIKTOK_IDENTITY_COOLDOWN_HINT_CHECK_FAILED] " + ex.Message);
+            }
+
+            if (hasNicknameCooldownHint)
+            {
+                try
+                {
+                    if (!string.IsNullOrWhiteSpace(originalUrl)
+                        && originalUrl.StartsWith("https://www.tiktok.com/", StringComparison.OrdinalIgnoreCase))
+                        await NavigateAndWaitAsync(originalUrl, 700, 12000, ct);
+                }
+                catch { }
+
+                _log.Info("[TIKTOK_IDENTITY_SKIP_NICKNAME_COOLDOWN_HINT] phát hiện 'Bạn có thể tiếp tục thay đổi biệt danh sau ...'; bỏ qua toàn bộ Sửa hồ sơ trong phiên này, không ghi DONE.");
+                return new TikTokProfileIdentityUpdateResult(
+                    false, false, false, true, false, true,
+                    "TikTok đang khóa thời gian đổi biệt danh (Bạn có thể tiếp tục thay đổi biệt danh sau ...). Bỏ qua Sửa hồ sơ trong phiên hiện tại; không ghi DONE.");
+            }
+        }
+
         var nameChanged = false;
         var avatarChanged = false;
         var bioChanged = false;
 
-        // Không tự xác minh/đoán hạn đổi biệt danh 7 ngày.
-        // DONE Excel và bước xác nhận trạng thái đã thiết lập sẵn vẫn được giữ nguyên.
-        // Nếu TikTok thực tế không cho đổi tên, luồng sẽ dựa trên kết quả thao tác/Lưu thực tế.
+        // Không đoán ngày cooldown. Chỉ nhận diện câu thông báo cooldown thực tế trong DOM
+        // ở bước phía trên; nếu không có câu đó thì tiếp tục kiểm tra/cập nhật như bình thường.
 
         // XÁC NHẬN TRẠNG THÁI THỰC TẾ TRƯỚC KHI ĐỔI. Chỉ dùng cho Auto Identity.
         // Đây là lớp bảo vệ DONE Excel: nếu trạng thái TikTok đã phù hợp thì không đổi lại và cho phép ghi DONE.
@@ -1858,26 +2090,35 @@ public sealed class ChromeController : IAsyncDisposable
         string password,
         string totpSecret,
         bool autoLogin = true,
+        bool openLiveWhenReady = true,
         CancellationToken ct = default)
     {
         const string loginUrl = "https://www.tiktok.com/login/phone-or-email/email";
 
-        // Every managed profile opens at TikTok LIVE by default. Session-cookie
+        // Authentication and LIVE navigation are deliberately separable. Opening a
+        // profile runs the normal auto-login flow but stays on TikTok home; pressing
+        // Bắt đầu runs the same authentication gate and then opens LIVE. Session-cookie
         // detection is done through CDP so HttpOnly cookies are included.
         try
         {
             if (await HasTikTokSessionCookieAsync(ct))
             {
-                await OpenTikTokLiveReadyAsync(ct);
-                return new TikTokStartupResult("READY", "Đã đăng nhập; đã mở TikTok LIVE và xử lý màn 'Nhấp để xem LIVE' nếu có.", true, true);
+                return await FinalizeTikTokAuthenticatedAsync(
+                    openLiveWhenReady,
+                    "Đã đăng nhập; đã mở TikTok LIVE và xử lý màn 'Nhấp để xem LIVE' nếu có.",
+                    "Đã đăng nhập; giữ TikTok ở trang chủ, chưa vào LIVE.",
+                    ct);
             }
         }
         catch (Exception ex) when (IsTransientDocumentContextError(ex)) { }
 
         if (!autoLogin || string.IsNullOrWhiteSpace(username) || string.IsNullOrEmpty(password))
         {
-            await OpenTikTokLiveReadyAsync(ct);
-            return new TikTokStartupResult("LOGIN_REQUIRED", "Profile chưa có phiên đăng nhập hoặc chưa lưu tài khoản/mật khẩu.", false, true);
+            if (openLiveWhenReady)
+                await OpenTikTokLiveReadyAsync(ct);
+            else
+                await OpenTikTokHomeReadyAsync(ct);
+            return new TikTokStartupResult("LOGIN_REQUIRED", "Profile chưa có phiên đăng nhập hoặc chưa lưu tài khoản/mật khẩu.", false, openLiveWhenReady);
         }
 
         _log.Info("[TIKTOK_LOGIN_START] auto=true usernameConfigured=true totpConfigured=" + (!string.IsNullOrWhiteSpace(totpSecret)));
@@ -1898,8 +2139,11 @@ public sealed class ChromeController : IAsyncDisposable
                 // navigate away here: keep the current TikTok authentication state.
                 if (await HasTikTokSessionCookieAsync(ct))
                 {
-                    await OpenTikTokLiveReadyAsync(ct);
-                    return new TikTokStartupResult("READY", "CAPTCHA đã xử lý; TikTok đã đăng nhập và LIVE đã mở.", true, true);
+                    return await FinalizeTikTokAuthenticatedAsync(
+                        openLiveWhenReady,
+                        "CAPTCHA đã xử lý; TikTok đã đăng nhập và LIVE đã mở.",
+                        "CAPTCHA đã xử lý; TikTok đã đăng nhập và đã về trang chủ.",
+                        ct);
                 }
 
                 if (await DetectTotpChallengeAsync(ct))
@@ -1908,7 +2152,7 @@ public sealed class ChromeController : IAsyncDisposable
                         return new TikTokStartupResult("TOTP_REQUIRED", "TikTok yêu cầu mã 2FA nhưng profile chưa lưu secret TOTP.", false, false);
 
                     await FillAndSubmitTotpAsync(totpSecret, ct);
-                    var afterTotp = await WaitForTikTokLoginCompletionAsync(totpSecret, TimeSpan.FromSeconds(45), ct);
+                    var afterTotp = await WaitForTikTokLoginCompletionAsync(totpSecret, TimeSpan.FromSeconds(45), openLiveWhenReady, ct);
                     if (afterTotp is not null) return afterTotp;
                 }
 
@@ -1919,8 +2163,11 @@ public sealed class ChromeController : IAsyncDisposable
             {
                 if (await HasTikTokSessionCookieAsync(ct))
                 {
-                    await OpenTikTokLiveReadyAsync(ct);
-                    return new TikTokStartupResult("READY", "TikTok đã có phiên đăng nhập; đã mở LIVE.", true, true);
+                    return await FinalizeTikTokAuthenticatedAsync(
+                        openLiveWhenReady,
+                        "TikTok đã có phiên đăng nhập; đã mở LIVE.",
+                        "TikTok đã có phiên đăng nhập; đã về trang chủ.",
+                        ct);
                 }
                 return new TikTokStartupResult("LOGIN_FORM_NOT_FOUND", "Không tìm thấy form đăng nhập TikTok sau khi chờ CAPTCHA/trang tải xong.", false, false);
             }
@@ -1930,20 +2177,26 @@ public sealed class ChromeController : IAsyncDisposable
         // finish quickly during redirects. Re-check here before touching the form.
         if (await HasTikTokSessionCookieAsync(ct))
         {
-            await OpenTikTokLiveReadyAsync(ct);
-            return new TikTokStartupResult("READY", "TikTok đã đăng nhập trong lúc chờ; đã mở LIVE.", true, true);
+            return await FinalizeTikTokAuthenticatedAsync(
+                openLiveWhenReady,
+                "TikTok đã đăng nhập trong lúc chờ; đã mở LIVE.",
+                "TikTok đã đăng nhập trong lúc chờ; đã về trang chủ.",
+                ct);
         }
 
         await FillTikTokLoginFormAsync(username, password, ct);
         await ClickTikTokLoginSubmitAsync(ct);
 
-        var completion = await WaitForTikTokLoginCompletionAsync(totpSecret, TimeSpan.FromSeconds(45), ct);
+        var completion = await WaitForTikTokLoginCompletionAsync(totpSecret, TimeSpan.FromSeconds(45), openLiveWhenReady, ct);
         if (completion is not null) return completion;
 
         if (await HasTikTokSessionCookieAsync(ct))
         {
-            await OpenTikTokLiveReadyAsync(ct);
-            return new TikTokStartupResult("READY", "Đăng nhập thành công; đã mở TikTok LIVE.", true, true);
+            return await FinalizeTikTokAuthenticatedAsync(
+                openLiveWhenReady,
+                "Đăng nhập thành công; đã mở TikTok LIVE.",
+                "Đăng nhập thành công; đã về trang chủ TikTok, chưa vào LIVE.",
+                ct);
         }
 
         return new TikTokStartupResult("LOGIN_FAILED", "Đăng nhập TikTok chưa thành công sau thời gian chờ.", false, false);
@@ -1952,6 +2205,7 @@ public sealed class ChromeController : IAsyncDisposable
     async Task<TikTokStartupResult?> WaitForTikTokLoginCompletionAsync(
         string totpSecret,
         TimeSpan activeLoginTimeout,
+        bool openLiveWhenReady,
         CancellationToken ct)
     {
         var loginDeadline = DateTime.UtcNow + activeLoginTimeout;
@@ -1964,8 +2218,11 @@ public sealed class ChromeController : IAsyncDisposable
             if (await HasTikTokSessionCookieAsync(ct))
             {
                 _log.Info("[TIKTOK_LOGIN_OK] sessionCookie=true");
-                await OpenTikTokLiveReadyAsync(ct);
-                return new TikTokStartupResult("READY", "Đăng nhập thành công; đã mở TikTok LIVE và xử lý màn 'Nhấp để xem LIVE' nếu có.", true, true);
+                return await FinalizeTikTokAuthenticatedAsync(
+                    openLiveWhenReady,
+                    "Đăng nhập thành công; đã mở TikTok LIVE và xử lý màn 'Nhấp để xem LIVE' nếu có.",
+                    "Đăng nhập thành công; đã về trang chủ TikTok, chưa vào LIVE.",
+                    ct);
             }
 
             if (await DetectCaptchaAsync(ct))
@@ -2004,6 +2261,28 @@ public sealed class ChromeController : IAsyncDisposable
         }
 
         return null;
+    }
+
+    async Task<TikTokStartupResult> FinalizeTikTokAuthenticatedAsync(
+        bool openLiveWhenReady,
+        string liveMessage,
+        string homeMessage,
+        CancellationToken ct)
+    {
+        if (openLiveWhenReady)
+        {
+            await OpenTikTokLiveReadyAsync(ct);
+            return new TikTokStartupResult("READY", liveMessage, true, true);
+        }
+
+        await OpenTikTokHomeReadyAsync(ct);
+        return new TikTokStartupResult("READY", homeMessage, true, false);
+    }
+
+    async Task OpenTikTokHomeReadyAsync(CancellationToken ct)
+    {
+        await NavigateAndWaitAsync(TikTokUrl, 700, 15000, ct);
+        _log.Info("[TIKTOK_HOME_READY] authenticated=true liveNavigation=false");
     }
 
     async Task<bool> WaitForCaptchaResolutionAsync(TimeSpan timeout, CancellationToken ct)
@@ -2160,6 +2439,9 @@ public sealed class ChromeController : IAsyncDisposable
 """, ct: ct);
         return r.TryGetProperty("value", out var v) ? v.GetString() ?? "" : "";
     }
+
+    public Task<bool> IsTikTokSessionActiveAsync(CancellationToken ct = default)
+        => HasTikTokSessionCookieAsync(ct);
 
     async Task<bool> HasTikTokSessionCookieAsync(CancellationToken ct)
     {
@@ -3016,12 +3298,9 @@ public sealed class ChromeController : IAsyncDisposable
         // PID cache cũ có thể không còn chứa PID sở hữu top-level window.
         // Chỉ refresh danh sách PID khi người dùng thực sự bấm View.
         var refreshedPids = FindChromeProcessIds(normalized, port);
-        if (refreshedPids.Count > 0)
-        {
-            _managedPids.Clear();
-            foreach (var pid in refreshedPids)
-                _managedPids.Add(pid);
-        }
+        _managedPids.Clear();
+        foreach (var pid in refreshedPids)
+            _managedPids.Add(pid);
 
         _managedWindowHandle = DiscoverManagedWindowHandle();
         var value = IsLiveWindowHandle(_managedWindowHandle)
@@ -3030,6 +3309,122 @@ public sealed class ChromeController : IAsyncDisposable
 
         _log.Info($"[CHROME_VIEW_HANDLE_REFRESH] port={port} pids={_managedPids.Count} hwnd={value}");
         return value;
+    }
+
+    /// <summary>
+    /// Resolve lại Chrome đúng profile theo ownership của CDP port và
+    /// --user-data-dir. Cache PID/HWND cũ luôn bị thay thế, kể cả khi lần dò mới
+    /// không có kết quả, để không giữ PID của Chrome trước khi restart/recover.
+    /// </summary>
+    public async Task<ManagedChromeWindowResolution> ResolveManagedWindowAsync(
+        string profileDir,
+        int port,
+        int windowAttempts = 8,
+        int retryDelayMs = 250)
+    {
+        if (string.IsNullOrWhiteSpace(profileDir))
+            return new ManagedChromeWindowResolution(0, 0, 0, "profile_path_missing");
+
+        var normalized = NormalizeProfilePath(profileDir);
+        var cachedPid = GetCachedManagedProcessId();
+        _managedProfileDir = normalized;
+        _managedWindowPort = port;
+
+        var resolvedPids = new List<int>();
+        var reason = "matching_process_not_found";
+        var listenerPid = TryGetListeningProcessId(port);
+        if (listenerPid is > 0)
+        {
+            var listenerOwner = await InspectExistingChromeProcessAsync(listenerPid.Value, normalized);
+            if (listenerOwner is not null
+                && CommandLineUsesRemoteDebuggingPort(listenerOwner.CommandLine, port))
+            {
+                resolvedPids.Add(listenerOwner.ProcessId);
+                reason = "cdp_listener+profile_path";
+            }
+            else
+            {
+                reason = "cdp_listener_profile_mismatch";
+            }
+        }
+
+        if (resolvedPids.Count == 0)
+        {
+            var owners = await FindChromeProcessesUsingProfileAsync(normalized, TimeSpan.FromSeconds(3));
+            resolvedPids.AddRange(owners
+                .Where(owner => CommandLineUsesProfile(owner.CommandLine, normalized)
+                    && CommandLineUsesRemoteDebuggingPort(owner.CommandLine, port))
+                .Select(owner => owner.ProcessId)
+                .Distinct());
+            if (resolvedPids.Count > 0) reason = "command_line_profile+cdp_port";
+        }
+
+        // Một số máy khách chặn CIM/đọc CommandLine. Khi đó vẫn chỉ chấp nhận
+        // đúng PID đang listen CDP port mà Worker hiện đang CONNECTED tới; không
+        // bao giờ rơi xuống chọn đại một chrome.exe.
+        if (resolvedPids.Count == 0
+            && listenerPid is > 0
+            && Connected
+            && IsChromeProcess(listenerPid.Value))
+        {
+            resolvedPids.Add(listenerPid.Value);
+            reason = "connected_cdp_listener;profile_query_unavailable";
+        }
+
+        _managedPids.Clear();
+        foreach (var pid in resolvedPids) _managedPids.Add(pid);
+        _managedWindowHandle = IntPtr.Zero;
+
+        if (_managedPids.Count == 0)
+            return new ManagedChromeWindowResolution(cachedPid, 0, 0, reason);
+
+        windowAttempts = Math.Clamp(windowAttempts, 1, 10);
+        retryDelayMs = Math.Clamp(retryDelayMs, 200, 300);
+        for (var attempt = 1; attempt <= windowAttempts; attempt++)
+        {
+            _managedWindowHandle = DiscoverManagedWindowHandle(out var resolvedPid);
+            if (IsLiveWindowHandle(_managedWindowHandle))
+            {
+                var result = new ManagedChromeWindowResolution(
+                    cachedPid,
+                    resolvedPid,
+                    _managedWindowHandle.ToInt64(),
+                    $"{reason};attempt={attempt}/{windowAttempts}");
+                _log.Info($"[CHROME_VIEW_RESOLVE] port={port} cachedPid={result.CachedPid} resolvedPid={result.ResolvedPid} hwnd={result.WindowHandle} reason={result.Reason}");
+                return result;
+            }
+
+            if (attempt < windowAttempts) await Task.Delay(retryDelayMs);
+        }
+
+        var failed = new ManagedChromeWindowResolution(
+            cachedPid,
+            resolvedPids.FirstOrDefault(),
+            0,
+            $"window_not_found;source={reason};attempts={windowAttempts}");
+        _log.Warn($"[CHROME_VIEW_RESOLVE] port={port} cachedPid={failed.CachedPid} resolvedPid={failed.ResolvedPid} hwnd=0 reason={failed.Reason}");
+        return failed;
+    }
+
+    int GetCachedManagedProcessId()
+    {
+        if (IsLiveWindowHandle(_managedWindowHandle))
+        {
+            GetWindowThreadProcessId(_managedWindowHandle, out var windowPid);
+            if (windowPid > 0) return (int)windowPid;
+        }
+
+        return _managedPids.FirstOrDefault();
+    }
+
+    static bool IsChromeProcess(int pid)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(pid);
+            return process.ProcessName.Equals("chrome", StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
     }
 
     public ChromeWindowState GetManagedWindowState(string profileDir, int port)
@@ -3062,20 +3457,45 @@ public sealed class ChromeController : IAsyncDisposable
     }
 
     IntPtr DiscoverManagedWindowHandle()
+        => DiscoverManagedWindowHandle(out _);
+
+    IntPtr DiscoverManagedWindowHandle(out int resolvedPid)
     {
+        resolvedPid = 0;
         if (_managedPids.Count == 0) return IntPtr.Zero;
-        IntPtr found = IntPtr.Zero;
+
+        IntPtr best = IntPtr.Zero;
+        var bestPid = 0;
+        var bestScore = int.MinValue;
         EnumWindows((hwnd, _) =>
         {
-            if (found != IntPtr.Zero) return false;
             if (GetWindow(hwnd, GW_OWNER) != IntPtr.Zero) return true;
             GetWindowThreadProcessId(hwnd, out var pid);
             if (pid == 0 || !_managedPids.Contains((int)pid)) return true;
-            if (!IsWindowVisible(hwnd) && !IsIconic(hwnd)) return true;
-            found = hwnd;
-            return false;
+
+            var classNameBuffer = new StringBuilder(128);
+            GetClassName(hwnd, classNameBuffer, classNameBuffer.Capacity);
+            var isChromeBrowserWindow = classNameBuffer.ToString().Equals("Chrome_WidgetWin_1", StringComparison.OrdinalIgnoreCase);
+            var isVisible = IsWindowVisible(hwnd);
+            var isMinimized = IsIconic(hwnd);
+            var hasTitle = GetWindowTextLength(hwnd) > 0;
+
+            // Hidden Chrome browser windows must remain eligible. Ignore only
+            // unrelated hidden helper/message windows owned by the same PID.
+            if (!isChromeBrowserWindow && !isVisible && !isMinimized && !hasTitle) return true;
+
+            var score = (isChromeBrowserWindow ? 100 : 0)
+                + (isVisible ? 20 : 0)
+                + (isMinimized ? 10 : 0)
+                + (hasTitle ? 5 : 0);
+            if (score <= bestScore) return true;
+            best = hwnd;
+            bestPid = (int)pid;
+            bestScore = score;
+            return true;
         }, IntPtr.Zero);
-        return found;
+        resolvedPid = bestPid;
+        return best;
     }
 
     public async ValueTask DisposeAsync()
@@ -3098,4 +3518,6 @@ public sealed class ChromeController : IAsyncDisposable
     [DllImport("user32.dll")] static extern bool IsIconic(IntPtr hWnd);
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
     [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowTextLength(IntPtr hWnd);
 }

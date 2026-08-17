@@ -1,3 +1,4 @@
+﻿using ToolTikTokV12.Utils;
 using System.Runtime.InteropServices;
 using System.Drawing.Drawing2D;
 using ToolTikTokV12.Controls;
@@ -18,20 +19,34 @@ internal sealed record ChromeMonitorProfileInfo(
 
 internal static class ChromeMonitorWindowActions
 {
+    const int SW_SHOW = 5;
     const int SW_RESTORE = 9;
     const int SW_MAXIMIZE = 3;
 
     [DllImport("user32.dll")] static extern bool IsWindow(IntPtr hWnd);
     [DllImport("user32.dll")] static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr hWnd);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    public static bool IsValid(IntPtr hwnd) => hwnd != IntPtr.Zero && IsWindow(hwnd);
+
+    public static int GetProcessId(IntPtr hwnd)
+    {
+        if (!IsValid(hwnd)) return 0;
+        GetWindowThreadProcessId(hwnd, out var processId);
+        return processId <= int.MaxValue ? (int)processId : 0;
+    }
 
     public static bool RestoreMaximizeAndActivate(IntPtr hwnd)
     {
-        if (hwnd == IntPtr.Zero || !IsWindow(hwnd)) return false;
+        if (!IsValid(hwnd)) return false;
         ShowWindowAsync(hwnd, SW_RESTORE);
+        ShowWindowAsync(hwnd, SW_SHOW);
         ShowWindowAsync(hwnd, SW_MAXIMIZE);
+        BringWindowToTop(hwnd);
         SetForegroundWindow(hwnd);
-        return true;
+        return IsValid(hwnd);
     }
 }
 
@@ -76,11 +91,13 @@ internal sealed class ChromeMonitorForm : Form
         _getProfiles = getProfiles;
         _activateChrome = activateChrome;
 
-        Text = "Giám sát Chrome — V13.5";
+        Text = $"Giám sát Chrome — {AppVersionInfo.Display}";
         Width = 1240;
         Height = 820;
         MinimumSize = new Size(880, 600);
-        StartPosition = FormStartPosition.CenterParent;
+        // This form is intentionally ownerless so Manager and Monitor can overlap in either
+        // Z-order. CenterScreen avoids relying on a parent/owner just for initial placement.
+        StartPosition = FormStartPosition.CenterScreen;
         BackColor = UiTheme.Canvas;
         Font = new Font("Segoe UI", 9F);
         DoubleBuffered = true;

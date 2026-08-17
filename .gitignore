@@ -14,3 +14,8 @@ TikTokProfiles/
 profiles/
 *.log
 runtime_stats.json
+publish_v13_5_vm/
+SETUP_OUTPUT/
+dist_v13/
+ToolTikTok_V13.5_VM_CLIENT_WIN_X64.zip
+.zip

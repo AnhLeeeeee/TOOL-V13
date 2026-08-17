@@ -1,3 +1,4 @@
+﻿using ToolTikTokV12.Utils;
 using System.IO.Compression;
 using ToolTikTokV11.Models;
 using ToolTikTokV11.Utils;
@@ -148,7 +149,7 @@ public sealed class SettingsService
         // chỉ chứa dữ liệu còn được dùng. Không mang theo ảnh legacy để tránh ZIP/profile phình trên VM.
         var manifest = zip.CreateEntry("CONFIG_V13_INFO.txt", CompressionLevel.Fastest);
         using var w = new StreamWriter(manifest.Open(), new System.Text.UTF8Encoding(true));
-        w.WriteLine("Tool TikTok V13.4.1 XPath-only configuration package");
+        w.WriteLine($"Tool TikTok {AppVersionInfo.Display} XPath-only configuration package");
         w.WriteLine("Created=" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
         w.WriteLine("Includes=auto_chrome.ini, content text");
         w.WriteLine("Legacy image templates and Chrome profile/cookies are intentionally NOT exported.");

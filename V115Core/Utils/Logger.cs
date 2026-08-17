@@ -4,14 +4,16 @@ using System.Text;
 namespace ToolTikTokV11.Utils;
 
 /// <summary>
-/// Logger có giới hạn dung lượng cho môi trường VM.
+/// Logger Worker tối ưu cho VM.
+/// - Mỗi profile chỉ giữ tối đa 500 dòng log gần nhất trên ổ đĩa.
+/// - Chia log thành các segment tối đa 50 dòng để tránh rewrite file sau mỗi dòng mới.
 /// - Ghi theo buffer để tránh I/O đồng bộ trên hot path.
-/// - Rotate file đang ghi khi đạt 1 MB.
-/// - Mỗi profile chỉ giữ tối đa 2 MB log và tối đa 6 giờ.
 /// - WARN/ERROR luôn được ghi; PERF/CDP chi tiết có thể tắt bằng VerboseDiagnosticsEnabled.
 /// </summary>
 public sealed class Logger : IDisposable
 {
+    const int MaxSegmentLines = 50;
+    const int MaxSavedLines = 500;
     const long MaxActiveLogBytes = 1L * 1024 * 1024;
     const long MaxTotalLogBytes = 2L * 1024 * 1024;
     static readonly TimeSpan MaxLogAge = TimeSpan.FromHours(6);
@@ -26,6 +28,7 @@ public sealed class Logger : IDisposable
     FileStream? _writerStream;
     string _activePath = "";
     long _activeBytes;
+    int _activeLineCount;
     bool _disposed;
 
     public bool VerboseDiagnosticsEnabled { get; set; } = true;
@@ -36,6 +39,7 @@ public sealed class Logger : IDisposable
         _dir = Path.GetFullPath(Path.Combine(baseDir, "logs"));
         Directory.CreateDirectory(_dir);
         CleanupLogs(_dir);
+        TrimDirectoryToLatestLines(_dir, MaxSavedLines);
 
         _flushTimer = new System.Threading.Timer(_ => FlushBuffered(), null, BufferedFlushInterval, BufferedFlushInterval);
         ScheduleLogCleanup();
@@ -62,7 +66,8 @@ public sealed class Logger : IDisposable
             ThrowIfDisposed();
             var path = Path.Combine(_dir, $"{now:yyyy-MM-dd}.log");
             EnsureWriter(path);
-            if (_activeBytes + incomingBytes > MaxActiveLogBytes)
+
+            if (_activeLineCount >= MaxSegmentLines || _activeBytes + incomingBytes > MaxActiveLogBytes)
             {
                 RotateActive(path);
                 EnsureWriter(path);
@@ -70,6 +75,7 @@ public sealed class Logger : IDisposable
 
             _writer!.WriteLine(line);
             _activeBytes += incomingBytes;
+            _activeLineCount++;
             if (level.Equals("ERROR", StringComparison.OrdinalIgnoreCase))
                 _writer.Flush();
         }
@@ -92,6 +98,11 @@ public sealed class Logger : IDisposable
         if (_writer is not null && path.Equals(_activePath, StringComparison.OrdinalIgnoreCase)) return;
 
         CloseWriterNoThrow();
+
+        // Khi sang ngày/file mới, dành sẵn chỗ cho một segment mới để tổng log không vượt 500 dòng.
+        if (!File.Exists(path))
+            TrimDirectoryToLatestLines(_dir, MaxSavedLines - MaxSegmentLines);
+
         _writerStream = new FileStream(
             path,
             FileMode.Append,
@@ -100,6 +111,7 @@ public sealed class Logger : IDisposable
             16 * 1024,
             FileOptions.SequentialScan);
         _activeBytes = _writerStream.Length;
+        _activeLineCount = SafeCountLines(path);
         _writer = new StreamWriter(_writerStream, new UTF8Encoding(true), 16 * 1024, leaveOpen: false)
         {
             AutoFlush = false
@@ -119,11 +131,77 @@ public sealed class Logger : IDisposable
             var baseName = Path.GetFileNameWithoutExtension(activePath);
             var archive = Path.Combine(directory, $"{baseName}-{DateTime.Now:HHmmss_fff}.log");
             File.Move(activePath, archive);
+
+            // Giữ tối đa 450 dòng cũ; segment đang bắt đầu có thể thêm tối đa 50 dòng.
+            TrimDirectoryToLatestLines(_dir, MaxSavedLines - MaxSegmentLines);
             CleanupLogs(_dir);
         }
         catch (FileNotFoundException) { }
         catch (IOException) { }
         catch (UnauthorizedAccessException) { }
+    }
+
+    static int SafeCountLines(string path)
+    {
+        try
+        {
+            if (!File.Exists(path)) return 0;
+            var count = 0;
+            foreach (var _ in File.ReadLines(path)) count++;
+            return count;
+        }
+        catch (IOException) { return 0; }
+        catch (UnauthorizedAccessException) { return 0; }
+    }
+
+    static void TrimDirectoryToLatestLines(string directory, int maxLines)
+    {
+        if (maxLines < 0 || !Directory.Exists(directory)) return;
+
+        List<FileInfo> files;
+        try
+        {
+            files = new DirectoryInfo(directory)
+                .GetFiles("*.log", SearchOption.TopDirectoryOnly)
+                .Where(f => (f.Attributes & FileAttributes.ReparsePoint) == 0)
+                .OrderByDescending(f => f.LastWriteTimeUtc)
+                .ThenByDescending(f => f.Name, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+        catch (IOException) { return; }
+        catch (UnauthorizedAccessException) { return; }
+
+        var remaining = maxLines;
+        foreach (var file in files)
+        {
+            string[] lines;
+            try { lines = File.ReadAllLines(file.FullName); }
+            catch (IOException) { continue; }
+            catch (UnauthorizedAccessException) { continue; }
+
+            if (remaining <= 0)
+            {
+                try { file.Delete(); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+                continue;
+            }
+
+            if (lines.Length <= remaining)
+            {
+                remaining -= lines.Length;
+                continue;
+            }
+
+            try
+            {
+                var kept = lines[^remaining..];
+                var temp = file.FullName + ".trim.tmp";
+                File.WriteAllLines(temp, kept, new UTF8Encoding(true));
+                File.Move(temp, file.FullName, true);
+                remaining = 0;
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
     }
 
     void FlushBuffered()
@@ -145,6 +223,7 @@ public sealed class Logger : IDisposable
         _writerStream = null;
         _activePath = "";
         _activeBytes = 0;
+        _activeLineCount = 0;
     }
 
     void ThrowIfDisposed()

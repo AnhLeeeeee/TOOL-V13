@@ -3,8 +3,21 @@ setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
 cd /d "%~dp0"
 
+if not exist "VERSION.txt" (
+    echo [LOI] Khong tim thay VERSION.txt
+    pause
+    exit /b 1
+)
+set /p APP_VERSION=<"VERSION.txt"
+powershell -NoProfile -ExecutionPolicy Bypass -File ".\SYNC_VERSION.ps1"
+if errorlevel 1 (
+    echo [LOI] Khong dong bo duoc version.
+    pause
+    exit /b 1
+)
+
 echo ============================================================
-echo   TAO SETUP CHUAN - TOOL TIKTOK V13.5
+echo   TAO SETUP CHUAN - TOOL TIKTOK V%APP_VERSION%
 echo ============================================================
 echo.
 
@@ -68,7 +81,7 @@ if exist "SETUP_OUTPUT\ToolTikTok_V13.5_Setup.exe" (
 echo Dang tao bo cai...
 echo.
 
-"%ISCC%" "ToolTikTok_V13_5.iss"
+"%ISCC%" /DMyAppVersion=%APP_VERSION% "ToolTikTok_V13_5.iss"
 
 if errorlevel 1 (
     echo.
@@ -85,6 +98,14 @@ if not exist "SETUP_OUTPUT\ToolTikTok_V13.5_Setup.exe" (
     echo.
     echo [LOI] Compile xong nhung khong thay file Setup dau ra.
     echo.
+    pause
+    exit /b 1
+)
+
+powershell -NoProfile -ExecutionPolicy Bypass -File ".\SYNC_VERSION.ps1" -SetupPath "SETUP_OUTPUT\ToolTikTok_V13.5_Setup.exe"
+if errorlevel 1 (
+    echo.
+    echo [LOI] Setup da tao nhung khong cap nhat duoc SHA-256 vao version.json.
     pause
     exit /b 1
 )

@@ -1,4 +1,5 @@
-﻿using System.Diagnostics;
+﻿using ToolTikTokV12.Utils;
+using System.Diagnostics;
 using System.Net.Http;
 using System.Linq;
 using System.Security.Cryptography;
@@ -10,7 +11,7 @@ namespace ToolTikTokManagerV13;
 
 public sealed partial class ManagerForm
 {
-    const string ManagerDisplayVersion = "13.5.4";
+    static string ManagerDisplayVersion => AppVersionInfo.Current;
     const string UpdateSettingsFileName = "manager_update.json";
 
     sealed class DashboardMarker { }
@@ -240,6 +241,7 @@ public sealed partial class ManagerForm
     {
         var grid = new DataGridView
         {
+            Name = "DashboardGrid",
             Dock = DockStyle.Fill,
             AllowUserToAddRows = false,
             AllowUserToDeleteRows = false,
@@ -270,6 +272,7 @@ public sealed partial class ManagerForm
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Rounds", HeaderText = "Vòng", Width = 75 });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Ram", HeaderText = "RAM chính", Width = 95 });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Detail", HeaderText = "Chi tiết", AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill, MinimumWidth = 220 });
+        LogGridSchema(grid, "DashboardGrid", "Profile", "Account", "RunState", "Chrome", "Viewer", "Step", "Rounds", "Ram", "Detail");
 
         grid.CellDoubleClick += async (_, e) =>
         {
@@ -335,7 +338,7 @@ public sealed partial class ManagerForm
             if (ctx.Worker is null || ctx.Worker.HasExited)
                 await OpenProfileAsync(ctx);
             try { await RefreshStatusAsync(ctx); } catch { }
-            var paused = string.Equals(ctx.LastSnapshot?.RunState, "PAUSED", StringComparison.OrdinalIgnoreCase);
+            var paused = string.Equals(GetLastConfirmedRuntimeState(ctx), RuntimeStatePaused, StringComparison.Ordinal);
             await SendCommandAsync(ctx, paused ? "resume" : "pause", TimeSpan.FromSeconds(8));
         }));
         flow.Controls.Add(ActionButton("■ Stop", UiButtonKind.Danger, async ctx =>
@@ -409,6 +412,7 @@ public sealed partial class ManagerForm
         var paused = 0;
         var recovering = 0;
         var stopped = 0;
+        var unknown = 0;
         long viewerTotal = 0;
         var viewerCount = 0;
 
@@ -419,16 +423,19 @@ public sealed partial class ManagerForm
             foreach (var ctx in contexts)
             {
                 var snapshot = ctx.LastSnapshot;
-                var runState = snapshot?.RunState ?? (ctx.Worker is null || ctx.Worker.HasExited ? "CHƯA MỞ" : "ĐANG KHỞI ĐỘNG");
+                var runState = GetEffectiveRuntimeState(ctx);
                 var detail = snapshot?.Detail ?? "";
-                var recovery = detail.Contains("recover", StringComparison.OrdinalIgnoreCase)
-                               || detail.Contains("out of memory", StringComparison.OrdinalIgnoreCase)
-                               || detail.Contains("oom", StringComparison.OrdinalIgnoreCase)
-                               || detail.Contains("crash", StringComparison.OrdinalIgnoreCase);
-                if (recovery) recovering++;
-                else if (runState.Equals("RUNNING", StringComparison.OrdinalIgnoreCase)) running++;
-                else if (runState.Equals("PAUSED", StringComparison.OrdinalIgnoreCase)) paused++;
-                else stopped++;
+                if (ctx.ConsecutiveStatusPollFailures > 0)
+                {
+                    var transient = $"Status poll tạm thời lỗi ({ctx.ConsecutiveStatusPollFailures}); giữ {GetLastConfirmedRuntimeState(ctx)}";
+                    detail = string.IsNullOrWhiteSpace(detail) ? transient : $"{transient} | {detail}";
+                }
+
+                if (runState == RuntimeStateRecovering) recovering++;
+                else if (runState == RuntimeStateRunning) running++;
+                else if (runState == RuntimeStatePaused) paused++;
+                else if (runState == RuntimeStateStopped) stopped++;
+                else unknown++;
 
                 var viewer = snapshot?.Viewer ?? -1;
                 if (viewer >= 0)
@@ -446,7 +453,7 @@ public sealed partial class ManagerForm
                 var rowIndex = _dashboardGrid.Rows.Add(
                     ctx.Profile.Name,
                     string.IsNullOrWhiteSpace(account) ? "—" : account,
-                    recovery ? "RECOVERING" : runState,
+                    runState,
                     chrome,
                     viewerText,
                     stepText,
@@ -456,22 +463,22 @@ public sealed partial class ManagerForm
                 var row = _dashboardGrid.Rows[rowIndex];
                 row.Tag = ctx;
 
-                if (recovery)
+                if (runState == RuntimeStateRecovering)
                 {
                     row.DefaultCellStyle.BackColor = Color.FromArgb(255, 248, 218);
                     row.DefaultCellStyle.ForeColor = Color.FromArgb(112, 82, 14);
                 }
-                else if (runState.Equals("RUNNING", StringComparison.OrdinalIgnoreCase))
+                else if (runState == RuntimeStateRunning)
                 {
                     row.DefaultCellStyle.BackColor = Color.FromArgb(237, 249, 240);
                     row.DefaultCellStyle.ForeColor = Color.FromArgb(28, 98, 54);
                 }
-                else if (runState.Equals("PAUSED", StringComparison.OrdinalIgnoreCase))
+                else if (runState == RuntimeStatePaused)
                 {
                     row.DefaultCellStyle.BackColor = Color.FromArgb(255, 246, 229);
                     row.DefaultCellStyle.ForeColor = Color.FromArgb(140, 83, 12);
                 }
-                else if (runState.Equals("STOPPED", StringComparison.OrdinalIgnoreCase))
+                else if (runState == RuntimeStateStopped)
                 {
                     row.DefaultCellStyle.ForeColor = Color.FromArgb(146, 54, 54);
                 }
@@ -488,7 +495,7 @@ public sealed partial class ManagerForm
             var profileCountText = showAllProfiles
                 ? $"Profiles: {allContexts.Count}"
                 : $"Profiles đang mở: {contexts.Count}/{allContexts.Count}";
-            _dashboardSummary.Text = $"{profileCountText}   |   🟢 Running: {running}   |   🟠 Paused: {paused}   |   🟡 Recovering: {recovering}   |   ⚪ Khác/Dừng: {stopped}   |   Viewer TB: {avg}";
+            _dashboardSummary.Text = $"{profileCountText}   |   🟢 Running: {running}   |   🟠 Paused: {paused}   |   🟡 Recovering: {recovering}   |   ⚪ Stopped: {stopped}   |   ❔ Unknown: {unknown}   |   Viewer TB: {avg}";
         }
     }
 
@@ -719,7 +726,7 @@ public sealed partial class ManagerForm
                 _dashboardUpdateStatus.ForeColor = Color.DarkOrange;
             }
             using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
-            client.DefaultRequestHeaders.UserAgent.ParseAdd("ToolTikTokManager/13.5");
+            client.DefaultRequestHeaders.UserAgent.ParseAdd($"ToolTikTokManager/{AppVersionInfo.Current}");
             var json = await client.GetStringAsync(manifestUri);
             var manifest = JsonSerializer.Deserialize<UpdateManifest>(json, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
             if (manifest is null || string.IsNullOrWhiteSpace(manifest.Version) || string.IsNullOrWhiteSpace(manifest.SetupUrl))
@@ -796,7 +803,7 @@ public sealed partial class ManagerForm
             if (File.Exists(temp)) File.Delete(temp);
 
             using var client = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
-            client.DefaultRequestHeaders.UserAgent.ParseAdd("ToolTikTokManager/13.5");
+            client.DefaultRequestHeaders.UserAgent.ParseAdd($"ToolTikTokManager/{AppVersionInfo.Current}");
             using var response = await client.GetAsync(setupUri, HttpCompletionOption.ResponseHeadersRead);
             response.EnsureSuccessStatusCode();
             var total = response.Content.Headers.ContentLength;

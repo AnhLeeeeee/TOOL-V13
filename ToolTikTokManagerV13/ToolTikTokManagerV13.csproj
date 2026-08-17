@@ -10,9 +10,6 @@
     <AssemblyName>ToolTikTokManagerV13</AssemblyName>
     <RootNamespace>ToolTikTokManagerV13</RootNamespace>
     <Product>Tool TikTok Manager V13</Product>
-    <Version>13.5.4</Version>
-    <FileVersion>13.5.4.0</FileVersion>
-    <AssemblyVersion>13.5.4.0</AssemblyVersion>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>ToolTikTok.ico</ApplicationIcon>
     <OutputPath>..\dist_v13\</OutputPath>

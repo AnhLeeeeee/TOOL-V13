@@ -38,6 +38,7 @@ public sealed partial class ManagerForm
     string IdentityToolStatePath => Path.Combine(_baseDir, "tiktok_identity_tool.json");
     readonly HashSet<string> _autoIdentityHandledSession = new(StringComparer.OrdinalIgnoreCase);
     readonly HashSet<string> _autoIdentityInFlight = new(StringComparer.OrdinalIgnoreCase);
+    readonly Dictionary<string, DateTime> _autoIdentityNextProbeUtc = new(StringComparer.OrdinalIgnoreCase);
     readonly SemaphoreSlim _autoIdentityQueueGate = new(1, 1);
 
     IdentityToolState LoadIdentityToolState()
@@ -50,7 +51,11 @@ public sealed partial class ManagerForm
             state.LastAvatarByProfile = new Dictionary<string, string>(state.LastAvatarByProfile ?? new(), StringComparer.OrdinalIgnoreCase);
             return state;
         }
-        catch { return new IdentityToolState(); }
+        catch (Exception ex)
+        {
+            _log.Warn($"[IDENTITY_TOOL_STATE_LOAD] fallback=defaults error={ex.Message}");
+            return new IdentityToolState();
+        }
     }
 
     void SaveIdentityToolState(IdentityToolState state)
@@ -64,8 +69,17 @@ public sealed partial class ManagerForm
 
     void ShowTikTokIdentityDialog()
     {
+        const string gridName = "TikTokIdentityGrid";
+        const string useColumn = "Use";
+        const string profileColumn = "Profile";
+        const string namePreviewColumn = "NamePreview";
+        const string avatarPreviewColumn = "AvatarPreview";
+        const string bioPreviewColumn = "BioPreview";
+        const string resultColumn = "Result";
+
         var state = LoadIdentityToolState();
         var previews = new Dictionary<string, IdentityPreview>(StringComparer.OrdinalIgnoreCase);
+        var updateResults = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var contexts = _contexts.Values.OrderBy(x => x.Profile.Name, NaturalProfileNameOrder).ToList();
 
         using var form = new Form
@@ -237,6 +251,7 @@ public sealed partial class ManagerForm
 
         var grid = new DataGridView
         {
+            Name = gridName,
             Dock = DockStyle.Fill,
             AllowUserToAddRows = false,
             AllowUserToDeleteRows = false,
@@ -253,19 +268,28 @@ public sealed partial class ManagerForm
         };
         grid.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(231, 239, 249);
         grid.ColumnHeadersDefaultCellStyle.Font = new Font("Segoe UI", 9F, FontStyle.Bold);
-        grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "Use", HeaderText = "Chọn", Width = 55 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Profile", HeaderText = "Profile", Width = 110, ReadOnly = true });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "NamePreview", HeaderText = "Tên dự kiến", Width = 190, ReadOnly = true });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "AvatarPreview", HeaderText = "Avatar", Width = 165, ReadOnly = true });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "BioPreview", HeaderText = "Tiểu sử", Width = 175, ReadOnly = true });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Result", HeaderText = "Kết quả", AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill, MinimumWidth = 180, ReadOnly = true });
+        grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = useColumn, HeaderText = "Chọn", Width = 55 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = profileColumn, HeaderText = "Profile", Width = 110, ReadOnly = true });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = namePreviewColumn, HeaderText = "Tên dự kiến", Width = 190, ReadOnly = true });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = avatarPreviewColumn, HeaderText = "Avatar", Width = 165, ReadOnly = true });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = bioPreviewColumn, HeaderText = "Tiểu sử", Width = 175, ReadOnly = true });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = resultColumn, HeaderText = "Kết quả", AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill, MinimumWidth = 180, ReadOnly = true });
+        LogGridSchema(grid, gridName, useColumn, profileColumn, namePreviewColumn, avatarPreviewColumn, bioPreviewColumn, resultColumn);
 
         var selected = SelectedContext();
         foreach (var ctx in contexts)
         {
             var rowIndex = grid.Rows.Add(ReferenceEquals(ctx, selected), ctx.Profile.Name, "—", "—", "—", "Chưa chạy");
             grid.Rows[rowIndex].Tag = ctx;
+            updateResults[ctx.Profile.Name] = "Chưa chạy";
         }
+
+        void SetRowColorIfAttached(DataGridViewRow row, Color color)
+        {
+            if (!grid.IsDisposed && ReferenceEquals(row.DataGridView, grid))
+                row.DefaultCellStyle.ForeColor = color;
+        }
+
         body.Panel1.Controls.Add(grid);
 
         var previewPanel = new Panel { Dock = DockStyle.Fill, Padding = new Padding(12), BackColor = Color.FromArgb(245, 248, 252) };
@@ -289,6 +313,7 @@ public sealed partial class ManagerForm
         var footer = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, FlowDirection = FlowDirection.RightToLeft, WrapContents = false, Padding = new Padding(0, 10, 0, 0) };
         var close = new Button { Text = "Đóng", Width = 104, Height = 42, DialogResult = DialogResult.Cancel };
         var apply = new Button { Text = "Cập nhật đã chọn", Width = 164, Height = 42 };
+        var updateInProgress = false;
         ModernDialog.StyleSecondaryButton(close);
         ModernDialog.StylePrimaryButton(apply);
         footer.Controls.Add(close);
@@ -406,9 +431,9 @@ public sealed partial class ManagerForm
                 }
 
                 previews[ctx.Profile.Name] = new IdentityPreview(ctx, displayName, avatarPath, bioText);
-                row.Cells["NamePreview"].Value = string.IsNullOrWhiteSpace(displayName) ? "—" : displayName;
-                row.Cells["AvatarPreview"].Value = string.IsNullOrWhiteSpace(avatarPath) ? "—" : Path.GetFileName(avatarPath);
-                row.Cells["BioPreview"].Value = string.IsNullOrWhiteSpace(bioText) ? "—" : bioText;
+                TrySetGridCellValue(row, namePreviewColumn, string.IsNullOrWhiteSpace(displayName) ? "—" : displayName, "ShowTikTokIdentityDialog.RebuildPreview");
+                TrySetGridCellValue(row, avatarPreviewColumn, string.IsNullOrWhiteSpace(avatarPath) ? "—" : Path.GetFileName(avatarPath), "ShowTikTokIdentityDialog.RebuildPreview");
+                TrySetGridCellValue(row, bioPreviewColumn, string.IsNullOrWhiteSpace(bioText) ? "—" : bioText, "ShowTikTokIdentityDialog.RebuildPreview");
             }
             ShowRowPreview();
         }
@@ -431,10 +456,22 @@ public sealed partial class ManagerForm
         randomNames.CheckedChanged += (_, _) => RebuildPreview();
         avoidLast.CheckedChanged += (_, _) => RebuildPreview();
         grid.SelectionChanged += (_, _) => ShowRowPreview();
-        grid.CellValueChanged += (_, e) => { if (e.ColumnIndex == grid.Columns["Use"].Index) ShowRowPreview(); };
+        grid.CellValueChanged += (_, e) =>
+        {
+            var useGridColumn = TryGetGridColumn(grid, useColumn, "ShowTikTokIdentityDialog.CellValueChanged");
+            if (useGridColumn is not null && e.ColumnIndex == useGridColumn.Index) ShowRowPreview();
+        };
         grid.CurrentCellDirtyStateChanged += (_, _) => { if (grid.IsCurrentCellDirty) grid.CommitEdit(DataGridViewDataErrorContexts.Commit); };
-        selectAll.Click += (_, _) => { foreach (DataGridViewRow row in grid.Rows) row.Cells["Use"].Value = true; };
-        clearAll.Click += (_, _) => { foreach (DataGridViewRow row in grid.Rows) row.Cells["Use"].Value = false; };
+        selectAll.Click += (_, _) =>
+        {
+            foreach (DataGridViewRow row in grid.Rows)
+                TrySetGridCellValue(row, useColumn, true, "ShowTikTokIdentityDialog.SelectAll");
+        };
+        clearAll.Click += (_, _) =>
+        {
+            foreach (DataGridViewRow row in grid.Rows)
+                TrySetGridCellValue(row, useColumn, false, "ShowTikTokIdentityDialog.ClearAll");
+        };
 
         apply.Click += async (_, _) =>
         {
@@ -442,7 +479,8 @@ public sealed partial class ManagerForm
             {
                 grid.EndEdit();
                 var selectedRows = grid.Rows.Cast<DataGridViewRow>()
-                    .Where(r => r.Tag is ProfileContext && Convert.ToBoolean(r.Cells["Use"].Value ?? false))
+                    .Where(r => r.Tag is ProfileContext
+                        && Convert.ToBoolean(GetGridCellValueOrNull(r, useColumn, "ShowTikTokIdentityDialog.Apply") ?? false))
                     .ToList();
                 if (selectedRows.Count == 0)
                 {
@@ -484,16 +522,20 @@ public sealed partial class ManagerForm
                 var confirm = $"Sẽ cập nhật {selectedRows.Count} profile theo phần Xem trước.\n\nProfile đang chạy automation sẽ được DỪNG trước khi đổi hồ sơ. Sau khi đổi xong tool không tự chạy lại automation.\n\nTiếp tục?";
                 if (ModernDialog.ShowConfirm(form, confirm, "Xác nhận cập nhật TikTok") != DialogResult.Yes) return;
 
+                updateInProgress = true;
                 apply.Enabled = false;
                 randomize.Enabled = false;
+                close.Enabled = false;
                 var success = 0;
                 var skipped = 0;
                 var failed = 0;
                 foreach (var row in selectedRows)
                 {
                     if (row.Tag is not ProfileContext ctx || !previews.TryGetValue(ctx.Profile.Name, out var preview)) continue;
-                    row.Cells["Result"].Value = "Đang xử lý...";
-                    grid.CurrentCell = row.Cells["Profile"];
+                    updateResults[ctx.Profile.Name] = "Đang xử lý...";
+                    TrySetGridCellValue(row, resultColumn, updateResults[ctx.Profile.Name], "ShowTikTokIdentityDialog.Apply");
+                    var profileCell = TryGetGridCell(row, profileColumn, "ShowTikTokIdentityDialog.Apply");
+                    if (profileCell is not null) grid.CurrentCell = profileCell;
                     grid.FirstDisplayedScrollingRowIndex = Math.Max(0, row.Index);
                     Application.DoEvents();
                     try
@@ -503,15 +545,16 @@ public sealed partial class ManagerForm
                             updateAvatar.Checked ? preview.AvatarPath : "",
                             updateBio.Checked ? preview.Bio : "");
                         if (!reply.Ok) throw new InvalidOperationException(string.IsNullOrWhiteSpace(reply.Error) ? reply.Message : reply.Error);
-                        row.Cells["Result"].Value = reply.Message.Length > 0 ? reply.Message : "Đã cập nhật";
+                        updateResults[ctx.Profile.Name] = reply.Message.Length > 0 ? reply.Message : "Đã cập nhật";
+                        TrySetGridCellValue(row, resultColumn, updateResults[ctx.Profile.Name], "ShowTikTokIdentityDialog.Apply");
                         if (reply.Skipped || reply.NameCooldown)
                         {
-                            row.DefaultCellStyle.ForeColor = Color.DarkOrange;
+                            SetRowColorIfAttached(row, Color.DarkOrange);
                             skipped++;
                         }
                         else
                         {
-                            row.DefaultCellStyle.ForeColor = Color.DarkGreen;
+                            SetRowColorIfAttached(row, Color.DarkGreen);
                             success++;
                             if (reply.AvatarChanged && !string.IsNullOrWhiteSpace(preview.AvatarPath))
                                 state.LastAvatarByProfile[ctx.Profile.Name] = preview.AvatarPath;
@@ -521,15 +564,18 @@ public sealed partial class ManagerForm
                     catch (Exception ex)
                     {
                         failed++;
-                        row.Cells["Result"].Value = "Lỗi: " + ex.Message;
-                        row.DefaultCellStyle.ForeColor = Color.Firebrick;
+                        updateResults[ctx.Profile.Name] = "Lỗi: " + ex.Message;
+                        TrySetGridCellValue(row, resultColumn, updateResults[ctx.Profile.Name], "ShowTikTokIdentityDialog.Apply");
+                        SetRowColorIfAttached(row, Color.Firebrick);
                         _log.Warn($"[TIKTOK_IDENTITY_UPDATE] profile={ctx.Profile.Name} result=failed message={ex.Message}");
                     }
                 }
-                var failedDetails = grid.Rows.Cast<DataGridViewRow>()
-                    .Where(r => (r.Cells["Result"].Value?.ToString() ?? "").StartsWith("Lỗi:", StringComparison.OrdinalIgnoreCase))
+
+                if (form.IsDisposed) return;
+                var failedDetails = updateResults
+                    .Where(item => item.Value.StartsWith("Lỗi:", StringComparison.OrdinalIgnoreCase))
                     .Take(8)
-                    .Select(r => $"{r.Cells["Profile"].Value}: {r.Cells["Result"].Value}")
+                    .Select(item => $"{item.Key}: {item.Value}")
                     .ToList();
                 var summary = $"Hoàn tất.\nThành công: {success}\nBỏ qua: {skipped}\nLỗi: {failed}";
                 if (failedDetails.Count > 0) summary += "\n\n" + string.Join("\n", failedDetails);
@@ -538,9 +584,21 @@ public sealed partial class ManagerForm
             }
             finally
             {
-                apply.Enabled = true;
-                randomize.Enabled = true;
+                updateInProgress = false;
+                if (!form.IsDisposed)
+                {
+                    apply.Enabled = true;
+                    randomize.Enabled = true;
+                    close.Enabled = true;
+                }
             }
+        };
+
+        form.FormClosing += (_, e) =>
+        {
+            if (!updateInProgress || e.CloseReason != CloseReason.UserClosing) return;
+            e.Cancel = true;
+            ModernDialog.ShowMessage(form, "Manager đang cập nhật profile. Hãy chờ thao tác hiện tại hoàn tất rồi đóng cửa sổ.", "Tên & ảnh TikTok", MessageBoxIcon.Information);
         };
 
         form.FormClosed += (_, _) =>
@@ -568,7 +626,7 @@ public sealed partial class ManagerForm
     {
         await OpenProfileAsync(ctx);
         try { await RefreshStatusAsync(ctx); } catch { }
-        var previousRunState = ctx.LastSnapshot?.RunState ?? "STOPPED";
+        var previousRunState = GetLastConfirmedRuntimeState(ctx);
         var shouldResume = resumeAutomation && (previousRunState is "RUNNING" or "PAUSED");
         if (previousRunState is "RUNNING" or "PAUSED")
         {
@@ -581,7 +639,13 @@ public sealed partial class ManagerForm
             try { await RefreshStatusAsync(ctx); } catch { }
         }
         if (!string.Equals(ctx.LastSnapshot?.Chrome, "CONNECTED", StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("Chrome/TikTok chưa kết nối. Nếu có CAPTCHA hoặc cần đăng nhập, hãy xử lý trên Chrome rồi thử lại.");
+            throw new InvalidOperationException("Chrome chưa kết nối. Hãy mở Chrome của profile rồi thử lại.");
+
+        // Đổi tên/ảnh là luồng setup tài khoản độc lập với LIVE. Chỉ cần TikTok
+        // đã đăng nhập; không gọi startup gate và không điều hướng sang /live.
+        var identityReady = await SendCommandAsync(ctx, "identity_ready", TimeSpan.FromSeconds(6));
+        if (!string.Equals(identityReady, "ready", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("TikTok chưa đăng nhập trên profile này. Chrome đã được giữ ở trang chủ; hãy đăng nhập tài khoản rồi cập nhật tên/ảnh lại.");
 
         var username = "";
         try
@@ -646,7 +710,15 @@ public sealed partial class ManagerForm
             var snapshot = ctx.LastSnapshot;
             if (snapshot is null) continue;
             if (!string.Equals(snapshot.Chrome, "CONNECTED", StringComparison.OrdinalIgnoreCase)) continue;
+
+            // READY ở V13.5 mới chỉ có nghĩa là gate mở Chrome/đăng nhập đã hoàn tất.
+            // Khi mở profile để setup, READY vẫn dừng ở trang chủ và KHÔNG vào LIVE.
+            // Chờ READY trước khi Auto Identity chạy để tránh tranh điều hướng với
+            // luồng tự đăng nhập/đưa về trang chủ vừa được thực hiện trong Worker.
             if (!string.Equals(snapshot.TikTokStartupState, "READY", StringComparison.OrdinalIgnoreCase)) continue;
+
+            if (_autoIdentityNextProbeUtc.TryGetValue(ctx.Profile.Name, out var nextProbeUtc)
+                && DateTime.UtcNow < nextProbeUtc) continue;
             if (_autoIdentityHandledSession.Contains(ctx.Profile.Name) || _autoIdentityInFlight.Contains(ctx.Profile.Name)) continue;
             _autoIdentityInFlight.Add(ctx.Profile.Name);
             _ = RunAutoIdentityForProfileAsync(ctx);
@@ -657,6 +729,17 @@ public sealed partial class ManagerForm
     {
         try
         {
+            // Gate riêng cho setup hồ sơ: có Chrome + có session TikTok là đủ.
+            // Nếu người dùng đang đăng nhập thủ công, thử lại sau vài giây mà không
+            // đánh dấu profile là đã xử lý và không ép Chrome vào LIVE.
+            var readiness = await SendCommandAsync(ctx, "identity_ready", TimeSpan.FromSeconds(6));
+            if (!string.Equals(readiness, "ready", StringComparison.OrdinalIgnoreCase))
+            {
+                _autoIdentityNextProbeUtc[ctx.Profile.Name] = DateTime.UtcNow.AddSeconds(4);
+                return;
+            }
+            _autoIdentityNextProbeUtc.Remove(ctx.Profile.Name);
+
             await _autoIdentityQueueGate.WaitAsync();
             try
             {
@@ -723,14 +806,18 @@ public sealed partial class ManagerForm
                     resumeAutomation: true,
                     knownDisplayNames: names,
                     verifyExistingState: true);
-                _autoIdentityHandledSession.Add(ctx.Profile.Name);
-                _autoIdentityHandledSession.Add(accountSessionKey);
 
                 if (!reply.Ok)
                 {
+                    // Lỗi tạm thời không được khóa profile cho cả session. Cho phép
+                    // Auto Identity thử lại sau, thay vì coi là đã xử lý xong.
+                    _autoIdentityNextProbeUtc[ctx.Profile.Name] = DateTime.UtcNow.AddSeconds(20);
                     _log.Warn($"[AUTO_IDENTITY_FAILED] profile={ctx.Profile.Name} account={account.Username} {reply.Error}");
                     return;
                 }
+
+                _autoIdentityHandledSession.Add(ctx.Profile.Name);
+                _autoIdentityHandledSession.Add(accountSessionKey);
                 if (reply.AlreadyConfigured)
                 {
                     _accountPoolService.MarkIdentityDone(account.Username);
@@ -755,7 +842,7 @@ public sealed partial class ManagerForm
         }
         catch (Exception ex)
         {
-            _autoIdentityHandledSession.Add(ctx.Profile.Name);
+            _autoIdentityNextProbeUtc[ctx.Profile.Name] = DateTime.UtcNow.AddSeconds(20);
             _log.Warn($"[AUTO_IDENTITY_ERROR] profile={ctx.Profile.Name} {ex.Message}");
         }
         finally { _autoIdentityInFlight.Remove(ctx.Profile.Name); }

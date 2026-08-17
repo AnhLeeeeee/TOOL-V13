@@ -1,4 +1,5 @@
-﻿using System.Text.Json;
+﻿using ToolTikTokV12.Utils;
+using System.Text.Json;
 using System.Xml.XPath;
 using ToolTikTokV11.Models;
 using ToolTikTokV11.Utils;
@@ -208,7 +209,7 @@ public sealed partial class AutomationEngine
         if (settings.InputGuard.Enabled && string.IsNullOrWhiteSpace(settings.InputGuard.NormalPlaceholderText))
             throw new InvalidOperationException("V13 InputGuard đang bật nhưng chữ placeholder bình thường đang trống.");
         if (settings.OldLive.Enabled && string.IsNullOrWhiteSpace(settings.OldLive.IdentityXPath))
-            throw new InvalidOperationException("V13.4.1 Live cũ đang bật nhưng XPath tài khoản LIVE đang trống.");
+            throw new InvalidOperationException($"{AppVersionInfo.Display} Live cũ đang bật nhưng XPath tài khoản LIVE đang trống.");
 
         _s = settings;
         _contents = contents;
@@ -240,8 +241,8 @@ public sealed partial class AutomationEngine
         SyncPeriodicSnapshot();
         _cts = new CancellationTokenSource();
         _task = Task.Run(() => LoopAsync(_cts.Token));
-        _log.Info("V13.4.1 bắt đầu. InputGuard và Live cũ đều đọc trạng thái trực tiếp bằng DOM/XPath; flow click/phím/F5/chuyển LIVE giữ từ V12.5.");
-        SetStatus("ĐANG CHẠY", "V13.4.1 XPath-only + DOM Input Guard đã bắt đầu.");
+        _log.Info($"{AppVersionInfo.Display} bắt đầu. InputGuard và Live cũ đều đọc trạng thái trực tiếp bằng DOM/XPath; flow click/phím/F5/chuyển LIVE giữ nguyên.");
+        SetStatus("ĐANG CHẠY", $"{AppVersionInfo.Display} XPath-only + DOM Input Guard đã bắt đầu.");
         NotifyStateChanged();
     }
 

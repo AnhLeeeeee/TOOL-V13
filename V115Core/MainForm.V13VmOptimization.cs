@@ -1,3 +1,4 @@
+﻿using ToolTikTokV12.Utils;
 using ToolTikTokV11.Models;
 
 namespace ToolTikTokV11;
@@ -31,7 +32,7 @@ public sealed partial class MainForm
         {
             AutoSize = true,
             Font = new Font(Font, FontStyle.Bold),
-            Text = "V13.4.1 — chế độ tiết kiệm tài nguyên cho máy ảo"
+            Text = $"{AppVersionInfo.Display} — chế độ tiết kiệm tài nguyên cho máy ảo"
         });
 
         _vmMode.Items.Clear();
