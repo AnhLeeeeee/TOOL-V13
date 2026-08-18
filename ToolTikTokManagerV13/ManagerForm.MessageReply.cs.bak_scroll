@@ -243,20 +243,9 @@ public sealed partial class ManagerForm
         };
         ModernDialog.Apply(form, fixedDialog: false);
 
-        // Host cuon toan bo noi dung. Tren man hinh thap / DPI lon, nguoi dung co the
-        // cuon tu phan nhap tin nhan xuong danh sach tai khoan va cac nut ben duoi.
-        var scrollHost = new Panel
-        {
-            Dock = DockStyle.Fill,
-            AutoScroll = true,
-            BackColor = ModernDialog.Canvas
-        };
-
         var root = new TableLayoutPanel
         {
-            Dock = DockStyle.Top,
-            AutoSize = true,
-            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Dock = DockStyle.Fill,
             ColumnCount = 1,
             RowCount = 5,
             Padding = new Padding(16),
@@ -264,9 +253,10 @@ public sealed partial class ManagerForm
         };
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        // Giảm chiều cao cấu hình để ưu tiên danh sách tài khoản trên màn hình thấp.
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 230F));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 320F));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
         var intro = new Label
@@ -280,9 +270,7 @@ public sealed partial class ManagerForm
 
         var config = new TableLayoutPanel
         {
-            Dock = DockStyle.Top,
-            AutoSize = true,
-            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Dock = DockStyle.Fill,
             ColumnCount = 4,
             RowCount = 5,
             Margin = new Padding(0, 0, 0, 10)
@@ -291,7 +279,7 @@ public sealed partial class ManagerForm
         config.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
         config.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 155));
         config.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
-        config.RowStyles.Add(new RowStyle(SizeType.Absolute, 130F));
+        config.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
         config.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         config.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         config.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -304,7 +292,6 @@ public sealed partial class ManagerForm
             ScrollBars = ScrollBars.Vertical,
             AcceptsReturn = true,
             Dock = DockStyle.Fill,
-            MinimumSize = new Size(0, 110),
             Text = state.MessagesText
         };
         ModernDialog.StyleTextInput(messages);
@@ -484,7 +471,6 @@ public sealed partial class ManagerForm
         var tabs = new TabControl
         {
             Dock = DockStyle.Fill,
-            MinimumSize = new Size(0, 280),
             Margin = new Padding(0),
             Padding = new Point(14, 5)
         };
@@ -866,8 +852,7 @@ public sealed partial class ManagerForm
         root.Controls.Add(status, 0, 2);
         root.Controls.Add(tabs, 0, 3);
         root.Controls.Add(buttons, 0, 4);
-        scrollHost.Controls.Add(root);
-        form.Controls.Add(scrollHost);
+        form.Controls.Add(root);
 
         var running = false;
         var stopRequested = false;
