@@ -20,3 +20,5 @@ publish_v13_5_vm/
 SETUP_OUTPUT/
 RELEASE_OUTPUT/
 *.zip
+
+SOURCE_OUTPUT/

@@ -63,6 +63,7 @@ internal sealed class ChromeMonitorForm : Form
         public Rectangle PreviewBounds { get; set; }
         public IntPtr SourceHwnd { get; set; }
         public IntPtr Thumbnail { get; set; }
+        public Rectangle LastDwmDestination { get; set; }
     }
 
     readonly Func<IReadOnlyList<ChromeMonitorProfileInfo>> _getProfiles;
@@ -83,6 +84,31 @@ internal sealed class ChromeMonitorForm : Form
     static readonly Color SoftBlue = Color.FromArgb(232, 242, 255);
     static readonly Color SoftBlue2 = Color.FromArgb(247, 250, 254);
     static readonly Color BlueBorder = Color.FromArgb(174, 201, 231);
+
+    // Các resource GDI này dùng lại cho mọi lần repaint; tránh tạo/dispose hàng chục
+    // Brush/Pen mỗi tick khi có nhiều ô giám sát.
+    readonly SolidBrush _cardBrush = new(UiTheme.Card);
+    readonly SolidBrush _headerBrush = new(SoftBlue);
+    readonly SolidBrush _footerBrush = new(SoftBlue2);
+    readonly Pen _borderPen = new(BlueBorder, 1F);
+    readonly SolidBrush _primaryBrush = new(UiTheme.Primary);
+    readonly SolidBrush _previewBackgroundBrush = new(Color.FromArgb(28, 32, 38));
+    readonly Pen _previewBorderPen = new(Color.FromArgb(207, 217, 229));
+    readonly SolidBrush _mutedBrush = new(TextMuted);
+    readonly Pen _runningPen = new(Color.FromArgb(41, 145, 82), 4F);
+    readonly Pen _pausedPen = new(Color.FromArgb(210, 137, 38), 4F);
+    readonly Pen _disconnectedPen = new(Color.FromArgb(188, 68, 68), 4F);
+    readonly Pen _neutralPen = new(Color.FromArgb(122, 135, 151), 4F);
+    readonly SolidBrush _runningBackBrush = new(Color.FromArgb(232, 247, 237));
+    readonly SolidBrush _pausedBackBrush = new(Color.FromArgb(255, 246, 229));
+    readonly SolidBrush _disconnectedBackBrush = new(Color.FromArgb(255, 238, 238));
+    readonly SolidBrush _neutralBackBrush = new(Color.FromArgb(241, 244, 248));
+    readonly SolidBrush _runningForeBrush = new(Color.FromArgb(41, 145, 82));
+    readonly SolidBrush _pausedForeBrush = new(Color.FromArgb(210, 137, 38));
+    readonly SolidBrush _disconnectedForeBrush = new(Color.FromArgb(188, 68, 68));
+    readonly SolidBrush _neutralForeBrush = new(Color.FromArgb(122, 135, 151));
+    readonly SolidBrush _disconnectedDotBrush = new(Color.FromArgb(158, 168, 180));
+
     int _pageIndex;
     bool _suspended;
 
@@ -175,6 +201,27 @@ internal sealed class ChromeMonitorForm : Form
             _headerFont.Dispose();
             _footerFont.Dispose();
             _metricValueFont.Dispose();
+            _cardBrush.Dispose();
+            _headerBrush.Dispose();
+            _footerBrush.Dispose();
+            _borderPen.Dispose();
+            _primaryBrush.Dispose();
+            _previewBackgroundBrush.Dispose();
+            _previewBorderPen.Dispose();
+            _mutedBrush.Dispose();
+            _runningPen.Dispose();
+            _pausedPen.Dispose();
+            _disconnectedPen.Dispose();
+            _neutralPen.Dispose();
+            _runningBackBrush.Dispose();
+            _pausedBackBrush.Dispose();
+            _disconnectedBackBrush.Dispose();
+            _neutralBackBrush.Dispose();
+            _runningForeBrush.Dispose();
+            _pausedForeBrush.Dispose();
+            _disconnectedForeBrush.Dispose();
+            _neutralForeBrush.Dispose();
+            _disconnectedDotBrush.Dispose();
         };
     }
 
@@ -198,11 +245,22 @@ internal sealed class ChromeMonitorForm : Form
         }
         if (!_suspended)
         {
-            LayoutTiles();
-            UpdateAllThumbnails();
+            var layoutChanged = LayoutTiles();
+            var sourceChanged = SyncThumbnails();
+            if (layoutChanged || sourceChanged) UpdateAllThumbnails(force: true);
             Invalidate();
         }
     }
+
+    static bool SameVisualInfo(ChromeMonitorProfileInfo left, ChromeMonitorProfileInfo right)
+        => left.Name.Equals(right.Name, StringComparison.OrdinalIgnoreCase)
+           && left.RunState == right.RunState
+           && left.ChromeState == right.ChromeState
+           && left.ChromeWindowHandle == right.ChromeWindowHandle
+           && left.Viewer == right.Viewer
+           && left.Step == right.Step
+           && left.Rounds == right.Rounds
+           && left.F5RemainingSec == right.F5RemainingSec;
 
     void RefreshModel(bool rebuildThumbnails)
     {
@@ -212,29 +270,46 @@ internal sealed class ChromeMonitorForm : Form
         if (_pageIndex >= pageCount) _pageIndex = pageCount - 1;
         var page = all.Skip(_pageIndex * PageSize).Take(PageSize).ToList();
         var namesChanged = page.Count != _tiles.Count || page.Where((x, i) => i >= _tiles.Count || !_tiles[i].Info.Name.Equals(x.Name, StringComparison.OrdinalIgnoreCase)).Any();
+        var visualChanged = namesChanged;
 
         if (namesChanged || rebuildThumbnails)
         {
             ClearThumbnails();
             _tiles.Clear();
             foreach (var info in page) _tiles.Add(new TileState { Info = info });
+            visualChanged = true;
         }
         else
         {
-            for (var i = 0; i < page.Count; i++) _tiles[i].Info = page[i];
+            for (var i = 0; i < page.Count; i++)
+            {
+                if (!SameVisualInfo(_tiles[i].Info, page[i])) visualChanged = true;
+                _tiles[i].Info = page[i];
+            }
         }
 
-        _pageLabel.Text = all.Count == 0 ? "Chưa có profile đang mở" : $"Nhóm {_pageIndex + 1}/{pageCount}";
+        var newPageLabel = all.Count == 0 ? "Chưa có profile đang mở" : $"Nhóm {_pageIndex + 1}/{pageCount}";
+        if (!string.Equals(_pageLabel.Text, newPageLabel, StringComparison.Ordinal))
+        {
+            _pageLabel.Text = newPageLabel;
+            visualChanged = true;
+        }
         _prev.Enabled = _pageIndex > 0;
         _next.Enabled = _pageIndex + 1 < pageCount;
 
-        LayoutTiles();
-        SyncThumbnails();
-        Invalidate();
+        // DWM tự cập nhật nội dung thumbnail. Chỉ gửi lại properties khi layout/HWND đổi,
+        // thay vì gọi DwmUpdateThumbnailProperties mỗi 700 ms.
+        var layoutChanged = namesChanged || rebuildThumbnails ? LayoutTiles() : false;
+        var sourceChanged = SyncThumbnails();
+        if (layoutChanged || sourceChanged || rebuildThumbnails)
+            UpdateAllThumbnails(force: true);
+        if (visualChanged || layoutChanged || sourceChanged || rebuildThumbnails)
+            Invalidate();
     }
 
-    void LayoutTiles()
+    bool LayoutTiles()
     {
+        var changed = false;
         var pageSize = PageSize;
         var columns = pageSize switch { 4 => 2, 6 => 3, _ => 3 };
         var rows = pageSize switch { 4 => 2, 6 => 2, _ => 3 };
@@ -251,13 +326,17 @@ internal sealed class ChromeMonitorForm : Form
             var col = i % columns;
             var row = i / columns;
             var bounds = new Rectangle(left + col * (tileWidth + gap), top + row * (tileHeight + gap), tileWidth, tileHeight);
+            var preview = new Rectangle(bounds.Left + 2, bounds.Top + 39, Math.Max(10, bounds.Width - 4), Math.Max(10, bounds.Height - 88));
+            if (_tiles[i].Bounds != bounds || _tiles[i].PreviewBounds != preview) changed = true;
             _tiles[i].Bounds = bounds;
-            _tiles[i].PreviewBounds = new Rectangle(bounds.Left + 2, bounds.Top + 39, Math.Max(10, bounds.Width - 4), Math.Max(10, bounds.Height - 88));
+            _tiles[i].PreviewBounds = preview;
         }
+        return changed;
     }
 
-    void SyncThumbnails()
+    bool SyncThumbnails()
     {
+        var changed = false;
         foreach (var tile in _tiles)
         {
             var source = tile.Info.ChromeWindowHandle > 0 ? new IntPtr(tile.Info.ChromeWindowHandle) : IntPtr.Zero;
@@ -265,6 +344,8 @@ internal sealed class ChromeMonitorForm : Form
             {
                 UnregisterThumbnail(tile);
                 tile.SourceHwnd = source;
+                tile.LastDwmDestination = Rectangle.Empty;
+                changed = true;
                 if (source != IntPtr.Zero && DwmNative.IsWindow(source))
                 {
                     var hr = DwmNative.DwmRegisterThumbnail(Handle, source, out var thumbnail);
@@ -272,16 +353,17 @@ internal sealed class ChromeMonitorForm : Form
                 }
             }
         }
-        UpdateAllThumbnails();
+        return changed;
     }
 
-    void UpdateAllThumbnails()
+    void UpdateAllThumbnails(bool force = false)
     {
         if (_suspended || !IsHandleCreated) return;
         foreach (var tile in _tiles)
         {
             if (tile.Thumbnail == IntPtr.Zero) continue;
             var r = tile.PreviewBounds;
+            if (!force && tile.LastDwmDestination == r) continue;
             var props = new DwmNative.DWM_THUMBNAIL_PROPERTIES
             {
                 dwFlags = DwmNative.DWM_TNP_RECTDESTINATION | DwmNative.DWM_TNP_VISIBLE | DwmNative.DWM_TNP_OPACITY | DwmNative.DWM_TNP_SOURCECLIENTAREAONLY,
@@ -290,7 +372,8 @@ internal sealed class ChromeMonitorForm : Form
                 fVisible = true,
                 fSourceClientAreaOnly = false
             };
-            DwmNative.DwmUpdateThumbnailProperties(tile.Thumbnail, ref props);
+            if (DwmNative.DwmUpdateThumbnailProperties(tile.Thumbnail, ref props) == 0)
+                tile.LastDwmDestination = r;
         }
     }
 
@@ -312,44 +395,43 @@ internal sealed class ChromeMonitorForm : Form
     void DrawTile(Graphics g, TileState tile)
     {
         var info = tile.Info;
-        var stateColor = info.RunState switch
+        var disconnected = info.ChromeState == "DISCONNECTED";
+        var statePen = info.RunState switch
         {
-            "RUNNING" => Color.FromArgb(41, 145, 82),
-            "PAUSED" => Color.FromArgb(210, 137, 38),
-            _ when info.ChromeState == "DISCONNECTED" => Color.FromArgb(188, 68, 68),
-            _ => Color.FromArgb(122, 135, 151)
+            "RUNNING" => _runningPen,
+            "PAUSED" => _pausedPen,
+            _ when disconnected => _disconnectedPen,
+            _ => _neutralPen
         };
-        var stateBack = info.RunState switch
+        var stateBackBrush = info.RunState switch
         {
-            "RUNNING" => Color.FromArgb(232, 247, 237),
-            "PAUSED" => Color.FromArgb(255, 246, 229),
-            _ when info.ChromeState == "DISCONNECTED" => Color.FromArgb(255, 238, 238),
-            _ => Color.FromArgb(241, 244, 248)
+            "RUNNING" => _runningBackBrush,
+            "PAUSED" => _pausedBackBrush,
+            _ when disconnected => _disconnectedBackBrush,
+            _ => _neutralBackBrush
+        };
+        var stateForeBrush = info.RunState switch
+        {
+            "RUNNING" => _runningForeBrush,
+            "PAUSED" => _pausedForeBrush,
+            _ when disconnected => _disconnectedForeBrush,
+            _ => _neutralForeBrush
         };
 
         var bounds = tile.Bounds;
         var headerRect = new Rectangle(bounds.Left + 1, bounds.Top + 4, Math.Max(1, bounds.Width - 2), 34);
         var footerRect = new Rectangle(bounds.Left + 1, tile.PreviewBounds.Bottom, Math.Max(1, bounds.Width - 2), Math.Max(1, bounds.Bottom - tile.PreviewBounds.Bottom - 1));
 
-        using var cardBrush = new SolidBrush(UiTheme.Card);
-        using var headerBrush = new SolidBrush(SoftBlue);
-        using var footerBrush = new SolidBrush(SoftBlue2);
-        using var borderPen = new Pen(BlueBorder, 1F);
-        using var statePen = new Pen(stateColor, 4F);
-        using var primary = new SolidBrush(UiTheme.Primary);
-        using var previewBackground = new SolidBrush(Color.FromArgb(28, 32, 38));
-
-        g.FillRectangle(cardBrush, bounds);
-        g.FillRectangle(headerBrush, headerRect);
-        g.FillRectangle(footerBrush, footerRect);
-        g.DrawRectangle(borderPen, bounds.X, bounds.Y, Math.Max(1, bounds.Width - 1), Math.Max(1, bounds.Height - 1));
+        g.FillRectangle(_cardBrush, bounds);
+        g.FillRectangle(_headerBrush, headerRect);
+        g.FillRectangle(_footerBrush, footerRect);
+        g.DrawRectangle(_borderPen, bounds.X, bounds.Y, Math.Max(1, bounds.Width - 1), Math.Max(1, bounds.Height - 1));
         g.DrawLine(statePen, bounds.Left + 2, bounds.Top + 2, bounds.Right - 3, bounds.Top + 2);
 
-        var dotColor = info.ChromeState == "CONNECTED" ? stateColor : Color.FromArgb(158, 168, 180);
-        using (var dotBrush = new SolidBrush(dotColor))
-            g.FillEllipse(dotBrush, bounds.Left + 10, bounds.Top + 15, 7, 7);
+        var dotBrush = info.ChromeState == "CONNECTED" ? stateForeBrush : _disconnectedDotBrush;
+        g.FillEllipse(dotBrush, bounds.Left + 10, bounds.Top + 15, 7, 7);
 
-        g.DrawString(info.Name, _headerFont, primary, bounds.Left + 23, bounds.Top + 9);
+        g.DrawString(info.Name, _headerFont, _primaryBrush, bounds.Left + 23, bounds.Top + 9);
 
         var badgeText = info.RunState;
         var badgeTextSize = g.MeasureString(badgeText, _footerFont);
@@ -358,14 +440,11 @@ internal sealed class ChromeMonitorForm : Form
             bounds.Top + 8,
             badgeTextSize.Width + 14,
             22);
-        using (var badgeBack = new SolidBrush(stateBack))
-            FillRoundedRectangle(g, badgeBack, badgeRect, 8F);
-        using (var badgeFore = new SolidBrush(stateColor))
-            g.DrawString(badgeText, _footerFont, badgeFore, badgeRect.Left + 7, badgeRect.Top + 3);
+        FillRoundedRectangle(g, stateBackBrush, badgeRect, 8F);
+        g.DrawString(badgeText, _footerFont, stateForeBrush, badgeRect.Left + 7, badgeRect.Top + 3);
 
-        g.FillRectangle(previewBackground, tile.PreviewBounds);
-        using (var previewPen = new Pen(Color.FromArgb(207, 217, 229)))
-            g.DrawRectangle(previewPen, tile.PreviewBounds.X, tile.PreviewBounds.Y, Math.Max(1, tile.PreviewBounds.Width - 1), Math.Max(1, tile.PreviewBounds.Height - 1));
+        g.FillRectangle(_previewBackgroundBrush, tile.PreviewBounds);
+        g.DrawRectangle(_previewBorderPen, tile.PreviewBounds.X, tile.PreviewBounds.Y, Math.Max(1, tile.PreviewBounds.Width - 1), Math.Max(1, tile.PreviewBounds.Height - 1));
 
         if (tile.Thumbnail == IntPtr.Zero)
         {
@@ -390,14 +469,12 @@ internal sealed class ChromeMonitorForm : Form
 
     void DrawMetric(Graphics g, string label, string value, int x, int y, int width)
     {
-        using var muted = new SolidBrush(TextMuted);
-        using var primary = new SolidBrush(UiTheme.Primary);
-        g.DrawString($"{label}:", _footerFont, muted, x, y);
+        g.DrawString($"{label}:", _footerFont, _mutedBrush, x, y);
         var labelWidth = g.MeasureString($"{label}:", _footerFont).Width;
         var valueX = x + (int)Math.Ceiling(labelWidth) + 4;
         var state = g.Save();
         g.SetClip(new Rectangle(x, y, Math.Max(1, width), 18), CombineMode.Intersect);
-        g.DrawString(value, _metricValueFont, primary, valueX, y);
+        g.DrawString(value, _metricValueFont, _primaryBrush, valueX, y);
         g.Restore(state);
     }
 
@@ -444,6 +521,7 @@ internal sealed class ChromeMonitorForm : Form
         if (tile.Thumbnail == IntPtr.Zero) return;
         try { DwmNative.DwmUnregisterThumbnail(tile.Thumbnail); } catch { }
         tile.Thumbnail = IntPtr.Zero;
+        tile.LastDwmDestination = Rectangle.Empty;
     }
 
     static class DwmNative

@@ -1,9 +1,14 @@
 param(
-    [string]$Root = $PSScriptRoot,
+    [string]$Root = "",
     [string]$SetupPath = ""
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ([string]::IsNullOrWhiteSpace($Root)) {
+    $Root = Split-Path -Parent $PSScriptRoot
+}
+$Root = [System.IO.Path]::GetFullPath($Root)
 
 $versionFile = Join-Path $Root 'VERSION.txt'
 $manifestFile = Join-Path $Root 'version.json'
@@ -21,7 +26,6 @@ if (Test-Path $manifestFile) {
     $json = Get-Content -LiteralPath $manifestFile -Raw | ConvertFrom-Json
     $oldVersion = [string]$json.version
 
-    # Nếu tăng version thì hash của Setup cũ không còn hợp lệ.
     if ($oldVersion -ne $version) {
         $json.sha256 = ""
     }

@@ -1,6 +1,9 @@
 ﻿@echo off
 setlocal EnableExtensions
-cd /d "%~dp0"
+set "NOPAUSE=%~1"
+set "SCRIPT_DIR=%~dp0"
+for %%I in ("%SCRIPT_DIR%..") do set "ROOT=%%~fI"
+cd /d "%ROOT%"
 
 set "OUT=%CD%\publish_v13_5_vm"
 set "ZIP=%CD%\ToolTikTok_V13.5_VM_CLIENT_WIN_X64.zip"
@@ -8,7 +11,7 @@ set "TMPZIP=%TEMP%\ToolTikTok_V13.5_VM_CLIENT_WIN_X64_%RANDOM%_%RANDOM%.zip"
 
 if not exist "VERSION.txt" goto :versionfail
 set /p APP_VERSION=<"VERSION.txt"
-powershell -NoProfile -ExecutionPolicy Bypass -File ".\SYNC_VERSION.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%SYNC_VERSION.ps1" -Root "%ROOT%"
 if errorlevel 1 goto :versionfail
 
 if exist "%OUT%" rmdir /s /q "%OUT%"
@@ -19,7 +22,7 @@ if exist "%OUT%" (
     echo %OUT%
     echo Hay dong Tool/Chrome/Explorer dang mo thu muc nay roi thu lai.
     echo ========================================
-    pause
+    if /I not "%NOPAUSE%"=="--no-pause" pause
     exit /b 1
 )
 
@@ -32,7 +35,7 @@ if exist "%ZIP%" (
         echo %ZIP%
         echo Hay dong Explorer/phan mem dang mo file ZIP roi thu lai.
         echo ========================================
-        pause
+        if /I not "%NOPAUSE%"=="--no-pause" pause
         exit /b 1
     )
 )
@@ -102,7 +105,7 @@ echo HOAN TAT
 echo %ZIP%
 echo ========================================
 echo.
-pause
+if /I not "%NOPAUSE%"=="--no-pause" pause
 exit /b 0
 
 :versionfail
@@ -111,7 +114,7 @@ echo ========================================
 echo LOI: VERSION KHONG HOP LE HOAC KHONG DONG BO DUOC
 echo Kiem tra VERSION.txt va SYNC_VERSION.ps1
 echo ========================================
-pause
+if /I not "%NOPAUSE%"=="--no-pause" pause
 exit /b 1
 
 :zipfail
@@ -142,5 +145,5 @@ echo ========================================
 echo Kiem tra phan loi phia tren.
 
 :failpause
-pause
+if /I not "%NOPAUSE%"=="--no-pause" pause
 exit /b 1

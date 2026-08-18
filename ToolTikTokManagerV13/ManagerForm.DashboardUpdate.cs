@@ -159,6 +159,7 @@ public sealed partial class ManagerForm
         root.Controls.Add(_dashboardGrid, 0, 2);
         root.Controls.Add(actions, 0, 3);
         page.Controls.Add(root);
+        page.Enter += (_, _) => RefreshDashboard();
 
         _dashboardTab = page;
         _tabs.TabPages.Insert(0, page);
@@ -263,16 +264,25 @@ public sealed partial class ManagerForm
         grid.DefaultCellStyle.SelectionBackColor = Color.FromArgb(215, 232, 252);
         grid.DefaultCellStyle.SelectionForeColor = Color.FromArgb(30, 50, 75);
 
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Profile", HeaderText = "Profile", Width = 105 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            Name = "Profile", HeaderText = "Profile", Width = 105,
+            DefaultCellStyle = new DataGridViewCellStyle
+            {
+                Font = new Font("Segoe UI", 9F, FontStyle.Bold),
+                ForeColor = Color.FromArgb(25, 67, 112),
+                SelectionForeColor = Color.FromArgb(18, 55, 95)
+            }
+        });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Account", HeaderText = "Tài khoản", Width = 155 });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "RunState", HeaderText = "Trạng thái", Width = 110 });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Chrome", HeaderText = "Chrome", Width = 105 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Viewer", HeaderText = "Viewer", Width = 90 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "RunTime", HeaderText = "T/g chạy", Width = 100 });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Step", HeaderText = "Bước", Width = 70 });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Rounds", HeaderText = "Vòng", Width = 75 });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Ram", HeaderText = "RAM chính", Width = 95 });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Detail", HeaderText = "Chi tiết", AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill, MinimumWidth = 220 });
-        LogGridSchema(grid, "DashboardGrid", "Profile", "Account", "RunState", "Chrome", "Viewer", "Step", "Rounds", "Ram", "Detail");
+        LogGridSchema(grid, "DashboardGrid", "Profile", "Account", "RunState", "Chrome", "RunTime", "Step", "Rounds", "Ram", "Detail");
 
         grid.CellDoubleClick += async (_, e) =>
         {
@@ -387,6 +397,49 @@ public sealed partial class ManagerForm
         return grid.SelectedRows[0].Tag as ProfileContext;
     }
 
+    static void SetDashboardCellIfChanged(DataGridViewRow row, string columnName, string value)
+    {
+        var cell = row.Cells[columnName];
+        var current = Convert.ToString(cell.Value) ?? "";
+        if (!string.Equals(current, value, StringComparison.Ordinal))
+            cell.Value = value;
+    }
+
+    static void ApplyDashboardRowStyle(DataGridViewRow row, string runState)
+    {
+        row.DefaultCellStyle.BackColor = Color.White;
+        row.DefaultCellStyle.ForeColor = SystemColors.ControlText;
+        if (runState == RuntimeStateRecovering)
+        {
+            row.DefaultCellStyle.BackColor = Color.FromArgb(255, 248, 218);
+            row.DefaultCellStyle.ForeColor = Color.FromArgb(112, 82, 14);
+        }
+        else if (runState == RuntimeStateRunning)
+        {
+            row.DefaultCellStyle.BackColor = Color.FromArgb(237, 249, 240);
+            row.DefaultCellStyle.ForeColor = Color.FromArgb(28, 98, 54);
+        }
+        else if (runState == RuntimeStatePaused)
+        {
+            row.DefaultCellStyle.BackColor = Color.FromArgb(255, 246, 229);
+            row.DefaultCellStyle.ForeColor = Color.FromArgb(140, 83, 12);
+        }
+        else if (runState == RuntimeStateStopped)
+        {
+            row.DefaultCellStyle.ForeColor = Color.FromArgb(146, 54, 54);
+        }
+
+        // Chỉ nhấn thị giác, không thay đổi dữ liệu/logic trạng thái.
+        var profileCell = row.Cells["Profile"];
+        profileCell.Style.Font = new Font("Segoe UI", 9F, FontStyle.Bold);
+        profileCell.Style.ForeColor = Color.FromArgb(25, 67, 112);
+        profileCell.Style.SelectionForeColor = Color.FromArgb(18, 55, 95);
+
+        var stateCell = row.Cells["RunState"];
+        stateCell.Style.Font = new Font("Segoe UI", 9F, FontStyle.Bold);
+        stateCell.Style.ForeColor = GetRuntimeStateColor(runState);
+    }
+
     void RefreshDashboard(bool forceAccountRefresh = false)
     {
         if (IsDisposed || Disposing || _dashboardGrid is null || _dashboardGrid.IsDisposed) return;
@@ -395,6 +448,11 @@ public sealed partial class ManagerForm
             try { BeginInvoke(new Action(() => RefreshDashboard(forceAccountRefresh))); } catch { }
             return;
         }
+
+        // Khi tab Tổng quan không hiển thị, LastSnapshot vẫn được Worker refresh như cũ;
+        // chỉ bỏ phần dựng/repaint DataGridView để giảm tải UI. Khi quay lại tab, Enter sẽ refresh ngay.
+        if (!forceAccountRefresh && _dashboardTab is not null && !ReferenceEquals(_tabs.SelectedTab, _dashboardTab))
+            return;
 
         if (forceAccountRefresh || DateTime.UtcNow - _dashboardAccountCacheUtc > TimeSpan.FromSeconds(15))
         {
@@ -419,9 +477,35 @@ public sealed partial class ManagerForm
         _dashboardGrid.SuspendLayout();
         try
         {
-            _dashboardGrid.Rows.Clear();
-            foreach (var ctx in contexts)
+            var needsRowRebuild = _dashboardGrid.Rows.Count != contexts.Count;
+            if (!needsRowRebuild)
             {
+                for (var i = 0; i < contexts.Count; i++)
+                {
+                    if (_dashboardGrid.Rows[i].Tag is not ProfileContext existing
+                        || !existing.Profile.Name.Equals(contexts[i].Profile.Name, StringComparison.OrdinalIgnoreCase))
+                    {
+                        needsRowRebuild = true;
+                        break;
+                    }
+                }
+            }
+
+            if (needsRowRebuild)
+            {
+                _dashboardGrid.Rows.Clear();
+                foreach (var ctx in contexts)
+                {
+                    var rowIndex = _dashboardGrid.Rows.Add(ctx.Profile.Name, "—", "—", "—", "—", "—", "—", "—", "");
+                    _dashboardGrid.Rows[rowIndex].Tag = ctx;
+                }
+            }
+
+            for (var i = 0; i < contexts.Count; i++)
+            {
+                var ctx = contexts[i];
+                var row = _dashboardGrid.Rows[i];
+                row.Tag = ctx;
                 var snapshot = ctx.LastSnapshot;
                 var runState = GetEffectiveRuntimeState(ctx);
                 var detail = snapshot?.Detail ?? "";
@@ -445,45 +529,28 @@ public sealed partial class ManagerForm
                 }
 
                 var account = GetDashboardAccount(ctx);
-                var viewerText = viewer < 0 ? "—" : FormatDashboardViewer(viewer);
                 var stepText = snapshot is null || snapshot.Step <= 0 ? "—" : snapshot.Step.ToString();
                 var roundsText = snapshot is null ? "—" : snapshot.Rounds.ToString();
                 var chrome = snapshot?.Chrome ?? "—";
+                var runTime = FormatDashboardRuntime(snapshot?.TotalRunSeconds ?? -1);
                 var ram = GetDashboardPrimaryRamMb(ctx, snapshot);
-                var rowIndex = _dashboardGrid.Rows.Add(
-                    ctx.Profile.Name,
-                    string.IsNullOrWhiteSpace(account) ? "—" : account,
-                    runState,
-                    chrome,
-                    viewerText,
-                    stepText,
-                    roundsText,
-                    ram < 0 ? "—" : $"{ram:N0} MB",
-                    detail);
-                var row = _dashboardGrid.Rows[rowIndex];
-                row.Tag = ctx;
+                var previousRunState = Convert.ToString(row.Cells["RunState"].Value) ?? "";
 
-                if (runState == RuntimeStateRecovering)
-                {
-                    row.DefaultCellStyle.BackColor = Color.FromArgb(255, 248, 218);
-                    row.DefaultCellStyle.ForeColor = Color.FromArgb(112, 82, 14);
-                }
-                else if (runState == RuntimeStateRunning)
-                {
-                    row.DefaultCellStyle.BackColor = Color.FromArgb(237, 249, 240);
-                    row.DefaultCellStyle.ForeColor = Color.FromArgb(28, 98, 54);
-                }
-                else if (runState == RuntimeStatePaused)
-                {
-                    row.DefaultCellStyle.BackColor = Color.FromArgb(255, 246, 229);
-                    row.DefaultCellStyle.ForeColor = Color.FromArgb(140, 83, 12);
-                }
-                else if (runState == RuntimeStateStopped)
-                {
-                    row.DefaultCellStyle.ForeColor = Color.FromArgb(146, 54, 54);
-                }
+                SetDashboardCellIfChanged(row, "Profile", ctx.Profile.Name);
+                SetDashboardCellIfChanged(row, "Account", string.IsNullOrWhiteSpace(account) ? "—" : account);
+                SetDashboardCellIfChanged(row, "RunState", runState);
+                SetDashboardCellIfChanged(row, "Chrome", chrome);
+                SetDashboardCellIfChanged(row, "RunTime", runTime);
+                SetDashboardCellIfChanged(row, "Step", stepText);
+                SetDashboardCellIfChanged(row, "Rounds", roundsText);
+                SetDashboardCellIfChanged(row, "Ram", ram < 0 ? "—" : $"{ram:N0} MB");
+                SetDashboardCellIfChanged(row, "Detail", detail);
 
-                if (!string.IsNullOrWhiteSpace(selectedName) && ctx.Profile.Name.Equals(selectedName, StringComparison.OrdinalIgnoreCase))
+                if (needsRowRebuild || !string.Equals(previousRunState, runState, StringComparison.Ordinal))
+                    ApplyDashboardRowStyle(row, runState);
+
+                if (needsRowRebuild && !string.IsNullOrWhiteSpace(selectedName)
+                    && ctx.Profile.Name.Equals(selectedName, StringComparison.OrdinalIgnoreCase))
                     row.Selected = true;
             }
         }
@@ -514,6 +581,13 @@ public sealed partial class ManagerForm
             _dashboardAccountCache[ctx.Profile.Name] = "";
             return "";
         }
+    }
+
+    static string FormatDashboardRuntime(long totalSeconds)
+    {
+        if (totalSeconds < 0) return "—";
+        var value = TimeSpan.FromSeconds(totalSeconds);
+        return $"{(long)value.TotalHours}h {value.Minutes:00}m";
     }
 
     static string FormatDashboardViewer(int value)

@@ -53,37 +53,117 @@ public sealed partial class ManagerForm
     readonly HashSet<string> _messageReplyProfilesInFlight = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, DateTime> _autoMessageReplyNextRunUtc = new(StringComparer.OrdinalIgnoreCase);
     readonly SemaphoreSlim _autoMessageReplyQueueGate = new(1, 1);
+    readonly List<ProfileContext> _messageReplySortedContextsCache = new();
+    readonly object _messageReplyStateGate = new();
+    MessageReplyToolState? _messageReplyStateCache;
+    DateTime _messageReplyStateCacheWriteUtc = DateTime.MinValue;
+    long _messageReplyStateCacheLength = -1;
+    string _messageReplyParsedCacheText = "";
+    string[] _messageReplyParsedCache = Array.Empty<string>();
+    event Action<string, string>? _messageReplyAutoNoteChanged;
     string MessageReplyToolStatePath => Path.Combine(_baseDir, "tiktok_message_reply_tool.json");
+
+    static MessageReplyAutoStats CloneMessageReplyAutoStats(MessageReplyAutoStats stats) => new()
+    {
+        CheckRuns = stats.CheckRuns,
+        ReplyRuns = stats.ReplyRuns,
+        TotalReplied = stats.TotalReplied,
+        LastReplied = stats.LastReplied,
+        LastFailed = stats.LastFailed,
+        LastRunUtc = stats.LastRunUtc,
+        LastResult = stats.LastResult ?? ""
+    };
+
+    static MessageReplyToolState CloneMessageReplyToolState(MessageReplyToolState state) => new()
+    {
+        MessagesText = state.MessagesText ?? "",
+        AcceptRequests = state.AcceptRequests,
+        ReplyAfterAccept = state.ReplyAfterAccept,
+        SkipAlreadyReplied = state.SkipAlreadyReplied,
+        OnlyInitialRequests = state.OnlyInitialRequests,
+        DelayMinSeconds = state.DelayMinSeconds,
+        DelayMaxSeconds = state.DelayMaxSeconds,
+        RetryCount = state.RetryCount,
+        AutoEnabled = state.AutoEnabled,
+        AutoIntervalMinutes = NormalizeMessageReplyInterval(state.AutoIntervalMinutes),
+        AutoStats = (state.AutoStats ?? new Dictionary<string, MessageReplyAutoStats>())
+            .ToDictionary(x => x.Key, x => CloneMessageReplyAutoStats(x.Value), StringComparer.OrdinalIgnoreCase)
+    };
 
     MessageReplyToolState LoadMessageReplyToolState()
     {
-        try
+        lock (_messageReplyStateGate)
         {
-            if (!File.Exists(MessageReplyToolStatePath)) return new MessageReplyToolState();
-            var state = JsonSerializer.Deserialize<MessageReplyToolState>(File.ReadAllText(MessageReplyToolStatePath)) ?? new MessageReplyToolState();
-            state.AutoIntervalMinutes = NormalizeMessageReplyInterval(state.AutoIntervalMinutes);
-            state.AutoStats = new Dictionary<string, MessageReplyAutoStats>(state.AutoStats ?? new(), StringComparer.OrdinalIgnoreCase);
-            return state;
-        }
-        catch (Exception ex)
-        {
-            _log.Warn("[MESSAGE_REPLY_STATE_LOAD] " + ex.Message);
-            return new MessageReplyToolState();
+            try
+            {
+                if (!File.Exists(MessageReplyToolStatePath))
+                {
+                    _messageReplyStateCache ??= new MessageReplyToolState();
+                    _messageReplyStateCacheWriteUtc = DateTime.MinValue;
+                    _messageReplyStateCacheLength = -1;
+                    return CloneMessageReplyToolState(_messageReplyStateCache);
+                }
+
+                var info = new FileInfo(MessageReplyToolStatePath);
+                if (_messageReplyStateCache is not null
+                    && info.LastWriteTimeUtc == _messageReplyStateCacheWriteUtc
+                    && info.Length == _messageReplyStateCacheLength)
+                    return CloneMessageReplyToolState(_messageReplyStateCache);
+
+                var state = JsonSerializer.Deserialize<MessageReplyToolState>(File.ReadAllText(MessageReplyToolStatePath)) ?? new MessageReplyToolState();
+                state.AutoIntervalMinutes = NormalizeMessageReplyInterval(state.AutoIntervalMinutes);
+                state.AutoStats = new Dictionary<string, MessageReplyAutoStats>(state.AutoStats ?? new(), StringComparer.OrdinalIgnoreCase);
+                _messageReplyStateCache = CloneMessageReplyToolState(state);
+                info.Refresh();
+                _messageReplyStateCacheWriteUtc = info.LastWriteTimeUtc;
+                _messageReplyStateCacheLength = info.Length;
+                return CloneMessageReplyToolState(state);
+            }
+            catch (Exception ex)
+            {
+                _log.Warn("[MESSAGE_REPLY_STATE_LOAD] " + ex.Message);
+                _messageReplyStateCache ??= new MessageReplyToolState();
+                return CloneMessageReplyToolState(_messageReplyStateCache);
+            }
         }
     }
 
     void SaveMessageReplyToolState(MessageReplyToolState state)
     {
-        try
+        lock (_messageReplyStateGate)
         {
-            File.WriteAllText(MessageReplyToolStatePath,
-                JsonSerializer.Serialize(state, new JsonSerializerOptions { WriteIndented = true }));
+            try
+            {
+                var snapshot = CloneMessageReplyToolState(state);
+                File.WriteAllText(MessageReplyToolStatePath,
+                    JsonSerializer.Serialize(snapshot, new JsonSerializerOptions { WriteIndented = true }));
+                _messageReplyStateCache = snapshot;
+                var info = new FileInfo(MessageReplyToolStatePath);
+                _messageReplyStateCacheWriteUtc = info.LastWriteTimeUtc;
+                _messageReplyStateCacheLength = info.Length;
+            }
+            catch (Exception ex) { _log.Warn("[MESSAGE_REPLY_STATE_SAVE] " + ex.Message); }
         }
-        catch (Exception ex) { _log.Warn("[MESSAGE_REPLY_STATE_SAVE] " + ex.Message); }
     }
 
     static int NormalizeMessageReplyInterval(int minutes)
         => minutes switch { 30 => 30, 60 => 60, 120 => 120, 240 => 240, _ => 60 };
+
+    IReadOnlyList<ProfileContext> GetMessageReplySortedContexts()
+    {
+        if (_messageReplySortedContextsCache.Count == _contexts.Count
+            && _messageReplySortedContextsCache.All(ctx =>
+                _contexts.TryGetValue(ctx.Profile.Name, out var current) && ReferenceEquals(current, ctx))
+            && _messageReplySortedContextsCache
+                .Zip(_messageReplySortedContextsCache.Skip(1), (left, right) =>
+                    NaturalProfileNameOrder.Compare(left.Profile.Name, right.Profile.Name) <= 0)
+                .All(x => x))
+            return _messageReplySortedContextsCache;
+
+        _messageReplySortedContextsCache.Clear();
+        _messageReplySortedContextsCache.AddRange(_contexts.Values.OrderBy(x => x.Profile.Name, NaturalProfileNameOrder));
+        return _messageReplySortedContextsCache;
+    }
 
     static string BuildAutoReplyNote(string profileName, MessageReplyToolState state)
     {
@@ -93,13 +173,20 @@ public sealed partial class ManagerForm
         return $"Đã rep {stats.ReplyRuns} lần | Lần #{stats.CheckRuns}: {stats.LastReplied} tin | Tổng {stats.TotalReplied} tin | {local}";
     }
 
-    static string[] ParseSharedReplyMessages(string text)
+    string[] ParseSharedReplyMessages(string text)
     {
+        text ??= "";
+        lock (_messageReplyStateGate)
+        {
+            if (string.Equals(_messageReplyParsedCacheText, text, StringComparison.Ordinal))
+                return _messageReplyParsedCache;
+        }
+
         // Một dòng chỉ chứa --- là ranh giới giữa hai tin nhắn riêng biệt.
         // Những dòng nằm trong cùng một khối được giữ nguyên xuống dòng.
         var result = new List<string>();
         var current = new List<string>();
-        foreach (var line in (text ?? "").Replace("\r\n", "\n").Replace('\r', '\n').Split('\n'))
+        foreach (var line in text.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n'))
         {
             if (string.Equals(line.Trim(), "---", StringComparison.Ordinal))
             {
@@ -112,18 +199,38 @@ public sealed partial class ManagerForm
         }
         var last = string.Join(Environment.NewLine, current).Trim();
         if (last.Length > 0) result.Add(last);
-        return result.ToArray();
+        var parsed = result.ToArray();
+
+        lock (_messageReplyStateGate)
+        {
+            _messageReplyParsedCacheText = text;
+            _messageReplyParsedCache = parsed;
+        }
+        return parsed;
     }
 
     void ShowTikTokMessageReplyDialog()
     {
-        const string useColumn = "Use";
         const string profileColumn = "Profile";
+        const string accountColumn = "Account";
         const string resultColumn = "Result";
         const string noteColumn = "AutoNote";
 
         var state = LoadMessageReplyToolState();
         var contexts = _contexts.Values.OrderBy(x => x.Profile.Name, NaturalProfileNameOrder).ToList();
+        var selectedProfiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var initiallySelected = SelectedContext();
+        if (state.AutoEnabled)
+        {
+            // Tận dụng đúng khái niệm "profile đang mở" của Dashboard. Khi auto LIVE bật,
+            // phần Tin nhắn tự bám các profile đang mở thay vì bắt người dùng chọn lại.
+            foreach (var ctx in contexts.Where(IsDashboardProfileOpen))
+                selectedProfiles.Add(ctx.Profile.Name);
+        }
+        else if (initiallySelected is not null)
+        {
+            selectedProfiles.Add(initiallySelected.Profile.Name);
+        }
         using var form = new Form
         {
             Text = "Tin nhắn TikTok",
@@ -304,36 +411,62 @@ public sealed partial class ManagerForm
             AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
             BackgroundColor = Color.White,
             BorderStyle = BorderStyle.FixedSingle,
-            ColumnHeadersHeight = 36
+            ColumnHeadersHeight = 36,
+            ReadOnly = true
         };
-        grid.RowTemplate.Height = 38;
+        grid.RowTemplate.Height = 36;
         grid.DefaultCellStyle.Padding = new Padding(4, 2, 4, 2);
-        grid.Columns.Add(new DataGridViewCheckBoxColumn
-        {
-            Name = useColumn,
-            HeaderText = "Chọn",
-            AutoSizeMode = DataGridViewAutoSizeColumnMode.None,
-            Width = 72,
-            MinimumWidth = 72
-        });
         grid.Columns.Add(new DataGridViewTextBoxColumn
         {
             Name = profileColumn,
             HeaderText = "Profile",
             ReadOnly = true,
             AutoSizeMode = DataGridViewAutoSizeColumnMode.None,
-            Width = 125,
-            MinimumWidth = 100
+            Width = 105,
+            MinimumWidth = 90
+        });
+        grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            Name = accountColumn,
+            HeaderText = "Tài khoản TikTok",
+            ReadOnly = true,
+            AutoSizeMode = DataGridViewAutoSizeColumnMode.None,
+            Width = 190,
+            MinimumWidth = 140
         });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = resultColumn, HeaderText = "Trạng thái / kết quả", ReadOnly = true, FillWeight = 45, MinimumWidth = 180 });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = noteColumn, HeaderText = "Ghi chú tự động", ReadOnly = true, FillWeight = 55, MinimumWidth = 220 });
-        var selectedContext = SelectedContext();
-        foreach (var ctx in contexts)
+        LogGridSchema(grid, "TikTokMessageReplyGrid", profileColumn, accountColumn, resultColumn, noteColumn);
+
+        void RefreshSelectedProfileGrid()
         {
-            var index = grid.Rows.Add(ReferenceEquals(ctx, selectedContext), ctx.Profile.Name, "Chưa chạy", BuildAutoReplyNote(ctx.Profile.Name, state));
-            grid.Rows[index].Tag = ctx;
+            if (grid.IsDisposed) return;
+            var previousResults = grid.Rows.Cast<DataGridViewRow>()
+                .Where(r => r.Tag is ProfileContext)
+                .ToDictionary(
+                    r => ((ProfileContext)r.Tag!).Profile.Name,
+                    r => Convert.ToString(GetGridCellValueOrNull(r, resultColumn, "ShowTikTokMessageReplyDialog.PreserveResult")) ?? "Chưa chạy",
+                    StringComparer.OrdinalIgnoreCase);
+
+            var latestState = LoadMessageReplyToolState();
+            grid.SuspendLayout();
+            try
+            {
+                grid.Rows.Clear();
+                foreach (var ctx in contexts.Where(c => selectedProfiles.Contains(c.Profile.Name)))
+                {
+                    var result = previousResults.TryGetValue(ctx.Profile.Name, out var oldResult) ? oldResult : "Chưa chạy";
+                    var account = GetDashboardAccount(ctx);
+                    var index = grid.Rows.Add(
+                        ctx.Profile.Name,
+                        string.IsNullOrWhiteSpace(account) ? "—" : account,
+                        result,
+                        BuildAutoReplyNote(ctx.Profile.Name, latestState));
+                    grid.Rows[index].Tag = ctx;
+                }
+            }
+            finally { grid.ResumeLayout(); }
         }
-        LogGridSchema(grid, "TikTokMessageReplyGrid", useColumn, profileColumn, resultColumn, noteColumn);
 
         var tabs = new TabControl
         {
@@ -344,27 +477,24 @@ public sealed partial class ManagerForm
         var accountsTab = new TabPage("Tài khoản") { BackColor = ModernDialog.Canvas, Padding = new Padding(6) };
         var journalTab = new TabPage("Nhật ký") { BackColor = ModernDialog.Canvas, Padding = new Padding(6) };
 
-        // Thanh chọn tài khoản đặt ngay trên danh sách để màn hình nhỏ vẫn dễ thao tác.
-        var selectAll = new Button { Text = "Chọn tất", Width = 92, Height = 32 };
-        var clearAll = new Button { Text = "Bỏ chọn", Width = 92, Height = 32 };
-        var invertSelection = new Button { Text = "Đảo chọn", Width = 92, Height = 32 };
-        ModernDialog.StyleSecondaryButton(selectAll);
-        ModernDialog.StyleSecondaryButton(clearAll);
-        ModernDialog.StyleSecondaryButton(invertSelection);
+        // Việc chọn profile được tách sang dialog riêng để cửa sổ Tin nhắn gọn hơn.
+        // Dialog chọn có ô tìm kiếm theo cả tên profile lẫn username TikTok.
+        var chooseProfiles = new Button { Text = "Chọn tài khoản...", Width = 150, Height = 34 };
+        ModernDialog.StyleSecondaryButton(chooseProfiles);
         var selectionSummary = new Label
         {
             AutoSize = true,
-            Text = "Đã chọn: 0/0",
+            Text = $"Đã chọn: {selectedProfiles.Count}/{contexts.Count}",
             ForeColor = Color.FromArgb(55, 76, 103),
             Font = new Font("Segoe UI", 9F, FontStyle.Bold),
-            Margin = new Padding(12, 8, 0, 0)
+            Margin = new Padding(12, 9, 0, 0)
         };
         var accountHint = new Label
         {
             AutoSize = true,
-            Text = "Bấm vào bất kỳ chỗ nào trên một dòng để chọn / bỏ chọn.",
+            Text = "Danh sách dưới chỉ hiện profile đã chọn. Khi bật Tự động LIVE, danh sách sẽ tự bám các profile đang mở; chỉ profile RUNNING mới tới lượt xử lý.",
             ForeColor = Color.DimGray,
-            Margin = new Padding(12, 8, 0, 0)
+            Margin = new Padding(12, 9, 0, 0)
         };
         var accountToolbar = new FlowLayoutPanel
         {
@@ -373,11 +503,274 @@ public sealed partial class ManagerForm
             WrapContents = true,
             Margin = new Padding(0, 0, 0, 6)
         };
-        accountToolbar.Controls.Add(selectAll);
-        accountToolbar.Controls.Add(clearAll);
-        accountToolbar.Controls.Add(invertSelection);
+        accountToolbar.Controls.Add(chooseProfiles);
         accountToolbar.Controls.Add(selectionSummary);
         accountToolbar.Controls.Add(accountHint);
+
+        bool SyncAutoSelectionFromOpenProfiles(bool refreshGrid = true)
+        {
+            if (!autoEnabled.Checked) return false;
+
+            var openNames = contexts
+                .Where(IsDashboardProfileOpen)
+                .Select(ctx => ctx.Profile.Name)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            var changed = selectedProfiles.Count != openNames.Count
+                || selectedProfiles.Any(name => !openNames.Contains(name));
+            if (!changed)
+            {
+                selectionSummary.Text = $"Tự động: {selectedProfiles.Count} profile đang mở";
+                return false;
+            }
+
+            selectedProfiles.Clear();
+            foreach (var name in openNames) selectedProfiles.Add(name);
+            selectionSummary.Text = $"Tự động: {selectedProfiles.Count} profile đang mở";
+            if (refreshGrid) RefreshSelectedProfileGrid();
+            return true;
+        }
+
+        void UpdateProfileSelectionMode()
+        {
+            if (autoEnabled.Checked)
+            {
+                chooseProfiles.Enabled = false;
+                chooseProfiles.Text = "Tự động theo profile mở";
+                accountHint.Text = "Tự động LIVE đang bật: profile mở thêm/đóng đi sẽ tự cập nhật danh sách. Chỉ profile RUNNING + Chrome CONNECTED mới được xử lý.";
+                SyncAutoSelectionFromOpenProfiles();
+            }
+            else
+            {
+                chooseProfiles.Enabled = true;
+                chooseProfiles.Text = "Chọn tài khoản...";
+                selectionSummary.Text = $"Đã chọn: {selectedProfiles.Count}/{contexts.Count}";
+                accountHint.Text = "Danh sách dưới chỉ hiện profile đã chọn. Bật Tự động LIVE nếu muốn tự bám toàn bộ profile đang mở.";
+            }
+        }
+
+        void ShowProfileSelector()
+        {
+            var workingSelection = new HashSet<string>(selectedProfiles, StringComparer.OrdinalIgnoreCase);
+            using var selector = new Form
+            {
+                Text = "Chọn tài khoản xử lý Tin nhắn",
+                Width = 820,
+                Height = 650,
+                MinimumSize = new Size(680, 520),
+                FormBorderStyle = FormBorderStyle.Sizable,
+                MinimizeBox = false,
+                MaximizeBox = true,
+                StartPosition = FormStartPosition.CenterParent
+            };
+            ModernDialog.Apply(selector, fixedDialog: false);
+
+            var selectorRoot = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 1,
+                RowCount = 4,
+                Padding = new Padding(14),
+                BackColor = ModernDialog.Canvas
+            };
+            selectorRoot.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            selectorRoot.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            selectorRoot.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            selectorRoot.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            selectorRoot.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+            var searchPanel = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                AutoSize = true,
+                WrapContents = false,
+                Margin = new Padding(0, 0, 0, 8)
+            };
+            searchPanel.Controls.Add(new Label { Text = "Tìm profile / tài khoản:", AutoSize = true, Margin = new Padding(0, 8, 8, 0) });
+            var searchBox = new TextBox { Width = 360, PlaceholderText = "Ví dụ: 15 hoặc phuongnhi74" };
+            ModernDialog.StyleTextInput(searchBox);
+            searchPanel.Controls.Add(searchBox);
+            var selectorSummary = new Label
+            {
+                AutoSize = true,
+                Font = new Font("Segoe UI", 9F, FontStyle.Bold),
+                ForeColor = Color.FromArgb(55, 76, 103),
+                Margin = new Padding(12, 8, 0, 0)
+            };
+            searchPanel.Controls.Add(selectorSummary);
+
+            var quickPanel = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                AutoSize = true,
+                WrapContents = false,
+                Margin = new Padding(0, 0, 0, 8)
+            };
+            var selectVisible = new Button { Text = "Chọn tất đang lọc", Width = 140, Height = 32 };
+            var clearVisible = new Button { Text = "Bỏ chọn đang lọc", Width = 140, Height = 32 };
+            var invertVisible = new Button { Text = "Đảo chọn đang lọc", Width = 140, Height = 32 };
+            ModernDialog.StyleSecondaryButton(selectVisible);
+            ModernDialog.StyleSecondaryButton(clearVisible);
+            ModernDialog.StyleSecondaryButton(invertVisible);
+            quickPanel.Controls.Add(selectVisible);
+            quickPanel.Controls.Add(clearVisible);
+            quickPanel.Controls.Add(invertVisible);
+
+            const string selectorUse = "Use";
+            const string selectorProfile = "Profile";
+            const string selectorAccount = "Account";
+            const string selectorLive = "Live";
+            const string selectorChrome = "Chrome";
+            var selectorGrid = new DataGridView
+            {
+                Dock = DockStyle.Fill,
+                AllowUserToAddRows = false,
+                AllowUserToDeleteRows = false,
+                AllowUserToResizeRows = false,
+                RowHeadersVisible = false,
+                SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+                MultiSelect = false,
+                AutoGenerateColumns = false,
+                BackgroundColor = Color.White,
+                BorderStyle = BorderStyle.FixedSingle,
+                ColumnHeadersHeight = 36
+            };
+            selectorGrid.RowTemplate.Height = 36;
+            selectorGrid.Columns.Add(new DataGridViewCheckBoxColumn { Name = selectorUse, HeaderText = "Chọn", Width = 62 });
+            selectorGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = selectorProfile, HeaderText = "Profile", Width = 100, ReadOnly = true });
+            selectorGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = selectorAccount, HeaderText = "Tài khoản TikTok", Width = 220, ReadOnly = true });
+            selectorGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = selectorLive, HeaderText = "LIVE", Width = 120, ReadOnly = true });
+            selectorGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = selectorChrome, HeaderText = "Chrome", AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill, MinimumWidth = 120, ReadOnly = true });
+
+            var visibleContexts = new List<ProfileContext>();
+            void UpdateSelectorSummary()
+            {
+                selectorSummary.Text = $"Đã chọn: {workingSelection.Count}/{contexts.Count}";
+            }
+
+            void RenderSelectorRows()
+            {
+                selectorGrid.EndEdit();
+                var keyword = (searchBox.Text ?? "").Trim();
+                visibleContexts = contexts.Where(ctx =>
+                {
+                    if (keyword.Length == 0) return true;
+                    var account = GetDashboardAccount(ctx) ?? "";
+                    return ctx.Profile.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase)
+                        || account.Contains(keyword, StringComparison.OrdinalIgnoreCase);
+                }).ToList();
+
+                selectorGrid.SuspendLayout();
+                try
+                {
+                    selectorGrid.Rows.Clear();
+                    foreach (var ctx in visibleContexts)
+                    {
+                        var account = GetDashboardAccount(ctx);
+                        var runState = GetLastConfirmedRuntimeState(ctx);
+                        var chrome = ctx.LastSnapshot?.Chrome ?? "—";
+                        var rowIndex = selectorGrid.Rows.Add(
+                            workingSelection.Contains(ctx.Profile.Name),
+                            ctx.Profile.Name,
+                            string.IsNullOrWhiteSpace(account) ? "—" : account,
+                            runState,
+                            chrome);
+                        selectorGrid.Rows[rowIndex].Tag = ctx;
+                    }
+                }
+                finally { selectorGrid.ResumeLayout(); }
+                UpdateSelectorSummary();
+            }
+
+            selectorGrid.CurrentCellDirtyStateChanged += (_, _) =>
+            {
+                if (selectorGrid.IsCurrentCellDirty)
+                    selectorGrid.CommitEdit(DataGridViewDataErrorContexts.Commit);
+            };
+            selectorGrid.CellValueChanged += (_, e) =>
+            {
+                if (e.RowIndex < 0 || e.ColumnIndex != selectorGrid.Columns[selectorUse].Index) return;
+                var row = selectorGrid.Rows[e.RowIndex];
+                if (row.Tag is not ProfileContext ctx) return;
+                var chosen = Convert.ToBoolean(row.Cells[selectorUse].Value ?? false);
+                if (chosen) workingSelection.Add(ctx.Profile.Name);
+                else workingSelection.Remove(ctx.Profile.Name);
+                UpdateSelectorSummary();
+            };
+            selectorGrid.CellClick += (_, e) =>
+            {
+                if (e.RowIndex < 0 || e.ColumnIndex < 0 || selectorGrid.Columns[e.ColumnIndex].Name == selectorUse) return;
+                var row = selectorGrid.Rows[e.RowIndex];
+                if (row.Tag is not ProfileContext) return;
+                row.Cells[selectorUse].Value = !Convert.ToBoolean(row.Cells[selectorUse].Value ?? false);
+            };
+            searchBox.TextChanged += (_, _) => RenderSelectorRows();
+
+            void SetVisibleSelection(Func<bool, bool> transform)
+            {
+                selectorGrid.EndEdit();
+                foreach (DataGridViewRow row in selectorGrid.Rows)
+                {
+                    if (row.Tag is not ProfileContext ctx) continue;
+                    var current = workingSelection.Contains(ctx.Profile.Name);
+                    var next = transform(current);
+                    if (next) workingSelection.Add(ctx.Profile.Name);
+                    else workingSelection.Remove(ctx.Profile.Name);
+                    row.Cells[selectorUse].Value = next;
+                }
+                UpdateSelectorSummary();
+            }
+            selectVisible.Click += (_, _) => SetVisibleSelection(_ => true);
+            clearVisible.Click += (_, _) => SetVisibleSelection(_ => false);
+            invertVisible.Click += (_, _) => SetVisibleSelection(x => !x);
+
+            var footer = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                AutoSize = true,
+                FlowDirection = FlowDirection.RightToLeft,
+                WrapContents = false,
+                Margin = new Padding(0, 10, 0, 0)
+            };
+            var cancel = new Button { Text = "Hủy", Width = 100, Height = 38 };
+            var apply = new Button { Text = "Áp dụng", Width = 110, Height = 38 };
+            ModernDialog.StyleSecondaryButton(cancel);
+            ModernDialog.StylePrimaryButton(apply);
+            footer.Controls.Add(cancel);
+            footer.Controls.Add(apply);
+            cancel.Click += (_, _) => selector.DialogResult = DialogResult.Cancel;
+            apply.Click += (_, _) => selector.DialogResult = DialogResult.OK;
+
+            selectorRoot.Controls.Add(searchPanel, 0, 0);
+            selectorRoot.Controls.Add(quickPanel, 0, 1);
+            selectorRoot.Controls.Add(selectorGrid, 0, 2);
+            selectorRoot.Controls.Add(footer, 0, 3);
+            selector.Controls.Add(selectorRoot);
+            selector.Shown += (_, _) =>
+            {
+                RenderSelectorRows();
+                ModernDialog.FitToWorkingArea(selector);
+                searchBox.Focus();
+            };
+
+            if (selector.ShowDialog(form) != DialogResult.OK) return;
+            selectedProfiles.Clear();
+            foreach (var name in workingSelection) selectedProfiles.Add(name);
+            selectionSummary.Text = $"Đã chọn: {selectedProfiles.Count}/{contexts.Count}";
+            RefreshSelectedProfileGrid();
+        }
+
+        chooseProfiles.Click += (_, _) => ShowProfileSelector();
+
+        // Không tạo timer mới: dùng luôn refresh timer sẵn có của Manager để đồng bộ UI
+        // chọn profile trong lúc dialog đang mở. Scheduler nền vẫn là nguồn quyết định RUNNING/CONNECTED.
+        EventHandler autoSelectionRefresh = (_, _) =>
+        {
+            if (form.IsDisposed || !form.Visible || !autoEnabled.Checked) return;
+            SyncAutoSelectionFromOpenProfiles();
+        };
+        _refreshTimer.Tick += autoSelectionRefresh;
+        form.FormClosed += (_, _) => _refreshTimer.Tick -= autoSelectionRefresh;
 
         var accountRoot = new TableLayoutPanel
         {
@@ -392,6 +785,8 @@ public sealed partial class ManagerForm
         accountRoot.Controls.Add(accountToolbar, 0, 0);
         accountRoot.Controls.Add(grid, 0, 1);
         accountsTab.Controls.Add(accountRoot);
+        RefreshSelectedProfileGrid();
+        UpdateProfileSelectionMode();
 
         var journalRoot = new TableLayoutPanel
         {
@@ -553,10 +948,11 @@ public sealed partial class ManagerForm
 
         autoEnabled.CheckedChanged += (_, _) =>
         {
+            UpdateProfileSelectionMode();
             SaveUiState();
             _autoMessageReplyNextRunUtc.Clear();
             status.Text = autoEnabled.Checked
-                ? $"Trạng thái: Đã bật tự động kiểm tra tin nhắn mỗi {autoInterval.Text}."
+                ? $"Trạng thái: Đã bật tự động mỗi {autoInterval.Text}; tự chọn {selectedProfiles.Count} profile đang mở."
                 : "Trạng thái: Đã tắt tự động Tin nhắn.";
         };
         autoInterval.SelectedIndexChanged += (_, _) =>
@@ -567,58 +963,6 @@ public sealed partial class ManagerForm
             if (autoEnabled.Checked)
                 status.Text = $"Trạng thái: Đã đổi chu kỳ tự động thành {autoInterval.Text}.";
         };
-
-        void UpdateSelectionSummary()
-        {
-            var total = grid.Rows.Cast<DataGridViewRow>().Count(r => r.Tag is ProfileContext);
-            var selectedCount = grid.Rows.Cast<DataGridViewRow>().Count(r =>
-                r.Tag is ProfileContext
-                && Convert.ToBoolean(GetGridCellValueOrNull(r, useColumn, "ShowTikTokMessageReplyDialog.SelectionSummary") ?? false));
-            selectionSummary.Text = $"Đã chọn: {selectedCount}/{total}";
-        }
-
-        selectAll.Click += (_, _) =>
-        {
-            foreach (DataGridViewRow row in grid.Rows)
-                TrySetGridCellValue(row, useColumn, true, "ShowTikTokMessageReplyDialog.SelectAll");
-            UpdateSelectionSummary();
-        };
-        clearAll.Click += (_, _) =>
-        {
-            foreach (DataGridViewRow row in grid.Rows)
-                TrySetGridCellValue(row, useColumn, false, "ShowTikTokMessageReplyDialog.ClearAll");
-            UpdateSelectionSummary();
-        };
-        invertSelection.Click += (_, _) =>
-        {
-            foreach (DataGridViewRow row in grid.Rows)
-            {
-                var current = Convert.ToBoolean(GetGridCellValueOrNull(row, useColumn, "ShowTikTokMessageReplyDialog.Invert") ?? false);
-                TrySetGridCellValue(row, useColumn, !current, "ShowTikTokMessageReplyDialog.Invert");
-            }
-            UpdateSelectionSummary();
-        };
-        grid.CurrentCellDirtyStateChanged += (_, _) =>
-        {
-            if (grid.IsCurrentCellDirty)
-                grid.CommitEdit(DataGridViewDataErrorContexts.Commit);
-        };
-        grid.CellValueChanged += (_, e) =>
-        {
-            if (e.RowIndex >= 0 && e.ColumnIndex == grid.Columns[useColumn].Index)
-                UpdateSelectionSummary();
-        };
-        grid.CellClick += (_, e) =>
-        {
-            if (e.RowIndex < 0 || e.ColumnIndex < 0) return;
-            if (grid.Columns[e.ColumnIndex].Name == useColumn) return; // checkbox tự xử lý click của nó
-            var row = grid.Rows[e.RowIndex];
-            if (row.Tag is not ProfileContext) return;
-            var current = Convert.ToBoolean(GetGridCellValueOrNull(row, useColumn, "ShowTikTokMessageReplyDialog.RowClick") ?? false);
-            TrySetGridCellValue(row, useColumn, !current, "ShowTikTokMessageReplyDialog.RowClick");
-            UpdateSelectionSummary();
-        };
-        UpdateSelectionSummary();
 
         close.Click += (_, _) => form.Close();
         stop.Click += async (_, _) =>
@@ -638,7 +982,7 @@ public sealed partial class ManagerForm
             if (running) return;
             grid.EndEdit();
             var selected = grid.Rows.Cast<DataGridViewRow>()
-                .Where(r => r.Tag is ProfileContext && Convert.ToBoolean(GetGridCellValueOrNull(r, useColumn, "ShowTikTokMessageReplyDialog.Start") ?? false))
+                .Where(r => r.Tag is ProfileContext)
                 .ToList();
             if (selected.Count == 0)
             {
@@ -688,6 +1032,7 @@ public sealed partial class ManagerForm
             retry.Enabled = false;
             autoEnabled.Enabled = false;
             autoInterval.Enabled = false;
+            chooseProfiles.Enabled = false;
             var successProfiles = 0;
             var failedProfiles = 0;
 
@@ -845,6 +1190,7 @@ public sealed partial class ManagerForm
                     retry.Enabled = true;
                     autoEnabled.Enabled = true;
                     autoInterval.Enabled = true;
+                    chooseProfiles.Enabled = true;
                     if (stopRequested)
                         status.Text = "Trạng thái: Đã dừng.";
                     else if (string.IsNullOrWhiteSpace(status.Text) || !status.Text.StartsWith("Trạng thái: Hoàn tất", StringComparison.Ordinal))
@@ -853,17 +1199,26 @@ public sealed partial class ManagerForm
             }
         };
 
-        var noteRefreshTimer = new System.Windows.Forms.Timer { Interval = 1500, Enabled = true };
-        noteRefreshTimer.Tick += (_, _) =>
+        void HandleAutoNoteChanged(string profileName, string note)
         {
             if (form.IsDisposed || grid.IsDisposed) return;
-            var latest = LoadMessageReplyToolState();
-            foreach (DataGridViewRow row in grid.Rows)
+            void ApplyNote()
             {
-                if (row.Tag is not ProfileContext ctx) continue;
-                TrySetGridCellValue(row, noteColumn, BuildAutoReplyNote(ctx.Profile.Name, latest), "ShowTikTokMessageReplyDialog.AutoNoteRefresh");
+                if (form.IsDisposed || grid.IsDisposed) return;
+                foreach (DataGridViewRow row in grid.Rows)
+                {
+                    if (row.Tag is not ProfileContext ctx || !ctx.Profile.Name.Equals(profileName, StringComparison.OrdinalIgnoreCase)) continue;
+                    TrySetGridCellValue(row, noteColumn, note, "ShowTikTokMessageReplyDialog.AutoNoteChanged");
+                    break;
+                }
             }
-        };
+            if (form.InvokeRequired)
+            {
+                try { form.BeginInvoke((Action)ApplyNote); } catch { }
+            }
+            else ApplyNote();
+        }
+        _messageReplyAutoNoteChanged += HandleAutoNoteChanged;
 
         form.FormClosing += (_, e) =>
         {
@@ -873,8 +1228,7 @@ public sealed partial class ManagerForm
         };
         form.FormClosed += (_, _) =>
         {
-            noteRefreshTimer.Stop();
-            noteRefreshTimer.Dispose();
+            _messageReplyAutoNoteChanged -= HandleAutoNoteChanged;
             SaveUiState();
         };
         form.Shown += (_, _) => ModernDialog.FitToWorkingArea(form);
@@ -902,8 +1256,9 @@ public sealed partial class ManagerForm
 
         var intervalMinutes = NormalizeMessageReplyInterval(state.AutoIntervalMinutes);
         var now = DateTime.UtcNow;
-        foreach (var ctx in _contexts.Values.OrderBy(x => x.Profile.Name, NaturalProfileNameOrder).ToList())
+        foreach (var ctx in GetMessageReplySortedContexts())
         {
+            if (!IsDashboardProfileOpen(ctx)) continue;
             var snapshot = ctx.LastSnapshot;
             if (snapshot is null) continue;
             if (!string.Equals(GetLastConfirmedRuntimeState(ctx), "RUNNING", StringComparison.OrdinalIgnoreCase)) continue;
@@ -1109,6 +1464,7 @@ public sealed partial class ManagerForm
                     }
                     stats.LastResult = finalResult;
                     SaveMessageReplyToolState(state);
+                    _messageReplyAutoNoteChanged?.Invoke(ctx.Profile.Name, BuildAutoReplyNote(ctx.Profile.Name, state));
                     intervalMinutes = NormalizeMessageReplyInterval(state.AutoIntervalMinutes);
                 }
                 catch (Exception statsEx)

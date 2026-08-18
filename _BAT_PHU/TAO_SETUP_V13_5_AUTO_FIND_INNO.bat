@@ -1,18 +1,21 @@
 ﻿@echo off
 setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
-cd /d "%~dp0"
+set "NOPAUSE=%~1"
+set "SCRIPT_DIR=%~dp0"
+for %%I in ("%SCRIPT_DIR%..") do set "ROOT=%%~fI"
+cd /d "%ROOT%"
 
 if not exist "VERSION.txt" (
     echo [LOI] Khong tim thay VERSION.txt
-    pause
+    if /I not "%NOPAUSE%"=="--no-pause" pause
     exit /b 1
 )
 set /p APP_VERSION=<"VERSION.txt"
-powershell -NoProfile -ExecutionPolicy Bypass -File ".\SYNC_VERSION.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%SYNC_VERSION.ps1" -Root "%ROOT%"
 if errorlevel 1 (
     echo [LOI] Khong dong bo duoc version.
-    pause
+    if /I not "%NOPAUSE%"=="--no-pause" pause
     exit /b 1
 )
 
@@ -27,7 +30,7 @@ if not exist "publish_v13_5_vm\ToolTikTokManagerV13.exe" (
     echo.
     echo Hay chay TAO_BAN_CAI_V13_5.bat truoc.
     echo.
-    pause
+    if /I not "%NOPAUSE%"=="--no-pause" pause
     exit /b 1
 )
 
@@ -36,7 +39,7 @@ if not exist "ToolTikTok_V13_5.iss" (
     echo.
     echo Dat file .iss cung thu muc voi file BAT nay.
     echo.
-    pause
+    if /I not "%NOPAUSE%"=="--no-pause" pause
     exit /b 1
 )
 
@@ -66,7 +69,7 @@ if not defined ISCC (
     echo Hay mo Inno Setup, vao Help ^> About neu can,
     echo hoac gui anh thu muc cai dat cho ChatGPT.
     echo.
-    pause
+    if /I not "%NOPAUSE%"=="--no-pause" pause
     exit /b 1
 )
 
@@ -90,7 +93,7 @@ if errorlevel 1 (
     echo Gui anh toan bo cua so CMD nay cho ChatGPT.
     echo ============================================================
     echo.
-    pause
+    if /I not "%NOPAUSE%"=="--no-pause" pause
     exit /b 1
 )
 
@@ -98,15 +101,15 @@ if not exist "SETUP_OUTPUT\ToolTikTok_V13.5_Setup.exe" (
     echo.
     echo [LOI] Compile xong nhung khong thay file Setup dau ra.
     echo.
-    pause
+    if /I not "%NOPAUSE%"=="--no-pause" pause
     exit /b 1
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -File ".\SYNC_VERSION.ps1" -SetupPath "SETUP_OUTPUT\ToolTikTok_V13.5_Setup.exe"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%SYNC_VERSION.ps1" -Root "%ROOT%" -SetupPath "SETUP_OUTPUT\ToolTikTok_V13.5_Setup.exe"
 if errorlevel 1 (
     echo.
     echo [LOI] Setup da tao nhung khong cap nhat duoc SHA-256 vao version.json.
-    pause
+    if /I not "%NOPAUSE%"=="--no-pause" pause
     exit /b 1
 )
 
@@ -118,4 +121,4 @@ echo.
 echo Chi can gui DUY NHAT file EXE nay sang may khac.
 echo ============================================================
 echo.
-pause
+if /I not "%NOPAUSE%"=="--no-pause" pause

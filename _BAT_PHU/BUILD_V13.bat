@@ -1,11 +1,13 @@
-﻿@echo off
-setlocal
-cd /d "%~dp0"
+@echo off
+setlocal EnableExtensions
 set "NOPAUSE=%~1"
+set "SCRIPT_DIR=%~dp0"
+for %%I in ("%SCRIPT_DIR%..") do set "ROOT=%%~fI"
+cd /d "%ROOT%"
 
 if not exist "VERSION.txt" goto :versionfail
 set /p APP_VERSION=<"VERSION.txt"
-powershell -NoProfile -ExecutionPolicy Bypass -File ".\SYNC_VERSION.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%SYNC_VERSION.ps1" -Root "%ROOT%"
 if errorlevel 1 goto :versionfail
 
 echo ========================================
@@ -24,7 +26,7 @@ if errorlevel 1 goto :fail
 echo.
 echo ========================================
 echo BUILD OK
-echo Output: %CD%\dist_v13
+echo Output: %ROOT%\dist_v13
 echo ========================================
 echo.
 if /I not "%NOPAUSE%"=="--no-pause" pause
@@ -43,7 +45,7 @@ exit /b 1
 echo.
 echo ========================================
 echo VERSION SYNC FAILED
-echo Kiem tra VERSION.txt va SYNC_VERSION.ps1
+echo Kiem tra VERSION.txt va _BAT_PHU\SYNC_VERSION.ps1
 echo ========================================
 echo.
 if /I not "%NOPAUSE%"=="--no-pause" pause

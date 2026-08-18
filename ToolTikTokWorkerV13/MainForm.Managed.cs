@@ -183,6 +183,9 @@ public sealed partial class MainForm
             ? _startupOptions.ProfileName
             : CurrentProfileName;
         var periodic = _engine.GetPeriodicF5Snapshot();
+        // Tận dụng RuntimeStatsTracker đã có trong Worker; Dashboard chỉ đọc snapshot này,
+        // không tạo thêm bộ đếm/thời gian riêng ở Manager.
+        var runtime = _runtimeStats.GetSnapshot();
         var f5RemainingSec = periodic.Enabled && periodic.DueAt != DateTime.MaxValue
             ? Math.Max(0, (int)Math.Ceiling((periodic.DueAt - DateTime.Now).TotalSeconds))
             : -1;
@@ -200,6 +203,7 @@ public sealed partial class MainForm
             Viewer = _engine.LastViewerValue,
             Step = _engine.CurrentStep,
             Rounds = _engine.Rounds,
+            TotalRunSeconds = Math.Max(0L, (long)Math.Round(runtime.Total.TotalSeconds)),
             F5Enabled = periodic.Enabled,
             F5RemainingSec = f5RemainingSec
             ,TikTokStartupState = _startupPreparationState

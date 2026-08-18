@@ -3807,6 +3807,7 @@ public sealed partial class ManagerForm : Form
         public int Viewer { get; set; } = -1;
         public int Step { get; set; }
         public long Rounds { get; set; }
+        public long TotalRunSeconds { get; set; } = -1;
         public bool F5Enabled { get; set; }
         public int F5RemainingSec { get; set; } = -1;
         public string TikTokStartupState { get; set; } = "";

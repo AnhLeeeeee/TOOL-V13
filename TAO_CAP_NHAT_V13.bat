@@ -3,6 +3,10 @@ setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
 cd /d "%~dp0"
 
+set "HELPER=%CD%\_BAT_PHU"
+if not exist "%HELPER%\TAO_BAN_CAI_V13_5.bat" goto :missinghelper
+if not exist "%HELPER%\TAO_SETUP_V13_5_AUTO_FIND_INNO.bat" goto :missinghelper
+
 echo ============================================================
 echo   TAO BAN CAP NHAT TOOL TIKTOK - TU DONG THEO VERSION
 echo ============================================================
@@ -40,8 +44,8 @@ echo.
 
 echo ============================================================
 echo [1/2] TAO BAN PUBLISH / ZIP
- echo ============================================================
-call ".\TAO_BAN_CAI_V13_5.bat"
+echo ============================================================
+call "%HELPER%\TAO_BAN_CAI_V13_5.bat" --no-pause
 if errorlevel 1 (
     echo.
     echo [LOI] TAO_BAN_CAI_V13_5.bat that bai.
@@ -52,8 +56,8 @@ if errorlevel 1 (
 echo.
 echo ============================================================
 echo [2/2] TAO SETUP
- echo ============================================================
-call ".\TAO_SETUP_V13_5_AUTO_FIND_INNO.bat"
+echo ============================================================
+call "%HELPER%\TAO_SETUP_V13_5_AUTO_FIND_INNO.bat" --no-pause
 if errorlevel 1 (
     echo.
     echo [LOI] TAO_SETUP_V13_5_AUTO_FIND_INNO.bat that bai.
@@ -103,3 +107,12 @@ echo ============================================================
 echo.
 pause
 exit /b 0
+
+:missinghelper
+echo.
+echo ============================================================
+echo [LOI] THIEU FILE TRONG THU MUC _BAT_PHU
+ echo Hay ap dung lai PATCH_DON_GON_BAT_V13.
+echo ============================================================
+pause
+exit /b 1
