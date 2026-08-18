@@ -1,4 +1,4 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using ToolTikTokV12.Controls;
 
 namespace ToolTikTokManagerV13;
@@ -195,9 +195,10 @@ public sealed partial class ManagerForm
         });
         grid.Columns.Add(new DataGridViewTextBoxColumn
         {
-            Name = "Today",
-            HeaderText = "Hôm nay",
-            Width = 150,
+            Name = "RoundsPerHour",
+            HeaderText = "Vòng / giờ",
+            Width = 130,
+            ToolTipText = "Tốc độ trung bình của phiên hiện tại: số vòng hoàn tất / số giờ chạy Automation.",
             DefaultCellStyle = new DataGridViewCellStyle
             {
                 Alignment = DataGridViewContentAlignment.MiddleCenter
@@ -227,7 +228,7 @@ public sealed partial class ManagerForm
             "Profile",
             "Account",
             "Session",
-            "Today",
+            "RoundsPerHour",
             "Total",
             "RunState");
 
@@ -248,7 +249,7 @@ public sealed partial class ManagerForm
             ? Convert.ToString(grid.SelectedRows[0].Cells["Profile"].Value)
             : null;
 
-        var rows = new List<(ProfileContext Context, StatisticsRuntimeSnapshot Stats, string Account, string State)>();
+        var rows = new List<(ProfileContext Context, StatisticsRuntimeSnapshot Stats, string Account, string State, long? Rounds)>();
         foreach (var ctx in _contexts.Values.OrderBy(x => x.Profile.Name, NaturalProfileNameOrder))
         {
             var stats = ReadStatisticsRuntime(ctx);
@@ -260,7 +261,8 @@ public sealed partial class ManagerForm
             if (string.IsNullOrWhiteSpace(state) || string.Equals(state, RuntimeStateUnknown, StringComparison.OrdinalIgnoreCase))
                 state = workerAlive ? "UNKNOWN" : RuntimeStateStopped;
 
-            rows.Add((ctx, stats, account, state));
+            var rounds = ctx.LastSnapshot?.Rounds;
+            rows.Add((ctx, stats, account, state, rounds));
         }
 
         grid.SuspendLayout();
@@ -274,7 +276,7 @@ public sealed partial class ManagerForm
                     item.Context.Profile.Name,
                     item.Account,
                     FormatStatisticsDuration(item.Stats.Session),
-                    FormatStatisticsDuration(item.Stats.Today),
+                    FormatRoundsPerHour(item.Rounds, item.Stats.Session),
                     FormatStatisticsDuration(item.Stats.Total),
                     item.State);
 
@@ -296,10 +298,10 @@ public sealed partial class ManagerForm
         if (_statisticsSummary is not null && !_statisticsSummary.IsDisposed)
         {
             var running = rows.Count(x => string.Equals(x.State, RuntimeStateRunning, StringComparison.OrdinalIgnoreCase));
-            var todayAll = TimeSpan.FromSeconds(rows.Sum(x => Math.Max(0, x.Stats.Today.TotalSeconds)));
+            var totalAll = TimeSpan.FromSeconds(rows.Sum(x => Math.Max(0, x.Stats.Total.TotalSeconds)));
             _statisticsSummary.Text =
-                $"Profile: {rows.Count}   |   Đang chạy: {running}   |   Tổng thời gian hôm nay: {FormatStatisticsDuration(todayAll)}   " +
-                "|   Chỉ tính thời gian Automation ở trạng thái RUNNING";
+                $"Profile: {rows.Count}   |   Đang chạy: {running}   |   Tổng thời gian chạy: {FormatStatisticsDuration(totalAll)}   " +
+                "|   Vòng/giờ tính theo phiên hiện tại";
         }
     }
 
@@ -392,6 +394,18 @@ public sealed partial class ManagerForm
             _log.Warn($"[STATISTICS_READ] profile={ctx.Profile.Name} error={ex.Message}");
             return new StatisticsRuntimeSnapshot(TimeSpan.Zero, TimeSpan.Zero, TimeSpan.Zero, HasData: false);
         }
+    }
+
+    static string FormatRoundsPerHour(long? rounds, TimeSpan session)
+    {
+        if (rounds is null || rounds < 0 || session.TotalSeconds <= 0)
+            return "—";
+
+        var rate = rounds.Value / session.TotalHours;
+        if (double.IsNaN(rate) || double.IsInfinity(rate) || rate < 0)
+            return "—";
+
+        return rate.ToString("0.0");
     }
 
     static string FormatStatisticsDuration(TimeSpan value)
