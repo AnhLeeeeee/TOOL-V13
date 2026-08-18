@@ -50,15 +50,6 @@ public sealed class TikTokAccountPoolService
     static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     static readonly byte[] Entropy = Encoding.UTF8.GetBytes("ToolTikTok-V13.5-AccountPool-v1");
     readonly string _path;
-    readonly object _cacheGate = new();
-    StoredCatalog? _catalogCache;
-    List<TikTokAccountPoolItem>? _itemsCache;
-    DateTime _catalogCacheWriteUtc = DateTime.MinValue;
-    long _catalogCacheLength = -1;
-    HashSet<string>? _identityDoneCache;
-    string _identityDoneCachePath = "";
-    DateTime _identityDoneCacheWriteUtc = DateTime.MinValue;
-    long _identityDoneCacheLength = -1;
 
     public TikTokAccountPoolService(string baseDir)
     {
@@ -68,29 +59,11 @@ public sealed class TikTokAccountPoolService
     public string CatalogPath => _path;
     public string CurrentSourcePath => LoadStoredCatalog().SourceFilePath ?? "";
 
-    static (DateTime WriteUtc, long Length) FileFingerprint(string path)
-    {
-        var info = new FileInfo(path);
-        return (info.LastWriteTimeUtc, info.Length);
-    }
-
     public HashSet<string> GetIdentityDoneUsernames()
     {
-        var path = CurrentSourcePath;
-        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
-            return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        var fingerprint = FileFingerprint(path);
-        lock (_cacheGate)
-        {
-            if (_identityDoneCache is not null
-                && path.Equals(_identityDoneCachePath, StringComparison.OrdinalIgnoreCase)
-                && fingerprint.WriteUtc == _identityDoneCacheWriteUtc
-                && fingerprint.Length == _identityDoneCacheLength)
-                return new HashSet<string>(_identityDoneCache, StringComparer.OrdinalIgnoreCase);
-        }
-
         var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var path = CurrentSourcePath;
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) return result;
         var rows = ReadSourceRows(path);
         for (var i = 1; i < rows.Count; i++)
         {
@@ -103,15 +76,6 @@ public sealed class TikTokAccountPoolService
                 || done.Equals("TRUE", StringComparison.OrdinalIgnoreCase)
                 || done == "1")
                 result.Add(user);
-        }
-
-        fingerprint = FileFingerprint(path);
-        lock (_cacheGate)
-        {
-            _identityDoneCache = new HashSet<string>(result, StringComparer.OrdinalIgnoreCase);
-            _identityDoneCachePath = path;
-            _identityDoneCacheWriteUtc = fingerprint.WriteUtc;
-            _identityDoneCacheLength = fingerprint.Length;
         }
         return result;
     }
@@ -133,24 +97,6 @@ public sealed class TikTokAccountPoolService
             var user = row.Count > 0 ? (row[0] ?? "").Trim() : "";
             if (!user.Equals(username, StringComparison.OrdinalIgnoreCase)) continue;
             SetIdentityDoneCell(path, i + 1, "DONE");
-            var fingerprint = FileFingerprint(path);
-            lock (_cacheGate)
-            {
-                if (_identityDoneCache is not null && path.Equals(_identityDoneCachePath, StringComparison.OrdinalIgnoreCase))
-                {
-                    _identityDoneCache.Add(username);
-                    _identityDoneCacheWriteUtc = fingerprint.WriteUtc;
-                    _identityDoneCacheLength = fingerprint.Length;
-                }
-                else
-                {
-                    // Chưa có snapshot đầy đủ trong RAM: để lần đọc kế tiếp nạp lại toàn bộ cột DONE.
-                    _identityDoneCache = null;
-                    _identityDoneCachePath = "";
-                    _identityDoneCacheWriteUtc = DateTime.MinValue;
-                    _identityDoneCacheLength = -1;
-                }
-            }
             return;
         }
         throw new InvalidOperationException($"Không tìm thấy tài khoản {username} trong file Excel đang dùng để ghi DONE.");
@@ -160,9 +106,7 @@ public sealed class TikTokAccountPoolService
     {
         try
         {
-            LoadStoredCatalog();
-            lock (_cacheGate)
-                return _itemsCache is null ? new List<TikTokAccountPoolItem>() : new List<TikTokAccountPoolItem>(_itemsCache);
+            return ToItems(LoadStoredCatalog());
         }
         catch (Exception ex)
         {
@@ -325,30 +269,8 @@ public sealed class TikTokAccountPoolService
 
     StoredCatalog LoadStoredCatalog()
     {
-        lock (_cacheGate)
-        {
-            if (!File.Exists(_path))
-            {
-                _catalogCache ??= new StoredCatalog();
-                _itemsCache ??= new List<TikTokAccountPoolItem>();
-                _catalogCacheWriteUtc = DateTime.MinValue;
-                _catalogCacheLength = -1;
-                return _catalogCache;
-            }
-
-            var fingerprint = FileFingerprint(_path);
-            if (_catalogCache is not null
-                && fingerprint.WriteUtc == _catalogCacheWriteUtc
-                && fingerprint.Length == _catalogCacheLength)
-                return _catalogCache;
-
-            var loaded = JsonSerializer.Deserialize<StoredCatalog>(File.ReadAllText(_path)) ?? new StoredCatalog();
-            _catalogCache = loaded;
-            _itemsCache = ToItems(loaded);
-            _catalogCacheWriteUtc = fingerprint.WriteUtc;
-            _catalogCacheLength = fingerprint.Length;
-            return loaded;
-        }
+        if (!File.Exists(_path)) return new StoredCatalog();
+        return JsonSerializer.Deserialize<StoredCatalog>(File.ReadAllText(_path)) ?? new StoredCatalog();
     }
 
     static List<TikTokAccountPoolItem> ToItems(StoredCatalog stored)
@@ -387,14 +309,6 @@ public sealed class TikTokAccountPoolService
         };
         Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
         AtomicWrite(_path, JsonSerializer.Serialize(catalog, JsonOptions));
-        var fingerprint = FileFingerprint(_path);
-        lock (_cacheGate)
-        {
-            _catalogCache = catalog;
-            _itemsCache = ToItems(catalog);
-            _catalogCacheWriteUtc = fingerprint.WriteUtc;
-            _catalogCacheLength = fingerprint.Length;
-        }
     }
 
     static int NextSourceRow(List<TikTokAccountPoolItem> items)

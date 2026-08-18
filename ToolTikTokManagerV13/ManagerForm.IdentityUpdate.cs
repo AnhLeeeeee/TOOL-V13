@@ -40,77 +40,31 @@ public sealed partial class ManagerForm
     readonly HashSet<string> _autoIdentityInFlight = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, DateTime> _autoIdentityNextProbeUtc = new(StringComparer.OrdinalIgnoreCase);
     readonly SemaphoreSlim _autoIdentityQueueGate = new(1, 1);
-    readonly object _identityToolStateGate = new();
-    IdentityToolState? _identityToolStateCache;
-    DateTime _identityToolStateCacheWriteUtc = DateTime.MinValue;
-    long _identityToolStateCacheLength = -1;
-
-    static IdentityToolState CloneIdentityToolState(IdentityToolState state) => new()
-    {
-        NamesText = state.NamesText ?? "",
-        ImageFolder = state.ImageFolder ?? "",
-        BioText = state.BioText ?? "",
-        UpdateName = state.UpdateName,
-        UpdateAvatar = state.UpdateAvatar,
-        UpdateBio = state.UpdateBio,
-        AutoOnReady = state.AutoOnReady,
-        RandomNames = state.RandomNames,
-        AvoidLastAvatar = state.AvoidLastAvatar,
-        LastAvatarByProfile = new Dictionary<string, string>(state.LastAvatarByProfile ?? new(), StringComparer.OrdinalIgnoreCase)
-    };
 
     IdentityToolState LoadIdentityToolState()
     {
-        lock (_identityToolStateGate)
+        try
         {
-            try
-            {
-                if (!File.Exists(IdentityToolStatePath))
-                {
-                    _identityToolStateCache ??= new IdentityToolState();
-                    _identityToolStateCacheWriteUtc = DateTime.MinValue;
-                    _identityToolStateCacheLength = -1;
-                    return CloneIdentityToolState(_identityToolStateCache);
-                }
-
-                var info = new FileInfo(IdentityToolStatePath);
-                if (_identityToolStateCache is not null
-                    && info.LastWriteTimeUtc == _identityToolStateCacheWriteUtc
-                    && info.Length == _identityToolStateCacheLength)
-                    return CloneIdentityToolState(_identityToolStateCache);
-
-                var state = JsonSerializer.Deserialize<IdentityToolState>(File.ReadAllText(IdentityToolStatePath)) ?? new IdentityToolState();
-                state.LastAvatarByProfile = new Dictionary<string, string>(state.LastAvatarByProfile ?? new(), StringComparer.OrdinalIgnoreCase);
-                _identityToolStateCache = CloneIdentityToolState(state);
-                info.Refresh();
-                _identityToolStateCacheWriteUtc = info.LastWriteTimeUtc;
-                _identityToolStateCacheLength = info.Length;
-                return CloneIdentityToolState(state);
-            }
-            catch (Exception ex)
-            {
-                _log.Warn($"[IDENTITY_TOOL_STATE_LOAD] fallback=defaults error={ex.Message}");
-                _identityToolStateCache ??= new IdentityToolState();
-                return CloneIdentityToolState(_identityToolStateCache);
-            }
+            if (!File.Exists(IdentityToolStatePath)) return new IdentityToolState();
+            var state = JsonSerializer.Deserialize<IdentityToolState>(File.ReadAllText(IdentityToolStatePath));
+            if (state is null) return new IdentityToolState();
+            state.LastAvatarByProfile = new Dictionary<string, string>(state.LastAvatarByProfile ?? new(), StringComparer.OrdinalIgnoreCase);
+            return state;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"[IDENTITY_TOOL_STATE_LOAD] fallback=defaults error={ex.Message}");
+            return new IdentityToolState();
         }
     }
 
     void SaveIdentityToolState(IdentityToolState state)
     {
-        lock (_identityToolStateGate)
+        try
         {
-            try
-            {
-                var snapshot = CloneIdentityToolState(state);
-                File.WriteAllText(IdentityToolStatePath, JsonSerializer.Serialize(snapshot, new JsonSerializerOptions { WriteIndented = true }));
-                _identityToolStateCache = snapshot;
-                var info = new FileInfo(IdentityToolStatePath);
-                _identityToolStateCacheWriteUtc = info.LastWriteTimeUtc;
-                _identityToolStateCacheLength = info.Length;
-            }
-            catch (Exception ex) { _log.Warn("[IDENTITY_TOOL_STATE_SAVE] " + ex.Message); }
+            File.WriteAllText(IdentityToolStatePath, JsonSerializer.Serialize(state, new JsonSerializerOptions { WriteIndented = true }));
         }
+        catch (Exception ex) { _log.Warn("[IDENTITY_TOOL_STATE_SAVE] " + ex.Message); }
     }
 
     void ShowTikTokIdentityDialog()
@@ -810,10 +764,9 @@ public sealed partial class ManagerForm
                     return;
                 }
 
-                var accountPool = _accountPoolService.Load();
-                var account = accountPool.FirstOrDefault(x =>
+                var account = _accountPoolService.Load().FirstOrDefault(x =>
                     x.AssignedProfile.Equals(ctx.Profile.Name, StringComparison.OrdinalIgnoreCase))
-                    ?? accountPool.FirstOrDefault(x => x.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
+                    ?? _accountPoolService.Load().FirstOrDefault(x => x.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
                 if (account is null) return;
 
                 if (_accountPoolService.IsIdentityDone(account.Username))

@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$Root = "",
     [string]$SetupPath = ""
 )
@@ -31,8 +31,6 @@ if (Test-Path $manifestFile) {
     }
 
     $json.version = $version
-
-    $json.setupUrl = "https://github.com/AnhLeeeeee/TOOL-V13/releases/latest/download/ToolTikTok_V${version}_Setup.exe"
 
     if (-not [string]::IsNullOrWhiteSpace($SetupPath)) {
         $resolvedSetup = if ([System.IO.Path]::IsPathRooted($SetupPath)) {

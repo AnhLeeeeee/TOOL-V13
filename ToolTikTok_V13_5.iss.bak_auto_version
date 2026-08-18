@@ -15,19 +15,19 @@ SetupIconFile=ToolTikTokManagerV13\ToolTikTok.ico
 
 ; Cài theo user để Tool có quyền ghi profile/cấu hình mà không cần UAC.
 DefaultDirName={localappdata}\ToolTikTok\V13.5
-DefaultGroupName=Tool TikTok V{#MyAppVersion}
+DefaultGroupName=Tool TikTok V13.5
 UsePreviousAppDir=yes
 PrivilegesRequired=lowest
 
 OutputDir=SETUP_OUTPUT
-OutputBaseFilename=ToolTikTok_V{#MyAppVersion}_Setup
+OutputBaseFilename=ToolTikTok_V13.5_Setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 DisableWelcomePage=no
 DisableProgramGroupPage=yes
 Uninstallable=yes
-UninstallDisplayName=Tool TikTok V{#MyAppVersion}
+UninstallDisplayName=Tool TikTok V13.5
 UninstallDisplayIcon={app}\{#MyAppExeName}
 CloseApplications=yes
 RestartApplications=no
@@ -44,9 +44,9 @@ Source: "publish_v13_5_vm\*"; DestDir: "{app}"; \
   Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\Tool TikTok V{#MyAppVersion}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
-Name: "{autodesktop}\Tool TikTok V{#MyAppVersion}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{group}\Tool TikTok V13.5"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
+Name: "{autodesktop}\Tool TikTok V13.5"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "Mở Tool TikTok V{#MyAppVersion}"; WorkingDir: "{app}"; \
+Filename: "{app}\{#MyAppExeName}"; Description: "Mở Tool TikTok V13.5"; WorkingDir: "{app}"; \
   Flags: nowait postinstall skipifsilent

@@ -1,4 +1,4 @@
-@echo off
+﻿@echo off
 setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
 cd /d "%~dp0"
@@ -19,6 +19,7 @@ echo Phien ban hien tai: %CURRENT_VERSION%
 set "NEW_VERSION="
 set /p "NEW_VERSION=Nhap phien ban muon tao (Enter = %CURRENT_VERSION%): "
 if not defined NEW_VERSION set "NEW_VERSION=%CURRENT_VERSION%"
+set "SETUP_NAME=ToolTikTok_V%NEW_VERSION%_Setup.exe"
 
 if not defined NEW_VERSION (
     echo.
@@ -68,7 +69,7 @@ if errorlevel 1 (
 set "RELEASE_DIR=%CD%\RELEASE_OUTPUT\V%NEW_VERSION%"
 if not exist "%RELEASE_DIR%" mkdir "%RELEASE_DIR%"
 
-if not exist "SETUP_OUTPUT\ToolTikTok_V13.5_Setup.exe" (
+if not exist "SETUP_OUTPUT\%SETUP_NAME%" (
     echo [LOI] Khong tim thay file Setup sau khi build.
     pause
     exit /b 1
@@ -80,12 +81,12 @@ if not exist "ToolTikTok_V13.5_VM_CLIENT_WIN_X64.zip" (
     exit /b 1
 )
 
-copy /y "SETUP_OUTPUT\ToolTikTok_V13.5_Setup.exe" "%RELEASE_DIR%\ToolTikTok_V13.5_Setup.exe" >nul
+copy /y "SETUP_OUTPUT\%SETUP_NAME%" "%RELEASE_DIR%\%SETUP_NAME%" >nul
 copy /y "ToolTikTok_V13.5_VM_CLIENT_WIN_X64.zip" "%RELEASE_DIR%\ToolTikTok_V%NEW_VERSION%_VM_CLIENT_WIN_X64.zip" >nul
 copy /y "version.json" "%RELEASE_DIR%\version.json" >nul
 copy /y "VERSION.txt" "%RELEASE_DIR%\VERSION.txt" >nul
 
-for /f "usebackq delims=" %%H in (`powershell -NoProfile -Command "(Get-FileHash -LiteralPath '%RELEASE_DIR%\ToolTikTok_V13.5_Setup.exe' -Algorithm SHA256).Hash.ToLowerInvariant()"`) do set "SETUP_SHA=%%H"
+for /f "usebackq delims=" %%H in (`powershell -NoProfile -Command "(Get-FileHash -LiteralPath '%RELEASE_DIR%\%SETUP_NAME%' -Algorithm SHA256).Hash.ToLowerInvariant()"`) do set "SETUP_SHA=%%H"
 
 echo.
 echo ============================================================
@@ -95,7 +96,7 @@ echo Thu muc ban cap nhat:
 echo %RELEASE_DIR%
 echo.
 echo FILE UPLOAD LEN GITHUB RELEASE:
-echo %RELEASE_DIR%\ToolTikTok_V13.5_Setup.exe
+echo %RELEASE_DIR%\%SETUP_NAME%
 echo.
 echo Tag GitHub:   v%NEW_VERSION%
 echo Release:      Tool TikTok V%NEW_VERSION%

@@ -12,7 +12,6 @@ if not exist "VERSION.txt" (
     exit /b 1
 )
 set /p APP_VERSION=<"VERSION.txt"
-set "SETUP_NAME=ToolTikTok_V%APP_VERSION%_Setup.exe"
 powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%SYNC_VERSION.ps1" -Root "%ROOT%"
 if errorlevel 1 (
     echo [LOI] Khong dong bo duoc version.
@@ -78,8 +77,8 @@ echo [OK] Tim thay Inno Setup:
 echo "%ISCC%"
 echo.
 
-if exist "SETUP_OUTPUT\%SETUP_NAME%" (
-    del /f /q "SETUP_OUTPUT\%SETUP_NAME%" >nul 2>&1
+if exist "SETUP_OUTPUT\ToolTikTok_V13.5_Setup.exe" (
+    del /f /q "SETUP_OUTPUT\ToolTikTok_V13.5_Setup.exe" >nul 2>&1
 )
 
 echo Dang tao bo cai...
@@ -98,7 +97,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if not exist "SETUP_OUTPUT\%SETUP_NAME%" (
+if not exist "SETUP_OUTPUT\ToolTikTok_V13.5_Setup.exe" (
     echo.
     echo [LOI] Compile xong nhung khong thay file Setup dau ra.
     echo.
@@ -106,7 +105,7 @@ if not exist "SETUP_OUTPUT\%SETUP_NAME%" (
     exit /b 1
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%SYNC_VERSION.ps1" -Root "%ROOT%" -SetupPath "SETUP_OUTPUT\%SETUP_NAME%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%SYNC_VERSION.ps1" -Root "%ROOT%" -SetupPath "SETUP_OUTPUT\ToolTikTok_V13.5_Setup.exe"
 if errorlevel 1 (
     echo.
     echo [LOI] Setup da tao nhung khong cap nhat duoc SHA-256 vao version.json.
@@ -117,7 +116,7 @@ if errorlevel 1 (
 echo.
 echo ============================================================
 echo [OK] DA TAO XONG:
-echo SETUP_OUTPUT\%SETUP_NAME%
+echo SETUP_OUTPUT\ToolTikTok_V13.5_Setup.exe
 echo.
 echo Chi can gui DUY NHAT file EXE nay sang may khac.
 echo ============================================================
