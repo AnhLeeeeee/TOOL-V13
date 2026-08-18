@@ -144,6 +144,7 @@ public sealed partial class ManagerForm : Form
         InitializeDashboardAndUpdater();
         _refreshTimer.Tick += async (_, _) => await RefreshOpenProfilesAsync();
         InitializeIdentityAutoFlow();
+        InitializeMessageReplyAutoFlow();
         Shown += (_, _) => RegisterChromeMonitorHotkey();
         FormClosing += OnClosing;
     }
@@ -187,6 +188,7 @@ public sealed partial class ManagerForm : Form
         toolbarRow1.Controls.Add(Button("Kho tài khoản", (_, _) => ShowAccountPoolDialog(), UiButtonKind.Neutral));
         toolbarRow1.Controls.Add(Button("Cấu hình mặc định", (_, _) => ShowDefaultConfigDialog(), UiButtonKind.Neutral));
         toolbarRow1.Controls.Add(Button("Tên & ảnh TikTok", (_, _) => ShowTikTokIdentityDialog(), UiButtonKind.Neutral));
+        toolbarRow1.Controls.Add(Button("Tin nhắn TikTok", (_, _) => ShowTikTokMessageReplyDialog(), UiButtonKind.Neutral));
         toolbarRow1.Controls.Add(Button("Profile có sẵn", async (_, _) => { try { await AddExistingProfileAsync(); } catch (Exception ex) { ShowError(ex); } }));
 
         var toolbarRow2 = ToolbarRow();
@@ -232,7 +234,7 @@ public sealed partial class ManagerForm : Form
             {
                 "Mở profile" => (Color.FromArgb(232, 242, 255), Color.FromArgb(35, 91, 152)),
                 "+ Profile" => (Color.FromArgb(238, 246, 255), Color.FromArgb(35, 91, 152)),
-                "Profile có sẵn" or "Đổi tên" or "Đồng bộ tên Chrome" or "Kho tài khoản" or "Cấu hình mặc định" or "Tên & ảnh TikTok" => (Color.FromArgb(242, 246, 251), Color.FromArgb(55, 76, 103)),
+                "Profile có sẵn" or "Đổi tên" or "Đồng bộ tên Chrome" or "Kho tài khoản" or "Cấu hình mặc định" or "Tên & ảnh TikTok" or "Tin nhắn TikTok" => (Color.FromArgb(242, 246, 251), Color.FromArgb(55, 76, 103)),
                 "Giám sát Chrome" => (Color.FromArgb(234, 244, 255), Color.FromArgb(31, 91, 158)),
                 "Xóa profile" or "Dừng tất cả" => (Color.FromArgb(255, 239, 239), Color.FromArgb(171, 62, 62)),
                 "Chạy tất cả" => (Color.FromArgb(234, 248, 238), Color.FromArgb(36, 119, 66)),
@@ -930,12 +932,17 @@ public sealed partial class ManagerForm : Form
             // Status polling is observational only. A timeout/missing snapshot
             // must never replace/restart a live Worker and turn a transient IPC
             // failure into a fresh Worker's legitimate STOPPED snapshot.
-            if (command.Equals("status", StringComparison.OrdinalIgnoreCase))
+            if (command.Equals("status", StringComparison.OrdinalIgnoreCase)
+                || command.Equals("message_reply_status", StringComparison.OrdinalIgnoreCase)
+                || command.Equals("message_reply_log", StringComparison.OrdinalIgnoreCase))
             {
                 if (ctx.Worker is null || ctx.Worker.HasExited)
                     throw new InvalidOperationException($"Worker process is not running for profile '{ctx.Profile.Name}'.");
                 return await SendPipeAsync(ctx.Profile.Name, command, effectiveTimeout);
             }
+            if (command.Equals("message_reply_stop", StringComparison.OrdinalIgnoreCase)
+                && (ctx.Worker is null || ctx.Worker.HasExited))
+                return "not_running";
 
             await EnsureWorkerAsyncIfCommandNeedsIt(ctx, command);
             var response = await SendPipeAsync(ctx.Profile.Name, command, effectiveTimeout);
@@ -3803,6 +3810,7 @@ public sealed partial class ManagerForm : Form
         public bool F5Enabled { get; set; }
         public int F5RemainingSec { get; set; } = -1;
         public string TikTokStartupState { get; set; } = "";
+        public bool MessageReplyRunning { get; set; }
     }
 
     sealed class ChromeViewResolutionReply

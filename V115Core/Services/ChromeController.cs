@@ -19,7 +19,7 @@ public sealed record TikTokRecommendedLiveCandidate(string Href, string Username
 public sealed record TikTokProfileIdentityUpdateResult(bool NameChanged, bool AvatarChanged, bool BioChanged, bool NameCooldown, bool AlreadyConfigured, bool Skipped, string Message);
 public enum ChromeWindowState { NotFound, Visible, Minimized }
 
-public sealed class ChromeController : IAsyncDisposable
+public sealed partial class ChromeController : IAsyncDisposable
 {
     public sealed record PageHealthSnapshot(bool Healthy, bool CrashLike, string Reason, string Url);
 

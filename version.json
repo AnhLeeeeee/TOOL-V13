@@ -1,7 +1,7 @@
-{
-  "version": "13.5.5",
-  "setupUrl": "https://github.com/AnhLeeeeee/TOOL-V13/releases/latest/download/ToolTikTok_V13.5_Setup.exe",
-  "sha256": "bda136db0d24349b2e59ba9300cbe6b67ffcec0dd257c3b3267efd7a4f7aa358",
-  "notes": "Cập nhật Tool TikTok V13.5.5.",
-  "channel": "stable"
+﻿{
+    "version":  "13.5.5",
+    "setupUrl":  "https://github.com/AnhLeeeeee/TOOL-V13/releases/latest/download/ToolTikTok_V13.5_Setup.exe",
+    "sha256":  "bda136db0d24349b2e59ba9300cbe6b67ffcec0dd257c3b3267efd7a4f7aa358",
+    "notes":  "Cáº­p nháº­t Tool TikTok V13.5.5.",
+    "channel":  "stable"
 }

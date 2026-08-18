@@ -45,12 +45,16 @@ public sealed partial class MainForm
         // values.  The detail/window values are snapshots maintained by the UI,
         // while engine/chrome flags are safe lightweight reads.
         if (command == "status") return Task.FromResult(BuildManagedStatusResponse());
+        if (command == "message_reply_status") return Task.FromResult(BuildManagedMessageReplyStatusResponse());
+        if (command == "message_reply_log") return Task.FromResult(BuildManagedMessageReplyLogResponse());
+        if (command == "message_reply_stop") return Task.FromResult(StopManagedMessageReply());
 
         return InvokeManagedOnUiAsync(async () =>
         {
             switch (command)
             {
                 case "start":
+                    if (IsMessageReplyRunning) return "message_reply_running";
                     await StartAsync();
                     return _engine.Running ? "started" : "not_started";
                 case "pause":
@@ -79,7 +83,10 @@ public sealed partial class MainForm
                     await ConnectChromeAsync();
                     return _chrome.Connected ? "connected" : "disconnected";
                 case "close_chrome":
+                    StopManagedMessageReply();
                     return await CloseChromeAsync();
+                case "message_reply_start":
+                    return await StartManagedMessageReplyAsync(commandPayload);
                 case "identity_ready":
                 {
                     if (!_chrome.Connected) return "not_connected";
@@ -97,6 +104,8 @@ public sealed partial class MainForm
                 {
                     try
                     {
+                        if (IsMessageReplyRunning)
+                            throw new InvalidOperationException("Profile đang xử lý Tin nhắn TikTok. Hãy dừng mục Tin nhắn trước khi cập nhật tên/ảnh.");
                         if (string.IsNullOrWhiteSpace(commandPayload))
                             throw new InvalidOperationException("Thiếu payload đổi tên/ảnh TikTok.");
                         var json = Encoding.UTF8.GetString(Convert.FromBase64String(commandPayload));
@@ -159,6 +168,7 @@ public sealed partial class MainForm
                     Show();
                     return "shown";
                 case "shutdown":
+                    StopManagedMessageReply();
                     BeginInvoke(new Action(Close));
                     return "bye";
                 default:
@@ -193,6 +203,7 @@ public sealed partial class MainForm
             F5Enabled = periodic.Enabled,
             F5RemainingSec = f5RemainingSec
             ,TikTokStartupState = _startupPreparationState
+            ,MessageReplyRunning = IsMessageReplyRunning
         });
     }
 

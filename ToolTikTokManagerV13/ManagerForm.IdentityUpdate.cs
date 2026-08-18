@@ -624,6 +624,8 @@ public sealed partial class ManagerForm
         bool skipIfNameCooldown = false, bool resumeAutomation = false,
         IReadOnlyList<string>? knownDisplayNames = null, bool verifyExistingState = false)
     {
+        if (_messageReplyProfilesInFlight.Contains(ctx.Profile.Name))
+            throw new InvalidOperationException("Profile đang được mục Tin nhắn TikTok xử lý. Hãy dừng/đợi Tin nhắn hoàn tất rồi cập nhật tên/ảnh.");
         await OpenProfileAsync(ctx);
         try { await RefreshStatusAsync(ctx); } catch { }
         var previousRunState = GetLastConfirmedRuntimeState(ctx);
@@ -710,6 +712,7 @@ public sealed partial class ManagerForm
             var snapshot = ctx.LastSnapshot;
             if (snapshot is null) continue;
             if (!string.Equals(snapshot.Chrome, "CONNECTED", StringComparison.OrdinalIgnoreCase)) continue;
+            if (snapshot.MessageReplyRunning || _messageReplyProfilesInFlight.Contains(ctx.Profile.Name)) continue; // Không tranh điều hướng với module Tin nhắn TikTok.
 
             // READY ở V13.5 mới chỉ có nghĩa là gate mở Chrome/đăng nhập đã hoàn tất.
             // Khi mở profile để setup, READY vẫn dừng ở trang chủ và KHÔNG vào LIVE.
