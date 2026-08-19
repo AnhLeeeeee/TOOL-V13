@@ -20,5 +20,7 @@ publish_v13_5_vm/
 SETUP_OUTPUT/
 RELEASE_OUTPUT/
 *.zip
+*.bak_auto_version
+*.bak_statistics
 
 SOURCE_OUTPUT/
