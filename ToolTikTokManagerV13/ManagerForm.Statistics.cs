@@ -1,4 +1,4 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using ToolTikTokV12.Controls;
 
 namespace ToolTikTokManagerV13;
@@ -198,10 +198,17 @@ public sealed partial class ManagerForm
 
         grid.Columns.Add(new DataGridViewTextBoxColumn
         {
+<<<<<<< HEAD
             Name = "Rounds",
             HeaderText = "Vòng",
             Width = 90,
             ToolTipText = "Số vòng hoàn tất của phiên Automation hiện tại.",
+=======
+            Name = "RoundsPerHour",
+            HeaderText = "Vòng / giờ",
+            Width = 130,
+            ToolTipText = "Tốc độ trung bình của phiên hiện tại: số vòng hoàn tất / số giờ chạy Automation.",
+>>>>>>> fecffd8ad1b1803e545acc90536bc4e9698fe692
             DefaultCellStyle = new DataGridViewCellStyle
             {
                 Alignment = DataGridViewContentAlignment.MiddleCenter,
@@ -247,7 +254,10 @@ public sealed partial class ManagerForm
             "Profile",
             "Account",
             "Session",
+<<<<<<< HEAD
             "Rounds",
+=======
+>>>>>>> fecffd8ad1b1803e545acc90536bc4e9698fe692
             "RoundsPerHour",
             "Total",
             "RunState");
@@ -269,6 +279,7 @@ public sealed partial class ManagerForm
             ? Convert.ToString(grid.SelectedRows[0].Cells["Profile"].Value)
             : null;
 
+<<<<<<< HEAD
         var rows = new List<(
             ProfileContext Context,
             StatisticsRuntimeSnapshot Stats,
@@ -277,6 +288,9 @@ public sealed partial class ManagerForm
             long? Rounds,
             double? RoundsPerHour)>();
 
+=======
+        var rows = new List<(ProfileContext Context, StatisticsRuntimeSnapshot Stats, string Account, string State, long? Rounds)>();
+>>>>>>> fecffd8ad1b1803e545acc90536bc4e9698fe692
         foreach (var ctx in _contexts.Values.OrderBy(x => x.Profile.Name, NaturalProfileNameOrder))
         {
             var stats = ReadStatisticsRuntime(ctx);
@@ -291,12 +305,17 @@ public sealed partial class ManagerForm
                 state = workerAlive ? "UNKNOWN" : RuntimeStateStopped;
             }
 
+<<<<<<< HEAD
             // Rounds của Worker reset về 0 mỗi lần Bắt đầu, nên số vòng và Vòng/giờ
             // luôn đại diện cho chính phiên Automation đang hiển thị ở cột Phiên hiện tại.
             long? rounds = workerAlive ? ctx.LastSnapshot?.Rounds : null;
             var roundsPerHour = CalculateRoundsPerHour(rounds, stats.Session);
 
             rows.Add((ctx, stats, account, state, rounds, roundsPerHour));
+=======
+            var rounds = ctx.LastSnapshot?.Rounds;
+            rows.Add((ctx, stats, account, state, rounds));
+>>>>>>> fecffd8ad1b1803e545acc90536bc4e9698fe692
         }
 
         // Chỉ dùng profile đã chạy ít nhất 5 phút để tạo mốc so sánh.
@@ -321,8 +340,12 @@ public sealed partial class ManagerForm
                     item.Context.Profile.Name,
                     item.Account,
                     FormatStatisticsDuration(item.Stats.Session),
+<<<<<<< HEAD
                     item.Rounds is >= 0 ? item.Rounds.Value.ToString() : "—",
                     FormatRoundsPerHour(item.RoundsPerHour),
+=======
+                    FormatRoundsPerHour(item.Rounds, item.Stats.Session),
+>>>>>>> fecffd8ad1b1803e545acc90536bc4e9698fe692
                     FormatStatisticsDuration(item.Stats.Total),
                     item.State);
 
@@ -353,6 +376,7 @@ public sealed partial class ManagerForm
 
         if (_statisticsSummary is not null && !_statisticsSummary.IsDisposed)
         {
+<<<<<<< HEAD
             var running = rows.Count(x =>
                 string.Equals(x.State, RuntimeStateRunning, StringComparison.OrdinalIgnoreCase));
 
@@ -368,6 +392,13 @@ public sealed partial class ManagerForm
                 $"Vòng/giờ TB: {(averageRate is null ? "—" : averageRate.Value.ToString("0.0"))}   |   " +
                 $"Tổng thời gian chạy: {FormatStatisticsDuration(totalAll)}   |   " +
                 "Màu hiệu suất tính sau 5 phút chạy";
+=======
+            var running = rows.Count(x => string.Equals(x.State, RuntimeStateRunning, StringComparison.OrdinalIgnoreCase));
+            var totalAll = TimeSpan.FromSeconds(rows.Sum(x => Math.Max(0, x.Stats.Total.TotalSeconds)));
+            _statisticsSummary.Text =
+                $"Profile: {rows.Count}   |   Đang chạy: {running}   |   Tổng thời gian chạy: {FormatStatisticsDuration(totalAll)}   " +
+                "|   Vòng/giờ tính theo phiên hiện tại";
+>>>>>>> fecffd8ad1b1803e545acc90536bc4e9698fe692
         }
     }
 
@@ -559,6 +590,18 @@ public sealed partial class ManagerForm
             cell.ToolTipText =
                 $"Hiệu suất thấp: {rate.Value:0.0} vòng/giờ, bằng {ratio * 100:0}% trung vị.";
         }
+    }
+
+    static string FormatRoundsPerHour(long? rounds, TimeSpan session)
+    {
+        if (rounds is null || rounds < 0 || session.TotalSeconds <= 0)
+            return "—";
+
+        var rate = rounds.Value / session.TotalHours;
+        if (double.IsNaN(rate) || double.IsInfinity(rate) || rate < 0)
+            return "—";
+
+        return rate.ToString("0.0");
     }
 
     static string FormatStatisticsDuration(TimeSpan value)
