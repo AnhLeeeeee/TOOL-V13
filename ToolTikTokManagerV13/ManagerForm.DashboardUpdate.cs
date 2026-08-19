@@ -224,16 +224,30 @@ public sealed partial class ManagerForm
         panel.Controls.Add(configure);
         panel.Controls.Add(check);
         panel.Controls.Add(_dashboardUpdateButton);
-        panel.Resize += (_, _) =>
+
+        void LayoutUpdateButtons()
         {
-            // Giữ phần trạng thái co giãn theo cửa sổ, nhưng không đẩy nút ra ngoài.
-            var buttonsWidth = configure.Width + check.Width + (_dashboardUpdateButton.Visible ? _dashboardUpdateButton.Width : 0) + 50;
-            _dashboardUpdateStatus.Width = Math.Max(280, panel.ClientSize.Width - buttonsWidth - 28);
-            var x = _dashboardUpdateStatus.Right + 8;
-            configure.Left = x;
-            check.Left = configure.Right + 8;
-            _dashboardUpdateButton.Left = check.Right + 8;
-        };
+            if (panel.IsDisposed || _dashboardUpdateStatus.IsDisposed || _dashboardUpdateButton.IsDisposed)
+                return;
+
+            const int gap = 8;
+            const int rightPadding = 10;
+
+            // Luôn chừa sẵn chỗ cho cả 3 nút, kể cả khi "Tải & cập nhật" đang ẩn.
+            // Nhờ vậy khi phát hiện bản mới, nút thứ ba chỉ hiện lên tại chỗ đã chừa sẵn
+            // và không còn bị đẩy ra ngoài mép phải của cửa sổ.
+            var right = Math.Max(0, panel.ClientSize.Width - rightPadding);
+            _dashboardUpdateButton.Left = Math.Max(0, right - _dashboardUpdateButton.Width);
+            check.Left = Math.Max(0, _dashboardUpdateButton.Left - gap - check.Width);
+            configure.Left = Math.Max(0, check.Left - gap - configure.Width);
+
+            var statusRight = Math.Max(_dashboardUpdateStatus.Left + 160, configure.Left - gap);
+            _dashboardUpdateStatus.Width = Math.Max(160, statusRight - _dashboardUpdateStatus.Left);
+        }
+
+        panel.Resize += (_, _) => LayoutUpdateButtons();
+        _dashboardUpdateButton.VisibleChanged += (_, _) => LayoutUpdateButtons();
+        LayoutUpdateButtons();
 
         return panel;
     }
@@ -461,7 +475,7 @@ public sealed partial class ManagerForm
         }
 
         var selectedName = DashboardSelectedContext()?.Profile.Name;
-        var allContexts = _contexts.Values.OrderBy(c => c.Profile.Name, NaturalProfileNameOrder).ToList();
+        var allContexts = _contexts.Values.OrderByDescending(c => c.Profile.Name, NaturalProfileNameOrder).ToList();
         var showAllProfiles = _dashboardShowAllProfilesToggle?.Checked == true;
         var contexts = showAllProfiles
             ? allContexts

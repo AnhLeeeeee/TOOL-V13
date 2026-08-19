@@ -992,19 +992,32 @@ public sealed partial class ManagerForm : Form
 
     async Task StartAllAsync()
     {
-        foreach (var ctx in _contexts.Values.OrderBy(c => c.Profile.Name))
+        // "Chạy tất cả" chỉ áp dụng cho các profile đang có tab mở trong Manager.
+        // Profile chưa mở sẽ được bỏ qua hoàn toàn, không tự tạo tab/Worker.
+        var openContexts = _contexts.Values
+            .Where(ctx => ctx.Tab is not null
+                          && !ctx.Tab.IsDisposed
+                          && ctx.Tab.Parent == _tabs)
+            .OrderBy(ctx => ctx.Profile.Name, NaturalProfileNameOrder)
+            .ToList();
+
+        foreach (var ctx in openContexts)
         {
             try
             {
+                // Tab đã mở nhưng Worker có thể vừa thoát; OpenProfileAsync sẽ bảo đảm
+                // Worker của đúng profile sẵn sàng rồi mới gửi lệnh start.
                 await OpenProfileAsync(ctx);
                 await SendCommandAsync(ctx, "start", TimeSpan.FromSeconds(30));
             }
             catch (Exception ex)
             {
                 SetStatus(ctx, "Không chạy được: " + ex.Message, Color.Firebrick);
-                _log.Error($"[{ctx.Profile.Name}] START_ALL: {ex}");
+                _log.Error($"[{ctx.Profile.Name}] START_ALL_OPEN_ONLY: {ex}");
             }
         }
+
+        _log.Info($"[START_ALL_OPEN_ONLY] requested={openContexts.Count}");
     }
 
     async Task StopAllAsync()
@@ -3167,8 +3180,10 @@ public sealed partial class ManagerForm : Form
 
                 _profileService.RemoveFromCatalog(catalog, plan.Profile.Name);
                 _profileService.SaveWithBackup(catalog);
-                try { _accountPoolService.ReleaseByProfile(plan.Profile.Name); }
-                catch (Exception poolEx) { _log.Warn($"[ACCOUNT_POOL_RELEASE_FAILED] profile={plan.Profile.Name} {poolEx.Message}"); }
+                // Giữ nguyên lịch sử "Profile đã gán" trong Kho tài khoản và file Excel.
+                // Xóa profile chỉ xóa profile/Chrome/data của Tool, KHÔNG bỏ gán account.
+                // Nhờ vậy cột "Profile đã gán" vẫn giữ giá trị cũ để kiểm soát lịch sử acc về sau.
+                _log.Info($"[PROFILE_DELETE_KEEP_ACCOUNT_ASSIGNMENT] profile={plan.Profile.Name}");
                 deleted.Add(plan);
                 _log.Warn($"[PROFILE_DELETED] name={plan.Profile.Name} profilePath={plan.ChromeProfilePath} dataRoot={plan.DataRoot}");
             }

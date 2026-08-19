@@ -17,6 +17,7 @@ public sealed partial class ManagerForm
     TabPage? _statisticsTab;
     DataGridView? _statisticsGrid;
     Label? _statisticsSummary;
+    CheckBox? _statisticsShowAllProfilesToggle;
     DateTime _statisticsLastRefreshUtc = DateTime.MinValue;
     bool _statisticsInitialized;
 
@@ -99,6 +100,26 @@ public sealed partial class ManagerForm
             Location = new Point(14, 40)
         };
 
+        _statisticsShowAllProfilesToggle = new CheckBox
+        {
+            Appearance = Appearance.Button,
+            AutoSize = false,
+            Width = 170,
+            Height = 32,
+            Text = "Hồ sơ đang mở",
+            TextAlign = ContentAlignment.MiddleCenter,
+            FlatStyle = FlatStyle.Flat,
+            Checked = false,
+            Cursor = Cursors.Hand,
+            TabStop = false
+        };
+        _statisticsShowAllProfilesToggle.FlatAppearance.BorderSize = 1;
+        _statisticsShowAllProfilesToggle.CheckedChanged += (_, _) =>
+        {
+            UpdateStatisticsProfileFilterToggleStyle();
+            RefreshStatistics(force: true);
+        };
+
         var refresh = new Button
         {
             Text = "Làm mới",
@@ -109,17 +130,28 @@ public sealed partial class ManagerForm
         UiTheme.StyleButton(refresh, UiButtonKind.Neutral);
         refresh.Click += (_, _) => RefreshStatistics(force: true);
 
-        void LayoutRefreshButton()
+        void LayoutHeaderActions()
         {
-            refresh.Left = Math.Max(360, header.ClientSize.Width - refresh.Width - 12);
-            refresh.Top = 20;
+            if (_statisticsShowAllProfilesToggle is null || _statisticsShowAllProfilesToggle.IsDisposed)
+                return;
+
+            _statisticsShowAllProfilesToggle.Left =
+                Math.Max(520, header.ClientSize.Width - _statisticsShowAllProfilesToggle.Width - 12);
+            _statisticsShowAllProfilesToggle.Top = 20;
+
+            refresh.Left = Math.Max(
+                410,
+                _statisticsShowAllProfilesToggle.Left - refresh.Width - 8);
+            refresh.Top = 19;
         }
 
         header.Controls.Add(title);
         header.Controls.Add(_statisticsSummary);
         header.Controls.Add(refresh);
-        header.Resize += (_, _) => LayoutRefreshButton();
-        LayoutRefreshButton();
+        header.Controls.Add(_statisticsShowAllProfilesToggle);
+        header.Resize += (_, _) => LayoutHeaderActions();
+        LayoutHeaderActions();
+        UpdateStatisticsProfileFilterToggleStyle();
 
         _statisticsGrid = BuildStatisticsGrid();
 
@@ -136,6 +168,19 @@ public sealed partial class ManagerForm
             ? Math.Min(1, _tabs.TabPages.Count)
             : 0;
         _tabs.TabPages.Insert(insertIndex, page);
+    }
+
+    void UpdateStatisticsProfileFilterToggleStyle()
+    {
+        var toggle = _statisticsShowAllProfilesToggle;
+        if (toggle is null || toggle.IsDisposed) return;
+
+        var showAll = toggle.Checked;
+        toggle.Text = showAll ? "Tất cả hồ sơ" : "Hồ sơ đang mở";
+        toggle.BackColor = showAll ? Color.FromArgb(37, 99, 176) : Color.White;
+        toggle.ForeColor = showAll ? Color.White : Color.FromArgb(37, 77, 122);
+        toggle.FlatAppearance.BorderColor =
+            showAll ? Color.FromArgb(37, 99, 176) : Color.FromArgb(93, 128, 170);
     }
 
     DataGridView BuildStatisticsGrid()
@@ -277,7 +322,15 @@ public sealed partial class ManagerForm
             long? Rounds,
             double? RoundsPerHour)>();
 
-        foreach (var ctx in _contexts.Values.OrderBy(x => x.Profile.Name, NaturalProfileNameOrder))
+        var allContexts = _contexts.Values
+            .OrderBy(x => x.Profile.Name, NaturalProfileNameOrder)
+            .ToList();
+        var showAllProfiles = _statisticsShowAllProfilesToggle?.Checked == true;
+        var contexts = showAllProfiles
+            ? allContexts
+            : allContexts.Where(IsDashboardProfileOpen).ToList();
+
+        foreach (var ctx in contexts)
         {
             var stats = ReadStatisticsRuntime(ctx);
             var account = GetDashboardAccount(ctx);
@@ -377,8 +430,12 @@ public sealed partial class ManagerForm
                 ? eligibleRates.Average()
                 : (double?)null;
 
+            var profileCountText = showAllProfiles
+                ? $"Profiles: {allContexts.Count}"
+                : $"Profiles đang mở: {rows.Count}/{allContexts.Count}";
+
             _statisticsSummary.Text =
-                $"Profile: {rows.Count}   |   Đang chạy: {running}   |   " +
+                $"{profileCountText}   |   Đang chạy: {running}   |   " +
                 $"Vòng/giờ TB: {(averageRate is null ? "—" : averageRate.Value.ToString("0.0"))}   |   " +
                 $"Tổng thời gian chạy: {FormatStatisticsDuration(totalAll)}   |   " +
                 "Màu hiệu suất tính sau 5 phút chạy";

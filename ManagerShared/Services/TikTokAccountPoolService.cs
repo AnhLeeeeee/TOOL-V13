@@ -237,10 +237,9 @@ public sealed class TikTokAccountPoolService
         var current = items.FirstOrDefault(x => x.Id.Equals(accountId, StringComparison.OrdinalIgnoreCase));
         if (current is null) return;
 
-        var sourcePath = CurrentSourcePath;
-        if (!string.IsNullOrWhiteSpace(sourcePath))
-            ClearSourceRow(sourcePath, current.SourceRow);
-
+        // "Xóa dòng" trong Kho tài khoản chỉ xóa bản ghi khỏi catalog nội bộ của Tool.
+        // TUYỆT ĐỐI không ghi ngược/xóa dữ liệu trong file Excel/CSV/TXT nguồn:
+        // tài khoản, mật khẩu, 2FA, ghi chú, Profile đã gán và Tên/ảnh DONE đều giữ nguyên.
         items.RemoveAll(x => x.Id.Equals(accountId, StringComparison.OrdinalIgnoreCase));
         Save(items);
     }
