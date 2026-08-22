@@ -55,7 +55,10 @@ public sealed partial class AutomationEngine
     // Bộ F5 cứu trang độc lập: không đổi LIVE. Bình thường reload trang hiện tại mỗi 30 phút;
     // nếu renderer/tab crash (Aw, Snap!/Out of Memory/CDP target crashed) thì xử lý ngay.
     const int PageMaintenanceReloadMinutes = 30;
-    const int PageHealthProbeIntervalMs = 2000;
+    // PAGE_HEALTH là guard nhẹ. 30 giây/lần đủ phát hiện tab chết mà không tạo nhiều CDP call trên VM.
+    // Các exception CDP/renderer vẫn kích hoạt recovery NGAY, không chờ chu kỳ này.
+    const int PageHealthProbeIntervalMs = 30000;
+    const int PageRecoveryRetryAfterFailureMs = 120000;
     const int PageRecoveryReloadWaitMs = 1200;
     const int OldLiveScanIntervalMs = 1500;
     const int OldLiveScanRetryMs = 2500;
@@ -120,6 +123,9 @@ public sealed partial class AutomationEngine
     DateTime _nextPageHealthProbe = DateTime.MinValue;
     string _lastHealthyTikTokUrl = "";
     bool _pageRecoveryExecuting;
+    // Khi 2 lần F5 chưa cứu được, khóa workflow trên đúng profile này.
+    // Worker vẫn RUNNING để Manager watchdog 10 phút có thể theo dõi Detail=PAGE_RECOVERY_FAILED.
+    bool _pageRecoveryPending;
     bool _periodicExecuting;
     PeriodicF5Snapshot _periodicSnapshot = new(false, false, false, DateTime.MaxValue);
     DateTime? _lastOldLiveSavedAt;
@@ -241,6 +247,7 @@ public sealed partial class AutomationEngine
         // Runtime không còn lập lịch quét ảnh vùng lỗi/STOP/ban acc.
 
         _lastHealthyTikTokUrl = _chrome.Page?.Url ?? "";
+        _pageRecoveryPending = false;
         _nextPageHealthProbe = now;
         ResetPageMaintenanceDue("khởi động");
         ResetPeriodicDue("khởi động", cancelCandidate: true);
@@ -530,49 +537,53 @@ public sealed partial class AutomationEngine
             _log.Warn($"[PAGE_CRASH_PROBE_FALLBACK] context={context} reason={probeEx.Message}");
         }
 
+        // Với CDP_SESSION_LOST, không được coi reconnect target là đã cứu xong.
+        // Đây chính là trường hợp Chrome vẫn giữ URL /live nhưng renderer đang hiện Ôi, hỏng!/OOM.
         var crashLike = health.CrashLike ||
-            (cause is not null && _chrome.IsRendererCrashLike(cause));
+            (cause is not null && (_chrome.IsRendererCrashLike(cause) || _chrome.IsCdpSessionLost(cause)));
         if (!crashLike) return false;
 
         _pageRecoveryExecuting = true;
+        _pageRecoveryPending = true;
         var resumeStep = PageRecoveryRestartStep;
         _step = resumeStep;
         var fallback = !string.IsNullOrWhiteSpace(_lastHealthyTikTokUrl)
             ? _lastHealthyTikTokUrl
             : health.Url;
-        SetStatus("RECOVERING_CHROME", $"{context}: Chrome/tab lỗi ({health.Reason}) → đang tự phục hồi.");
-        _log.Warn($"[PAGE_CRASH_FAILURE_INTERCEPT] context={context} reason={health.Reason} action=reload-then-restart restartStep={resumeStep}");
+
+        SetStatus("ĐANG CỨU TRANG",
+            $"PAGE_RECOVERY: {context} • lỗi={health.Reason} • đang F5 tự cứu (tối đa 2 lần).");
+        _log.Warn($"[PAGE_CRASH_FAILURE_INTERCEPT] context={context} reason={health.Reason} action=F5_X2_THEN_WAIT_WATCHDOG restartStep={resumeStep}");
 
         try
         {
-            try
-            {
-                await _chrome.RecoverCurrentPageAsync(fallback, ct);
-                _log.Warn($"[PAGE_CRASH_FAILURE_RECOVERED] context={context} method=reload-or-navigate restartStep={resumeStep}");
-            }
-            catch (OperationCanceledException) { throw; }
-            catch (Exception recoverEx)
-            {
-                _log.Warn($"[PAGE_CRASH_PRIMARY_RECOVERY_FAILED] context={context} reason={recoverEx.Message} action=restart-managed-chrome");
-                await _chrome.RestartManagedChromeForRecoveryAsync(fallback, ct);
-                _log.Warn($"[PAGE_CRASH_FAILURE_RECOVERED] context={context} method=restart-managed-chrome restartStep={resumeStep}");
-            }
+            await _chrome.RecoverCurrentPageAsync(fallback, ct);
 
+            _pageRecoveryPending = false;
             ResetPageMaintenanceDue("sau tự cứu renderer crash");
             _nextPageHealthProbe = DateTime.Now.AddMilliseconds(PageHealthProbeIntervalMs);
             ResetInputGuardConsecutive("sau tự cứu renderer crash");
             ResetRecoveryFailures("renderer crash đã tự phục hồi");
-            SetStatus("ĐÃ CỨU TRANG", $"Chrome đã phục hồi; tiếp tục từ bước {resumeStep}/8.");
+
+            var after = await _chrome.ProbePageHealthAsync(ct);
+            if (after.Healthy && !string.IsNullOrWhiteSpace(after.Url))
+                _lastHealthyTikTokUrl = after.Url;
+
+            _log.Warn($"[PAGE_RECOVERY_OK] context={context} method=reload restartStep={resumeStep} health={after.Reason}");
+            SetStatus("ĐANG CHẠY", $"Trang đã tải lại bình thường; tiếp tục từ bước {resumeStep}/8.");
             return true;
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception finalEx)
         {
-            ReportProblem("PAGE_CRASH_HARD_RECOVERY_FAILED", "Chrome renderer",
-                $"{context}: reload/navigate/restart Chrome đều chưa phục hồi được: {finalEx.Message}",
-                error: true, throttleSeconds: 15);
-            _log.Error($"[PAGE_CRASH_HARD_RECOVERY_FAILED] context={context} {finalEx}");
-            return false;
+            // Không restart Chrome ngay. Giữ profile ở trạng thái recovery, khóa workflow và
+            // F5 lại sau 2 phút. Manager watchdog 10 phút sẽ đóng+bù nếu trang không tự hồi.
+            _pageRecoveryPending = true;
+            _nextPageHealthProbe = DateTime.Now.AddMilliseconds(PageRecoveryRetryAfterFailureMs);
+            _log.Error($"[PAGE_RECOVERY_FAILED] context={context} retryInMs={PageRecoveryRetryAfterFailureMs} reason={finalEx.Message}");
+            SetStatus("ĐANG CỨU TRANG",
+                $"PAGE_RECOVERY_FAILED: F5 2 lần chưa khỏe • sẽ thử lại sau 2 phút • watchdog tự đóng sau 10 phút nếu vẫn lỗi.");
+            return true;
         }
         finally
         {
@@ -586,14 +597,46 @@ public sealed partial class AutomationEngine
         {
             var delay = CdpReconnectBackoff[attempt - 1];
             _log.Warn($"[CDP_RECONNECT_START] context={context} attempt={attempt}/{CdpReconnectBackoff.Length} delayMs={(int)delay.TotalMilliseconds}");
-            SetStatus("ĐANG RECONNECT CDP", $"{context}: attempt {attempt}/{CdpReconnectBackoff.Length}");
+            SetStatus("ĐANG RECONNECT CDP", $"PAGE_RECOVERY: {context} • reconnect {attempt}/{CdpReconnectBackoff.Length}");
             if (delay > TimeSpan.Zero) await Task.Delay(delay, ct);
 
             try
             {
                 await _chrome.ReconnectAsync(ct);
-                _log.Warn($"[CDP_RECONNECTED] context={context} attempt={attempt}/{CdpReconnectBackoff.Length}");
-                SetStatus("ĐANG CHẠY", $"CDP đã phục hồi: {context}");
+                _log.Warn($"[CDP_RECONNECTED] context={context} attempt={attempt}/{CdpReconnectBackoff.Length} action=VERIFY_PAGE_HEALTH");
+
+                var health = await _chrome.ProbePageHealthAsync(ct);
+                if (health.Healthy)
+                {
+                    _pageRecoveryPending = false;
+                    if (!string.IsNullOrWhiteSpace(health.Url))
+                        _lastHealthyTikTokUrl = health.Url;
+                    _log.Info($"[PAGE_HEALTH_OK_AFTER_RECONNECT] context={context} url={health.Url}");
+                    SetStatus("ĐANG CHẠY", $"CDP và trang TikTok đã phục hồi: {context}");
+                    return true;
+                }
+
+                _log.Warn($"[PAGE_HEALTH_FAIL_AFTER_RECONNECT] context={context} reason={health.Reason} crashLike={health.CrashLike} url={health.Url} action=F5_X2");
+                _pageRecoveryPending = true;
+                SetStatus("ĐANG CỨU TRANG",
+                    $"PAGE_RECOVERY: reconnect được CDP nhưng trang chưa khỏe ({health.Reason}) → F5 tự cứu.");
+
+                var fallback = !string.IsNullOrWhiteSpace(_lastHealthyTikTokUrl)
+                    ? _lastHealthyTikTokUrl
+                    : health.Url;
+                await _chrome.RecoverCurrentPageAsync(fallback, ct);
+
+                var after = await _chrome.ProbePageHealthAsync(ct);
+                if (!after.Healthy)
+                    throw new InvalidOperationException($"Trang vẫn chưa khỏe sau F5: {after.Reason}");
+
+                _pageRecoveryPending = false;
+                if (!string.IsNullOrWhiteSpace(after.Url))
+                    _lastHealthyTikTokUrl = after.Url;
+                ResetPageMaintenanceDue("sau reconnect + F5 tự cứu");
+                _nextPageHealthProbe = DateTime.Now.AddMilliseconds(PageHealthProbeIntervalMs);
+                _log.Warn($"[PAGE_RECOVERY_OK_AFTER_RECONNECT] context={context} health={after.Reason} url={after.Url}");
+                SetStatus("ĐANG CHẠY", $"Trang đã F5 và hoạt động bình thường: {context}");
                 return true;
             }
             catch (OperationCanceledException) { throw; }
@@ -602,6 +645,11 @@ public sealed partial class AutomationEngine
                 _log.Warn($"[CDP_RECONNECT_FAILED] context={context} attempt={attempt}/{CdpReconnectBackoff.Length} reason={ex.Message}");
             }
         }
+
+        _pageRecoveryPending = true;
+        _nextPageHealthProbe = DateTime.Now.AddMilliseconds(PageRecoveryRetryAfterFailureMs);
+        SetStatus("ĐANG CỨU TRANG",
+            "PAGE_RECOVERY_FAILED: chưa phục hồi được CDP/trang • sẽ thử lại sau 2 phút • watchdog 10 phút vẫn theo dõi.");
         return false;
     }
 
@@ -990,7 +1038,19 @@ public sealed partial class AutomationEngine
 
     async Task<bool> HandleImmediatePageCrashRecoveryAsync(CancellationToken ct)
     {
-        if (_pageRecoveryExecuting || DateTime.Now < _nextPageHealthProbe) return false;
+        if (_pageRecoveryExecuting) return true;
+
+        // Sau khi F5 x2 vẫn lỗi, tuyệt đối không cho workflow tiếp tục thao tác trên sad-tab.
+        // Chờ mốc retry; Detail vẫn chứa PAGE_RECOVERY_FAILED để Manager watchdog 10p đếm lỗi.
+        if (_pageRecoveryPending && DateTime.Now < _nextPageHealthProbe)
+        {
+            await Task.Delay(500, ct);
+            return true;
+        }
+
+        if (!_pageRecoveryPending && DateTime.Now < _nextPageHealthProbe)
+            return false;
+
         _nextPageHealthProbe = DateTime.Now.AddMilliseconds(PageHealthProbeIntervalMs);
 
         ChromeController.PageHealthSnapshot health;
@@ -1002,6 +1062,12 @@ public sealed partial class AutomationEngine
         catch (Exception ex)
         {
             _log.Warn($"[PAGE_HEALTH_PROBE_FAILED] reason={ex.Message}");
+            if (_pageRecoveryPending)
+            {
+                _nextPageHealthProbe = DateTime.Now.AddMilliseconds(PageRecoveryRetryAfterFailureMs);
+                await Task.Delay(500, ct);
+                return true;
+            }
             return false;
         }
 
@@ -1010,59 +1076,62 @@ public sealed partial class AutomationEngine
             if (!string.IsNullOrWhiteSpace(health.Url) &&
                 health.Url.Contains("tiktok.com", StringComparison.OrdinalIgnoreCase))
                 _lastHealthyTikTokUrl = health.Url;
+
+            if (_pageRecoveryPending)
+            {
+                _pageRecoveryPending = false;
+                ResetRecoveryFailures("PAGE_HEALTH đã khỏe trở lại");
+                _log.Warn($"[PAGE_RECOVERY_OK] method=health-probe reason={health.Reason} url={health.Url}");
+                SetStatus("ĐANG CHẠY", $"Trang đã hoạt động bình thường; tiếp tục từ bước {PageRecoveryRestartStep}/8.");
+            }
             return false;
         }
 
-        if (!health.CrashLike) return false;
+        // DOCUMENT_NAVIGATING là trạng thái chuyển document ngắn; không F5 chồng lên navigation.
+        // Khi đang pending từ lần lỗi trước thì tới mốc retry vẫn thử F5 để tự cứu.
+        if (!health.CrashLike && !_pageRecoveryPending)
+            return false;
 
         _pageRecoveryExecuting = true;
+        _pageRecoveryPending = true;
         var resumeStep = PageRecoveryRestartStep;
         _step = resumeStep;
-        SetStatus("ĐANG CỨU TRANG", $"Phát hiện Chrome lỗi ({health.Reason}) → reload ngay.");
-        _log.Warn($"[PAGE_CRASH_DETECTED] reason={health.Reason} url={health.Url} action=RECOVER_NOW restartStep={resumeStep}");
+        SetStatus("ĐANG CỨU TRANG",
+            $"PAGE_RECOVERY: phát hiện trang lỗi ({health.Reason}) → F5 tự cứu tối đa 2 lần.");
+        _log.Warn($"[PAGE_CRASH_DETECTED] reason={health.Reason} url={health.Url} action=F5_X2 restartStep={resumeStep}");
+
         try
         {
             var fallback = !string.IsNullOrWhiteSpace(_lastHealthyTikTokUrl)
                 ? _lastHealthyTikTokUrl
                 : health.Url;
+
             await _chrome.RecoverCurrentPageAsync(fallback, ct);
+            var after = await _chrome.ProbePageHealthAsync(ct);
+            if (!after.Healthy)
+                throw new InvalidOperationException($"PAGE_HEALTH vẫn lỗi sau F5: {after.Reason}");
+
+            _pageRecoveryPending = false;
+            if (!string.IsNullOrWhiteSpace(after.Url))
+                _lastHealthyTikTokUrl = after.Url;
             ResetPageMaintenanceDue("vừa tự cứu trang crash");
             _nextPageHealthProbe = DateTime.Now.AddMilliseconds(PageHealthProbeIntervalMs);
             ResetInputGuardConsecutive("sau tự cứu trang crash");
-            _log.Warn($"[PAGE_CRASH_RECOVERED] restartStep={resumeStep} action=RECHECK_WORKFLOW");
-            SetStatus("ĐÃ CỨU TRANG", $"Chrome đã reload; tiếp tục từ bước {resumeStep}/8.");
+            ResetRecoveryFailures("trang crash đã tự phục hồi");
+            _log.Warn($"[PAGE_RECOVERY_OK] restartStep={resumeStep} health={after.Reason} url={after.Url}");
+            SetStatus("ĐANG CHẠY", $"Trang đã F5 và hoạt động bình thường; tiếp tục từ bước {resumeStep}/8.");
             return true;
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
-            _log.Warn($"[PAGE_CRASH_RECOVERY_RELOAD_FAILED] reason={ex.Message} action=restart-managed-chrome");
-            try
-            {
-                var fallback = !string.IsNullOrWhiteSpace(_lastHealthyTikTokUrl)
-                    ? _lastHealthyTikTokUrl
-                    : health.Url;
-                await _chrome.RestartManagedChromeForRecoveryAsync(fallback, ct);
-                ResetPageMaintenanceDue("restart Chrome sau renderer crash");
-                _nextPageHealthProbe = DateTime.Now.AddMilliseconds(PageHealthProbeIntervalMs);
-                ResetInputGuardConsecutive("sau restart Chrome renderer crash");
-                ResetRecoveryFailures("restart Chrome renderer crash thành công");
-                _log.Warn($"[PAGE_CRASH_RECOVERED] restartStep={resumeStep} method=restart-managed-chrome action=RECHECK_WORKFLOW");
-                SetStatus("ĐÃ CỨU TRANG", $"Chrome đã được mở lại; tiếp tục từ bước {resumeStep}/8.");
-                return true;
-            }
-            catch (OperationCanceledException) { throw; }
-            catch (Exception restartEx)
-            {
-                ReportProblem("PAGE_CRASH_RECOVERY_FAILED", "Chrome renderer",
-                    "Reload và restart Chrome đều chưa tự phục hồi được: " + restartEx.Message,
-                    error: true, throttleSeconds: 10);
-                _log.Error($"[PAGE_CRASH_RECOVERY_FAILED] reload={ex.Message}; restart={restartEx}");
-                // Không Stop() ở đây. Vòng chính sẽ tiếp tục probe/retry; chỉ cơ chế chống
-                // lỗi liên tiếp hiện có mới tạm dừng nếu Chrome thực sự không thể phục hồi.
-                await Task.Delay(1000, ct);
-                return true;
-            }
+            _pageRecoveryPending = true;
+            _nextPageHealthProbe = DateTime.Now.AddMilliseconds(PageRecoveryRetryAfterFailureMs);
+            _log.Error($"[PAGE_RECOVERY_FAILED] reason={ex.Message} retryInMs={PageRecoveryRetryAfterFailureMs} action=KEEP_RECOVERING");
+            SetStatus("ĐANG CỨU TRANG",
+                "PAGE_RECOVERY_FAILED: F5 2 lần chưa khỏe • khóa workflow • thử lại sau 2 phút • watchdog 10 phút sẽ đóng+bù nếu không hồi.");
+            await Task.Delay(500, ct);
+            return true;
         }
         finally
         {
@@ -1870,7 +1939,7 @@ public sealed partial class AutomationEngine
 
     async Task<bool> TryRecoverRendererCrashAfterArrowDownNoChangeAsync(string source, int resumeStep, CancellationToken ct)
     {
-        if (_pageRecoveryExecuting) return false;
+        if (_pageRecoveryExecuting) return true;
 
         ChromeController.PageHealthSnapshot health;
         try
@@ -1885,73 +1954,50 @@ public sealed partial class AutomationEngine
             return false;
         }
 
-        if (!health.CrashLike)
+        if (!health.CrashLike && !_pageRecoveryPending)
         {
             _log.Info($"[LIVE_SWITCH_PAGE_CRASH_NOT_FOUND] source={source} health={health.Reason}");
             return false;
         }
 
         _pageRecoveryExecuting = true;
+        _pageRecoveryPending = true;
         var fallback = !string.IsNullOrWhiteSpace(_lastHealthyTikTokUrl)
             ? _lastHealthyTikTokUrl
             : health.Url;
         _step = resumeStep;
-        SetStatus("ĐANG CỨU TRANG", $"{source}: phát hiện {health.Reason} → reload/restart Chrome nếu cần.");
-        _log.Warn($"[LIVE_SWITCH_PAGE_CRASH_DETECTED] source={source} reason={health.Reason} url={health.Url} resumeStep={resumeStep}");
+        SetStatus("ĐANG CỨU TRANG",
+            $"PAGE_RECOVERY: {source} • phát hiện {health.Reason} → F5 tự cứu tối đa 2 lần.");
+        _log.Warn($"[LIVE_SWITCH_PAGE_CRASH_DETECTED] source={source} reason={health.Reason} url={health.Url} resumeStep={resumeStep} action=F5_X2");
 
         try
         {
-            var needRestart = false;
-            try
-            {
-                _log.Warn($"[LIVE_SWITCH_PAGE_CRASH_RELOAD_START] source={source} fallback={fallback}");
-                await _chrome.RecoverCurrentPageAsync(fallback, ct);
+            await _chrome.RecoverCurrentPageAsync(fallback, ct);
+            var after = await _chrome.ProbePageHealthAsync(ct);
+            if (!after.Healthy)
+                throw new InvalidOperationException($"Trang vẫn chưa khỏe sau F5: {after.Reason}");
 
-                var afterReload = await _chrome.ProbePageHealthAsync(ct);
-                if (!afterReload.Healthy || afterReload.CrashLike)
-                {
-                    needRestart = true;
-                    _log.Warn($"[LIVE_SWITCH_PAGE_CRASH_RELOAD_STILL_BAD] source={source} health={afterReload.Reason} url={afterReload.Url} action=restart-managed-chrome");
-                }
-                else
-                {
-                    _log.Warn($"[LIVE_SWITCH_PAGE_CRASH_RELOAD_OK] source={source} health={afterReload.Reason}");
-                }
-            }
-            catch (OperationCanceledException) { throw; }
-            catch (Exception ex)
-            {
-                needRestart = true;
-                _log.Warn($"[LIVE_SWITCH_PAGE_CRASH_RELOAD_FAILED] source={source} reason={ex.Message} action=restart-managed-chrome");
-            }
-
-            if (needRestart)
-            {
-                await _chrome.RestartManagedChromeForRecoveryAsync(fallback, ct);
-                var afterRestart = await _chrome.ProbePageHealthAsync(ct);
-                if (!afterRestart.Healthy || afterRestart.CrashLike)
-                    throw new InvalidOperationException($"Chrome đã restart nhưng trang vẫn chưa khỏe: {afterRestart.Reason}");
-
-                _log.Warn($"[LIVE_SWITCH_PAGE_CRASH_RESTART_OK] source={source} health={afterRestart.Reason}");
-            }
-
+            _pageRecoveryPending = false;
+            if (!string.IsNullOrWhiteSpace(after.Url))
+                _lastHealthyTikTokUrl = after.Url;
             _step = resumeStep;
             ResetPageMaintenanceDue("sau tự cứu OOM trong ArrowDown");
             _nextPageHealthProbe = DateTime.Now.AddMilliseconds(PageHealthProbeIntervalMs);
             ResetInputGuardConsecutive("sau tự cứu OOM trong ArrowDown");
             ResetRecoveryFailures("OOM trong ArrowDown đã tự phục hồi");
-            SetStatus("ĐÃ CỨU TRANG", $"Chrome đã phục hồi; tiếp tục lại bước {resumeStep}/8.");
+            SetStatus("ĐANG CHẠY", $"Trang đã F5 và hoạt động bình thường; tiếp tục lại bước {resumeStep}/8.");
             _log.Warn($"[LIVE_SWITCH_PAGE_CRASH_RECOVERY_DONE] source={source} resumeStep={resumeStep} action=resume-same-step");
             return true;
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
-            ReportProblem("LIVE_SWITCH_PAGE_CRASH_RECOVERY_FAILED", source,
-                "Đã phát hiện renderer/Out of Memory nhưng reload và restart Chrome vẫn chưa phục hồi được: " + ex.Message,
-                error: true, throttleSeconds: 15);
-            _log.Error($"[LIVE_SWITCH_PAGE_CRASH_RECOVERY_FAILED] source={source} {ex}");
-            return false;
+            _pageRecoveryPending = true;
+            _nextPageHealthProbe = DateTime.Now.AddMilliseconds(PageRecoveryRetryAfterFailureMs);
+            _log.Error($"[LIVE_SWITCH_PAGE_CRASH_RECOVERY_FAILED] source={source} reason={ex.Message} retryInMs={PageRecoveryRetryAfterFailureMs}");
+            SetStatus("ĐANG CỨU TRANG",
+                "PAGE_RECOVERY_FAILED: F5 2 lần chưa khỏe • khóa workflow • thử lại sau 2 phút • watchdog 10 phút sẽ đóng+bù nếu không hồi.");
+            return true;
         }
         finally
         {

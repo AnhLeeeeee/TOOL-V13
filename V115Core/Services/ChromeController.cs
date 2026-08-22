@@ -3049,8 +3049,8 @@ public sealed partial class ChromeController : IAsyncDisposable
     {
         var url = Page?.Url ?? "";
 
-        // /json là đường kiểm tra ngoài renderer. Nếu trang đã đổi sang chrome-error://
-        // thì phát hiện được ngay cả khi Runtime.evaluate không còn chạy.
+        // /json là đường kiểm tra ngoài renderer. URL vẫn có thể giữ nguyên /live trên sad-tab,
+        // nên metadata chỉ là lớp đầu; phía dưới còn kiểm tra Runtime/DOM/LayoutMetrics.
         try
         {
             if (_port > 0)
@@ -3067,8 +3067,7 @@ public sealed partial class ChromeController : IAsyncDisposable
         }
         catch
         {
-            // Browser HTTP endpoint có thể chập chờn đúng lúc renderer/document đổi.
-            // Tiếp tục thử qua session hiện tại trước khi kết luận crash.
+            // Browser HTTP endpoint có thể chập chờn lúc document đổi; thử session hiện tại tiếp.
         }
 
         if (!Connected)
@@ -3077,26 +3076,68 @@ public sealed partial class ChromeController : IAsyncDisposable
         try
         {
             var r = await EvalAsync("""
-(() => ({
-  href: String(location.href || ''),
-  title: String(document.title || ''),
-  ready: String(document.readyState || '')
-}))()
+(() => {
+  const href = String(location.href || '');
+  const title = String(document.title || '');
+  const ready = String(document.readyState || '');
+  const bodyText = String(document.body?.innerText || document.body?.textContent || '').slice(0, 1800);
+  const bodyChildren = Number(document.body?.childElementCount || 0);
+  let host = '';
+  try { host = String(location.hostname || '').toLowerCase(); } catch {}
+  const onTikTok = host === 'tiktok.com' || host.endsWith('.tiktok.com');
+  const hasTikTokShell = !onTikTok || !!document.querySelector(
+    '#app,#root,[data-e2e],[data-testid],script[src*="tiktok"],link[href*="tiktok"],meta[property="og:site_name"]');
+  return { href, title, ready, bodyText, bodyChildren, onTikTok, hasTikTokShell };
+})()
 """, ct: ct);
+
             var v = r.GetProperty("value");
             var href = v.TryGetProperty("href", out var hrefEl) ? hrefEl.GetString() ?? "" : "";
             var title = v.TryGetProperty("title", out var titleEl) ? titleEl.GetString() ?? "" : "";
+            var ready = v.TryGetProperty("ready", out var readyEl) ? readyEl.GetString() ?? "" : "";
+            var bodyText = v.TryGetProperty("bodyText", out var bodyEl) ? bodyEl.GetString() ?? "" : "";
+            var bodyChildren = v.TryGetProperty("bodyChildren", out var childEl) && childEl.TryGetInt32(out var childCount) ? childCount : 0;
+            var onTikTok = v.TryGetProperty("onTikTok", out var tikEl) && tikEl.ValueKind == JsonValueKind.True;
+            var hasTikTokShell = v.TryGetProperty("hasTikTokShell", out var shellEl) && shellEl.ValueKind == JsonValueKind.True;
+
             if (!string.IsNullOrWhiteSpace(href)) url = href;
 
-            if (LooksLikeCrashUrl(href) || LooksLikeRendererCrashText(title))
-                return new PageHealthSnapshot(false, true, "CRASH_PAGE_DOM", url);
+            var visibleText = title + "\n" + bodyText;
+            if (LooksLikeCrashUrl(href) || LooksLikeRendererCrashText(visibleText))
+                return new PageHealthSnapshot(false, true, "CRASH_PAGE_DOM_TEXT", url);
+
+            // Sad-tab/OOM đôi khi vẫn giữ location.href=/live và Runtime.evaluate trả về được,
+            // nhưng renderer không còn TikTok DOM thật. ready=complete + DOM trống là dấu hiệu lỗi.
+            if (onTikTok && ready.Equals("complete", StringComparison.OrdinalIgnoreCase)
+                && bodyChildren == 0)
+                return new PageHealthSnapshot(false, true, "TIKTOK_RENDERER_EMPTY", url);
+
+            if (onTikTok && ready.Equals("complete", StringComparison.OrdinalIgnoreCase)
+                && !hasTikTokShell && string.IsNullOrWhiteSpace(bodyText))
+                return new PageHealthSnapshot(false, true, "TIKTOK_SHELL_MISSING", url);
+
+            if (ready != "interactive" && ready != "complete")
+                return new PageHealthSnapshot(false, false, "DOCUMENT_NOT_READY", url);
+
+            // Lệnh này buộc Page domain hỏi renderer về layout. Trên target/sad-tab đã crash,
+            // đây thường là điểm lộ lỗi dù URL và title vẫn còn như cũ.
+            try
+            {
+                await Cdp.CallAsync("Page.getLayoutMetrics", ct: ct);
+            }
+            catch (Exception layoutEx)
+            {
+                if (IsCdpSessionLost(layoutEx) || IsRendererCrashLike(layoutEx) || LooksLikeRendererCrashText(layoutEx.ToString()))
+                    return new PageHealthSnapshot(false, true, "LAYOUT_RENDERER_CRASHED", url);
+                return new PageHealthSnapshot(false, false, "LAYOUT_PROBE_ERROR", url);
+            }
 
             return new PageHealthSnapshot(true, false, "OK", url);
         }
         catch (Exception ex)
         {
             var message = ex.ToString();
-            if (IsCdpSessionLost(ex) || LooksLikeRendererCrashText(message))
+            if (IsCdpSessionLost(ex) || IsRendererCrashLike(ex) || LooksLikeRendererCrashText(message))
                 return new PageHealthSnapshot(false, true, "RENDERER_OR_TARGET_CRASHED", url);
 
             if (IsTransientDocumentContextError(ex))
@@ -3154,55 +3195,73 @@ public sealed partial class ChromeController : IAsyncDisposable
             ? fallbackUrl
             : (IsSafeTikTokRecoveryUrl(Page?.Url ?? "") ? Page!.Url : TikTokUrl);
 
-        for (int attempt = 1; attempt <= 3; attempt++)
+        const int maxReloadAttempts = 2;
+        const int healthTimeoutMs = 25000;
+        const int healthPollMs = 500;
+
+        for (int attempt = 1; attempt <= maxReloadAttempts; attempt++)
         {
             ct.ThrowIfCancellationRequested();
-            _log.Warn($"[PAGE_RECOVERY_ATTEMPT] attempt={attempt}/3 url={TrimForLog(recoveryUrl)}");
+            _log.Warn($"[PAGE_RECOVERY_RELOAD] attempt={attempt}/{maxReloadAttempts} url={TrimForLog(recoveryUrl)}");
 
             try
             {
                 if (!Connected)
                     await ReconnectAsync(ct);
 
-                await ReloadAndWaitAsync(1200, 15000, ct);
-                _log.Warn($"[PAGE_RECOVERY_RELOAD_OK] attempt={attempt}/3");
-                return;
+                await ReloadAndWaitAsync(1200, 18000, ct);
+
+                var started = Environment.TickCount64;
+                PageHealthSnapshot lastHealth = new(false, false, "NOT_PROBED", Page?.Url ?? recoveryUrl);
+                while (Environment.TickCount64 - started < healthTimeoutMs)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    lastHealth = await ProbePageHealthAsync(ct);
+                    if (lastHealth.Healthy)
+                    {
+                        _log.Warn($"[PAGE_HEALTH_OK] attempt={attempt}/{maxReloadAttempts} elapsedMs={Environment.TickCount64 - started} url={lastHealth.Url}");
+                        _log.Warn($"[PAGE_RECOVERY_OK] attempt={attempt}/{maxReloadAttempts} method=F5");
+                        return;
+                    }
+
+                    _log.Warn($"[PAGE_HEALTH_WAIT] attempt={attempt}/{maxReloadAttempts} reason={lastHealth.Reason} crashLike={lastHealth.CrashLike}");
+
+                    // Nếu reload vừa rơi thẳng về sad-tab/crash lần nữa thì không chờ đủ 25s.
+                    if (lastHealth.CrashLike && Environment.TickCount64 - started >= 2000)
+                        break;
+
+                    await Task.Delay(healthPollMs, ct);
+                }
+
+                last = new InvalidOperationException($"Trang chưa khỏe sau F5 lần {attempt}: {lastHealth.Reason}");
+                _log.Warn($"[PAGE_RECOVERY_RELOAD_NOT_HEALTHY] attempt={attempt}/{maxReloadAttempts} reason={lastHealth.Reason}");
             }
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
                 last = ex;
-                _log.Warn($"[PAGE_RECOVERY_RELOAD_FAILED] attempt={attempt}/3 reason={ex.Message}");
+                _log.Warn($"[PAGE_RECOVERY_RELOAD_FAILED] attempt={attempt}/{maxReloadAttempts} reason={ex.Message}");
+
+                // F5 có thể làm target/session cũ đóng. Reconnect để lần F5 sau thao tác trên target mới.
+                try
+                {
+                    await ReconnectAsync(ct);
+                    _log.Warn($"[PAGE_RECOVERY_RECONNECTED_FOR_RETRY] attempt={attempt}/{maxReloadAttempts}");
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception reconnectEx)
+                {
+                    last = reconnectEx;
+                    _log.Warn($"[PAGE_RECOVERY_RECONNECT_FAILED] attempt={attempt}/{maxReloadAttempts} reason={reconnectEx.Message}");
+                }
             }
 
-            try
-            {
-                await ReconnectAsync(ct);
-            }
-            catch (OperationCanceledException) { throw; }
-            catch (Exception ex)
-            {
-                last = ex;
-                _log.Warn($"[PAGE_RECOVERY_RECONNECT_FAILED] attempt={attempt}/3 reason={ex.Message}");
-            }
-
-            try
-            {
-                await NavigateAndWaitAsync(recoveryUrl, 1200, 15000, ct);
-                _log.Warn($"[PAGE_RECOVERY_NAVIGATE_OK] attempt={attempt}/3");
-                return;
-            }
-            catch (OperationCanceledException) { throw; }
-            catch (Exception ex)
-            {
-                last = ex;
-                _log.Warn($"[PAGE_RECOVERY_NAVIGATE_FAILED] attempt={attempt}/3 reason={ex.Message}");
-            }
-
-            await Task.Delay(500 * attempt, ct);
+            if (attempt < maxReloadAttempts)
+                await Task.Delay(3000, ct);
         }
 
-        throw new InvalidOperationException("Không thể tự phục hồi trang Chrome sau 3 lần thử.", last);
+        throw new InvalidOperationException(
+            "F5 tự cứu 2 lần nhưng trang TikTok vẫn chưa trở lại trạng thái khỏe.", last);
     }
 
     public async Task RestartManagedChromeForRecoveryAsync(string fallbackUrl, CancellationToken ct = default)
