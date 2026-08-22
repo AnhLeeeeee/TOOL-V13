@@ -1,4 +1,6 @@
-﻿namespace ToolTikTokManagerV13;
+﻿using ToolTikTokV12.Services;
+
+namespace ToolTikTokManagerV13;
 
 public sealed partial class ManagerForm
 {
@@ -9,6 +11,7 @@ public sealed partial class ManagerForm
     {
         base.OnHandleCreated(e);
         InitializeBanExcelNoteWatcher();
+        InitializeAutoCloseFeature();
     }
 
     void InitializeBanExcelNoteWatcher()
@@ -25,28 +28,75 @@ public sealed partial class ManagerForm
     {
         if (_closing || IsDisposed || Disposing) return;
 
-        foreach (var ctx in _contexts.Values)
+        foreach (var ctx in _contexts.Values.ToList())
         {
+            string detail;
+
             try
             {
                 var state = GetEffectiveRuntimeState(ctx);
                 if (!string.Equals(state, RuntimeStateStopped, StringComparison.OrdinalIgnoreCase))
                     continue;
 
-                var detail = ctx.LastSnapshot?.Detail ?? "";
+                detail = ctx.LastSnapshot?.Detail ?? "";
                 if (!LooksLikeAccountBanStop(detail))
                     continue;
+            }
+            catch (Exception ex)
+            {
+                _log.Warn(
+                    $"[BAN_WATCH_CHECK_ERROR] profile={ctx.Profile.Name} error={ex.Message}");
+                continue;
+            }
 
-                if (_banExcelNoteMarkedProfiles.Contains(ctx.Profile.Name))
-                    continue;
+            // Tự đóng BAN là nhánh độc lập với việc ghi Excel.
+            // Dù Excel đang bị khóa/lỗi ghi, profile BAN vẫn phải được đóng và tạo suất bù.
+            var workerRunning = false;
+            var chromeInUse = false;
 
+            try
+            {
+                workerRunning = ctx.Worker is not null && !ctx.Worker.HasExited;
+            }
+            catch { }
+
+            try
+            {
+                chromeInUse = ChromeProfileNameSyncService.IsProfileInUse(ctx.Profile.ProfilePath);
+            }
+            catch { }
+
+            var hasActiveRuntime =
+                (ctx.Tab is not null && !ctx.Tab.IsDisposed && ctx.Tab.Parent == _tabs)
+                || workerRunning
+                || ctx.Opening
+                || chromeInUse;
+
+            if (hasActiveRuntime)
+            {
+                try
+                {
+                    QueueAutoCloseForBan(ctx, detail);
+                }
+                catch (Exception ex)
+                {
+                    _log.Warn(
+                        $"[BAN_AUTO_CLOSE_ERROR] profile={ctx.Profile.Name} error={ex.Message}");
+                }
+            }
+
+            // Ghi "ban" vào Excel vẫn retry độc lập mỗi tick cho tới khi thành công.
+            if (_banExcelNoteMarkedProfiles.Contains(ctx.Profile.Name))
+                continue;
+
+            try
+            {
                 MarkAssignedAccountAsBan(ctx.Profile.Name, detail);
             }
             catch (Exception ex)
             {
-                // Không làm ảnh hưởng luồng chạy chính. Nếu Excel đang bị khóa,
-                // tick sau sẽ thử lại.
-                _log.Warn($"[BAN_EXCEL_NOTE_ERROR] profile={ctx.Profile.Name} error={ex.Message}");
+                _log.Warn(
+                    $"[BAN_EXCEL_NOTE_ERROR] profile={ctx.Profile.Name} error={ex.Message}");
             }
         }
     }

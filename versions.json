@@ -1,42 +1,15 @@
-<<<<<<< HEAD
 ﻿{
     "schemaVersion":  1,
     "versions":  [
                      {
-                         "version":  "13.6.4",
-                         "setupUrl":  "https://github.com/AnhLeeeeee/TOOL-V13/releases/download/v13.6.4/ToolTikTok_V13.6.4_Setup.exe",
-                         "sha256":  "5b9468de155916aaa4c22b4f00883878e7205548eec5bd56fdcd005de78c9d6a",
-                         "notes":  "Cáº­p nháº­t Tool TikTok V13.6.4.",
+                         "version":  "13.6.5",
+                         "setupUrl":  "https://github.com/AnhLeeeeee/TOOL-V13/releases/download/v13.6.5/ToolTikTok_V13.6.5_Setup.exe",
+                         "sha256":  "f0a432557311c41e51f8bd1d9a7ab7b3871f7acea0fb3174b46c62c005a82010",
+                         "notes":  "Cáº­p nháº­t Tool TikTok V13.6.5.",
                          "channel":  "stable",
                          "status":  "stable",
-                         "releaseDate":  "2026-08-22",
-                         "allowInstall":  true
-                     },
-                     {
-                         "version":  "13.6.3",
-                         "setupUrl":  "https://github.com/AnhLeeeeee/TOOL-V13/releases/download/v13.6.3/ToolTikTok_V13.6.3_Setup.exe",
-                         "sha256":  "6cbc882696d3185db2f46da8756003bef573cad3700413ce5751c2b5cb69a15d",
-                         "notes":  "Cập nhật Tool TikTok V13.6.3.",
-                         "channel":  "stable",
-                         "status":  "stable",
-                         "releaseDate":  "2026-08-22",
+                         "releaseDate":  "2026-08-23",
                          "allowInstall":  true
                      }
                  ]
-=======
-{
-  "schemaVersion": 1,
-  "versions": [
-    {
-      "version": "13.6.3",
-      "setupUrl": "https://github.com/AnhLeeeeee/TOOL-V13/releases/download/v13.6.3/ToolTikTok_V13.6.3_Setup.exe",
-      "sha256": "6cbc882696d3185db2f46da8756003bef573cad3700413ce5751c2b5cb69a15d",
-      "notes": "Cập nhật Tool TikTok V13.6.3.",
-      "channel": "stable",
-      "status": "stable",
-      "releaseDate": "2026-08-22",
-      "allowInstall": true
-    }
-  ]
->>>>>>> 49987bc4349f8b0125d2277b2f74c9f4ea1f20e4
 }

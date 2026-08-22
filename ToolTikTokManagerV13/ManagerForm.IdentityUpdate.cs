@@ -622,7 +622,8 @@ public sealed partial class ManagerForm
     async Task<IdentityUpdateReply> UpdateTikTokIdentityAsync(
         ProfileContext ctx, string displayName, string avatarPath, string bio = "",
         bool skipIfNameCooldown = false, bool resumeAutomation = false,
-        IReadOnlyList<string>? knownDisplayNames = null, bool verifyExistingState = false)
+        IReadOnlyList<string>? knownDisplayNames = null, bool verifyExistingState = false,
+        TimeSpan? workerTimeout = null)
     {
         if (_messageReplyProfilesInFlight.Contains(ctx.Profile.Name))
             throw new InvalidOperationException("Profile đang được mục Tin nhắn TikTok xử lý. Hãy dừng/đợi Tin nhắn hoàn tất rồi cập nhật tên/ảnh.");
@@ -673,7 +674,7 @@ public sealed partial class ManagerForm
                 VerifyExistingState = verifyExistingState
             });
             var payload = Convert.ToBase64String(Encoding.UTF8.GetBytes(request));
-            var raw = await SendCommandAsync(ctx, "update_tiktok_identity|" + payload, TimeSpan.FromSeconds(100));
+            var raw = await SendCommandAsync(ctx, "update_tiktok_identity|" + payload, workerTimeout ?? TimeSpan.FromSeconds(100));
             var reply = JsonSerializer.Deserialize<IdentityUpdateReply>(raw, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
             return reply ?? new IdentityUpdateReply { Ok = false, Error = "Worker trả về kết quả không hợp lệ." };
         }

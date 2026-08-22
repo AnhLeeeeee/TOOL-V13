@@ -13,7 +13,7 @@ namespace ToolTikTokV12.Services;
 public sealed class ChromeProfileNameSyncService
 {
     public sealed record SyncResult(bool Updated, string PreferencesPath, string Detail);
-    sealed record ChromeProcessInfo(int ProcessId, string CommandLine);
+    sealed record ChromeProcessInfo(int ProcessId, string ProcessName, string CommandLine);
 
     public SyncResult SyncBeforeLaunch(string userDataDir, string profileName, string? profileDirectory = null)
     {
@@ -142,9 +142,10 @@ public sealed class ChromeProfileNameSyncService
     }
 
     /// <summary>
-    /// Stops only Chrome process trees whose --user-data-dir exactly matches the
-    /// persisted profile path.  It deliberately never uses a display name to find
-    /// a process, so another profile cannot be terminated by mistake.
+    /// Stops Chrome/Crashpad processes that reference the exact persisted profile path.
+    /// The profile path, never a display name, is used so another profile is not
+    /// terminated by mistake.  This also catches late Crashpad helpers that no longer
+    /// carry --user-data-dir but still hold a file below the profile directory.
     /// </summary>
     public static IReadOnlyList<int> StopChromeUsingProfile(string userDataDir)
     {
@@ -172,7 +173,7 @@ public sealed class ChromeProfileNameSyncService
         using var process = new Process
         {
             StartInfo = new ProcessStartInfo("powershell.exe",
-                "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$target=$env:TOOL_TIKTOK_PROFILE_TARGET; $items=Get-CimInstance Win32_Process -Filter \\\"Name = 'chrome.exe'\\\" | Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf($target,[System.StringComparison]::OrdinalIgnoreCase) -ge 0 } | Select-Object ProcessId,CommandLine; if($items){$items|ConvertTo-Json -Compress}\"")
+                "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$target=$env:TOOL_TIKTOK_PROFILE_TARGET; $items=Get-CimInstance Win32_Process -Filter \\\"Name = 'chrome.exe' OR Name = 'crashpad_handler.exe' OR Name = 'chrome_crashpad_handler.exe' OR Name = 'GoogleCrashHandler.exe' OR Name = 'GoogleCrashHandler64.exe'\\\" | Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf($target,[System.StringComparison]::OrdinalIgnoreCase) -ge 0 } | Select-Object ProcessId,Name,CommandLine; if($items){$items|ConvertTo-Json -Compress}\"")
             {
                 UseShellExecute = false,
                 CreateNoWindow = true,
@@ -197,8 +198,15 @@ public sealed class ChromeProfileNameSyncService
             void Read(JsonElement item)
             {
                 if (!item.TryGetProperty("ProcessId", out var id) || !id.TryGetInt32(out var pid) || pid <= 0) return;
+                var processName = item.TryGetProperty("Name", out var name) ? name.GetString() ?? "" : "";
                 var commandLine = item.TryGetProperty("CommandLine", out var command) ? command.GetString() ?? "" : "";
-                if (ProfileArgumentMatches(commandLine, target)) result.Add(new ChromeProcessInfo(pid, commandLine));
+
+                // Main Chrome normally exposes --user-data-dir.  Detached helper / Crashpad
+                // processes may only reference a file below the profile directory (for example
+                // CrashpadMetrics-active.pma), so accepting an exact profile-path reference here
+                // is required to release those late file handles before profile deletion.
+                if (ProfileArgumentMatches(commandLine, target) || CommandLineReferencesProfile(commandLine, target))
+                    result.Add(new ChromeProcessInfo(pid, processName, commandLine));
             }
             if (doc.RootElement.ValueKind == JsonValueKind.Array)
                 foreach (var item in doc.RootElement.EnumerateArray()) Read(item);
@@ -207,6 +215,22 @@ public sealed class ChromeProfileNameSyncService
             return result;
         }
         catch { return []; }
+    }
+
+    static bool CommandLineReferencesProfile(string commandLine, string target)
+    {
+        if (string.IsNullOrWhiteSpace(commandLine) || string.IsNullOrWhiteSpace(target)) return false;
+        var normalizedCommand = commandLine.Replace('/', '\\');
+        var normalizedTarget = target.Replace('/', '\\').TrimEnd('\\');
+        var index = normalizedCommand.IndexOf(normalizedTarget, StringComparison.OrdinalIgnoreCase);
+        if (index < 0) return false;
+
+        // Avoid treating a profile path that is only a prefix of another directory as a match.
+        // A real reference is either the exact path or continues into a child path / argument end.
+        var end = index + normalizedTarget.Length;
+        if (end >= normalizedCommand.Length) return true;
+        var next = normalizedCommand[end];
+        return next is '\\' or '\"' or '\'' or ' ' or '\t' or ';' or ',';
     }
 
     static bool TryGetCanonicalUserDataDir(string? userDataDir, out string target)

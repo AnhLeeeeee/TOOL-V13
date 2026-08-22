@@ -1196,9 +1196,13 @@ public sealed partial class MainForm : Form
         _log.Info($"[CHROME_PROFILE_NAME_SYNC] name={CurrentProfileName} updated={result.Updated} preferences={result.PreferencesPath}");
     }
 
-    async Task LaunchChromeAsync()
+    async Task LaunchChromeAsync(bool stopOnCaptcha = false, bool suppressDialogs = false)
     {
-        if (_engine.Running) { MessageBox.Show("Hãy Dừng tool trước khi mở lại Chrome để tránh cắt ngang một vòng xử lý.", "Chrome V13", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+        if (_engine.Running)
+        {
+            if (!suppressDialogs) MessageBox.Show("Hãy Dừng tool trước khi mở lại Chrome để tránh cắt ngang một vòng xử lý.", "Chrome V13", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
         try
         {
             SaveFromUi();
@@ -1213,17 +1217,17 @@ public sealed partial class MainForm : Form
                 // có thể tự nhập tài khoản/mật khẩu/2FA. Khác biệt duy nhất: sau khi
                 // đăng nhập thành công chỉ về trang chủ, KHÔNG điều hướng sang LIVE.
                 // LIVE chỉ được chuẩn bị trong StartAsync() khi người dùng bấm Bắt đầu.
-                await PrepareTikTokProfileStartupAsync(openLiveWhenReady: false);
+                await PrepareTikTokProfileStartupAsync(openLiveWhenReady: false, stopOnCaptcha: stopOnCaptcha);
             }
         }
         catch (Exception ex)
         {
             SetChromeStatus($"Trạng thái Chrome: 🔴 Lỗi mở Chrome: {ShortText(ex.Message, 90)}", Color.Firebrick, "TikTok: —", Color.DimGray);
-            ShowUiProblem("CHROME_LAUNCH", "Chrome V13", ex);
+            ShowUiProblem("CHROME_LAUNCH", "Chrome V13", ex, showDialog: !suppressDialogs);
         }
     }
 
-    async Task PrepareTikTokProfileStartupAsync(bool openLiveWhenReady = true)
+    async Task PrepareTikTokProfileStartupAsync(bool openLiveWhenReady = true, bool stopOnCaptcha = false)
     {
         try
         {
@@ -1233,7 +1237,7 @@ public sealed partial class MainForm : Form
                 "TikTok: 🟡 Nếu có CAPTCHA, hãy xử lý trên Chrome — tool sẽ tự tiếp tục", Color.Goldenrod);
             var auth = _tiktokAuthService.Load(_baseDir);
             var result = await _chrome.PrepareTikTokStartupAsync(
-                auth.Username, auth.Password, auth.TotpSecret, auth.AutoLogin, openLiveWhenReady);
+                auth.Username, auth.Password, auth.TotpSecret, auth.AutoLogin, openLiveWhenReady, stopOnCaptcha);
             _startupPreparationState = result.State;
 
             switch (result.State)
@@ -1594,7 +1598,7 @@ public sealed partial class MainForm : Form
         }
     }
 
-    async Task StartAsync()
+    async Task StartAsync(bool suppressDialogs = false)
     {
         if (_engine.Running || _startStopCommandInFlight) return;
         _startStopCommandInFlight = true;
@@ -1627,7 +1631,7 @@ public sealed partial class MainForm : Form
                     const string detail = "TikTok đang ở trang LIVE nhưng DOM vẫn chưa tải xong sau thời gian chờ. Tool chưa bắt đầu và không tải lại trang; hãy để Chrome tải tiếp rồi bấm Bắt đầu lại.";
                     _log.Warn("[TIKTOK_STARTUP_LIVE_LOADING_TIMEOUT] action=NO_NAVIGATE_NO_F5");
                     AppendProblem("[PAGE_READY_STARTUP_TIMEOUT] " + detail);
-                    MessageBox.Show(detail, "TikTok chưa tải xong", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    if (!suppressDialogs) MessageBox.Show(detail, "TikTok chưa tải xong", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return;
                 }
 
@@ -1645,15 +1649,15 @@ public sealed partial class MainForm : Form
                         _ => "TikTok chưa sẵn sàng: " + _startupPreparationState
                     };
                     AppendProblem("[TIKTOK_STARTUP_GATE] " + detail);
-                    MessageBox.Show(detail, "TikTok chưa sẵn sàng", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    if (!suppressDialogs) MessageBox.Show(detail, "TikTok chưa sẵn sàng", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return;
                 }
             }
 
-            if (!await ValidateCoreXpathsBeforeStartAsync()) return;
+            if (!await ValidateCoreXpathsBeforeStartAsync(suppressDialogs)) return;
             _engine.Start(_settings, GetAutomationContents());
         }
-        catch (Exception ex) { ShowUiProblem("START_FAILED", "Không thể bắt đầu", ex); }
+        catch (Exception ex) { ShowUiProblem("START_FAILED", "Không thể bắt đầu", ex, showDialog: !suppressDialogs); }
         finally
         {
             _startStopCommandInFlight = false;
@@ -1812,7 +1816,7 @@ public sealed partial class MainForm : Form
 
     void OnEngineProblem(string message) => AppendProblem(message);
 
-    async Task<bool> ValidateCoreXpathsBeforeStartAsync()
+    async Task<bool> ValidateCoreXpathsBeforeStartAsync(bool suppressDialogs = false)
     {
         var errors = new List<string>();
 
@@ -1856,7 +1860,7 @@ public sealed partial class MainForm : Form
         if (errors.Count > 0)
         {
             foreach (var e in errors) AppendProblem("[XPATH_CORE] " + e);
-            MessageBox.Show("Không thể bắt đầu vì cấu hình XPath thao tác chính chưa hợp lệ:\n\n" + string.Join("\n", errors), "Kiểm tra XPath", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            if (!suppressDialogs) MessageBox.Show("Không thể bắt đầu vì cấu hình XPath thao tác chính chưa hợp lệ:\n\n" + string.Join("\n", errors), "Kiểm tra XPath", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return false;
         }
 
@@ -1867,7 +1871,7 @@ public sealed partial class MainForm : Form
         {
             var detail = "TikTok vẫn chưa render xong trang LIVE sau 2 lần chờ 25 giây. Tool chưa bắt đầu và không F5/không đổi LIVE. Hãy kiểm tra Chrome hoặc bấm Bắt đầu lại khi trang đã hiện đầy đủ.";
             AppendProblem("[PAGE_READY_STARTUP_TIMEOUT] " + detail);
-            MessageBox.Show(detail, "TikTok chưa tải xong", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            if (!suppressDialogs) MessageBox.Show(detail, "TikTok chưa tải xong", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return false;
         }
 

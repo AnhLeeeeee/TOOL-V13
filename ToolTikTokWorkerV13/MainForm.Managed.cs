@@ -57,6 +57,10 @@ public sealed partial class MainForm
                     if (IsMessageReplyRunning) return "message_reply_running";
                     await StartAsync();
                     return _engine.Running ? "started" : "not_started";
+                case "start_auto":
+                    if (IsMessageReplyRunning) return "message_reply_running";
+                    await StartAsync(suppressDialogs: true);
+                    return _engine.Running ? "started" : "not_started";
                 case "pause":
                     if (_engine.Running && !_engine.Paused) _engine.TogglePause();
                     return _engine.Paused ? "paused" : "not_paused";
@@ -69,16 +73,21 @@ public sealed partial class MainForm
                 case "launch":
                     await LaunchChromeAsync();
                     if (!_chrome.Connected) return "not_opened";
-                    return _startupPreparationState switch
+                    return MapManagedLaunchState();
+                case "launch_auto":
+                    // Auto Profile không giữ cả hàng đợi 15 phút khi gặp CAPTCHA.
+                    // Chrome vẫn được giữ nguyên để người dùng xử lý thủ công sau.
+                    await LaunchChromeAsync(stopOnCaptcha: true, suppressDialogs: true);
+                    if (!_chrome.Connected) return "not_opened";
+                    return MapManagedLaunchState();
+                case "captcha_check":
+                    if (!_chrome.Connected) return "not_connected";
+                    try { return await _chrome.IsCaptchaVisibleAsync() ? "captcha" : "clear"; }
+                    catch (Exception ex)
                     {
-                        "CAPTCHA_REQUIRED" => "captcha_required",
-                        "TOTP_REQUIRED" => "totp_required",
-                        "LOGIN_REQUIRED" => "login_required",
-                        "LOGIN_FAILED" => "login_failed",
-                        "LOGIN_FORM_NOT_FOUND" => "login_form_not_found",
-                        "ERROR" => "startup_error",
-                        _ => "opened"
-                    };
+                        _log.Warn("[CAPTCHA_CHECK] " + ex.Message);
+                        return "probe_error";
+                    }
                 case "connect":
                     await ConnectChromeAsync();
                     return _chrome.Connected ? "connected" : "disconnected";
@@ -176,6 +185,18 @@ public sealed partial class MainForm
             }
         });
     }
+
+    string MapManagedLaunchState()
+        => _startupPreparationState switch
+        {
+            "CAPTCHA_REQUIRED" => "captcha_required",
+            "TOTP_REQUIRED" => "totp_required",
+            "LOGIN_REQUIRED" => "login_required",
+            "LOGIN_FAILED" => "login_failed",
+            "LOGIN_FORM_NOT_FOUND" => "login_form_not_found",
+            "ERROR" => "startup_error",
+            _ => "opened"
+        };
 
     string BuildManagedStatusResponse()
     {

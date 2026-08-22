@@ -185,6 +185,7 @@ public sealed partial class ManagerForm : Form
         var toolbarRow1 = ToolbarRow();
         toolbarRow1.Controls.Add(Button("Mở profile", (_, _) => OpenProfileChooser(), UiButtonKind.Primary));
         toolbarRow1.Controls.Add(Button("+ Profile", (_, _) => AddProfile(), UiButtonKind.Primary));
+        toolbarRow1.Controls.Add(Button("+ Auto Profile", (_, _) => ShowAutoProfileDialog(), UiButtonKind.Primary));
         toolbarRow1.Controls.Add(Button("Kho tài khoản", (_, _) => ShowAccountPoolDialog(), UiButtonKind.Neutral));
         toolbarRow1.Controls.Add(Button("Cấu hình mặc định", (_, _) => ShowDefaultConfigDialog(), UiButtonKind.Neutral));
         toolbarRow1.Controls.Add(Button("Tên & ảnh TikTok", (_, _) => ShowTikTokIdentityDialog(), UiButtonKind.Neutral));
@@ -233,7 +234,7 @@ public sealed partial class ManagerForm : Form
             var (background, foreground) = button.Text switch
             {
                 "Mở profile" => (Color.FromArgb(232, 242, 255), Color.FromArgb(35, 91, 152)),
-                "+ Profile" => (Color.FromArgb(238, 246, 255), Color.FromArgb(35, 91, 152)),
+                "+ Profile" or "+ Auto Profile" => (Color.FromArgb(238, 246, 255), Color.FromArgb(35, 91, 152)),
                 "Profile có sẵn" or "Đổi tên" or "Đồng bộ tên Chrome" or "Kho tài khoản" or "Cấu hình mặc định" or "Tên & ảnh TikTok" or "Tin nhắn TikTok" => (Color.FromArgb(242, 246, 251), Color.FromArgb(55, 76, 103)),
                 "Giám sát Chrome" => (Color.FromArgb(234, 244, 255), Color.FromArgb(31, 91, 158)),
                 "Xóa profile" or "Dừng tất cả" => (Color.FromArgb(255, 239, 239), Color.FromArgb(171, 62, 62)),
@@ -3175,7 +3176,7 @@ public sealed partial class ManagerForm : Form
             {
                 await StopProfileRuntimeForDeletionAsync(plan);
                 DeleteDirectoryStrict(plan.Profile.Name, "dữ liệu Tool", plan.DataRoot);
-                DeleteDirectoryStrict(plan.Profile.Name, "Chrome profile", plan.ChromeProfilePath);
+                await DeleteChromeProfileDirectoryWithRetryAsync(plan.Profile.Name, plan.ChromeProfilePath);
                 RemoveManagedProfileContainerIfEmpty(plan.ChromeProfilePath);
 
                 _profileService.RemoveFromCatalog(catalog, plan.Profile.Name);
@@ -3344,6 +3345,50 @@ public sealed partial class ManagerForm : Form
         using var cts = new CancellationTokenSource(timeout);
         try { await process.WaitForExitAsync(cts.Token); return true; }
         catch (OperationCanceledException) when (cts.IsCancellationRequested) { return process.HasExited; }
+    }
+
+    async Task DeleteChromeProfileDirectoryWithRetryAsync(string profileName, string path)
+    {
+        if (!Directory.Exists(path)) return;
+
+        // Chrome/Crashpad can outlive the visible Chrome window for a short time and keep
+        // files such as CrashpadMetrics-active.pma open.  Re-scan processes that reference
+        // this exact profile path and retry deletion instead of failing on the first locked file.
+        var retryDelaysMs = new[] { 250, 350, 500, 650, 800, 1000, 1200, 1500 };
+        Exception? lastError = null;
+
+        for (var attempt = 1; attempt <= retryDelaysMs.Length; attempt++)
+        {
+            var stoppedPids = ChromeProfileNameSyncService.StopChromeUsingProfile(path);
+            if (stoppedPids.Count > 0)
+                _log.Warn($"[{profileName}] [PROFILE_DELETE_UNLOCK] attempt={attempt}/{retryDelaysMs.Length} stoppedPid={string.Join(',', stoppedPids)}");
+
+            // Give Windows a moment to release late Crashpad/Chrome file handles.
+            await Task.Delay(retryDelaysMs[attempt - 1]);
+
+            try
+            {
+                if (!Directory.Exists(path)) return;
+                Directory.Delete(path, recursive: true);
+                if (!Directory.Exists(path))
+                {
+                    if (attempt > 1)
+                        _log.Info($"[{profileName}] [PROFILE_DELETE_RETRY_OK] attempt={attempt}/{retryDelaysMs.Length}");
+                    return;
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                lastError = ex;
+                _log.Warn($"[{profileName}] [PROFILE_DELETE_LOCKED] attempt={attempt}/{retryDelaysMs.Length} detail={ex.Message}");
+            }
+        }
+
+        throw new IOException(
+            $"Không xóa được Chrome profile của profile “{profileName}” sau {retryDelaysMs.Length} lần thử. " +
+            $"Tool đã dừng lại Chrome/Crashpad theo đúng ProfilePath nhưng Windows vẫn đang khóa tệp: {path}\n" +
+            $"Chi tiết: {lastError?.Message ?? "Thư mục vẫn còn tồn tại."}",
+            lastError);
     }
 
     static void DeleteDirectoryStrict(string profileName, string kind, string path)

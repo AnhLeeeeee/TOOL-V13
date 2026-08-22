@@ -1256,7 +1256,43 @@ public sealed partial class ChromeController : IAsyncDisposable
             }
         }
         if (!editClicked)
-            throw new InvalidOperationException($"Không tìm thấy nút Chỉnh sửa hồ sơ / Edit profile trên trang {profileHref}. Hãy kiểm tra Username đã lưu có đúng @ TikTok của profile này không.");
+        {
+            // TikTok đôi lúc vừa đăng nhập xong nhưng session/UI trên profile page chưa đồng bộ:
+            // URL đã đúng /@username nhưng nút Edit profile chưa render. Thực tế F5 là đủ.
+            // Vì vậy reload trang rồi thử lại trước khi kết luận lỗi.
+            const int editProfileReloadRetries = 2;
+
+            for (var refreshAttempt = 1;
+                 refreshAttempt <= editProfileReloadRetries && !editClicked;
+                 refreshAttempt++)
+            {
+                try
+                {
+                    _log.Warn(
+                        $"[TIKTOK_IDENTITY_EDIT_MISSING_RELOAD] href={profileHref} attempt={refreshAttempt}/{editProfileReloadRetries}");
+
+                    await ReloadAndWaitAsync(1200, 18000, ct);
+                    await Task.Delay(700, ct);
+
+                    editClicked = await TryClickEditProfileAsync(10000);
+
+                    if (editClicked)
+                    {
+                        _log.Info(
+                            $"[TIKTOK_IDENTITY_EDIT_FOUND_AFTER_RELOAD] href={profileHref} attempt={refreshAttempt}");
+                        break;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _log.Warn(
+                        $"[TIKTOK_IDENTITY_EDIT_RELOAD_WARN] href={profileHref} attempt={refreshAttempt} message={ex.Message}");
+                }
+            }
+        }
+
+        if (!editClicked)
+            throw new InvalidOperationException($"Không tìm thấy nút Chỉnh sửa hồ sơ / Edit profile trên trang {profileHref} sau khi đã F5 thử lại. Hãy kiểm tra Username/session TikTok của profile này.");
 
         var editorReady = await WaitBoolAsync("""
 (() => {
@@ -1872,12 +1908,43 @@ public sealed partial class ChromeController : IAsyncDisposable
         _log.Info($"[TIKTOK_IDENTITY_UPDATE_SAVED] name={nameChanged} avatar={avatarChanged} bio={bioChanged} cooldown=false finalConfirm={saveConfirmPresent}");
 
         // Trả người dùng về trang trước đó nếu trước khi cập nhật đang ở TikTok.
+        // Sau khi đổi TÊN, TikTok đôi khi đã quay lại trang chủ nhưng header/sidebar vẫn
+        // giữ nickname cũ trong state/cache của SPA. Một F5 quá sớm cũng có thể vẫn lấy
+        // state cũ, nên phải chờ trang quay về ổn định trước, nghỉ thêm 3 giây rồi mới
+        // reload đúng 1 lần để nickname mới được nhận đầy đủ.
+        var returnPageStable = true;
         if (!string.IsNullOrWhiteSpace(originalUrl)
             && originalUrl.StartsWith("https://www.tiktok.com/", StringComparison.OrdinalIgnoreCase)
             && !string.Equals(originalUrl.TrimEnd('/'), profileHref.TrimEnd('/'), StringComparison.OrdinalIgnoreCase))
         {
-            try { await NavigateAndWaitAsync(originalUrl, 900, 15000, ct); }
-            catch (Exception ex) { _log.Warn("[TIKTOK_IDENTITY_RETURN_URL] " + ex.Message); }
+            try
+            {
+                await NavigateAndWaitAsync(originalUrl, 900, 15000, ct);
+                _log.Info("[TIKTOK_IDENTITY_RETURN_URL_READY] page=stable");
+            }
+            catch (Exception ex)
+            {
+                returnPageStable = false;
+                _log.Warn("[TIKTOK_IDENTITY_RETURN_URL] " + ex.Message);
+            }
+        }
+
+        if (nameChanged && returnPageStable)
+        {
+            try
+            {
+                _log.Info("[TIKTOK_IDENTITY_NAME_REFRESH_WAIT] delayMs=3000 reason=wait-after-return-page-stable");
+                await Task.Delay(3000, ct);
+                await ReloadAndWaitAsync(900, 15000, ct);
+                _log.Info("[TIKTOK_IDENTITY_NAME_REFRESH_OK] action=reload-once-after-3s");
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                // Việc đổi tên đã được lưu thành công ở TikTok; F5 bổ sung chỉ để
+                // đồng bộ phần hiển thị. Không biến lỗi refresh phụ thành lỗi đổi tên.
+                _log.Warn("[TIKTOK_IDENTITY_NAME_REFRESH_FAILED] " + ex.Message);
+            }
         }
 
         var pieces = new List<string>();
@@ -2091,6 +2158,7 @@ public sealed partial class ChromeController : IAsyncDisposable
         string totpSecret,
         bool autoLogin = true,
         bool openLiveWhenReady = true,
+        bool stopOnCaptcha = false,
         CancellationToken ct = default)
     {
         const string loginUrl = "https://www.tiktok.com/login/phone-or-email/email";
@@ -2129,6 +2197,11 @@ public sealed partial class ChromeController : IAsyncDisposable
         {
             if (await DetectCaptchaAsync(ct))
             {
+                if (stopOnCaptcha)
+                {
+                    _log.Warn("[TIKTOK_LOGIN_CAPTCHA_PAUSE] phase=before-login-form action=RETURN_TO_MANAGER");
+                    return new TikTokStartupResult("CAPTCHA_REQUIRED", "Phát hiện CAPTCHA khi đăng nhập; Auto Profile tạm dừng profile này để xử lý sau.", false, false);
+                }
                 _log.Warn("[TIKTOK_LOGIN_CAPTCHA_WAIT] phase=before-login-form manual_action_required=true action=WAIT_FOR_USER");
                 var solved = await WaitForCaptchaResolutionAsync(TimeSpan.FromMinutes(15), ct);
                 if (!solved)
@@ -2152,7 +2225,7 @@ public sealed partial class ChromeController : IAsyncDisposable
                         return new TikTokStartupResult("TOTP_REQUIRED", "TikTok yêu cầu mã 2FA nhưng profile chưa lưu secret TOTP.", false, false);
 
                     await FillAndSubmitTotpAsync(totpSecret, ct);
-                    var afterTotp = await WaitForTikTokLoginCompletionAsync(totpSecret, TimeSpan.FromSeconds(45), openLiveWhenReady, ct);
+                    var afterTotp = await WaitForTikTokLoginCompletionAsync(totpSecret, TimeSpan.FromSeconds(45), openLiveWhenReady, stopOnCaptcha, ct);
                     if (afterTotp is not null) return afterTotp;
                 }
 
@@ -2187,7 +2260,7 @@ public sealed partial class ChromeController : IAsyncDisposable
         await FillTikTokLoginFormAsync(username, password, ct);
         await ClickTikTokLoginSubmitAsync(ct);
 
-        var completion = await WaitForTikTokLoginCompletionAsync(totpSecret, TimeSpan.FromSeconds(45), openLiveWhenReady, ct);
+        var completion = await WaitForTikTokLoginCompletionAsync(totpSecret, TimeSpan.FromSeconds(45), openLiveWhenReady, stopOnCaptcha, ct);
         if (completion is not null) return completion;
 
         if (await HasTikTokSessionCookieAsync(ct))
@@ -2206,6 +2279,7 @@ public sealed partial class ChromeController : IAsyncDisposable
         string totpSecret,
         TimeSpan activeLoginTimeout,
         bool openLiveWhenReady,
+        bool stopOnCaptcha,
         CancellationToken ct)
     {
         var loginDeadline = DateTime.UtcNow + activeLoginTimeout;
@@ -2227,6 +2301,11 @@ public sealed partial class ChromeController : IAsyncDisposable
 
             if (await DetectCaptchaAsync(ct))
             {
+                if (stopOnCaptcha)
+                {
+                    _log.Warn("[TIKTOK_LOGIN_CAPTCHA_PAUSE] phase=after-submit action=RETURN_TO_MANAGER");
+                    return new TikTokStartupResult("CAPTCHA_REQUIRED", "Phát hiện CAPTCHA sau khi gửi đăng nhập; Auto Profile tạm dừng profile này để xử lý sau.", false, false);
+                }
                 // Old behavior returned CAPTCHA_REQUIRED immediately, which made
                 // StartAsync exit. Keep this call alive while the user solves the
                 // CAPTCHA manually, then continue the SAME login flow so 2FA can
@@ -2528,6 +2607,9 @@ public sealed partial class ChromeController : IAsyncDisposable
             throw new InvalidOperationException("Không tìm thấy nút Đăng nhập TikTok.");
         _log.Info("[TIKTOK_LOGIN_SUBMIT] clicked=true");
     }
+
+    public Task<bool> IsCaptchaVisibleAsync(CancellationToken ct = default)
+        => DetectCaptchaAsync(ct);
 
     async Task<bool> DetectCaptchaAsync(CancellationToken ct)
     {

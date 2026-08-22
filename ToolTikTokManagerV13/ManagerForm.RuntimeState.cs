@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 
 namespace ToolTikTokManagerV13;
 
@@ -124,7 +124,10 @@ public sealed partial class ManagerForm
         };
 
         if (confirmedState.Length > 0)
+        {
             ConfirmRuntimeState(ctx, confirmedState, $"worker_command:{normalizedCommand}");
+            NotifyAutoCloseRuntimeCommand(ctx, normalizedCommand, confirmedState);
+        }
     }
 
     void HandleStatusPollFailure(ProfileContext ctx, Exception exception, string method)
