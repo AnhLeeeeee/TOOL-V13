@@ -1608,6 +1608,7 @@ public sealed partial class MainForm : Form
             // Trước đây mỗi lần bấm Bắt đầu đều chạy PrepareTikTokProfileStartupAsync(),
             // khiến profile đang đứng trong một LIVE hợp lệ vẫn bị điều hướng về /live
             // và TikTok chọn sang một LIVE ngẫu nhiên khác.
+            var liveUrlBeforeProbe = LooksLikeTikTokLiveUrl(_chrome.Page?.Url ?? "");
             var alreadyOnReadyLive = await IsCurrentLiveReadyForStartAsync();
             if (alreadyOnReadyLive)
             {
@@ -1619,9 +1620,20 @@ public sealed partial class MainForm : Form
             }
             else
             {
-                // Chỉ khi chưa có XPath LIVE hiện tại mới thực hiện startup/login gate
+                // Nếu URL đã là LIVE nhưng PAGE_READY vẫn timeout thì KHÔNG điều hướng /live
+                // thêm lần nữa. Navigation/F5 lúc renderer đang ì chỉ làm VM tải lại từ đầu.
+                if (liveUrlBeforeProbe)
+                {
+                    const string detail = "TikTok đang ở trang LIVE nhưng DOM vẫn chưa tải xong sau thời gian chờ. Tool chưa bắt đầu và không tải lại trang; hãy để Chrome tải tiếp rồi bấm Bắt đầu lại.";
+                    _log.Warn("[TIKTOK_STARTUP_LIVE_LOADING_TIMEOUT] action=NO_NAVIGATE_NO_F5");
+                    AppendProblem("[PAGE_READY_STARTUP_TIMEOUT] " + detail);
+                    MessageBox.Show(detail, "TikTok chưa tải xong", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                // Chỉ khi chưa ở URL LIVE mới thực hiện startup/login gate
                 // và điều hướng TikTok vào /live như logic cũ.
-                _log.Info("[TIKTOK_STARTUP_NEED_LIVE] coreXpathsPresent=false action=PREPARE_TIKTOK_LIVE");
+                _log.Info("[TIKTOK_STARTUP_NEED_LIVE] currentUrlIsLive=false action=PREPARE_TIKTOK_LIVE");
                 await PrepareTikTokProfileStartupAsync();
                 if (!string.Equals(_startupPreparationState, "READY", StringComparison.OrdinalIgnoreCase))
                 {
@@ -1649,43 +1661,124 @@ public sealed partial class MainForm : Form
         }
     }
 
-    async Task<bool> IsCurrentLiveReadyForStartAsync()
-    {
-        // Dùng chính XPath thao tác đã lưu của profile làm dấu hiệu "đang ở LIVE".
-        // Yêu cầu cả hai XPath chính cùng tồn tại vì Start/Automation cũng bắt buộc
-        // cả Điểm/ô nhập 1 và 2. Poll ngắn vài lần để tránh DOM vừa render bị hụt.
-        var xp1 = _settings.XPathPoint1?.Trim() ?? "";
-        var xp2 = _settings.XPathPoint2?.Trim() ?? "";
-        if (string.IsNullOrWhiteSpace(xp1) || string.IsNullOrWhiteSpace(xp2))
-        {
-            _log.Info("[TIKTOK_STARTUP_LIVE_PROBE] ready=false reason=core-xpath-empty");
-            return false;
-        }
+    static bool LooksLikeTikTokLiveUrl(string url)
+        => !string.IsNullOrWhiteSpace(url)
+           && (url.Contains("tiktok.com/live", StringComparison.OrdinalIgnoreCase)
+               || (url.Contains("tiktok.com/@", StringComparison.OrdinalIgnoreCase)
+                   && url.Contains("/live", StringComparison.OrdinalIgnoreCase)));
 
-        const int attempts = 4;
-        for (var attempt = 1; attempt <= attempts; attempt++)
+    static bool HasReliableStartupLiveIdentity(string identity)
+    {
+        if (string.IsNullOrWhiteSpace(identity)) return false;
+        if (identity.Contains("roomId=", StringComparison.OrdinalIgnoreCase)
+            || identity.Contains("broadcaster=", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // URL /@user/live là tín hiệu LIVE cụ thể. URL /live chung chưa đủ vì nó có thể
+        // xuất hiện ngay khi navigation bắt đầu trong khi React/DOM vẫn chưa hydrate.
+        var marker = "href=";
+        var start = identity.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+        if (start >= 0)
+        {
+            start += marker.Length;
+            var finish = identity.IndexOf(" | ", start, StringComparison.Ordinal);
+            if (finish < 0) finish = identity.Length;
+            var href = identity[start..finish];
+            if (href.Contains("tiktok.com/@", StringComparison.OrdinalIgnoreCase)
+                && href.Contains("/live", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    async Task<(bool Ready, string Signal)> ProbeStartupLivePageReadyAsync()
+    {
+        var probes = new List<(string Name, string XPath)>();
+        if (!string.IsNullOrWhiteSpace(_settings.XPathPoint1)) probes.Add(("point1", _settings.XPathPoint1));
+        if (!string.IsNullOrWhiteSpace(_settings.XPathPoint2)) probes.Add(("point2", _settings.XPathPoint2));
+        if (_settings.OldLive.Enabled && !string.IsNullOrWhiteSpace(_settings.OldLive.IdentityXPath))
+            probes.Add(("old-live-identity", _settings.OldLive.IdentityXPath));
+        if (_settings.Viewer.Enabled && !string.IsNullOrWhiteSpace(_settings.Viewer.XPath))
+            probes.Add(("viewer", _settings.Viewer.XPath));
+
+        foreach (var probe in probes
+            .Where(x => !string.IsNullOrWhiteSpace(x.XPath))
+            .GroupBy(x => x.XPath.Trim(), StringComparer.Ordinal)
+            .Select(g => g.First()))
         {
             try
             {
-                var point1Exists = await _chrome.XPathExistsAsync(xp1);
-                var point2Exists = string.Equals(xp1, xp2, StringComparison.Ordinal)
-                    ? point1Exists
-                    : await _chrome.XPathExistsAsync(xp2);
-
-                _log.Info($"[TIKTOK_STARTUP_LIVE_PROBE] attempt={attempt}/{attempts} point1={point1Exists} point2={point2Exists}");
-                if (point1Exists && point2Exists)
-                    return true;
+                if (await _chrome.XPathExistsAsync(probe.XPath)) return (true, "xpath:" + probe.Name);
             }
-            catch (Exception ex)
+            catch (Exception ex) when (!_chrome.IsCdpSessionLost(ex))
             {
-                _log.Warn($"[TIKTOK_STARTUP_LIVE_PROBE] attempt={attempt}/{attempts} error={ShortText(ex.Message, 120)}");
+                _log.Warn($"[PAGE_READY_STARTUP_PROBE_WARN] signal={probe.Name} reason={ShortText(ex.Message, 120)}");
             }
-
-            if (attempt < attempts)
-                await Task.Delay(350);
         }
 
+        try
+        {
+            var identity = await _chrome.GetCurrentLiveIdentityAsync();
+            if (HasReliableStartupLiveIdentity(identity)) return (true, "live-identity");
+        }
+        catch (Exception ex) when (!_chrome.IsCdpSessionLost(ex))
+        {
+            _log.Warn($"[PAGE_READY_STARTUP_PROBE_WARN] signal=live-identity reason={ShortText(ex.Message, 120)}");
+        }
+
+        return (false, "none");
+    }
+
+    async Task<bool> WaitForStartupLivePageReadyAsync(string source)
+    {
+        const int attempts = 2;
+        const int timeoutMs = 25000;
+        const int pollMs = 500;
+        const int retryPauseMs = 2000;
+
+        for (var attempt = 1; attempt <= attempts; attempt++)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            _log.Info($"[PAGE_READY_STARTUP_WAIT] source={source} attempt={attempt}/{attempts} timeoutMs={timeoutMs} pollMs={pollMs}");
+            SetChromeStatus(
+                "Trạng thái Chrome: 🟡 Đang chờ TikTok tải xong...", Color.Goldenrod,
+                $"TikTok: 🟡 PAGE_READY {attempt}/{attempts} — tối đa {timeoutMs / 1000}s", Color.Goldenrod);
+
+            while (sw.ElapsedMilliseconds < timeoutMs)
+            {
+                var probe = await ProbeStartupLivePageReadyAsync();
+                if (probe.Ready)
+                {
+                    _log.Info($"[PAGE_READY_STARTUP] source={source} attempt={attempt}/{attempts} elapsedMs={sw.ElapsedMilliseconds} signal={probe.Signal}");
+                    return true;
+                }
+                await Task.Delay(pollMs);
+            }
+
+            _log.Warn($"[PAGE_READY_STARTUP_TIMEOUT] source={source} attempt={attempt}/{attempts} waitedMs={sw.ElapsedMilliseconds} action=NO_F5");
+            if (attempt < attempts)
+            {
+                _log.Warn($"[PAGE_READY_STARTUP_RETRY] source={source} nextAttempt={attempt + 1}/{attempts} waitMs={retryPauseMs} action=WAIT_ONLY");
+                await Task.Delay(retryPauseMs);
+            }
+        }
         return false;
+    }
+
+    async Task<bool> IsCurrentLiveReadyForStartAsync()
+    {
+        // Nếu đang ở trang chủ/login thì không tốn 25-50 giây chờ PAGE_READY; chạy startup
+        // navigation như cũ. Chỉ mở cửa sổ chờ dài khi URL hiện tại thực sự là LIVE.
+        var url = _chrome.Page?.Url ?? "";
+        if (!LooksLikeTikTokLiveUrl(url))
+        {
+            _log.Info($"[TIKTOK_STARTUP_LIVE_PROBE] ready=false reason=not-live-url url={ShortText(url, 140)}");
+            return false;
+        }
+
+        var ready = await WaitForStartupLivePageReadyAsync("giữ LIVE hiện tại");
+        _log.Info($"[TIKTOK_STARTUP_LIVE_PROBE] ready={ready} mode=conditional-wait url={ShortText(url, 140)}");
+        return ready;
     }
 
     void AppendProblem(string message)
@@ -1722,34 +1815,68 @@ public sealed partial class MainForm : Form
     async Task<bool> ValidateCoreXpathsBeforeStartAsync()
     {
         var errors = new List<string>();
-        async Task CheckRequired(string name, string xp)
+
+        void CheckConfigured(string name, string xp)
         {
-            if (string.IsNullOrWhiteSpace(xp)) { errors.Add($"{name}: XPath đang trống."); return; }
-            if (!await _chrome.XPathExistsAsync(xp)) errors.Add($"{name}: không tìm thấy XPath trên trang hiện tại: {xp}");
+            if (string.IsNullOrWhiteSpace(xp))
+            {
+                errors.Add($"{name}: XPath đang trống.");
+                return;
+            }
+
+            try
+            {
+                System.Xml.XPath.XPathExpression.Compile(xp);
+            }
+            catch (Exception ex)
+            {
+                errors.Add($"{name}: XPath không hợp lệ: {xp} ({ShortText(ex.Message, 100)})");
+            }
         }
-        await CheckRequired("Điểm/ô nhập 1", _settings.XPathPoint1);
-        await CheckRequired("Điểm/ô nhập 2", _settings.XPathPoint2);
+
+        CheckConfigured("Điểm/ô nhập 1", _settings.XPathPoint1);
+        CheckConfigured("Điểm/ô nhập 2", _settings.XPathPoint2);
 
         if (_settings.InputGuard.Enabled && string.IsNullOrWhiteSpace(_settings.InputGuard.NormalPlaceholderText))
             errors.Add("Kiểm tra ô nhập: chữ bình thường đang trống (mặc định nên là ‘Nhập’). ");
 
         if (_settings.OldLive.Enabled)
-            await CheckRequired("Live cũ — tài khoản LIVE", _settings.OldLive.IdentityXPath);
+            CheckConfigured("Live cũ — tài khoản LIVE", _settings.OldLive.IdentityXPath);
 
         var needsLiveSwitch = _settings.InputGuard.Enabled
             || _settings.PeriodicF5Minutes > 0
             || _settings.OldLive.Enabled;
         if (needsLiveSwitch && !_settings.UseArrowDownForLiveSwitch)
         {
-            await CheckRequired("Nút chuyển LIVE", _settings.XPathPeriodicAction);
+            CheckConfigured("Nút chuyển LIVE", _settings.XPathPeriodicAction);
             if (_settings.SwitchNeedsHover)
-                await CheckRequired("Vùng hover để hiện nút chuyển live", _settings.XPathHoverArea);
+                CheckConfigured("Vùng hover để hiện nút chuyển live", _settings.XPathHoverArea);
         }
 
-        if (errors.Count == 0) return true;
-        foreach (var e in errors) AppendProblem("[XPATH_CORE] " + e);
-        MessageBox.Show("Không thể bắt đầu vì XPath thao tác chính chưa hợp lệ:\n\n" + string.Join("\n", errors), "Kiểm tra XPath", MessageBoxButtons.OK, MessageBoxIcon.Error);
-        return false;
+        if (errors.Count > 0)
+        {
+            foreach (var e in errors) AppendProblem("[XPATH_CORE] " + e);
+            MessageBox.Show("Không thể bắt đầu vì cấu hình XPath thao tác chính chưa hợp lệ:\n\n" + string.Join("\n", errors), "Kiểm tra XPath", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return false;
+        }
+
+        // Không kết luận XPath sai ngay khi Runtime.evaluate trả false. Trên VM chậm,
+        // document.readyState có thể đã xong nhưng TikTok vẫn đang hydrate DOM. Chờ có
+        // điều kiện tối đa 25s × 2; không F5 và không đổi LIVE trong giai đoạn này.
+        if (!await WaitForStartupLivePageReadyAsync("xác nhận trước khi Start"))
+        {
+            var detail = "TikTok vẫn chưa render xong trang LIVE sau 2 lần chờ 25 giây. Tool chưa bắt đầu và không F5/không đổi LIVE. Hãy kiểm tra Chrome hoặc bấm Bắt đầu lại khi trang đã hiện đầy đủ.";
+            AppendProblem("[PAGE_READY_STARTUP_TIMEOUT] " + detail);
+            MessageBox.Show(detail, "TikTok chưa tải xong", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
+        }
+
+        // Sau PAGE_READY, XPath nghiệp vụ có thể vẫn tạm thời không tồn tại vì chính trạng
+        // thái LIVE (ví dụ ô bình luận bị khóa). Không chặn Start ở đây: InputGuard/runtime
+        // sẽ phân loại sau khi trang đã sẵn sàng. Nút "Kiểm tra toàn bộ XPath" vẫn dùng để
+        // chẩn đoán XPath cấu hình sai khi người dùng cần.
+        _log.Info("[XPATH_CORE_START_READY] configuration=valid pageReady=true action=ALLOW_ENGINE_START");
+        return true;
     }
 
     async Task CheckConfiguredXpathsAsync()

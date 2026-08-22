@@ -1,4 +1,4 @@
-using ToolTikTokV11.Models;
+﻿using ToolTikTokV11.Models;
 
 namespace ToolTikTokV11.Services;
 
@@ -6,6 +6,15 @@ public sealed partial class AutomationEngine
 {
     async Task<bool> GuardAndProcessBeforeClickAsync(string inputXPath, string pointName, CancellationToken ct)
     {
+        // Một navigation có thể xảy ra ngay bên trong Viewer Gate (ví dụ chọn LIVE đề xuất).
+        // Vì vậy kiểm tra PAGE_READY thêm đúng tại ranh giới InputGuard để không diễn giải
+        // "DOM chưa hydrate" thành "ô nhập bất thường" rồi đổi LIVE/F5 nhầm.
+        if (!await WaitForLivePageReadyAsync($"trước InputGuard {pointName}", ct))
+        {
+            _log.Warn($"[INPUT_GUARD_PAGE_NOT_READY] point={pointName} action=SKIP_CHECK_NO_SWITCH");
+            return true;
+        }
+
         // Chặn trang vi phạm trước khi InputGuard diễn giải việc mất ô nhập là một LIVE lỗi
         // thông thường và cố chuyển LIVE tiếp.
         await StopIfFatalTikTokRestrictionAsync($"InputGuard {pointName}", ct);

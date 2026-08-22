@@ -63,6 +63,12 @@ public sealed partial class AutomationEngine
     const int ViewerReadRetryDelayMs = 350;
     const int ViewerGateRetryCooldownMs = 1000;
     const int ViewerLowStreakFeedResetThreshold = 5;
+    // VM/chrome chậm: document.readyState có thể đã complete nhưng TikTok React/DOM LIVE
+    // vẫn chưa hydrate xong. Chờ tín hiệu DOM thực tế trước khi Viewer/InputGuard kết luận lỗi.
+    const int PageReadyPollMs = 500;
+    const int PageReadyTimeoutMs = 25000;
+    const int PageReadyRetryAttempts = 2;
+    const int PageReadyRetryPauseMs = 2000;
     const string OldLiveDirectoryName = "live_cu_tam";
     const string OldLiveManifestFileName = "old_live_identity_manifest.json";
     const int RequiredXPathRecoveryMaxAttempts = 3;
@@ -760,6 +766,88 @@ public sealed partial class AutomationEngine
         }
     }
 
+    async Task<(bool Ready, string Signal)> ProbeLivePageReadyAsync(CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        // Ưu tiên các XPath nhẹ. Chỉ cần MỘT tín hiệu LIVE đã render là đủ để bắt đầu
+        // kiểm tra trạng thái nghiệp vụ; không yêu cầu ô nhập phải tồn tại vì chính
+        // InputGuard cần phân biệt LIVE bị khóa bình luận với trang chưa load.
+        var probes = new List<(string Name, string XPath)>();
+        if (_s.OldLive.Enabled && !string.IsNullOrWhiteSpace(_s.OldLive.IdentityXPath))
+            probes.Add(("old-live-identity", _s.OldLive.IdentityXPath));
+        if (_s.Viewer.Enabled && !string.IsNullOrWhiteSpace(_s.Viewer.XPath))
+            probes.Add(("viewer", _s.Viewer.XPath));
+        if (!string.IsNullOrWhiteSpace(CurrentInputXPath))
+            probes.Add((CurrentPointName + "-input", CurrentInputXPath));
+
+        foreach (var probe in probes
+            .Where(x => !string.IsNullOrWhiteSpace(x.XPath))
+            .GroupBy(x => x.XPath.Trim(), StringComparer.Ordinal)
+            .Select(g => g.First()))
+        {
+            try
+            {
+                if (await _chrome.XPathExistsAsync(probe.XPath, ct))
+                    return (true, "xpath:" + probe.Name);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) when (!_chrome.IsCdpSessionLost(ex))
+            {
+                _log.Warn($"[PAGE_READY_PROBE_WARN] signal={probe.Name} reason={ex.Message}");
+            }
+        }
+
+        try
+        {
+            var identity = await GetCurrentLiveIdentityAsync(ct);
+            if (HasReliableLiveIdentity(identity))
+                return (true, "live-identity:" + TrimIdentityForLog(GetLivePageChangeKey(identity), 100));
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex) when (!_chrome.IsCdpSessionLost(ex))
+        {
+            _log.Warn($"[PAGE_READY_PROBE_WARN] signal=live-identity reason={ex.Message}");
+        }
+
+        return (false, "none");
+    }
+
+    async Task<bool> WaitForLivePageReadyAsync(string source, CancellationToken ct)
+    {
+        for (var attempt = 1; attempt <= PageReadyRetryAttempts; attempt++)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            _log.Info($"[PAGE_READY_WAIT] source={source} attempt={attempt}/{PageReadyRetryAttempts} timeoutMs={PageReadyTimeoutMs} pollMs={PageReadyPollMs}");
+            SetStatus("ĐANG CHỜ TRANG LIVE", $"{source} • lần {attempt}/{PageReadyRetryAttempts} • tối đa {PageReadyTimeoutMs / 1000}s");
+
+            while (sw.ElapsedMilliseconds < PageReadyTimeoutMs)
+            {
+                await WaitIfPausedAsync(ct);
+                var probe = await ProbeLivePageReadyAsync(ct);
+                if (probe.Ready)
+                {
+                    _log.Info($"[PAGE_READY] source={source} attempt={attempt}/{PageReadyRetryAttempts} elapsedMs={sw.ElapsedMilliseconds} signal={probe.Signal}");
+                    return true;
+                }
+
+                await Task.Delay(PageReadyPollMs, ct);
+            }
+
+            _log.Warn($"[PAGE_READY_TIMEOUT] source={source} attempt={attempt}/{PageReadyRetryAttempts} waitedMs={sw.ElapsedMilliseconds} action=NO_F5");
+            if (attempt < PageReadyRetryAttempts)
+            {
+                _log.Warn($"[PAGE_READY_RETRY] source={source} nextAttempt={attempt + 1}/{PageReadyRetryAttempts} waitMs={PageReadyRetryPauseMs} action=WAIT_ONLY");
+                await Task.Delay(PageReadyRetryPauseMs, ct);
+            }
+        }
+
+        ReportProblem("PAGE_READY_TIMEOUT", source,
+            $"TikTok chưa render xong tín hiệu LIVE sau {PageReadyRetryAttempts} lần chờ × {PageReadyTimeoutMs / 1000}s. Không F5/không đổi LIVE; vòng chính sẽ kiểm tra lại.",
+            throttleSeconds: 20);
+        return false;
+    }
+
     string CurrentInputXPath => _step <= 4 ? _s.XPathPoint1 : _s.XPathPoint2;
     int CurrentRestartStep => _step <= 4 ? 1 : 5;
     string CurrentPointName => _step <= 4 ? "điểm 1" : "điểm 2";
@@ -785,6 +873,7 @@ public sealed partial class AutomationEngine
                 case 1:
                 {
                     SetStatus("BƯỚC 1/8", $"Kiểm tra người xem + ô nhập → Click ô 1 • nội dung {_contentIndex + 1}/{_contents.Count}");
+                    if (!await WaitForLivePageReadyAsync("trước bước 1/8", ct)) return;
                     if (!await EnsureViewerGateBeforeActionAsync("trước Click điểm 1", ct)) return;
                     if (await GuardAndProcessBeforeClickAsync(_s.XPathPoint1, "điểm 1", ct)) return;
                     _log.Info($"Nội dung {_contentIndex + 1}/{_contents.Count}: ô nhập 1 bình thường, bắt đầu click.");
@@ -817,6 +906,7 @@ public sealed partial class AutomationEngine
                 case 5:
                 {
                     SetStatus("BƯỚC 5/8", $"Kiểm tra người xem + ô nhập → Click ô 2 • nội dung {_contentIndex + 1}/{_contents.Count}");
+                    if (!await WaitForLivePageReadyAsync("trước bước 5/8", ct)) return;
                     if (!await EnsureViewerGateBeforeActionAsync("trước Click điểm 2", ct)) return;
                     if (await GuardAndProcessBeforeClickAsync(_s.XPathPoint2, "điểm 2", ct)) return;
                     _log.Info($"Nội dung {_contentIndex + 1}/{_contents.Count}: ô nhập 2 bình thường, bắt đầu click.");
@@ -1003,6 +1093,13 @@ public sealed partial class AutomationEngine
             {
                 _log.Warn($"[PAGE_MAINTENANCE_RELOAD_FALLBACK] normalReloadFailed={ex.Message}");
                 await _chrome.RecoverCurrentPageAsync(_lastHealthyTikTokUrl, ct);
+            }
+
+            if (!await WaitForLivePageReadyAsync("sau F5 bảo trì", ct))
+            {
+                _pageMaintenanceDue = DateTime.Now.AddMinutes(1);
+                _log.Warn("[PAGE_MAINTENANCE_PAGE_NOT_READY] F5 đã hoàn tất nhưng TikTok chưa hydrate xong; không F5 thêm, sẽ kiểm tra lại ở vòng chính.");
+                return true;
             }
 
             ResetPageMaintenanceDue("F5 bảo trì thành công");
@@ -1448,6 +1545,11 @@ public sealed partial class AutomationEngine
 
             await _chrome.NavigateAndWaitAsync(best.Candidate.Href, Math.Max(900, _s.Viewer.WaitAfterF5Sec * 1000), 15000, ct);
             await StopIfFatalTikTokRestrictionAsync($"sau chọn LIVE đề xuất: {source}", ct);
+            if (!await WaitForLivePageReadyAsync($"sau chọn LIVE đề xuất: {source}", ct))
+            {
+                _log.Warn($"[VIEWER_RECOMMENDED_PAGE_NOT_READY] source={source} action=RETURN_FALSE_NO_F5");
+                return false;
+            }
             ResetPeriodicDue("Viewer recommended LIVE direct navigation", cancelCandidate: true);
             ResetPageMaintenanceDue("Viewer recommended LIVE direct navigation");
             ResetInputGuardConsecutive("sau chọn LIVE đề xuất");
@@ -1576,6 +1678,11 @@ public sealed partial class AutomationEngine
         {
             await _chrome.ResetTikTokLiveRecommendationFeedAsync(ct);
             await StopIfFatalTikTokRestrictionAsync($"sau reset nguồn đề xuất Viewer: {source}", ct);
+            if (!await WaitForLivePageReadyAsync($"sau reset nguồn đề xuất Viewer: {source}", ct))
+            {
+                _log.Warn($"[VIEWER_FEED_RESET_PAGE_NOT_READY] source={source} action=RETURN_FALSE_NO_EXTRA_F5");
+                return false;
+            }
             ResetPeriodicDue("Viewer low-streak hard reset /live", cancelCandidate: true);
             ResetPageMaintenanceDue("Viewer low-streak hard reset /live");
             ResetInputGuardConsecutive("sau reset nguồn đề xuất Viewer");
@@ -2055,6 +2162,12 @@ public sealed partial class AutomationEngine
                 return false;
             }
 
+            if (!await WaitForLivePageReadyAsync($"sau chuyển LIVE: {source}", ct))
+            {
+                _log.Warn($"[LIVE_SWITCH_PAGE_NOT_READY] source={source} changed=true action=RETURN_TO_MAIN_LOOP_NO_EXTRA_F5");
+                return false;
+            }
+
             ResetPeriodicDue(source + " da xac nhan sang LIVE moi va F5 xong", cancelCandidate: !scheduledPeriodic);
             ResetPageMaintenanceDue(source + " vừa F5 sau chuyển LIVE");
             completed = true;
@@ -2082,6 +2195,12 @@ public sealed partial class AutomationEngine
                     }
 
                     ReportProblem("LIVE_SWITCH_FAILED", source, "Đã retry chuyển LIVE nhưng chưa xác nhận LIVE mới; sẽ tiếp tục cơ chế bỏ qua LIVE lỗi.", throttleSeconds: 10);
+                    return false;
+                }
+
+                if (!await WaitForLivePageReadyAsync($"sau retry chuyển LIVE: {source}", ct))
+                {
+                    _log.Warn($"[LIVE_SWITCH_PAGE_NOT_READY] source={source} retry=true changed=true action=RETURN_TO_MAIN_LOOP_NO_EXTRA_F5");
                     return false;
                 }
 
