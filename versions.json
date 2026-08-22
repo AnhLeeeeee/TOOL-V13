@@ -1,22 +1,16 @@
-<<<<<<< HEAD
-﻿{
-    "schemaVersion":  1,
-    "versions":  [
-                     {
-                         "version":  "13.6.5",
-                         "setupUrl":  "https://github.com/AnhLeeeeee/TOOL-V13/releases/download/v13.6.5/ToolTikTok_V13.6.5_Setup.exe",
-                         "sha256":  "f0a432557311c41e51f8bd1d9a7ab7b3871f7acea0fb3174b46c62c005a82010",
-                         "notes":  "Cáº­p nháº­t Tool TikTok V13.6.5.",
-                         "channel":  "stable",
-                         "status":  "stable",
-                         "releaseDate":  "2026-08-23",
-                         "allowInstall":  true
-                     }
-                 ]
-=======
 {
   "schemaVersion": 1,
   "versions": [
+    {
+      "version": "13.6.5",
+      "setupUrl": "https://github.com/AnhLeeeeee/TOOL-V13/releases/download/v13.6.5/ToolTikTok_V13.6.5_Setup.exe",
+      "sha256": "f0a432557311c41e51f8bd1d9a7ab7b3871f7acea0fb3174b46c62c005a82010",
+      "notes": "Cập nhật Tool TikTok V13.6.5: tự đóng và tự bù profile khi BAN, đủ giờ hoặc lỗi quá 10 phút; hàng đợi bù bền vững; xác nhận RUNNING trước khi tính bù thành công; cải thiện Excel và tự F5 khi không tìm thấy nút Sửa hồ sơ.",
+      "channel": "stable",
+      "status": "stable",
+      "releaseDate": "2026-08-23",
+      "allowInstall": true
+    },
     {
       "version": "13.6.4",
       "setupUrl": "https://github.com/AnhLeeeeee/TOOL-V13/releases/download/v13.6.4/ToolTikTok_V13.6.4_Setup.exe",
@@ -38,5 +32,4 @@
       "allowInstall": true
     }
   ]
->>>>>>> e0c9fadc25be2b80eeed5d448c97bc0f28d7f389
 }
