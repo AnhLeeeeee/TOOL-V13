@@ -147,7 +147,9 @@ public sealed partial class ManagerForm
         if (_autoCloseSettings.CloseOnBan) parts.Add("BAN");
         if (_autoCloseSettings.CloseOnRunTime) parts.Add($"{_autoCloseSettings.RunHours}h");
         if (_autoCloseSettings.CloseOnNotRunning10Minutes) parts.Add("Lỗi10p");
-        if (parts.Count > 0 && _autoCloseSettings.OpenReplacementAfterAutoClose) parts.Add("Bù");
+
+        if (parts.Count > 0 && _autoCloseSettings.OpenReplacementAfterAutoClose)
+            parts.Add(_autoReplacementSessionArmed ? "Bù" : "Bù: CHỜ");
 
         _autoCloseToolbarButton.Text = parts.Count == 0
             ? "Tự đóng: Tắt"
@@ -240,7 +242,7 @@ public sealed partial class ManagerForm
                 "• Nếu profile trở lại RUNNING khỏe trước 10 phút, đồng hồ lỗi được xóa và tính lại từ đầu nếu lỗi lần sau.\r\n" +
                 "• Tự bù: đóng 1 → bù 1; đóng nhiều → giữ đúng số suất bù. Suất chưa bù được sẽ lưu file và tự thử lại 2→3→5 phút.\r\n" +
                 "• Mỗi suất bù lấy tài khoản chưa gán trong Excel và tạo profile mới; không quét/tái sử dụng profile cũ. Profile bù chỉ tính thành công sau khi RUNNING khỏe 30 giây.\r\n" +
-                "• Hàng đợi bù được lưu lại; khởi động lại Manager vẫn tiếp tục. Đóng profile thủ công không tự mở lại."
+                "• Hàng đợi bù được lưu lại. Khi vừa mở Manager, queue chỉ được khôi phục ở trạng thái CHỜ và không tự tạo profile. Sau START/RESUME hoặc một sự kiện Tự đóng mới trong phiên hiện tại, queue mới được phép chạy. Đóng profile thủ công không tự mở lại."
         };
 
         var save = new Button
@@ -654,6 +656,10 @@ public sealed partial class ManagerForm
         {
             _autoCloseExpectedRunningProfiles.Add(profileName);
             _autoCloseNotRunningSinceUtc.Remove(profileName);
+
+            // Người dùng/Manager vừa chủ động START hoặc RESUME.
+            // Từ thời điểm này mới cho phép xử lý các suất bù đang chờ.
+            ArmAutoReplacementSession($"runtime_command:{command}:{profileName}");
             return;
         }
 

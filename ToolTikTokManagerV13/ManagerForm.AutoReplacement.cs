@@ -57,6 +57,7 @@ public sealed partial class ManagerForm
     readonly object _profileSupplyStateLock = new();
     bool _autoReplacementFeatureInitialized;
     bool _autoReplacementQueueRunning;
+    bool _autoReplacementSessionArmed;
 
     string ProfileSupplyStatePath => Path.Combine(_baseDir, "manager_profile_supply.json");
     string AutoReplacementQueuePath => Path.Combine(_baseDir, "manager_auto_replacement_queue.json");
@@ -114,7 +115,41 @@ public sealed partial class ManagerForm
             _log.Warn($"[AUTO_REPLACE_RESTORE_ERROR] {ex.Message}");
         }
 
-        if (_autoCloseSettings.OpenReplacementAfterAutoClose)
+        // SAFE START: chỉ khôi phục queue, không tự chạy khi Manager vừa mở.
+        _autoReplacementSessionArmed = false;
+
+        if (_autoCloseSettings.OpenReplacementAfterAutoClose
+            && GetAutoReplacementPendingCount() > 0)
+        {
+            _log.Warn(
+                $"[AUTO_REPLACE_STARTUP_HOLD] pending={GetAutoReplacementPendingCount()} armed=false action=wait_for_start_or_new_auto_close");
+        }
+
+        UpdateAutoCloseToolbarButtonText();
+    }
+
+    void ArmAutoReplacementSession(string source)
+    {
+        if (_closing || IsDisposed || Disposing)
+            return;
+
+        if (!_autoReplacementFeatureInitialized)
+            InitializeAutoReplacementFeature();
+
+        if (!_autoCloseSettings.OpenReplacementAfterAutoClose)
+            return;
+
+        source = string.IsNullOrWhiteSpace(source) ? "unknown" : source.Trim();
+
+        if (!_autoReplacementSessionArmed)
+        {
+            _autoReplacementSessionArmed = true;
+            _log.Info(
+                $"[AUTO_REPLACE_SESSION_ARMED] source={source} pending={GetAutoReplacementPendingCount()}");
+            UpdateAutoCloseToolbarButtonText();
+        }
+
+        if (GetAutoReplacementPendingCount() > 0)
             _ = RunAutoReplacementQueueAsync();
     }
 
@@ -125,15 +160,25 @@ public sealed partial class ManagerForm
 
         if (_autoCloseSettings.OpenReplacementAfterAutoClose)
         {
-            _log.Info(
-                $"[AUTO_REPLACE_RESUME_SETTING] pending={GetAutoReplacementPendingCount()}");
-            _ = RunAutoReplacementQueueAsync();
+            if (_autoReplacementSessionArmed)
+            {
+                _log.Info(
+                    $"[AUTO_REPLACE_RESUME_SETTING] pending={GetAutoReplacementPendingCount()} armed=true");
+                _ = RunAutoReplacementQueueAsync();
+            }
+            else
+            {
+                _log.Info(
+                    $"[AUTO_REPLACE_RESUME_SETTING_HELD] pending={GetAutoReplacementPendingCount()} armed=false action=wait_for_start_or_new_auto_close");
+            }
         }
         else
         {
             _log.Info(
                 $"[AUTO_REPLACE_PAUSE_SETTING] pending={GetAutoReplacementPendingCount()} preserved=true");
         }
+
+        UpdateAutoCloseToolbarButtonText();
     }
 
     void QueueAutoReplacementAfterAutoClose(string closedProfileName, string reason)
@@ -168,6 +213,10 @@ public sealed partial class ManagerForm
             {
                 _log.Info(
                     $"[AUTO_REPLACE_QUEUE_DUPLICATE] closed={closedProfileName} id={duplicate.Id} pending={_autoReplacementQueue.Count}");
+
+                // Nếu đây là một Tự đóng mới của phiên hiện tại nhưng slot cũ đã
+                // tồn tại từ lần chạy trước, vẫn ARM phiên để slot đang chờ được xử lý.
+                ArmAutoReplacementSession("new_auto_close_duplicate:" + reason);
                 return;
             }
 
@@ -187,11 +236,19 @@ public sealed partial class ManagerForm
         _log.Info(
             $"[AUTO_REPLACE_QUEUE] id={queued.Id} closed={closedProfileName} reason={reason} pending={GetAutoReplacementPendingCount()} persisted=true");
 
-        _ = RunAutoReplacementQueueAsync();
+        // Sự kiện Tự đóng mới trong phiên hiện tại cho phép bù.
+        ArmAutoReplacementSession("new_auto_close:" + reason);
     }
 
     async Task RunAutoReplacementQueueAsync()
     {
+        if (!_autoReplacementSessionArmed)
+        {
+            if (GetAutoReplacementPendingCount() > 0)
+                _log.Info($"[AUTO_REPLACE_QUEUE_HELD] pending={GetAutoReplacementPendingCount()} armed=false");
+            return;
+        }
+
         if (_autoReplacementQueueRunning)
             return;
 
@@ -201,6 +258,13 @@ public sealed partial class ManagerForm
         {
             while (!_closing && !IsDisposed && !Disposing)
             {
+                if (!_autoReplacementSessionArmed)
+                {
+                    _log.Info(
+                        $"[AUTO_REPLACE_QUEUE_SESSION_PAUSED] pending={GetAutoReplacementPendingCount()} armed=false");
+                    return;
+                }
+
                 if (!_autoCloseSettings.OpenReplacementAfterAutoClose)
                 {
                     _log.Info(
@@ -248,8 +312,12 @@ public sealed partial class ManagerForm
                 // Cho tiến trình đóng cũ nhả hẳn Worker/Chrome trước khi mở profile bù.
                 await Task.Delay(650);
 
-                if (_closing || !_autoCloseSettings.OpenReplacementAfterAutoClose)
+                if (_closing
+                    || !_autoReplacementSessionArmed
+                    || !_autoCloseSettings.OpenReplacementAfterAutoClose)
+                {
                     return;
+                }
 
                 var filled = false;
                 var lastError = "";
@@ -297,6 +365,7 @@ public sealed partial class ManagerForm
 
             if (GetAutoReplacementPendingCount() > 0
                 && !_closing
+                && _autoReplacementSessionArmed
                 && _autoCloseSettings.OpenReplacementAfterAutoClose)
             {
                 _ = RunAutoReplacementQueueAsync();
