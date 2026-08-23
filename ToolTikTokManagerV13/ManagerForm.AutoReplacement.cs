@@ -256,13 +256,17 @@ public sealed partial class ManagerForm
 
                 try
                 {
-                    filled = await TryOpenNextExistingReplacementAsync(request);
+                    // V13.6.6+: Tự bù KHÔNG quét/tái sử dụng profile MỚI/TEST nữa.
+                    // Mỗi suất bù lấy thẳng tài khoản chưa gán và tạo một profile mới.
+                    // Việc này loại bỏ vòng quét IsProfileInUse() trên toàn bộ catalog,
+                    // tránh PowerShell/Get-CimInstance lặp theo từng profile làm nghẽn UI Manager.
+                    _log.Info(
+                        $"[AUTO_REPLACE_NEW_ACCOUNT_ONLY] id={request.Id} closed={request.ClosedProfileName} mode=create_new_from_unassigned_account");
+
+                    filled = await TryCreateReplacementAsync(request);
 
                     if (!filled)
-                        filled = await TryCreateReplacementAsync(request);
-
-                    if (!filled)
-                        lastError = "Không tìm được profile MỚI/TEST chạy khỏe và tạo mới cũng chưa thành công.";
+                        lastError = "Chưa tạo được profile mới từ tài khoản chưa gán; giữ suất bù để thử lại.";
                 }
                 catch (Exception ex)
                 {
@@ -521,8 +525,12 @@ public sealed partial class ManagerForm
 
     async Task<bool> TryCreateReplacementAsync(AutoReplacementRequest request)
     {
-        // Tạo profile mới dùng cùng gate với cửa sổ "+ Auto Profile" để không
-        // có hai luồng đồng thời tranh account / tên profile / Chrome trên VM.
+        // Tự bù chỉ dùng tài khoản CHƯA GÁN và luôn tạo profile MỚI.
+        // BuildAutoProfileQueue(requestedNew: 1, resumeIncomplete: false) sẽ lấy
+        // tài khoản chưa gán + có mật khẩu theo thứ tự Excel, sau đó ASSIGN ngay
+        // để các suất bù khác không thể lấy trùng tài khoản.
+        // Dùng cùng gate với cửa sổ "+ Auto Profile" để không có hai luồng
+        // đồng thời tranh account / tên profile / Chrome trên VM.
         await _autoProfileQueueGate.WaitAsync();
 
         try

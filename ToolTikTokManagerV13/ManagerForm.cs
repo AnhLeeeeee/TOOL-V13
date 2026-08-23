@@ -1710,9 +1710,9 @@ public sealed partial class ManagerForm : Form
         using var form = new Form
         {
             Text = $"Kho tài khoản TikTok — {AppVersionInfo.Display}",
-            Width = 1080,
-            Height = 650,
-            MinimumSize = new Size(800, 520),
+            Width = 1240,
+            Height = 720,
+            MinimumSize = new Size(900, 560),
             StartPosition = FormStartPosition.CenterParent,
             FormBorderStyle = FormBorderStyle.Sizable,
             MinimizeBox = false,
@@ -1726,7 +1726,7 @@ public sealed partial class ManagerForm : Form
         var sourceInfo = new Label
         {
             Dock = DockStyle.Top,
-            Height = 76,
+            Height = 92,
             Padding = new Padding(18, 9, 18, 6),
             AutoEllipsis = true,
             ForeColor = Color.DimGray,
@@ -1747,40 +1747,199 @@ public sealed partial class ManagerForm : Form
             RowHeadersVisible = false,
             BackgroundColor = ModernDialog.Canvas,
             BorderStyle = BorderStyle.None,
-            AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill
+            AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None,
+            ScrollBars = ScrollBars.Both
         };
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "row", HeaderText = "Dòng Excel", FillWeight = 18 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "user", HeaderText = "Tài khoản", FillWeight = 42 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "pass", HeaderText = "Mật khẩu", FillWeight = 18 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "totp", HeaderText = "2FA", FillWeight = 16 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "note", HeaderText = "Ghi chú", FillWeight = 34 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "assigned", HeaderText = "Profile đã gán", FillWeight = 28 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "identity", HeaderText = "Tên/ảnh", FillWeight = 18 });
-        LogGridSchema(grid, "AccountPoolGrid", "row", "user", "pass", "totp", "note", "assigned", "identity");
+
+        grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            Name = "row",
+            HeaderText = "Dòng Excel",
+            Width = 82,
+            Frozen = true
+        });
+        grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            Name = "user",
+            HeaderText = "Tài khoản",
+            Width = 220,
+            Frozen = true
+        });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "pass", HeaderText = "Mật khẩu", Width = 90 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "totp", HeaderText = "2FA", Width = 85 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "note", HeaderText = "Ghi chú", Width = 180 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "assigned", HeaderText = "Profile đã gán", Width = 120 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "identity", HeaderText = "Tên/ảnh", Width = 90 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "autoStatus", HeaderText = "+auto trạng thái", Width = 135 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "autoStep", HeaderText = "+auto bước", Width = 165 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            Name = "autoNote",
+            HeaderText = "+auto ghi chú",
+            Width = 430
+        });
+        LogGridSchema(
+            grid,
+            "AccountPoolGrid",
+            "row", "user", "pass", "totp", "note", "assigned", "identity",
+            "autoStatus", "autoStep", "autoNote");
+
+        var detailInfo = new Label
+        {
+            Dock = DockStyle.Bottom,
+            Height = 112,
+            Padding = new Padding(16, 8, 16, 8),
+            AutoEllipsis = false,
+            ForeColor = Color.FromArgb(46, 65, 88),
+            BackColor = Color.FromArgb(247, 250, 253),
+            BorderStyle = BorderStyle.FixedSingle,
+            Text = "Chọn một tài khoản để xem đầy đủ Ghi chú và trạng thái +auto."
+        };
 
         List<TikTokAccountPoolItem> items = new();
+        Dictionary<string, TikTokAccountPoolService.TikTokAccountAutoState> autoStates =
+            new(StringComparer.OrdinalIgnoreCase);
+        DateTime lastSourceWriteUtc = DateTime.MinValue;
+
+        void CaptureSourceWriteTime()
+        {
+            try
+            {
+                var path = _accountPoolService.CurrentSourcePath;
+                lastSourceWriteUtc =
+                    !string.IsNullOrWhiteSpace(path) && File.Exists(path)
+                        ? File.GetLastWriteTimeUtc(path)
+                        : DateTime.MinValue;
+            }
+            catch
+            {
+                lastSourceWriteUtc = DateTime.MinValue;
+            }
+        }
+
+        void UpdateDetailInfo()
+        {
+            if (grid.SelectedRows.Count == 0)
+            {
+                detailInfo.Text = "Chọn một tài khoản để xem đầy đủ Ghi chú và trạng thái +auto.";
+                return;
+            }
+
+            var id = grid.SelectedRows[0].Tag as string;
+            var item = items.FirstOrDefault(x => x.Id == id);
+            if (item is null)
+            {
+                detailInfo.Text = "Không còn tìm thấy tài khoản đã chọn.";
+                return;
+            }
+
+            autoStates.TryGetValue(item.Id, out var autoState);
+
+            var noteText = string.IsNullOrWhiteSpace(item.Note) ? "—" : item.Note.Trim();
+            var autoStatusText = string.IsNullOrWhiteSpace(autoState?.Status) ? "—" : autoState!.Status.Trim();
+            var autoStepText = string.IsNullOrWhiteSpace(autoState?.Step) ? "—" : autoState!.Step.Trim();
+            var autoNoteText = string.IsNullOrWhiteSpace(autoState?.Note) ? "—" : autoState!.Note.Trim();
+
+            detailInfo.Text =
+                $"Dòng {item.SourceRow} | {item.Username} | Profile: {(string.IsNullOrWhiteSpace(item.AssignedProfile) ? "—" : item.AssignedProfile)}\n"
+                + $"Ghi chú: {noteText}\n"
+                + $"+auto trạng thái: {autoStatusText}    |    +auto bước: {autoStepText}\n"
+                + $"+auto ghi chú: {autoNoteText}";
+        }
+
         void RefreshGrid()
         {
-            items = _accountPoolService.Load().OrderBy(x => x.SourceRow).ThenBy(x => x.Username, StringComparer.OrdinalIgnoreCase).ToList();
+            var selectedId = grid.SelectedRows.Count > 0
+                ? grid.SelectedRows[0].Tag as string
+                : null;
+
+            items = _accountPoolService.Load()
+                .OrderBy(x => x.SourceRow)
+                .ThenBy(x => x.Username, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            try
+            {
+                autoStates = _accountPoolService.LoadAutoStates();
+            }
+            catch
+            {
+                autoStates = new Dictionary<string, TikTokAccountPoolService.TikTokAccountAutoState>(
+                    StringComparer.OrdinalIgnoreCase);
+            }
+
             grid.Rows.Clear();
             var doneUsers = _accountPoolService.GetIdentityDoneUsernames();
+            DataGridViewRow? rowToSelect = null;
+
             foreach (var item in items)
             {
-                var index = grid.Rows.Add(item.SourceRow, item.Username,
+                autoStates.TryGetValue(item.Id, out var autoState);
+
+                var index = grid.Rows.Add(
+                    item.SourceRow,
+                    item.Username,
                     string.IsNullOrEmpty(item.Password) ? "" : "••••••",
                     string.IsNullOrWhiteSpace(item.TotpSecret) ? "" : "••••••",
                     item.Note,
                     item.AssignedProfile,
-                    doneUsers.Contains(item.Username) ? "DONE" : "—");
-                grid.Rows[index].Tag = item.Id;
+                    doneUsers.Contains(item.Username) ? "DONE" : "—",
+                    autoState?.Status ?? "",
+                    autoState?.Step ?? "",
+                    autoState?.Note ?? "");
+
+                var row = grid.Rows[index];
+                row.Tag = item.Id;
+
+                if (string.Equals((item.Note ?? "").Trim(), "ban", StringComparison.OrdinalIgnoreCase))
+                {
+                    row.Cells["note"].Style.BackColor = Color.MistyRose;
+                    row.Cells["note"].Style.ForeColor = Color.Firebrick;
+                }
+
+                var statusText = (autoState?.Status ?? "").Trim();
+                if (statusText.Equals("READY", StringComparison.OrdinalIgnoreCase))
+                {
+                    row.Cells["autoStatus"].Style.BackColor = Color.Honeydew;
+                    row.Cells["autoStatus"].Style.ForeColor = Color.DarkGreen;
+                }
+                else if (statusText.Contains("CAPTCHA", StringComparison.OrdinalIgnoreCase)
+                         || statusText.StartsWith("ERROR", StringComparison.OrdinalIgnoreCase)
+                         || statusText.StartsWith("FAILED", StringComparison.OrdinalIgnoreCase))
+                {
+                    row.Cells["autoStatus"].Style.BackColor = Color.MistyRose;
+                    row.Cells["autoStatus"].Style.ForeColor = Color.Firebrick;
+                }
+
+                if (!string.IsNullOrWhiteSpace(selectedId)
+                    && item.Id.Equals(selectedId, StringComparison.OrdinalIgnoreCase))
+                {
+                    rowToSelect = row;
+                }
             }
-            if (grid.Rows.Count > 0) grid.Rows[0].Selected = true;
+
+            if (rowToSelect is not null)
+            {
+                grid.ClearSelection();
+                rowToSelect.Selected = true;
+                grid.CurrentCell = rowToSelect.Cells["user"];
+            }
+            else if (grid.Rows.Count > 0)
+            {
+                grid.Rows[0].Selected = true;
+                grid.CurrentCell = grid.Rows[0].Cells["user"];
+            }
 
             var currentFile = _accountPoolService.CurrentSourcePath;
             sourceInfo.Text = string.IsNullOrWhiteSpace(currentFile)
-                ? "Chưa chọn file Excel. Bấm Mở Excel để chọn nguồn.\nA = Tài khoản, B = Mật khẩu, C = 2FA, D = Ghi chú, E = Profile đã gán, F = Tên/ảnh DONE."
-                : $"File đang dùng: {currentFile}\nKho phản ánh đúng file này. Mở file khác sẽ thay toàn bộ danh sách hiện tại; Sửa/Thêm/Xóa trong Kho sẽ ghi ngược vào file này.";
+                ? "Chưa chọn file Excel. Bấm Mở Excel để chọn nguồn.\nTool tự nhận diện các cột dữ liệu và các cột +auto theo tiêu đề."
+                : $"File đang dùng: {currentFile}\n"
+                  + "Kho hiển thị Ghi chú + +auto trạng thái / +auto bước / +auto ghi chú. "
+                  + "Kéo thanh ngang để xem các cột bên phải. File thay đổi sẽ tự đồng bộ khoảng 5 giây/lần.";
             sourceInfo.Tag = currentFile;
+
+            CaptureSourceWriteTime();
+            UpdateDetailInfo();
         }
 
         TikTokAccountPoolItem? SelectedItem()
@@ -1912,7 +2071,34 @@ public sealed partial class ManagerForm : Form
                 ModernDialog.ShowMessage(form, ex.Message, "Không xóa được trong Excel", MessageBoxIcon.Warning);
             }
         };
+        grid.SelectionChanged += (_, _) => UpdateDetailInfo();
         grid.CellDoubleClick += (_, _) => edit.PerformClick();
+
+        var autoRefreshTimer = new System.Windows.Forms.Timer
+        {
+            Interval = 5000,
+            Enabled = false
+        };
+        autoRefreshTimer.Tick += (_, _) =>
+        {
+            try
+            {
+                var currentPath = _accountPoolService.CurrentSourcePath;
+                if (string.IsNullOrWhiteSpace(currentPath) || !File.Exists(currentPath))
+                    return;
+
+                var currentWriteUtc = File.GetLastWriteTimeUtc(currentPath);
+                if (currentWriteUtc == lastSourceWriteUtc)
+                    return;
+
+                _accountPoolService.ReloadCurrentExcel();
+                RefreshGrid();
+            }
+            catch
+            {
+                // Nếu Excel đang khóa thì giữ dữ liệu hiện tại và tự thử lại ở vòng sau.
+            }
+        };
 
         var footer = new FlowLayoutPanel
         {
@@ -1932,9 +2118,15 @@ public sealed partial class ManagerForm : Form
         footer.Controls.Add(close);
 
         form.Controls.Add(grid);
+        form.Controls.Add(detailInfo);
         form.Controls.Add(sourceInfo);
         form.Controls.Add(footer);
         form.CancelButton = close;
+        form.FormClosed += (_, _) =>
+        {
+            try { autoRefreshTimer.Stop(); } catch { }
+            try { autoRefreshTimer.Dispose(); } catch { }
+        };
         form.Shown += (_, _) =>
         {
             ModernDialog.FitToWorkingArea(form);
@@ -1949,6 +2141,7 @@ public sealed partial class ManagerForm : Form
                 // Nếu file nguồn tạm thời không đọc được, vẫn giữ cache hiện tại để người dùng có thể đổi file khác.
             }
             RefreshGrid();
+            autoRefreshTimer.Start();
         };
         form.ShowDialog(this);
     }
@@ -3688,15 +3881,44 @@ public sealed partial class ManagerForm : Form
     void RefreshSelectedProfilePresentation()
     {
         TryGetSelectedTabPage(out var selectedPage);
+
+        var notesByProfile = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            foreach (var account in _accountPoolService.Load())
+            {
+                var profileName = (account.AssignedProfile ?? "").Trim();
+                var note = (account.Note ?? "").Trim();
+                if (profileName.Length == 0 || note.Length == 0)
+                    continue;
+
+                notesByProfile[profileName] = note;
+            }
+        }
+        catch
+        {
+            // Ghi chú trên header chỉ là thông tin phụ.
+        }
+
         foreach (var context in _contexts.Values)
         {
             var header = context.ProfileHeader;
             if (header is null || header.IsDisposed) continue;
 
             var active = ReferenceEquals(context.Tab, selectedPage);
-            header.Text = active
+            var headerText = active
                 ? $"ĐANG CHỌN: {context.Profile.Name} | CDP {context.Profile.CdpPort}"
                 : $"{context.Profile.Name} | CDP {context.Profile.CdpPort}";
+
+            if (notesByProfile.TryGetValue(context.Profile.Name, out var noteText))
+            {
+                var compactNote = noteText.Length > 28
+                    ? noteText[..28] + "…"
+                    : noteText;
+                headerText += $" | Ghi chú: {compactNote}";
+            }
+
+            header.Text = headerText;
             header.BackColor = active ? ActiveProfileColor : UiTheme.Card;
             header.ForeColor = active ? Color.White : Color.FromArgb(42, 57, 76);
         }

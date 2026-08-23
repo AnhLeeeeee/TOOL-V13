@@ -218,7 +218,7 @@ public sealed partial class ManagerForm
 
         var openReplacement = new CheckBox
         {
-            Text = "Sau khi Tự đóng: lấy profile MỚI/TEST chưa treo; hết thì tự tạo mới",
+            Text = "Sau khi Tự đóng: lấy tài khoản chưa gán và tự tạo profile mới",
             Checked = _autoCloseSettings.OpenReplacementAfterAutoClose,
             AutoSize = true,
             Location = new Point(28, 205)
@@ -238,7 +238,7 @@ public sealed partial class ManagerForm
                 "• Lỗi 10p: profile đang treo mà RECOVERING/STOPPED/UNKNOWN, Chrome mất kết nối, status lỗi hoặc lỗi trang liên tục 10 phút sẽ tự đóng + bù. PAUSED thủ công không tính lỗi.\r\n" +
                 "• Nếu profile trở lại RUNNING khỏe trước 10 phút, đồng hồ lỗi được xóa và tính lại từ đầu nếu lỗi lần sau.\r\n" +
                 "• Tự bù: đóng 1 → bù 1; đóng nhiều → giữ đúng số suất bù. Suất chưa bù được sẽ lưu file và tự thử lại 2→3→5 phút.\r\n" +
-                "• Ưu tiên MỚI rồi TEST (<30 phút); hết thì Tạo profile tự động. Profile bù chỉ tính thành công sau khi RUNNING khỏe 30 giây.\r\n" +
+                "• Mỗi suất bù lấy tài khoản chưa gán trong Excel và tạo profile mới; không quét/tái sử dụng profile cũ. Profile bù chỉ tính thành công sau khi RUNNING khỏe 30 giây.\r\n" +
                 "• Hàng đợi bù được lưu lại; khởi động lại Manager vẫn tiếp tục. Đóng profile thủ công không tự mở lại."
         };
 
