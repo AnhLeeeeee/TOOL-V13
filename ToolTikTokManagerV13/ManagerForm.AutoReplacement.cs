@@ -122,6 +122,20 @@ public sealed partial class ManagerForm
         }
 
         UpdateAutoCloseToolbarButtonText();
+
+        // Queue "dùng lại" là queue riêng, KHÔNG bị xóa cùng suất bù cũ.
+        // Quét sau khi form hiển thị để không làm chậm thời điểm tạo Handle/UI.
+        Shown += async (_, _) =>
+        {
+            try
+            {
+                await RefreshReusableProfileQueueAsync("manager_shown");
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"[REUSE_QUEUE_STARTUP_WARN] {ex.Message}");
+            }
+        };
     }
 
     void ArmAutoReplacementSession(string source)
@@ -328,17 +342,27 @@ public sealed partial class ManagerForm
 
                 try
                 {
-                    // V13.6.6+: Tự bù KHÔNG quét/tái sử dụng profile MỚI/TEST nữa.
-                    // Mỗi suất bù lấy thẳng tài khoản chưa gán và tạo một profile mới.
-                    // Việc này loại bỏ vòng quét IsProfileInUse() trên toàn bộ catalog,
-                    // tránh PowerShell/Get-CimInstance lặp theo từng profile làm nghẽn UI Manager.
+                    // V13.7.0: ƯU TIÊN profile đã có trong queue dùng lại.
+                    // Queue được tạo bằng runtime_stats.json (<1h) + Ghi chú trống,
+                    // không quét PowerShell/IsProfileInUse trên toàn bộ catalog.
                     _log.Info(
-                        $"[AUTO_REPLACE_NEW_ACCOUNT_ONLY] id={request.Id} closed={request.ClosedProfileName} mode=create_new_from_unassigned_account");
+                        $"[AUTO_REPLACE_REUSE_FIRST] id={request.Id} closed={request.ClosedProfileName} reusePending={GetReusableProfileQueueCount()}");
 
-                    filled = await TryCreateReplacementAsync(request);
+                    filled = await TryOpenNextExistingReplacementAsync(request);
 
                     if (!filled)
-                        lastError = "Chưa tạo được profile mới từ tài khoản chưa gán; giữ suất bù để thử lại.";
+                    {
+                        _log.Info(
+                            $"[AUTO_REPLACE_REUSE_EMPTY_FALLBACK_NEW] id={request.Id} closed={request.ClosedProfileName}");
+
+                        filled = await TryCreateReplacementAsync(request);
+                    }
+
+                    if (!filled)
+                    {
+                        lastError =
+                            "Không dùng lại được profile chờ và chưa tạo được profile mới từ tài khoản chưa gán; giữ suất bù để thử lại.";
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -384,173 +408,13 @@ public sealed partial class ManagerForm
         }
     }
 
-    async Task<bool> TryOpenNextExistingReplacementAsync(AutoReplacementRequest request)
+    async Task<bool> TryOpenNextExistingReplacementAsync(
+        AutoReplacementRequest request)
     {
-        var catalog = _profileService.Load();
-        RefreshContextsFromCatalog(catalog);
-
-        var accounts = _accountPoolService.Load();
-
-        Dictionary<string, TikTokAccountPoolService.TikTokAccountAutoState> autoStates;
-        try
-        {
-            autoStates = _accountPoolService.LoadAutoStates();
-        }
-        catch
-        {
-            autoStates = new Dictionary<string, TikTokAccountPoolService.TikTokAccountAutoState>(
-                StringComparer.OrdinalIgnoreCase);
-        }
-
-        var candidates = new List<AutoReplacementCandidate>();
-
-        foreach (var profile in catalog.Profiles)
-        {
-            if (_closing)
-                return false;
-
-            if (_autoReplacementRetiredProfiles.Contains(profile.Name)
-                || _autoReplacementClaimedProfiles.Contains(profile.Name)
-                || IsReplacementProfileCoolingDown(profile.Name))
-            {
-                continue;
-            }
-
-            if (!_contexts.TryGetValue(profile.Name, out var ctx))
-                continue;
-
-            // Chỉ lấy profile đang thật sự rảnh.
-            if (ctx.Tab is not null
-                || (ctx.Worker is not null && !ctx.Worker.HasExited)
-                || ctx.Opening
-                || ChromeProfileNameSyncService.IsProfileInUse(ctx.Profile.ProfilePath))
-            {
-                continue;
-            }
-
-            // Profile bù phải là profile đã có tài khoản hợp lệ để có thể mở và chạy ngay.
-            var assignedAccount = accounts.FirstOrDefault(a =>
-                a.AssignedProfile.Equals(profile.Name, StringComparison.OrdinalIgnoreCase));
-
-            if (assignedAccount is null
-                || string.IsNullOrWhiteSpace(assignedAccount.Password))
-            {
-                continue;
-            }
-
-            if (string.Equals((assignedAccount.Note ?? "").Trim(), "ban", StringComparison.OrdinalIgnoreCase))
-            {
-                _autoReplacementRetiredProfiles.Add(profile.Name);
-                MarkProfileSupplyState(profile.Name, "retired", "account_note_ban");
-                _log.Info(
-                    $"[AUTO_REPLACE_SKIP_EXISTING] profile={profile.Name} reason=account_note_ban");
-                continue;
-            }
-
-            if (autoStates.TryGetValue(assignedAccount.Id, out var autoState)
-                && autoState.IsPausedOrError)
-            {
-                _log.Info(
-                    $"[AUTO_REPLACE_SKIP_EXISTING] profile={profile.Name} reason=auto_state_blocked status={autoState.Status} step={autoState.Step}");
-                continue;
-            }
-
-            if (!TryClassifyReplacementSupply(ctx, out var supplyState, out var totalRuntime, out var priority))
-                continue;
-
-            candidates.Add(new AutoReplacementCandidate(
-                ctx,
-                assignedAccount,
-                supplyState,
-                totalRuntime,
-                priority));
-        }
-
-        // Ưu tiên profile MỚI trước, rồi TEST. Trong cùng nhóm thì lấy theo thứ tự tên tự nhiên.
-        foreach (var candidate in candidates
-                     .OrderBy(x => x.Priority)
-                     .ThenBy(x => x.Context.Profile.Name, NaturalProfileNameOrder))
-        {
-            if (_closing)
-                return false;
-
-            var ctx = candidate.Context;
-            var profileName = ctx.Profile.Name;
-            _autoReplacementClaimedProfiles.Add(profileName);
-
-            try
-            {
-                _log.Info(
-                    $"[AUTO_REPLACE_OPEN_SUPPLY] closed={request.ClosedProfileName} replacement={profileName} supply={candidate.SupplyState} total={candidate.TotalRuntime:c} account={candidate.Account.Username}");
-
-                var opened = await OpenProfileAsync(
-                    ctx,
-                    $"Tự bù cho {request.ClosedProfileName}: mở profile {candidate.SupplyState}...");
-
-                if (!opened && (ctx.Worker is null || ctx.Worker.HasExited))
-                {
-                    MarkReplacementProfileFailed(profileName, "open_worker");
-                    _log.Warn(
-                        $"[AUTO_REPLACE_EXISTING_FAIL] profile={profileName} step=open_worker");
-                    continue;
-                }
-
-                // start_auto không bật dialog, phù hợp hàng đợi tự động.
-                var reply = await SendCommandAsync(
-                    ctx,
-                    "start_auto",
-                    TimeSpan.FromSeconds(100));
-
-                if (!string.Equals(reply, "started", StringComparison.OrdinalIgnoreCase))
-                {
-                    MarkReplacementProfileFailed(profileName, "start:" + reply);
-                    _log.Warn(
-                        $"[AUTO_REPLACE_EXISTING_FAIL] profile={profileName} step=start reply={reply}");
-
-                    await CloseFailedReplacementRuntimeAsync(ctx);
-                    continue;
-                }
-
-                // Không coi "started" là đã bù xong ngay. Chờ RUNNING khỏe liên tục
-                // 30 giây (timeout 60 giây) để tránh vừa mở xong đã lỗi trang/Chrome.
-                var healthy = await WaitForReplacementHealthyRunningAsync(
-                    ctx,
-                    request,
-                    "existing");
-
-                if (!healthy)
-                {
-                    MarkReplacementProfileFailed(profileName, "started_but_not_healthy");
-                    _log.Warn(
-                        $"[AUTO_REPLACE_EXISTING_FAIL] profile={profileName} step=confirm_running");
-
-                    await CloseFailedReplacementRuntimeAsync(ctx);
-                    continue;
-                }
-
-                // Chỉ sau khi RUNNING khỏe mới đánh dấu ĐÃ TREO và hoàn tất suất bù.
-                MarkProfileSupplyState(profileName, "used", "auto_replacement_running_confirmed");
-
-                _log.Info(
-                    $"[AUTO_REPLACE_EXISTING_OK] closed={request.ClosedProfileName} replacement={profileName} supply={candidate.SupplyState} confirmed=healthy_running");
-
-                return true;
-            }
-            catch (Exception ex)
-            {
-                MarkReplacementProfileFailed(profileName, "exception:" + ex.Message);
-                _log.Warn(
-                    $"[AUTO_REPLACE_EXISTING_ERROR] profile={profileName} error={ex.Message}");
-
-                try { await CloseFailedReplacementRuntimeAsync(ctx); } catch { }
-            }
-            finally
-            {
-                _autoReplacementClaimedProfiles.Remove(profileName);
-            }
-        }
-
-        return false;
+        // Không dùng scan MỚI/TEST cũ nữa vì scan đó gọi
+        // ChromeProfileNameSyncService.IsProfileInUse() cho từng profile.
+        // Queue dùng lại đã được lọc trước bằng file nhỏ runtime_stats.json.
+        return await TryUseReusableProfileQueueAsync(request);
     }
 
     async Task CloseFailedReplacementRuntimeAsync(ProfileContext ctx)

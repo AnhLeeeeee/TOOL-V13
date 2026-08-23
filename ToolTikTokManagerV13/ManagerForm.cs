@@ -1726,7 +1726,7 @@ public sealed partial class ManagerForm : Form
         var sourceInfo = new Label
         {
             Dock = DockStyle.Top,
-            Height = 92,
+            Height = 66,
             Padding = new Padding(18, 9, 18, 6),
             AutoEllipsis = true,
             ForeColor = Color.DimGray,
@@ -1751,49 +1751,91 @@ public sealed partial class ManagerForm : Form
             ScrollBars = ScrollBars.Both
         };
 
+        // Chỉ thay đổi HIỂN THỊ Kho tài khoản.
+        // Mật khẩu/2FA vẫn được đọc và lưu trong Excel như cũ, nhưng không đưa lên bảng.
         grid.Columns.Add(new DataGridViewTextBoxColumn
         {
             Name = "row",
-            HeaderText = "Dòng Excel",
-            Width = 82,
-            Frozen = true
+            HeaderText = "Dòng",
+            Width = 46,
+            Frozen = true,
+            DefaultCellStyle = new DataGridViewCellStyle
+            {
+                Alignment = DataGridViewContentAlignment.MiddleCenter,
+                ForeColor = Color.FromArgb(125, 133, 143),
+                Font = new Font("Segoe UI", 8.5F, FontStyle.Regular)
+            }
+        });
+        grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            Name = "assigned",
+            HeaderText = "Profile",
+            Width = 92,
+            Frozen = true,
+            DefaultCellStyle = new DataGridViewCellStyle
+            {
+                Alignment = DataGridViewContentAlignment.MiddleCenter,
+                BackColor = Color.FromArgb(231, 241, 255),
+                ForeColor = Color.FromArgb(24, 82, 155),
+                Font = new Font("Segoe UI", 10F, FontStyle.Bold)
+            },
+            HeaderCell =
+            {
+                Style =
+                {
+                    Alignment = DataGridViewContentAlignment.MiddleCenter,
+                    BackColor = Color.FromArgb(214, 231, 252),
+                    ForeColor = Color.FromArgb(24, 82, 155),
+                    Font = new Font("Segoe UI", 9.5F, FontStyle.Bold)
+                }
+            }
         });
         grid.Columns.Add(new DataGridViewTextBoxColumn
         {
             Name = "user",
             HeaderText = "Tài khoản",
-            Width = 220,
-            Frozen = true
+            Width = 245
         });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "pass", HeaderText = "Mật khẩu", Width = 90 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "totp", HeaderText = "2FA", Width = 85 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "note", HeaderText = "Ghi chú", Width = 180 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "assigned", HeaderText = "Profile đã gán", Width = 120 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "identity", HeaderText = "Tên/ảnh", Width = 90 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "autoStatus", HeaderText = "+auto trạng thái", Width = 135 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "autoStep", HeaderText = "+auto bước", Width = 165 });
         grid.Columns.Add(new DataGridViewTextBoxColumn
         {
-            Name = "autoNote",
-            HeaderText = "+auto ghi chú",
-            Width = 430
+            Name = "note",
+            HeaderText = "Ghi chú",
+            Width = 165
+        });
+        grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            Name = "identity",
+            HeaderText = "Tên/ảnh",
+            Width = 100
+        });
+        grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            Name = "autoProfile",
+            HeaderText = "Auto Profile",
+            Width = 115
+        });
+        grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            Name = "reuseQueue",
+            HeaderText = "Chờ dùng lại",
+            Width = 155
         });
         LogGridSchema(
             grid,
             "AccountPoolGrid",
-            "row", "user", "pass", "totp", "note", "assigned", "identity",
-            "autoStatus", "autoStep", "autoNote");
+            "row", "assigned", "user", "note", "identity",
+            "autoProfile", "reuseQueue");
 
         var detailInfo = new Label
         {
             Dock = DockStyle.Bottom,
-            Height = 112,
+            Height = 70,
             Padding = new Padding(16, 8, 16, 8),
             AutoEllipsis = false,
             ForeColor = Color.FromArgb(46, 65, 88),
             BackColor = Color.FromArgb(247, 250, 253),
             BorderStyle = BorderStyle.FixedSingle,
-            Text = "Chọn một tài khoản để xem đầy đủ Ghi chú và trạng thái +auto."
+            Text = "Chọn một tài khoản để xem Ghi chú, kết quả và trạng thái Chờ dùng lại."
         };
 
         List<TikTokAccountPoolItem> items = new();
@@ -1821,7 +1863,7 @@ public sealed partial class ManagerForm : Form
         {
             if (grid.SelectedRows.Count == 0)
             {
-                detailInfo.Text = "Chọn một tài khoản để xem đầy đủ Ghi chú và trạng thái +auto.";
+                detailInfo.Text = "Chọn một tài khoản để xem Ghi chú, kết quả và trạng thái Chờ dùng lại.";
                 return;
             }
 
@@ -1834,17 +1876,39 @@ public sealed partial class ManagerForm : Form
             }
 
             autoStates.TryGetValue(item.Id, out var autoState);
+            var identityResults = _accountPoolService.GetIdentityResults();
 
-            var noteText = string.IsNullOrWhiteSpace(item.Note) ? "—" : item.Note.Trim();
-            var autoStatusText = string.IsNullOrWhiteSpace(autoState?.Status) ? "—" : autoState!.Status.Trim();
-            var autoStepText = string.IsNullOrWhiteSpace(autoState?.Step) ? "—" : autoState!.Step.Trim();
-            var autoNoteText = string.IsNullOrWhiteSpace(autoState?.Note) ? "—" : autoState!.Note.Trim();
+            var noteText =
+                string.IsNullOrWhiteSpace(item.Note)
+                    ? "—"
+                    : item.Note.Trim();
+
+            var identityText =
+                identityResults.TryGetValue(item.Username, out var identityResult)
+                    ? identityResult
+                    : "—";
+
+            var autoProfileText =
+                string.IsNullOrWhiteSpace(autoState?.Status)
+                    ? "—"
+                    : autoState!.Status.Trim();
+
+            var reuseQueue =
+                GetReusableProfileQueueSnapshot();
+
+            var reuseText =
+                !string.IsNullOrWhiteSpace(item.AssignedProfile)
+                && reuseQueue.TryGetValue(
+                    item.AssignedProfile.Trim(),
+                    out var reuseItem)
+                    ? reuseItem.IsManual
+                        ? $"#{reuseItem.Position} (THỦ CÔNG · {FormatReusableRuntime(reuseItem.TotalRuntime)})"
+                        : $"#{reuseItem.Position} ({FormatReusableRuntime(reuseItem.TotalRuntime)})"
+                    : "—";
 
             detailInfo.Text =
-                $"Dòng {item.SourceRow} | {item.Username} | Profile: {(string.IsNullOrWhiteSpace(item.AssignedProfile) ? "—" : item.AssignedProfile)}\n"
-                + $"Ghi chú: {noteText}\n"
-                + $"+auto trạng thái: {autoStatusText}    |    +auto bước: {autoStepText}\n"
-                + $"+auto ghi chú: {autoNoteText}";
+                $"Profile {(string.IsNullOrWhiteSpace(item.AssignedProfile) ? "—" : item.AssignedProfile)}  •  {item.Username}  •  Dòng {item.SourceRow}\n"
+                + $"Ghi chú: {noteText}    |    Tên/ảnh: {identityText}    |    Auto Profile: {autoProfileText}    |    Chờ dùng lại: {reuseText}";
         }
 
         void RefreshGrid()
@@ -1869,7 +1933,8 @@ public sealed partial class ManagerForm : Form
             }
 
             grid.Rows.Clear();
-            var doneUsers = _accountPoolService.GetIdentityDoneUsernames();
+            var identityResults = _accountPoolService.GetIdentityResults();
+            var reuseQueue = GetReusableProfileQueueSnapshot();
             DataGridViewRow? rowToSelect = null;
 
             foreach (var item in items)
@@ -1878,18 +1943,30 @@ public sealed partial class ManagerForm : Form
 
                 var index = grid.Rows.Add(
                     item.SourceRow,
-                    item.Username,
-                    string.IsNullOrEmpty(item.Password) ? "" : "••••••",
-                    string.IsNullOrWhiteSpace(item.TotpSecret) ? "" : "••••••",
-                    item.Note,
                     item.AssignedProfile,
-                    doneUsers.Contains(item.Username) ? "DONE" : "—",
+                    item.Username,
+                    item.Note,
+                    identityResults.TryGetValue(item.Username, out var identityResult)
+                        ? identityResult
+                        : "",
                     autoState?.Status ?? "",
-                    autoState?.Step ?? "",
-                    autoState?.Note ?? "");
+                    !string.IsNullOrWhiteSpace(item.AssignedProfile)
+                    && reuseQueue.TryGetValue(
+                        item.AssignedProfile.Trim(),
+                        out var reuseItem)
+                        ? reuseItem.IsManual
+                            ? $"#{reuseItem.Position} · THỦ CÔNG"
+                            : $"#{reuseItem.Position} · {FormatReusableRuntime(reuseItem.TotalRuntime)}"
+                        : "");
 
                 var row = grid.Rows[index];
                 row.Tag = item.Id;
+
+                // Profile là thông tin quan sát thường xuyên: luôn giữ nổi bật.
+                row.Cells["assigned"].Style.BackColor = Color.FromArgb(231, 241, 255);
+                row.Cells["assigned"].Style.ForeColor = Color.FromArgb(24, 82, 155);
+                row.Cells["assigned"].Style.Font = new Font(grid.Font, FontStyle.Bold);
+                row.Cells["assigned"].Style.Alignment = DataGridViewContentAlignment.MiddleCenter;
 
                 if (string.Equals((item.Note ?? "").Trim(), "ban", StringComparison.OrdinalIgnoreCase))
                 {
@@ -1897,18 +1974,44 @@ public sealed partial class ManagerForm : Form
                     row.Cells["note"].Style.ForeColor = Color.Firebrick;
                 }
 
-                var statusText = (autoState?.Status ?? "").Trim();
-                if (statusText.Equals("READY", StringComparison.OrdinalIgnoreCase))
+                var identityText =
+                    identityResults.TryGetValue(item.Username, out var identityState)
+                        ? identityState
+                        : "";
+
+                if (identityText.Equals("DONE", StringComparison.OrdinalIgnoreCase))
                 {
-                    row.Cells["autoStatus"].Style.BackColor = Color.Honeydew;
-                    row.Cells["autoStatus"].Style.ForeColor = Color.DarkGreen;
+                    row.Cells["identity"].Style.BackColor = Color.Honeydew;
+                    row.Cells["identity"].Style.ForeColor = Color.DarkGreen;
                 }
-                else if (statusText.Contains("CAPTCHA", StringComparison.OrdinalIgnoreCase)
-                         || statusText.StartsWith("ERROR", StringComparison.OrdinalIgnoreCase)
-                         || statusText.StartsWith("FAILED", StringComparison.OrdinalIgnoreCase))
+                else if (identityText.Equals("FAIL", StringComparison.OrdinalIgnoreCase))
                 {
-                    row.Cells["autoStatus"].Style.BackColor = Color.MistyRose;
-                    row.Cells["autoStatus"].Style.ForeColor = Color.Firebrick;
+                    row.Cells["identity"].Style.BackColor = Color.MistyRose;
+                    row.Cells["identity"].Style.ForeColor = Color.Firebrick;
+                }
+
+                var statusText = (autoState?.Status ?? "").Trim();
+
+                if (statusText.Equals("DONE", StringComparison.OrdinalIgnoreCase))
+                {
+                    row.Cells["autoProfile"].Style.BackColor = Color.Honeydew;
+                    row.Cells["autoProfile"].Style.ForeColor = Color.DarkGreen;
+                }
+                else if (statusText.Equals("FAIL", StringComparison.OrdinalIgnoreCase))
+                {
+                    row.Cells["autoProfile"].Style.BackColor = Color.MistyRose;
+                    row.Cells["autoProfile"].Style.ForeColor = Color.Firebrick;
+                }
+
+                if (!string.IsNullOrWhiteSpace(item.AssignedProfile)
+                    && reuseQueue.ContainsKey(item.AssignedProfile.Trim()))
+                {
+                    row.Cells["reuseQueue"].Style.BackColor =
+                        Color.FromArgb(231, 241, 255);
+                    row.Cells["reuseQueue"].Style.ForeColor =
+                        Color.FromArgb(32, 83, 145);
+                    row.Cells["reuseQueue"].Style.Font =
+                        new Font(grid.Font, FontStyle.Bold);
                 }
 
                 if (!string.IsNullOrWhiteSpace(selectedId)
@@ -1922,20 +2025,19 @@ public sealed partial class ManagerForm : Form
             {
                 grid.ClearSelection();
                 rowToSelect.Selected = true;
-                grid.CurrentCell = rowToSelect.Cells["user"];
+                grid.CurrentCell = rowToSelect.Cells["assigned"];
             }
             else if (grid.Rows.Count > 0)
             {
                 grid.Rows[0].Selected = true;
-                grid.CurrentCell = grid.Rows[0].Cells["user"];
+                grid.CurrentCell = grid.Rows[0].Cells["assigned"];
             }
 
             var currentFile = _accountPoolService.CurrentSourcePath;
             sourceInfo.Text = string.IsNullOrWhiteSpace(currentFile)
-                ? "Chưa chọn file Excel. Bấm Mở Excel để chọn nguồn.\nTool tự nhận diện các cột dữ liệu và các cột +auto theo tiêu đề."
-                : $"File đang dùng: {currentFile}\n"
-                  + "Kho hiển thị Ghi chú + +auto trạng thái / +auto bước / +auto ghi chú. "
-                  + "Kéo thanh ngang để xem các cột bên phải. File thay đổi sẽ tự đồng bộ khoảng 5 giây/lần.";
+                ? "Chưa chọn Excel  •  Bấm Mở Excel để chọn nguồn tài khoản."
+                : $"{Path.GetFileName(currentFile)}  •  {items.Count} tài khoản  •  Chờ dùng lại: {reuseQueue.Count}  •  "
+                  + $"Tự quét: Tổng < {Math.Clamp(_autoCloseSettings.RunHours, 3, 8)}h";
             sourceInfo.Tag = currentFile;
 
             CaptureSourceWriteTime();
@@ -1951,6 +2053,9 @@ public sealed partial class ManagerForm : Form
 
         var openExcel = new Button { Text = "Mở Excel", AutoSize = true, Height = 36 };
         var reload = new Button { Text = "Tải lại", AutoSize = true, Height = 36 };
+        var scanReuse = new Button { Text = "Quét chờ", AutoSize = true, Height = 36 };
+        var addReuseManual = new Button { Text = "+ Vào chờ", AutoSize = true, Height = 36 };
+        var removeReuseManual = new Button { Text = "- Bỏ chờ", AutoSize = true, Height = 36 };
         var add = new Button { Text = "+ Thêm dòng", AutoSize = true, Height = 36 };
         var edit = new Button { Text = "Sửa", AutoSize = true, Height = 36 };
         var release = new Button { Text = "Bỏ gán profile", AutoSize = true, Height = 36 };
@@ -1958,6 +2063,9 @@ public sealed partial class ManagerForm : Form
         var close = new Button { Text = "Đóng", DialogResult = DialogResult.Cancel, AutoSize = true, Height = 36 };
         ModernDialog.StylePrimaryButton(openExcel);
         ModernDialog.StyleSecondaryButton(reload);
+        ModernDialog.StyleSecondaryButton(scanReuse);
+        ModernDialog.StylePrimaryButton(addReuseManual);
+        ModernDialog.StyleSecondaryButton(removeReuseManual);
         ModernDialog.StylePrimaryButton(add);
         ModernDialog.StyleSecondaryButton(edit);
         ModernDialog.StyleSecondaryButton(release);
@@ -2010,6 +2118,120 @@ public sealed partial class ManagerForm : Form
             catch (Exception ex)
             {
                 ModernDialog.ShowMessage(form, ex.Message, "Không tải lại được Excel", MessageBoxIcon.Warning);
+            }
+        };
+
+        scanReuse.Click += async (_, _) =>
+        {
+            scanReuse.Enabled = false;
+
+            try
+            {
+                await RefreshReusableProfileQueueAsync(
+                    "account_pool_manual");
+
+                RefreshGrid();
+
+                var autoReuseHours =
+                    Math.Clamp(
+                        _autoCloseSettings.RunHours,
+                        3,
+                        8);
+
+                ModernDialog.ShowMessage(
+                    form,
+                    $"Đã quét xong. Chờ dùng lại: {GetReusableProfileQueueCount()} profile.\n\n"
+                    + $"Tự quét nhận profile có Tổng chạy < {autoReuseHours} giờ và Ghi chú trống. "
+                    + "Profile thủ công vẫn được ưu tiên trước.",
+                    "Chờ dùng lại",
+                    MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                ModernDialog.ShowMessage(
+                    form,
+                    ex.Message,
+                    "Không quét được Chờ dùng lại",
+                    MessageBoxIcon.Warning);
+            }
+            finally
+            {
+                scanReuse.Enabled = true;
+            }
+        };
+
+        addReuseManual.Click += (_, _) =>
+        {
+            var current = SelectedItem();
+
+            if (current is null)
+            {
+                ModernDialog.ShowMessage(
+                    form,
+                    "Hãy chọn một tài khoản/profile trước.",
+                    "Thêm vào Chờ dùng lại",
+                    MessageBoxIcon.Information);
+                return;
+            }
+
+            if (TryAddReusableProfileManual(
+                    current.Id,
+                    current.Username,
+                    current.AssignedProfile,
+                    current.Note,
+                    out var message))
+            {
+                RefreshGrid();
+
+                ModernDialog.ShowMessage(
+                    form,
+                    message + "\n\nProfile thủ công được ưu tiên trước các profile tự quét.",
+                    "Đã thêm vào Chờ dùng lại",
+                    MessageBoxIcon.Information);
+            }
+            else
+            {
+                ModernDialog.ShowMessage(
+                    form,
+                    message,
+                    "Không thể thêm vào Chờ dùng lại",
+                    MessageBoxIcon.Warning);
+            }
+        };
+
+        removeReuseManual.Click += (_, _) =>
+        {
+            var current = SelectedItem();
+
+            if (current is null)
+            {
+                ModernDialog.ShowMessage(
+                    form,
+                    "Hãy chọn một tài khoản/profile trước.",
+                    "Bỏ khỏi Chờ dùng lại",
+                    MessageBoxIcon.Information);
+                return;
+            }
+
+            if (TryRemoveReusableProfileManual(
+                    current.AssignedProfile,
+                    out var message))
+            {
+                RefreshGrid();
+
+                ModernDialog.ShowMessage(
+                    form,
+                    message,
+                    "Đã bỏ khỏi Chờ dùng lại",
+                    MessageBoxIcon.Information);
+            }
+            else
+            {
+                ModernDialog.ShowMessage(
+                    form,
+                    message,
+                    "Chờ dùng lại",
+                    MessageBoxIcon.Information);
             }
         };
 
@@ -2103,14 +2325,17 @@ public sealed partial class ManagerForm : Form
         var footer = new FlowLayoutPanel
         {
             Dock = DockStyle.Bottom,
-            Height = 62,
+            Height = 106,
             Padding = new Padding(14, 10, 14, 10),
-            WrapContents = false,
+            WrapContents = true,
             FlowDirection = FlowDirection.LeftToRight,
             BackColor = ModernDialog.Canvas
         };
         footer.Controls.Add(openExcel);
         footer.Controls.Add(reload);
+        footer.Controls.Add(scanReuse);
+        footer.Controls.Add(addReuseManual);
+        footer.Controls.Add(removeReuseManual);
         footer.Controls.Add(add);
         footer.Controls.Add(edit);
         footer.Controls.Add(release);
@@ -2127,19 +2352,32 @@ public sealed partial class ManagerForm : Form
             try { autoRefreshTimer.Stop(); } catch { }
             try { autoRefreshTimer.Dispose(); } catch { }
         };
-        form.Shown += (_, _) =>
+        form.Shown += async (_, _) =>
         {
             ModernDialog.FitToWorkingArea(form);
+
             try
             {
                 var currentPath = _accountPoolService.CurrentSourcePath;
-                if (!string.IsNullOrWhiteSpace(currentPath) && File.Exists(currentPath))
+
+                if (!string.IsNullOrWhiteSpace(currentPath)
+                    && File.Exists(currentPath))
+                {
                     _accountPoolService.ReloadCurrentExcel();
+                }
             }
             catch
             {
-                // Nếu file nguồn tạm thời không đọc được, vẫn giữ cache hiện tại để người dùng có thể đổi file khác.
+                // Nếu file nguồn tạm thời không đọc được, vẫn giữ cache hiện tại.
             }
+
+            try
+            {
+                await RefreshReusableProfileQueueAsync(
+                    "account_pool_open");
+            }
+            catch { }
+
             RefreshGrid();
             autoRefreshTimer.Start();
         };

@@ -59,10 +59,9 @@ public sealed partial class ManagerForm
         var initialAvailable = initialAccounts.Count(x => !x.IsAssigned && !string.IsNullOrWhiteSpace(x.Password));
         var initialResume = initialAccounts.Count(x =>
             x.IsAssigned
-            && initialStates.TryGetValue(x.Id, out var state)
-            && !state.IsEmpty
-            && !state.IsReady
-            && !state.IsPausedOrError);
+            && (!initialStates.TryGetValue(x.Id, out var state)
+                || state.IsEmpty
+                || (!state.IsReady && !state.IsPausedOrError)));
 
         var form = new Form
         {
@@ -396,7 +395,7 @@ public sealed partial class ManagerForm
                         }
                     }
 
-                    status.Text = $"Hoàn tất. READY: {success} | Tạm dừng/lỗi: {pausedOrError}. Chi tiết đã ghi trong +auto/+auto_step/+auto_note.";
+                    status.Text = $"Hoàn tất. DONE: {success} | FAIL: {pausedOrError}. Excel chỉ ghi kết quả cuối DONE/FAIL.";
                 }
                 finally
                 {
@@ -448,9 +447,19 @@ public sealed partial class ManagerForm
         {
             foreach (var account in accounts.Where(x => x.IsAssigned))
             {
-                if (!states.TryGetValue(account.Id, out var state) || state.IsEmpty || state.IsReady) continue;
-                if (state.IsPausedOrError && !retryPaused) continue;
-                queue.Add(new AutoProfileQueueItem(account, account.AssignedProfile.Trim(), ResumeExisting: true));
+                if (states.TryGetValue(account.Id, out var state))
+                {
+                    if (state.IsReady)
+                        continue;
+
+                    if (state.IsPausedOrError && !retryPaused)
+                        continue;
+                }
+
+                queue.Add(new AutoProfileQueueItem(
+                    account,
+                    account.AssignedProfile.Trim(),
+                    ResumeExisting: true));
             }
             queue = queue
                 .OrderBy(x => x.ProfileName, NaturalProfileNameOrder)
@@ -584,6 +593,16 @@ public sealed partial class ManagerForm
         catch (AutoProfilePauseException ex)
         {
             _autoIdentityHandledSession.Add(item.ProfileName);
+
+            if (ex.Step.Equals(
+                    "RENAME",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                await TryMarkIdentityFailAsync(
+                    item.Account.Username,
+                    CancellationToken.None);
+            }
+
             await TryWriteAutoPauseCheckpointAsync(item.Account.Id, ex.Status, ex.Step, ex.Message, ct);
             ui(ex.Step, ex.Status + " — " + ex.Message, Color.DarkOrange);
             _log.Warn($"[AUTO_PROFILE_PAUSED] profile={item.ProfileName} account={item.Account.Username} status={ex.Status} step={ex.Step} message={ex.Message}");
@@ -599,6 +618,16 @@ public sealed partial class ManagerForm
         catch (Exception ex)
         {
             _autoIdentityHandledSession.Add(item.ProfileName);
+
+            if (step.Equals(
+                    "RENAME",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                await TryMarkIdentityFailAsync(
+                    item.Account.Username,
+                    CancellationToken.None);
+            }
+
             var captcha = ctx is not null && await TryIsCaptchaVisibleAsync(ctx);
             var status = captcha
                 ? (step == "RENAME" ? "PAUSED_CAPTCHA_RENAME" : "PAUSED_CAPTCHA")
@@ -834,6 +863,23 @@ public sealed partial class ManagerForm
             return string.Equals(result, "captcha", StringComparison.OrdinalIgnoreCase);
         }
         catch { return false; }
+    }
+
+    async Task TryMarkIdentityFailAsync(
+        string username,
+        CancellationToken ct)
+    {
+        try
+        {
+            await RunAccountPoolIoAsync(
+                () => _accountPoolService.MarkIdentityFail(username),
+                ct);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn(
+                $"[AUTO_PROFILE_IDENTITY_FAIL_WRITE] user={username} error={ex.Message}");
+        }
     }
 
     async Task SetAutoCheckpointWithRetryAsync(string accountId, string status, string step, string note, CancellationToken ct)

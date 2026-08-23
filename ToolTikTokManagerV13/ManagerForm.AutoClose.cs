@@ -494,11 +494,11 @@ public sealed partial class ManagerForm
             var timeThreshold = TimeSpan.FromHours(_autoCloseSettings.RunHours);
             var stuckThreshold = TimeSpan.FromMinutes(AutoCloseNotRunningMinutes);
 
+            // Không phụ thuộc tab Manager. Một profile có thể mất/tab bị detach nhưng
+            // Worker/Chrome vẫn còn chạy và trang TikTok đã OOM. Nếu chỉ lọc theo Tab,
+            // watchdog sẽ bỏ sót profile đó mãi mãi.
             var candidates = _contexts.Values
-                .Where(ctx =>
-                    ctx.Tab is not null
-                    && !ctx.Tab.IsDisposed
-                    && ctx.Tab.Parent == _tabs)
+                .Where(IsAutoCloseRuntimeCandidate)
                 .OrderBy(ctx => ctx.Profile.Name, NaturalProfileNameOrder)
                 .ToList();
 
@@ -571,7 +571,7 @@ public sealed partial class ManagerForm
                 // Khi Manager vừa mở lại giữa lúc profile đang lỗi, dùng runtime lịch sử
                 // hoặc trạng thái supply=used làm tín hiệu đây là profile đã treo thật.
                 if (!_autoCloseExpectedRunningProfiles.Contains(profileName)
-                    && !IsAutoCloseProfileExpectedToRun(ctx))
+                    && !IsAutoCloseProfileExpectedToRun(ctx, state))
                 {
                     _autoCloseNotRunningSinceUtc.Remove(profileName);
                     continue;
@@ -648,35 +648,133 @@ public sealed partial class ManagerForm
         return true;
     }
 
-    bool IsAutoCloseProfileExpectedToRun(ProfileContext ctx)
+    bool IsAutoCloseRuntimeCandidate(ProfileContext ctx)
     {
-        var persisted = GetProfileSupplyState(ctx.Profile.Name);
+        if (ctx is null)
+            return false;
 
-        // NEW/TEST là kho dự phòng: không tự kết luận lỗi chỉ vì đang mở mà chưa treo.
-        if (persisted is not null
-            && (persisted.State.Equals("new", StringComparison.OrdinalIgnoreCase)
-                || persisted.State.Equals("test", StringComparison.OrdinalIgnoreCase)))
+        var profileName = ctx.Profile.Name;
+
+        if (_autoCloseInProgressProfiles.Contains(profileName))
+            return false;
+
+        if (_autoCloseExpectedRunningProfiles.Contains(profileName)
+            || _autoCloseNotRunningSinceUtc.ContainsKey(profileName))
+        {
+            return true;
+        }
+
+        if (ctx.Opening)
+            return true;
+
+        var tabOpen =
+            ctx.Tab is not null
+            && !ctx.Tab.IsDisposed
+            && ctx.Tab.Parent == _tabs;
+
+        if (tabOpen)
+            return true;
+
+        try
+        {
+            if (ctx.Worker is not null
+                && !ctx.Worker.HasExited)
+            {
+                return true;
+            }
+        }
+        catch
+        {
+            // Worker object tồn tại nhưng trạng thái process không đọc được:
+            // vẫn cho watchdog kiểm tra thay vì bỏ qua.
+            if (ctx.Worker is not null)
+                return true;
+        }
+
+        var state = GetEffectiveRuntimeState(ctx);
+        if (state is RuntimeStateRunning or RuntimeStateRecovering)
+            return true;
+
+        // Sau crash cứng Worker có thể biến mất trước khi Manager kịp lưu expected-set.
+        // runtime_stats.json còn isRunning=true là dấu hiệu phiên trước chết khi đang RUNNING.
+        return RuntimeStatsFileSaysRunning(ctx);
+    }
+
+    bool IsAutoCloseProfileExpectedToRun(ProfileContext ctx, string state)
+    {
+        var profileName = ctx.Profile.Name;
+
+        // Tín hiệu thực tế luôn mạnh hơn supply-state NEW/TEST.
+        // Đây là phần quan trọng cho profile vừa được Auto Profile tạo nhưng đã Start thật.
+        if (state is RuntimeStateRunning or RuntimeStateRecovering)
+        {
+            _autoCloseExpectedRunningProfiles.Add(profileName);
+            return true;
+        }
+
+        // PAUSE/STOP được Worker xác nhận rõ ràng thì không suy ngược từ tổng runtime
+        // hoặc supply=used để biến thao tác thủ công thành lỗi watchdog.
+        if (state == RuntimeStatePaused)
+            return false;
+
+        if (state == RuntimeStateStopped
+            && !ctx.RuntimeRecoveryInProgress
+            && !SnapshotIndicatesRecovery(ctx.LastSnapshot)
+            && !RuntimeStatsFileSaysRunning(ctx))
         {
             return false;
         }
 
+        // Nếu Worker/crash chết đột ngột, file checkpoint có thể còn isRunning=true.
+        // Manual STOP/Pause sẽ checkpoint false nên không đi vào nhánh này.
+        if (RuntimeStatsFileSaysRunning(ctx))
+        {
+            _autoCloseExpectedRunningProfiles.Add(profileName);
+            return true;
+        }
+
+        var persisted = GetProfileSupplyState(profileName);
+
         if (persisted is not null
             && persisted.State.Equals("used", StringComparison.OrdinalIgnoreCase))
         {
-            _autoCloseExpectedRunningProfiles.Add(ctx.Profile.Name);
+            _autoCloseExpectedRunningProfiles.Add(profileName);
             return true;
         }
 
         var runtime = ReadStatisticsRuntime(ctx);
 
-        // Profile đã chạy đủ chuẩn ĐÃ TREO trước đây thì coi là profile chạy chính.
+        // NEW/TEST không còn return false ở đầu hàm. Nếu profile thực tế đã treo đủ
+        // ngưỡng lịch sử thì vẫn phải được watchdog bảo vệ.
         if (runtime.Total >= TimeSpan.FromMinutes(AutoReplacementTreoThresholdMinutes))
         {
-            _autoCloseExpectedRunningProfiles.Add(ctx.Profile.Name);
+            _autoCloseExpectedRunningProfiles.Add(profileName);
             return true;
         }
 
         return false;
+    }
+
+    bool RuntimeStatsFileSaysRunning(ProfileContext ctx)
+    {
+        try
+        {
+            var dataRoot = _profileService.ResolveDataRoot(ctx.Profile);
+            var path = Path.Combine(dataRoot, "runtime_stats.json");
+
+            if (!File.Exists(path))
+                return false;
+
+            using var document = JsonDocument.Parse(File.ReadAllText(path));
+            var root = document.RootElement;
+
+            return root.TryGetProperty("isRunning", out var running)
+                && running.ValueKind == JsonValueKind.True;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     string DescribeAutoCloseRuntimeFault(ProfileContext ctx, string state, DateTime nowUtc)

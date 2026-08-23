@@ -87,16 +87,21 @@ public sealed class TikTokAccountPoolService
     public string CurrentSourcePath
         => LoadStoredCatalog().SourceFilePath ?? "";
 
-    public HashSet<string> GetIdentityDoneUsernames()
+    public Dictionary<string, string> GetIdentityResults()
     {
-        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result =
+            new Dictionary<string, string>(
+                StringComparer.OrdinalIgnoreCase);
+
         var path = CurrentSourcePath;
 
         if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
             return result;
 
         var rows = ReadSourceRows(path);
-        var columns = ResolveSourceColumns(rows, allocateManagedColumns: false);
+        var columns = ResolveSourceColumns(
+            rows,
+            allocateManagedColumns: false);
 
         if (columns.HeaderRow < 0 || columns.IdentityDone < 0)
             return result;
@@ -105,34 +110,70 @@ public sealed class TikTokAccountPoolService
         {
             var row = rows[i];
             var user = GetCell(row, columns.User).Trim();
-            var done = GetCell(row, columns.IdentityDone).Trim();
 
-            if (user.Length == 0) continue;
-            if (IsDoneValue(done)) result.Add(user);
+            if (user.Length == 0)
+                continue;
+
+            var value =
+                NormalizeDoneFailValue(
+                    GetCell(row, columns.IdentityDone));
+
+            if (value.Length > 0)
+                result[user] = value;
         }
 
         return result;
     }
 
+    public HashSet<string> GetIdentityDoneUsernames()
+        => GetIdentityResults()
+            .Where(x =>
+                x.Value.Equals(
+                    "DONE",
+                    StringComparison.OrdinalIgnoreCase))
+            .Select(x => x.Key)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
     public bool IsIdentityDone(string username)
-        => GetIdentityDoneUsernames().Contains((username ?? "").Trim());
+        => GetIdentityResults().TryGetValue(
+               (username ?? "").Trim(),
+               out var value)
+           && value.Equals(
+               "DONE",
+               StringComparison.OrdinalIgnoreCase);
 
     public void MarkIdentityDone(string username)
+        => MarkIdentityResult(username, "DONE");
+
+    public void MarkIdentityFail(string username)
+        => MarkIdentityResult(username, "FAIL");
+
+    public void MarkIdentityResult(
+        string username,
+        string result)
     {
         username = (username ?? "").Trim();
 
         if (username.Length == 0)
             throw new InvalidOperationException(
-                "Username trống; không thể ghi DONE.");
+                "Username trống; không thể ghi trạng thái Tên/ảnh.");
+
+        result = NormalizeDoneFailValue(result);
+
+        if (result.Length == 0)
+            throw new InvalidOperationException(
+                "Tên/ảnh chỉ cho phép DONE hoặc FAIL.");
 
         var path = CurrentSourcePath;
 
         if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
             throw new InvalidOperationException(
-                "Kho tài khoản chưa có file Excel nguồn; không thể ghi DONE bền vững.");
+                "Kho tài khoản chưa có file Excel nguồn; không thể ghi trạng thái Tên/ảnh.");
 
         var rows = ReadSourceRows(path);
-        var columns = ResolveSourceColumns(rows, allocateManagedColumns: false);
+        var columns = ResolveSourceColumns(
+            rows,
+            allocateManagedColumns: false);
 
         if (columns.HeaderRow < 0)
             throw new InvalidOperationException(
@@ -142,15 +183,23 @@ public sealed class TikTokAccountPoolService
         {
             var user = GetCell(rows[i], columns.User).Trim();
 
-            if (!user.Equals(username, StringComparison.OrdinalIgnoreCase))
+            if (!user.Equals(
+                    username,
+                    StringComparison.OrdinalIgnoreCase))
+            {
                 continue;
+            }
 
-            SetIdentityDoneCell(path, i + 1, "DONE");
+            SetIdentityDoneCell(
+                path,
+                i + 1,
+                result);
+
             return;
         }
 
         throw new InvalidOperationException(
-            $"Không tìm thấy tài khoản {username} trong file Excel đang dùng để ghi DONE.");
+            $"Không tìm thấy tài khoản {username} trong file Excel để ghi Tên/ảnh={result}.");
     }
 
     public List<TikTokAccountPoolItem> Load()
@@ -177,7 +226,7 @@ public sealed class TikTokAccountPoolService
     // - Tự tìm Tài khoản / Mật khẩu / 2FA theo tiêu đề, fallback A/B/C.
     // - Không mặc định D/E/F là cột của Tool.
     // - Email, Ngày tạo và các cột riêng được giữ nguyên.
-    // - Ghi chú, Profile đã gán, Tên/ảnh DONE được thêm ở bên phải nếu chưa có.
+    // - Ghi chú, Profile đã gán, Tên/ảnh được thêm ở bên phải nếu chưa có.
     public TikTokAccountImportResult ImportExcel(string path)
     {
         if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
@@ -1051,6 +1100,7 @@ public sealed class TikTokAccountPoolService
             headers,
             "tên ảnh done",
             "ten anh done",
+            "tên/ảnh",
             "tên/ảnh done",
             "ten/anh done",
             "identity done",
@@ -1286,7 +1336,8 @@ public sealed class TikTokAccountPoolService
         if (values.Count == 0)
             return true;
 
-        return values.All(IsDoneValue);
+        return values.All(v =>
+            NormalizeDoneFailValue(v).Length > 0);
     }
 
     static List<string> DataValues(
@@ -1301,6 +1352,29 @@ public sealed class TikTokAccountPoolService
             .Where(v => v.Length > 0)
             .Take(50)
             .ToList();
+    }
+
+    static string NormalizeDoneFailValue(string? value)
+    {
+        value = (value ?? "").Trim();
+
+        if (IsDoneValue(value))
+            return "DONE";
+
+        if (value.Equals(
+                "FAIL",
+                StringComparison.OrdinalIgnoreCase)
+            || value.Equals(
+                "FAILED",
+                StringComparison.OrdinalIgnoreCase)
+            || value.Equals(
+                "ERROR",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return "FAIL";
+        }
+
+        return "";
     }
 
     static bool IsDoneValue(string? value)
@@ -1973,7 +2047,7 @@ public sealed class TikTokAccountPoolService
             "Profile đã gán";
 
         header[columns.IdentityDone] =
-            "Tên/ảnh DONE";
+            "Tên/ảnh";
 
         lines[columns.HeaderRow] =
             string.Join(
@@ -2027,7 +2101,7 @@ public sealed class TikTokAccountPoolService
             ns,
             ColumnName(columns.IdentityDone)
             + headerNumber,
-            "Tên/ảnh DONE");
+            "Tên/ảnh");
 
         ReorderCells(
             headerRow,
@@ -2585,11 +2659,20 @@ public sealed class TikTokAccountPoolService
             && string.IsNullOrWhiteSpace(Step)
             && string.IsNullOrWhiteSpace(Note);
 
-        public bool IsReady =>
-            string.Equals(
-                (Status ?? "").Trim(),
-                "READY",
-                StringComparison.OrdinalIgnoreCase);
+        public bool IsReady
+        {
+            get
+            {
+                var s = (Status ?? "").Trim();
+
+                return s.Equals(
+                           "DONE",
+                           StringComparison.OrdinalIgnoreCase)
+                    || s.Equals(
+                        "READY",
+                        StringComparison.OrdinalIgnoreCase);
+            }
+        }
 
         public bool IsPausedOrError
         {
@@ -2599,6 +2682,13 @@ public sealed class TikTokAccountPoolService
 
                 if (s.Length == 0)
                     return false;
+
+                if (s.Equals(
+                        "FAIL",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
 
                 return s.StartsWith(
                            "PAUSED",
@@ -2621,9 +2711,9 @@ public sealed class TikTokAccountPoolService
 
     sealed record AutoColumnLayout(
         int HeaderRow,
-        int Status,
-        int Step,
-        int Note);
+        int Result,
+        int LegacyStep,
+        int LegacyNote);
 
     public void EnsureAutoColumns()
     {
@@ -2638,18 +2728,31 @@ public sealed class TikTokAccountPoolService
                 "File Excel đang dùng không còn tồn tại.",
                 path);
 
-        var existingRows = ReadSourceRows(path);
-        var existingColumns = ResolveAutoColumns(
-            existingRows,
+        var rows = ReadSourceRows(path);
+        var columns = ResolveAutoColumns(
+            rows,
             allocateManagedColumns: false);
 
-        if (existingColumns.HeaderRow >= 0
-            && existingColumns.Status >= 0
-            && existingColumns.Step >= 0
-            && existingColumns.Note >= 0)
-        {
+        var currentHeader =
+            columns.HeaderRow >= 0
+            && columns.Result >= 0
+            && columns.HeaderRow < rows.Count
+                ? GetCell(
+                    rows[columns.HeaderRow],
+                    columns.Result).Trim()
+                : "";
+
+        var needsNormalize =
+            columns.HeaderRow < 0
+            || columns.Result < 0
+            || !currentHeader.Equals(
+                "Auto Profile",
+                StringComparison.OrdinalIgnoreCase)
+            || columns.LegacyStep >= 0
+            || columns.LegacyNote >= 0;
+
+        if (!needsNormalize)
             return;
-        }
 
         var ext = Path
             .GetExtension(path)
@@ -2657,13 +2760,13 @@ public sealed class TikTokAccountPoolService
 
         if (ext == ".xlsx")
         {
-            EnsureXlsxAutoColumns(path);
+            NormalizeXlsxAutoProfileColumn(path);
             return;
         }
 
         if (ext is ".csv" or ".txt")
         {
-            EnsureDelimitedAutoColumns(path);
+            NormalizeDelimitedAutoProfileColumn(path);
             return;
         }
 
@@ -2691,9 +2794,7 @@ public sealed class TikTokAccountPoolService
             allocateManagedColumns: false);
 
         if (columns.HeaderRow < 0
-            || columns.Status < 0
-            || columns.Step < 0
-            || columns.Note < 0)
+            || columns.Result < 0)
         {
             return result;
         }
@@ -2706,32 +2807,36 @@ public sealed class TikTokAccountPoolService
                 continue;
             }
 
-            var rowIndex =
-                account.SourceRow - 1;
+            var rowIndex = account.SourceRow - 1;
 
-            if (rowIndex < 0
-                || rowIndex >= rows.Count)
-            {
+            if (rowIndex < 0 || rowIndex >= rows.Count)
                 continue;
-            }
 
-            var row = rows[rowIndex];
+            var finalResult =
+                NormalizeAutoProfileResult(
+                    GetCell(
+                        rows[rowIndex],
+                        columns.Result));
+
+            if (finalResult.Length == 0)
+                continue;
 
             result[account.Id] =
                 new TikTokAccountAutoState(
-                    GetCell(
-                        row,
-                        columns.Status).Trim(),
-                    GetCell(
-                        row,
-                        columns.Step).Trim(),
-                    GetCell(
-                        row,
-                        columns.Note).Trim());
+                    finalResult,
+                    "",
+                    "");
         }
 
         return result;
     }
+
+    public Dictionary<string, string> LoadAutoProfileResults()
+        => LoadAutoStates()
+            .ToDictionary(
+                x => x.Key,
+                x => x.Value.Status,
+                StringComparer.OrdinalIgnoreCase);
 
     public void SetAutoState(
         string accountId,
@@ -2739,12 +2844,39 @@ public sealed class TikTokAccountPoolService
         string step,
         string note)
     {
-        accountId =
-            (accountId ?? "").Trim();
+        // Excel chỉ giữ kết quả cuối DONE / FAIL.
+        // Checkpoint kỹ thuật không còn ghi ra Excel.
+        var finalResult =
+            MapAutoProfileCheckpointToResult(status);
+
+        if (finalResult is null)
+            return;
+
+        SetAutoProfileResult(
+            accountId,
+            finalResult);
+    }
+
+    public void SetAutoProfileResult(
+        string accountId,
+        string result)
+    {
+        accountId = (accountId ?? "").Trim();
 
         if (accountId.Length == 0)
             throw new InvalidOperationException(
-                "AccountId trống; không thể ghi trạng thái +auto.");
+                "AccountId trống; không thể ghi Auto Profile.");
+
+        result = (result ?? "").Trim();
+
+        if (result.Length > 0)
+        {
+            result = NormalizeAutoProfileResult(result);
+
+            if (result.Length == 0)
+                throw new InvalidOperationException(
+                    "Auto Profile chỉ cho phép DONE hoặc FAIL.");
+        }
 
         var account =
             Load().FirstOrDefault(x =>
@@ -2754,51 +2886,129 @@ public sealed class TikTokAccountPoolService
 
         if (account is null)
             throw new InvalidOperationException(
-                "Không tìm thấy tài khoản trong Kho để ghi trạng thái +auto.");
+                "Không tìm thấy tài khoản trong Kho để ghi Auto Profile.");
 
         if (account.SourceRow <= 0)
             throw new InvalidOperationException(
-                "Tài khoản không có dòng Excel hợp lệ để ghi trạng thái +auto.");
+                "Tài khoản không có dòng Excel hợp lệ để ghi Auto Profile.");
+
+        EnsureAutoColumns();
 
         var path = CurrentSourcePath;
-
-        if (string.IsNullOrWhiteSpace(path)
-            || !File.Exists(path))
-        {
-            throw new InvalidOperationException(
-                "Kho tài khoản chưa có file Excel nguồn để ghi trạng thái +auto.");
-        }
-
         var ext = Path
             .GetExtension(path)
             .ToLowerInvariant();
 
         if (ext == ".xlsx")
         {
-            SetXlsxAutoState(
+            SetXlsxAutoProfileResult(
                 path,
                 account.SourceRow,
-                status ?? "",
-                step ?? "",
-                note ?? "");
-
+                result);
             return;
         }
 
         if (ext is ".csv" or ".txt")
         {
-            SetDelimitedAutoState(
+            SetDelimitedAutoProfileResult(
                 path,
                 account.SourceRow,
-                status ?? "",
-                step ?? "",
-                note ?? "");
-
+                result);
             return;
         }
 
         throw new InvalidOperationException(
             "Chỉ hỗ trợ file .xlsx, .csv hoặc .txt.");
+    }
+
+    static string? MapAutoProfileCheckpointToResult(
+        string? status)
+    {
+        var value = (status ?? "").Trim();
+
+        if (value.Equals(
+                "READY",
+                StringComparison.OrdinalIgnoreCase)
+            || value.Equals(
+                "DONE",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return "DONE";
+        }
+
+        if (value.Equals(
+                "RESERVED",
+                StringComparison.OrdinalIgnoreCase)
+            || value.Equals(
+                "RESUMING",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return "";
+        }
+
+        if (value.Equals(
+                "FAIL",
+                StringComparison.OrdinalIgnoreCase)
+            || value.StartsWith(
+                "PAUSED",
+                StringComparison.OrdinalIgnoreCase)
+            || value.StartsWith(
+                "ERROR",
+                StringComparison.OrdinalIgnoreCase)
+            || value.StartsWith(
+                "FAILED",
+                StringComparison.OrdinalIgnoreCase)
+            || value.StartsWith(
+                "STOPPED",
+                StringComparison.OrdinalIgnoreCase)
+            || value.Contains(
+                "CAPTCHA",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return "FAIL";
+        }
+
+        return null;
+    }
+
+    static string NormalizeAutoProfileResult(
+        string? value)
+    {
+        value = (value ?? "").Trim();
+
+        if (value.Equals(
+                "DONE",
+                StringComparison.OrdinalIgnoreCase)
+            || value.Equals(
+                "READY",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return "DONE";
+        }
+
+        if (value.Equals(
+                "FAIL",
+                StringComparison.OrdinalIgnoreCase)
+            || value.StartsWith(
+                "PAUSED",
+                StringComparison.OrdinalIgnoreCase)
+            || value.StartsWith(
+                "ERROR",
+                StringComparison.OrdinalIgnoreCase)
+            || value.StartsWith(
+                "FAILED",
+                StringComparison.OrdinalIgnoreCase)
+            || value.StartsWith(
+                "STOPPED",
+                StringComparison.OrdinalIgnoreCase)
+            || value.Contains(
+                "CAPTCHA",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return "FAIL";
+        }
+
+        return "";
     }
 
     static AutoColumnLayout ResolveAutoColumns(
@@ -2813,11 +3023,13 @@ public sealed class TikTokAccountPoolService
         if (headerRow < 0)
         {
             if (!allocateManagedColumns)
+            {
                 return new AutoColumnLayout(
                     -1,
                     -1,
                     -1,
                     -1);
+            }
 
             headerRow = 0;
         }
@@ -2827,68 +3039,45 @@ public sealed class TikTokAccountPoolService
                 ? rows[headerRow]
                 : new List<string>();
 
-        var status = FindHeader(
+        var result = FindHeader(
             headers,
+            "Auto Profile",
+            "auto profile",
             "+auto trạng thái",
             "auto trạng thái",
             "auto status",
             "+auto",
             "auto");
 
-        var step = FindHeader(
+        var legacyStep = FindHeader(
             headers,
             "+auto bước",
             "auto bước",
             "auto step");
 
-        var note = FindHeader(
+        var legacyNote = FindHeader(
             headers,
             "+auto ghi chú",
             "auto ghi chú",
             "auto note");
 
-        if (allocateManagedColumns)
+        if (allocateManagedColumns && result < 0)
         {
-            var lastUsed =
+            result =
                 Math.Max(
                     -1,
-                    LastUsedColumn(rows));
-
-            if (status < 0)
-                status = ++lastUsed;
-            else
-                lastUsed = Math.Max(
-                    lastUsed,
-                    status);
-
-            if (step < 0
-                || step == status)
-            {
-                step = ++lastUsed;
-            }
-            else
-            {
-                lastUsed = Math.Max(
-                    lastUsed,
-                    step);
-            }
-
-            if (note < 0
-                || note == status
-                || note == step)
-            {
-                note = ++lastUsed;
-            }
+                    LastUsedColumn(rows))
+                + 1;
         }
 
         return new AutoColumnLayout(
             headerRow,
-            status,
-            step,
-            note);
+            result,
+            legacyStep,
+            legacyNote);
     }
 
-    static void EnsureDelimitedAutoColumns(
+    static void NormalizeDelimitedAutoProfileColumn(
         string path)
     {
         var lines =
@@ -2897,8 +3086,7 @@ public sealed class TikTokAccountPoolService
                     Encoding.UTF8)
                 .ToList();
 
-        var separator =
-            DetectSeparator(lines);
+        var separator = DetectSeparator(lines);
 
         if (lines.Count == 0)
             lines.Add("");
@@ -2911,10 +3099,9 @@ public sealed class TikTokAccountPoolService
                         separator))
                 .ToList();
 
-        var columns =
-            ResolveAutoColumns(
-                rows,
-                allocateManagedColumns: true);
+        var columns = ResolveAutoColumns(
+            rows,
+            allocateManagedColumns: true);
 
         while (lines.Count <= columns.HeaderRow)
             lines.Add("");
@@ -2924,22 +3111,25 @@ public sealed class TikTokAccountPoolService
                 lines[columns.HeaderRow],
                 separator);
 
+        var maxColumn =
+            new[]
+            {
+                columns.Result,
+                columns.LegacyStep,
+                columns.LegacyNote
+            }.Max();
+
         EnsureCellCount(
             header,
-            Math.Max(
-                columns.Status,
-                Math.Max(
-                    columns.Step,
-                    columns.Note)) + 1);
+            Math.Max(0, maxColumn) + 1);
 
-        header[columns.Status] =
-            "+auto trạng thái";
+        header[columns.Result] = "Auto Profile";
 
-        header[columns.Step] =
-            "+auto bước";
+        if (columns.LegacyStep >= 0)
+            header[columns.LegacyStep] = "";
 
-        header[columns.Note] =
-            "+auto ghi chú";
+        if (columns.LegacyNote >= 0)
+            header[columns.LegacyNote] = "";
 
         lines[columns.HeaderRow] =
             string.Join(
@@ -2949,6 +3139,36 @@ public sealed class TikTokAccountPoolService
                         x,
                         separator)));
 
+        for (var i = columns.HeaderRow + 1; i < lines.Count; i++)
+        {
+            var cells =
+                SplitDelimited(
+                    lines[i],
+                    separator);
+
+            EnsureCellCount(
+                cells,
+                Math.Max(0, maxColumn) + 1);
+
+            cells[columns.Result] =
+                NormalizeAutoProfileResult(
+                    cells[columns.Result]);
+
+            if (columns.LegacyStep >= 0)
+                cells[columns.LegacyStep] = "";
+
+            if (columns.LegacyNote >= 0)
+                cells[columns.LegacyNote] = "";
+
+            lines[i] =
+                string.Join(
+                    separator,
+                    cells.Select(x =>
+                        EscapeDelimited(
+                            x,
+                            separator)));
+        }
+
         AtomicWrite(
             path,
             string.Join(
@@ -2956,28 +3176,22 @@ public sealed class TikTokAccountPoolService
                 lines));
     }
 
-    static void EnsureXlsxAutoColumns(
+    static void NormalizeXlsxAutoProfileColumn(
         string path)
     {
-        var rowsBeforeWrite =
-            ReadXlsx(path);
-
-        var columns =
-            ResolveAutoColumns(
-                rowsBeforeWrite,
-                allocateManagedColumns: true);
+        var rowsBeforeWrite = ReadXlsx(path);
+        var columns = ResolveAutoColumns(
+            rowsBeforeWrite,
+            allocateManagedColumns: true);
 
         using var source =
             new FileStream(
                 path,
                 FileMode.Open,
                 FileAccess.Read,
-                FileShare.ReadWrite
-                | FileShare.Delete);
+                FileShare.ReadWrite | FileShare.Delete);
 
-        using var memory =
-            new MemoryStream();
-
+        using var memory = new MemoryStream();
         source.CopyTo(memory);
         memory.Position = 0;
 
@@ -2995,14 +3209,11 @@ public sealed class TikTokAccountPoolService
                 ?? throw new InvalidOperationException(
                     "File Excel không có worksheet.");
 
-            sheetName =
-                sheetEntry.FullName;
+            sheetName = sheetEntry.FullName;
 
-            using (var stream =
-                   sheetEntry.Open())
+            using (var stream = sheetEntry.Open())
             {
-                sheetDoc =
-                    XDocument.Load(stream);
+                sheetDoc = XDocument.Load(stream);
             }
 
             sheetEntry.Delete();
@@ -3013,8 +3224,7 @@ public sealed class TikTokAccountPoolService
 
             var sheetData =
                 sheetDoc
-                    .Descendants(
-                        ns + "sheetData")
+                    .Descendants(ns + "sheetData")
                     .FirstOrDefault()
                 ?? throw new InvalidOperationException(
                     "Worksheet không có sheetData.");
@@ -3033,50 +3243,82 @@ public sealed class TikTokAccountPoolService
             SetInlineCell(
                 headerRow,
                 ns,
-                ColumnName(
-                    columns.Status)
-                + headerNumber,
-                "+auto trạng thái");
+                ColumnName(columns.Result) + headerNumber,
+                "Auto Profile");
 
-            SetInlineCell(
-                headerRow,
-                ns,
-                ColumnName(
-                    columns.Step)
-                + headerNumber,
-                "+auto bước");
+            if (columns.LegacyStep >= 0)
+            {
+                SetInlineCell(
+                    headerRow,
+                    ns,
+                    ColumnName(columns.LegacyStep) + headerNumber,
+                    "");
+            }
 
-            SetInlineCell(
-                headerRow,
-                ns,
-                ColumnName(
-                    columns.Note)
-                + headerNumber,
-                "+auto ghi chú");
+            if (columns.LegacyNote >= 0)
+            {
+                SetInlineCell(
+                    headerRow,
+                    ns,
+                    ColumnName(columns.LegacyNote) + headerNumber,
+                    "");
+            }
 
-            ReorderCells(
-                headerRow,
-                ns);
+            for (var rowIndex = columns.HeaderRow + 1;
+                 rowIndex < rowsBeforeWrite.Count;
+                 rowIndex++)
+            {
+                var excelRow = rowIndex + 1;
+                var row =
+                    GetOrCreateRow(
+                        sheetData,
+                        ns,
+                        excelRow);
 
-            ReorderRows(
-                sheetData,
-                ns);
+                SetInlineCell(
+                    row,
+                    ns,
+                    ColumnName(columns.Result) + excelRow,
+                    NormalizeAutoProfileResult(
+                        GetCell(
+                            rowsBeforeWrite[rowIndex],
+                            columns.Result)));
+
+                if (columns.LegacyStep >= 0)
+                {
+                    SetInlineCell(
+                        row,
+                        ns,
+                        ColumnName(columns.LegacyStep) + excelRow,
+                        "");
+                }
+
+                if (columns.LegacyNote >= 0)
+                {
+                    SetInlineCell(
+                        row,
+                        ns,
+                        ColumnName(columns.LegacyNote) + excelRow,
+                        "");
+                }
+
+                ReorderCells(row, ns);
+            }
+
+            ReorderCells(headerRow, ns);
+            ReorderRows(sheetData, ns);
 
             var newEntry =
                 zip.CreateEntry(
                     sheetName,
                     CompressionLevel.Optimal);
 
-            using var outStream =
-                newEntry.Open();
-
+            using var outStream = newEntry.Open();
             sheetDoc.Save(outStream);
         }
 
         memory.Position = 0;
-
-        var temp =
-            path + ".tooltmp";
+        var temp = path + ".tooltmp";
 
         using (var output =
                new FileStream(
@@ -3088,17 +3330,13 @@ public sealed class TikTokAccountPoolService
             memory.CopyTo(output);
         }
 
-        ReplaceFileFromTemp(
-            temp,
-            path);
+        ReplaceFileFromTemp(temp, path);
     }
 
-    static void SetDelimitedAutoState(
+    static void SetDelimitedAutoProfileResult(
         string path,
         int sourceRow,
-        string status,
-        string step,
-        string note)
+        string result)
     {
         var lines =
             File.ReadAllLines(
@@ -3106,8 +3344,7 @@ public sealed class TikTokAccountPoolService
                     Encoding.UTF8)
                 .ToList();
 
-        var separator =
-            DetectSeparator(lines);
+        var separator = DetectSeparator(lines);
 
         if (lines.Count == 0)
             lines.Add("");
@@ -3120,10 +3357,9 @@ public sealed class TikTokAccountPoolService
                         separator))
                 .ToList();
 
-        var columns =
-            ResolveAutoColumns(
-                rows,
-                allocateManagedColumns: true);
+        var columns = ResolveAutoColumns(
+            rows,
+            allocateManagedColumns: true);
 
         while (lines.Count <= columns.HeaderRow)
             lines.Add("");
@@ -3135,20 +3371,9 @@ public sealed class TikTokAccountPoolService
 
         EnsureCellCount(
             header,
-            Math.Max(
-                columns.Status,
-                Math.Max(
-                    columns.Step,
-                    columns.Note)) + 1);
+            columns.Result + 1);
 
-        header[columns.Status] =
-            "+auto trạng thái";
-
-        header[columns.Step] =
-            "+auto bước";
-
-        header[columns.Note] =
-            "+auto ghi chú";
+        header[columns.Result] = "Auto Profile";
 
         lines[columns.HeaderRow] =
             string.Join(
@@ -3168,20 +3393,9 @@ public sealed class TikTokAccountPoolService
 
         EnsureCellCount(
             cells,
-            Math.Max(
-                columns.Status,
-                Math.Max(
-                    columns.Step,
-                    columns.Note)) + 1);
+            columns.Result + 1);
 
-        cells[columns.Status] =
-            status;
-
-        cells[columns.Step] =
-            step;
-
-        cells[columns.Note] =
-            note;
+        cells[columns.Result] = result;
 
         lines[sourceRow - 1] =
             string.Join(
@@ -3198,32 +3412,24 @@ public sealed class TikTokAccountPoolService
                 lines));
     }
 
-    static void SetXlsxAutoState(
+    static void SetXlsxAutoProfileResult(
         string path,
         int sourceRow,
-        string status,
-        string step,
-        string note)
+        string result)
     {
-        var rowsBeforeWrite =
-            ReadXlsx(path);
-
-        var columns =
-            ResolveAutoColumns(
-                rowsBeforeWrite,
-                allocateManagedColumns: true);
+        var rowsBeforeWrite = ReadXlsx(path);
+        var columns = ResolveAutoColumns(
+            rowsBeforeWrite,
+            allocateManagedColumns: true);
 
         using var source =
             new FileStream(
                 path,
                 FileMode.Open,
                 FileAccess.Read,
-                FileShare.ReadWrite
-                | FileShare.Delete);
+                FileShare.ReadWrite | FileShare.Delete);
 
-        using var memory =
-            new MemoryStream();
-
+        using var memory = new MemoryStream();
         source.CopyTo(memory);
         memory.Position = 0;
 
@@ -3241,14 +3447,11 @@ public sealed class TikTokAccountPoolService
                 ?? throw new InvalidOperationException(
                     "File Excel không có worksheet.");
 
-            sheetName =
-                sheetEntry.FullName;
+            sheetName = sheetEntry.FullName;
 
-            using (var stream =
-                   sheetEntry.Open())
+            using (var stream = sheetEntry.Open())
             {
-                sheetDoc =
-                    XDocument.Load(stream);
+                sheetDoc = XDocument.Load(stream);
             }
 
             sheetEntry.Delete();
@@ -3259,8 +3462,7 @@ public sealed class TikTokAccountPoolService
 
             var sheetData =
                 sheetDoc
-                    .Descendants(
-                        ns + "sheetData")
+                    .Descendants(ns + "sheetData")
                     .FirstOrDefault()
                 ?? throw new InvalidOperationException(
                     "Worksheet không có sheetData.");
@@ -3279,30 +3481,8 @@ public sealed class TikTokAccountPoolService
             SetInlineCell(
                 headerRow,
                 ns,
-                ColumnName(
-                    columns.Status)
-                + headerNumber,
-                "+auto trạng thái");
-
-            SetInlineCell(
-                headerRow,
-                ns,
-                ColumnName(
-                    columns.Step)
-                + headerNumber,
-                "+auto bước");
-
-            SetInlineCell(
-                headerRow,
-                ns,
-                ColumnName(
-                    columns.Note)
-                + headerNumber,
-                "+auto ghi chú");
-
-            ReorderCells(
-                headerRow,
-                ns);
+                ColumnName(columns.Result) + headerNumber,
+                "Auto Profile");
 
             var row =
                 GetOrCreateRow(
@@ -3313,50 +3493,24 @@ public sealed class TikTokAccountPoolService
             SetInlineCell(
                 row,
                 ns,
-                ColumnName(
-                    columns.Status)
-                + sourceRow,
-                status);
+                ColumnName(columns.Result) + sourceRow,
+                result);
 
-            SetInlineCell(
-                row,
-                ns,
-                ColumnName(
-                    columns.Step)
-                + sourceRow,
-                step);
-
-            SetInlineCell(
-                row,
-                ns,
-                ColumnName(
-                    columns.Note)
-                + sourceRow,
-                note);
-
-            ReorderCells(
-                row,
-                ns);
-
-            ReorderRows(
-                sheetData,
-                ns);
+            ReorderCells(headerRow, ns);
+            ReorderCells(row, ns);
+            ReorderRows(sheetData, ns);
 
             var newEntry =
                 zip.CreateEntry(
                     sheetName,
                     CompressionLevel.Optimal);
 
-            using var outStream =
-                newEntry.Open();
-
+            using var outStream = newEntry.Open();
             sheetDoc.Save(outStream);
         }
 
         memory.Position = 0;
-
-        var temp =
-            path + ".tooltmp";
+        var temp = path + ".tooltmp";
 
         using (var output =
                new FileStream(
@@ -3368,9 +3522,7 @@ public sealed class TikTokAccountPoolService
             memory.CopyTo(output);
         }
 
-        ReplaceFileFromTemp(
-            temp,
-            path);
+        ReplaceFileFromTemp(temp, path);
     }
 
     static string Protect(string value)
