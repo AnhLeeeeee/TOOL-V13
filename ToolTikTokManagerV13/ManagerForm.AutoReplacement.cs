@@ -495,7 +495,9 @@ public sealed partial class ManagerForm
             {
                 try
                 {
-                    ChromeProfileNameSyncService.StopChromeUsingProfile(ctx.Profile.ProfilePath);
+                    await Task.Run(
+                        () => ChromeProfileNameSyncService.StopChromeUsingProfile(
+                            ctx.Profile.ProfilePath));
                 }
                 catch { }
             }
@@ -544,11 +546,13 @@ public sealed partial class ManagerForm
 
                 var startName = DetectNextAutoProfileName();
 
-                var queue = BuildAutoProfileQueue(
-                    requestedNew: 1,
-                    requestedStartName: startName,
-                    resumeIncomplete: false,
-                    retryPaused: false);
+                var queue = await RunAccountPoolIoAsync(
+                    () => BuildAutoProfileQueue(
+                        requestedNew: 1,
+                        requestedStartName: startName,
+                        resumeIncomplete: false,
+                        retryPaused: false),
+                    CancellationToken.None);
 
                 if (queue.Count == 0)
                 {

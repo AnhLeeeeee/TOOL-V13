@@ -303,9 +303,14 @@ public sealed partial class ManagerForm
             {
                 // Người dùng có thể sửa Excel trong lúc cửa sổ Auto Profile đang mở.
                 // Nạp lại lần cuối trước khi chọn account để tuyệt đối không lấy dòng đã được gán.
-                if (!string.IsNullOrWhiteSpace(_accountPoolService.CurrentSourcePath))
-                    _accountPoolService.ReloadCurrentExcel();
-                _accountPoolService.EnsureAutoColumns();
+                await RunAccountPoolIoAsync(
+                    () =>
+                    {
+                        if (!string.IsNullOrWhiteSpace(_accountPoolService.CurrentSourcePath))
+                            _accountPoolService.ReloadCurrentExcel();
+                        _accountPoolService.EnsureAutoColumns();
+                    },
+                    CancellationToken.None);
                 var requestedNew = (int)count.Value;
                 if (requestedNew > 0 && !TryParseAutoProfileName(nextProfile.Text.Trim(), out _, out _, out _))
                     throw new InvalidOperationException("Tên profile bắt đầu phải kết thúc bằng số, ví dụ 46 hoặc a02.");
@@ -318,11 +323,17 @@ public sealed partial class ManagerForm
                         throw new InvalidOperationException("Tự đổi tên đang bật nhưng danh sách tên trong mục ‘Tên & ảnh TikTok’ đang trống.");
                 }
 
-                var queue = BuildAutoProfileQueue(
-                    requestedNew,
-                    nextProfile.Text.Trim(),
-                    resumeIncomplete.Checked,
-                    retryPaused.Checked);
+                var requestedStartName = nextProfile.Text.Trim();
+                var resumeIncompleteValue = resumeIncomplete.Checked;
+                var retryPausedValue = retryPaused.Checked;
+
+                var queue = await RunAccountPoolIoAsync(
+                    () => BuildAutoProfileQueue(
+                        requestedNew,
+                        requestedStartName,
+                        resumeIncompleteValue,
+                        retryPausedValue),
+                    CancellationToken.None);
                 if (queue.Count == 0)
                     throw new InvalidOperationException("Không có profile tạo dở cần tiếp tục và không có tài khoản chưa gán phù hợp để tạo mới.");
 
@@ -488,7 +499,9 @@ public sealed partial class ManagerForm
             {
                 step = "ASSIGN_ACCOUNT";
                 ui(step, "Đang giữ chỗ tài khoản + profile trong Excel...", Color.RoyalBlue);
-                _accountPoolService.Assign(item.Account.Id, item.ProfileName);
+                await RunAccountPoolIoAsync(
+                    () => _accountPoolService.Assign(item.Account.Id, item.ProfileName),
+                    ct);
                 reservedNow = true;
                 await SetAutoCheckpointWithRetryAsync(item.Account.Id, "RESERVED", step,
                     AutoProfileNote($"Đã giữ chỗ profile {item.ProfileName}."), ct);
@@ -596,7 +609,9 @@ public sealed partial class ManagerForm
             {
                 try
                 {
-                    _accountPoolService.ReleaseAccount(item.Account.Id);
+                    await RunAccountPoolIoAsync(
+                        () => _accountPoolService.ReleaseAccount(item.Account.Id),
+                        CancellationToken.None);
                     note += " | Đã trả tài khoản về trạng thái chưa gán vì profile chưa được tạo hoàn chỉnh.";
                 }
                 catch (Exception releaseEx) { note += " | Không trả được tài khoản: " + releaseEx.Message; }
@@ -725,7 +740,9 @@ public sealed partial class ManagerForm
 
     async Task ApplyAutoProfileIdentityAsync(ProfileContext ctx, AutoProfileQueueItem item, CancellationToken ct)
     {
-        if (_accountPoolService.IsIdentityDone(item.Account.Username))
+        if (await RunAccountPoolIoAsync(
+                () => _accountPoolService.IsIdentityDone(item.Account.Username),
+                ct))
         {
             _log.Info($"[AUTO_PROFILE_RENAME_SKIP_DONE] profile={item.ProfileName} account={item.Account.Username}");
             return;
@@ -776,7 +793,10 @@ public sealed partial class ManagerForm
         if (reply.Skipped && !reply.AlreadyConfigured)
             throw new AutoProfilePauseException("PAUSED_RENAME", "RENAME", string.IsNullOrWhiteSpace(reply.Message) ? "TikTok bỏ qua thao tác đổi tên." : reply.Message);
 
-        _accountPoolService.MarkIdentityDone(item.Account.Username);
+        await RunAccountPoolIoAsync(
+            () => _accountPoolService.MarkIdentityDone(item.Account.Username),
+            ct);
+
         if (reply.AvatarChanged && !string.IsNullOrWhiteSpace(avatarPath))
         {
             state.LastAvatarByProfile[ctx.Profile.Name] = avatarPath;
@@ -824,7 +844,9 @@ public sealed partial class ManagerForm
             ct.ThrowIfCancellationRequested();
             try
             {
-                _accountPoolService.SetAutoState(accountId, status, step, note);
+                await RunAccountPoolIoAsync(
+                    () => _accountPoolService.SetAutoState(accountId, status, step, note),
+                    ct);
                 return;
             }
             catch (Exception ex)

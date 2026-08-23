@@ -22,6 +22,7 @@ public sealed partial class ManagerForm
     static readonly TimeSpan AutoCloseStatusStaleAfter = TimeSpan.FromSeconds(30);
 
     readonly HashSet<string> _autoCloseInProgressProfiles = new(StringComparer.OrdinalIgnoreCase);
+    readonly HashSet<string> _autoCloseBanHandledProfiles = new(StringComparer.OrdinalIgnoreCase);
     readonly HashSet<string> _autoCloseExpectedRunningProfiles = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, DateTime> _autoCloseNotRunningSinceUtc = new(StringComparer.OrdinalIgnoreCase);
     bool _autoCloseFeatureInitialized;
@@ -306,10 +307,48 @@ public sealed partial class ManagerForm
         if (!_autoCloseFeatureInitialized || !_autoCloseSettings.CloseOnBan)
             return;
 
-        _ = AutoCloseProfileAsync(
+        var profileName = ctx.Profile.Name;
+
+        if (!_autoCloseBanHandledProfiles.Add(profileName))
+            return;
+
+        _ = RunBanAutoCloseOnceAsync(
+            ctx,
+            string.IsNullOrWhiteSpace(detail) ? "TikTok account ban" : detail);
+    }
+
+    async Task RunBanAutoCloseOnceAsync(ProfileContext ctx, string detail)
+    {
+        var profileName = ctx.Profile.Name;
+
+        await AutoCloseProfileAsync(
             ctx,
             "BAN",
-            string.IsNullOrWhiteSpace(detail) ? "TikTok account ban" : detail);
+            detail);
+
+        var workerRunning = false;
+        try
+        {
+            workerRunning = ctx.Worker is not null && !ctx.Worker.HasExited;
+        }
+        catch { }
+
+        var tabOpen =
+            ctx.Tab is not null
+            && !ctx.Tab.IsDisposed
+            && ctx.Tab.Parent == _tabs;
+
+        if (workerRunning || tabOpen || ctx.Opening)
+        {
+            _autoCloseBanHandledProfiles.Remove(profileName);
+            _log.Warn(
+                $"[BAN_AUTO_CLOSE_RETRY_ARMED] profile={profileName} worker={workerRunning} tab={tabOpen} opening={ctx.Opening}");
+        }
+        else
+        {
+            _log.Info(
+                $"[BAN_AUTO_CLOSE_HANDLED] profile={profileName} no_repeat=true");
+        }
     }
 
     async Task CheckAutoCloseRuntimeAsync()
@@ -694,8 +733,9 @@ public sealed partial class ManagerForm
             {
                 try
                 {
-                    var stoppedPids = ChromeProfileNameSyncService.StopChromeUsingProfile(
-                        ctx.Profile.ProfilePath);
+                    var stoppedPids = await Task.Run(
+                        () => ChromeProfileNameSyncService.StopChromeUsingProfile(
+                            ctx.Profile.ProfilePath));
 
                     _log.Info(
                         $"[AUTO_CLOSE_CHROME_FALLBACK] profile={ctx.Profile.Name} stopped={stoppedPids.Count} pids={string.Join(",", stoppedPids)}");
@@ -732,6 +772,19 @@ public sealed partial class ManagerForm
                 {
                     _log.Warn(
                         $"[AUTO_CLOSE_WORKER_KILL_WARN] profile={ctx.Profile.Name} error={ex.Message}");
+                }
+            }
+
+            worker = ctx.Worker;
+            if (worker is not null)
+            {
+                var exited = false;
+                try { exited = worker.HasExited; } catch { }
+                if (exited)
+                {
+                    try { worker.Dispose(); } catch { }
+                    if (ReferenceEquals(ctx.Worker, worker))
+                        ctx.Worker = null;
                 }
             }
 

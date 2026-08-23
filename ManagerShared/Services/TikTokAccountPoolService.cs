@@ -2638,6 +2638,19 @@ public sealed class TikTokAccountPoolService
                 "File Excel đang dùng không còn tồn tại.",
                 path);
 
+        var existingRows = ReadSourceRows(path);
+        var existingColumns = ResolveAutoColumns(
+            existingRows,
+            allocateManagedColumns: false);
+
+        if (existingColumns.HeaderRow >= 0
+            && existingColumns.Status >= 0
+            && existingColumns.Step >= 0
+            && existingColumns.Note >= 0)
+        {
+            return;
+        }
+
         var ext = Path
             .GetExtension(path)
             .ToLowerInvariant();
@@ -2755,8 +2768,6 @@ public sealed class TikTokAccountPoolService
             throw new InvalidOperationException(
                 "Kho tài khoản chưa có file Excel nguồn để ghi trạng thái +auto.");
         }
-
-        EnsureAutoColumns();
 
         var ext = Path
             .GetExtension(path)
