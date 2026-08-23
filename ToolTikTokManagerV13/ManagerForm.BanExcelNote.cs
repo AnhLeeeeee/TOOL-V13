@@ -50,13 +50,73 @@ public sealed partial class ManagerForm
                 continue;
             }
 
-            // Không gọi IsProfileInUse() ở đây.
-            // Snapshot BAN chỉ xuất hiện khi profile đã/đang có Worker runtime.
-            // AutoClose tự chịu trách nhiệm đóng Chrome bằng Worker và fallback nền khi cần.
+            // QUAN TRỌNG:
+            // Chụp đúng account ngay lúc phát hiện BAN, trước khi AutoClose/Tự bù tiếp tục.
+            // Như vậy nhánh Excel không còn phụ thuộc "Profile đã gán" ở vài giây sau.
+            TikTokAccountPoolItem? banAccountSnapshot = null;
+            var shouldStartExcelWrite =
+                !_banExcelNoteMarkedProfiles.Contains(ctx.Profile.Name)
+                && _banExcelNoteWriteInProgressProfiles.Add(ctx.Profile.Name);
+
+            if (shouldStartExcelWrite)
+            {
+                try
+                {
+                    var items = _accountPoolService.Load();
+
+                    banAccountSnapshot = items.FirstOrDefault(x =>
+                        x.AssignedProfile.Equals(
+                            ctx.Profile.Name,
+                            StringComparison.OrdinalIgnoreCase));
+
+                    // Fallback: nếu mapping Profile đã gán vừa bị thay đổi/race,
+                    // dùng username Manager đang biết để bắt đúng account cũ.
+                    if (banAccountSnapshot is null)
+                    {
+                        var knownUsername =
+                            ResolveAutoActivityAccount(ctx.Profile.Name);
+
+                        if (!string.IsNullOrWhiteSpace(knownUsername))
+                        {
+                            banAccountSnapshot = items.FirstOrDefault(x =>
+                                x.Username.Equals(
+                                    knownUsername,
+                                    StringComparison.OrdinalIgnoreCase));
+                        }
+                    }
+
+                    if (banAccountSnapshot is null)
+                    {
+                        _log.Warn(
+                            $"[BAN_EXCEL_NOTE_SNAPSHOT_MISSING] profile={ctx.Profile.Name} reason=no_assigned_account");
+
+                        _banExcelNoteWriteInProgressProfiles.Remove(ctx.Profile.Name);
+                        shouldStartExcelWrite = false;
+                    }
+                    else
+                    {
+                        _log.Info(
+                            $"[BAN_EXCEL_NOTE_SNAPSHOT] profile={ctx.Profile.Name} user={banAccountSnapshot.Username} row={banAccountSnapshot.SourceRow} id={banAccountSnapshot.Id}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _banExcelNoteWriteInProgressProfiles.Remove(ctx.Profile.Name);
+                    shouldStartExcelWrite = false;
+
+                    _log.Warn(
+                        $"[BAN_EXCEL_NOTE_SNAPSHOT_ERROR] profile={ctx.Profile.Name} error={ex.Message}");
+                }
+            }
+
+            // AutoClose vẫn chạy độc lập với Excel:
+            // Excel có bị khóa/lỗi thì profile BAN vẫn phải được đóng + bù.
             var workerRunning = false;
             try
             {
-                workerRunning = ctx.Worker is not null && !ctx.Worker.HasExited;
+                workerRunning =
+                    ctx.Worker is not null
+                    && !ctx.Worker.HasExited;
             }
             catch { }
 
@@ -83,41 +143,154 @@ public sealed partial class ManagerForm
                 }
             }
 
-            // Excel là nhánh độc lập. Ghi nền + chống trùng để timer không rewrite XLSX mỗi giây.
-            if (_banExcelNoteMarkedProfiles.Contains(ctx.Profile.Name)
-                || !_banExcelNoteWriteInProgressProfiles.Add(ctx.Profile.Name))
+            if (shouldStartExcelWrite
+                && banAccountSnapshot is not null)
             {
-                continue;
+                _ = MarkAccountSnapshotAsBanInBackgroundAsync(
+                    ctx.Profile.Name,
+                    banAccountSnapshot,
+                    detail);
             }
-
-            _ = MarkAssignedAccountAsBanInBackgroundAsync(
-                ctx.Profile.Name,
-                detail);
         }
     }
 
-    async Task MarkAssignedAccountAsBanInBackgroundAsync(
+    async Task MarkAccountSnapshotAsBanInBackgroundAsync(
         string profileName,
+        TikTokAccountPoolItem accountSnapshot,
         string detail)
     {
+        const int maxAttempts = 5;
+        Exception? lastError = null;
+
         try
         {
-            var handled = await RunAccountPoolIoAsync(
-                () => MarkAssignedAccountAsBanCore(profileName, detail),
-                CancellationToken.None);
+            for (var attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                try
+                {
+                    var verified = await RunAccountPoolIoAsync(
+                        () => MarkAccountSnapshotAsBanCore(
+                            profileName,
+                            accountSnapshot,
+                            detail),
+                        CancellationToken.None);
 
-            if (handled)
-                _banExcelNoteMarkedProfiles.Add(profileName);
-        }
-        catch (Exception ex)
-        {
+                    if (verified)
+                    {
+                        _banExcelNoteMarkedProfiles.Add(profileName);
+
+                        WriteAutoActivityLog(
+                            action: "GHI EXCEL BAN",
+                            profile: profileName,
+                            account: accountSnapshot.Username,
+                            reason: "BAN",
+                            result: "THÀNH CÔNG",
+                            detail:
+                                $"Đã ghi ban và xác minh lại dòng {accountSnapshot.SourceRow} trong Excel.");
+
+                        return;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex;
+
+                    _log.Warn(
+                        $"[BAN_EXCEL_NOTE_RETRY] profile={profileName} user={accountSnapshot.Username} row={accountSnapshot.SourceRow} attempt={attempt}/{maxAttempts} error={ex.Message}");
+                }
+
+                if (attempt < maxAttempts)
+                    await Task.Delay(700 * attempt);
+            }
+
+            var finalMessage =
+                lastError?.Message
+                ?? "Không xác minh được ghi chú ban sau khi ghi.";
+
             _log.Warn(
-                $"[BAN_EXCEL_NOTE_ERROR] profile={profileName} error={ex.Message}");
+                $"[BAN_EXCEL_NOTE_FAILED] profile={profileName} user={accountSnapshot.Username} row={accountSnapshot.SourceRow} attempts={maxAttempts} error={finalMessage}");
+
+            WriteAutoActivityLog(
+                action: "GHI EXCEL BAN",
+                profile: profileName,
+                account: accountSnapshot.Username,
+                reason: "BAN",
+                result: "LỖI",
+                detail:
+                    $"Không ghi/xác minh được ban sau {maxAttempts} lần: {finalMessage}");
         }
         finally
         {
             _banExcelNoteWriteInProgressProfiles.Remove(profileName);
         }
+    }
+
+    bool MarkAccountSnapshotAsBanCore(
+        string profileName,
+        TikTokAccountPoolItem snapshot,
+        string detail)
+    {
+        var items = _accountPoolService.Load();
+
+        // Ưu tiên ID vì không đổi khi profile/account mapping thay đổi.
+        var account = items.FirstOrDefault(x =>
+            !string.IsNullOrWhiteSpace(snapshot.Id)
+            && x.Id.Equals(
+                snapshot.Id,
+                StringComparison.OrdinalIgnoreCase));
+
+        // Fallback theo username + source row cho catalog cũ.
+        account ??= items.FirstOrDefault(x =>
+            x.SourceRow == snapshot.SourceRow
+            && x.Username.Equals(
+                snapshot.Username,
+                StringComparison.OrdinalIgnoreCase));
+
+        account ??= items.FirstOrDefault(x =>
+            x.Username.Equals(
+                snapshot.Username,
+                StringComparison.OrdinalIgnoreCase));
+
+        if (account is null)
+            throw new InvalidOperationException(
+                $"Không còn tìm thấy account BAN {snapshot.Username} (row={snapshot.SourceRow}).");
+
+        // Luôn Upsert kể cả JSON đang ghi ban:
+        // mục tiêu là đảm bảo chính file Excel nguồn cũng có chữ "ban".
+        _accountPoolService.Upsert(
+            account with { Note = "ban" });
+
+        // Đọc lại Excel ngay trong cùng hàng đợi I/O để đồng bộ catalog
+        // và xác minh note thật sự đã nằm trong nguồn.
+        _accountPoolService.ReloadCurrentExcel();
+
+        var verified = _accountPoolService.Load()
+            .FirstOrDefault(x =>
+                x.Id.Equals(
+                    account.Id,
+                    StringComparison.OrdinalIgnoreCase));
+
+        verified ??= _accountPoolService.Load()
+            .FirstOrDefault(x =>
+                x.SourceRow == account.SourceRow
+                && x.Username.Equals(
+                    account.Username,
+                    StringComparison.OrdinalIgnoreCase));
+
+        if (verified is null
+            || !string.Equals(
+                (verified.Note ?? "").Trim(),
+                "ban",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"Đã ghi nhưng đọc lại chưa thấy note=ban (user={account.Username}, row={account.SourceRow}).");
+        }
+
+        _log.Info(
+            $"[BAN_EXCEL_NOTE_OK] profile={profileName} user={account.Username} row={account.SourceRow} note=ban verified=true detail={detail}");
+
+        return true;
     }
 
     static bool LooksLikeAccountBanStop(string? detail)
@@ -133,27 +306,4 @@ public sealed partial class ManagerForm
             || detail.Contains("ACCOUNT_VIOLATION", StringComparison.OrdinalIgnoreCase);
     }
 
-    bool MarkAssignedAccountAsBanCore(string profileName, string detail)
-    {
-        var items = _accountPoolService.Load();
-
-        var account = items.FirstOrDefault(x =>
-            x.AssignedProfile.Equals(profileName, StringComparison.OrdinalIgnoreCase));
-
-        if (account is null)
-        {
-            _log.Warn($"[BAN_EXCEL_NOTE_SKIP] profile={profileName} reason=no_assigned_account");
-            return false;
-        }
-
-        if (string.Equals((account.Note ?? "").Trim(), "ban", StringComparison.OrdinalIgnoreCase))
-            return true;
-
-        _accountPoolService.Upsert(account with { Note = "ban" });
-
-        _log.Info(
-            $"[BAN_EXCEL_NOTE_OK] profile={profileName} user={account.Username} row={account.SourceRow} note=ban detail={detail}");
-
-        return true;
-    }
 }

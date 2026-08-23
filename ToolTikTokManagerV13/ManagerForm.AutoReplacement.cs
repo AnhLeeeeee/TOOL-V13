@@ -69,60 +69,56 @@ public sealed partial class ManagerForm
 
         _autoReplacementFeatureInitialized = true;
 
+        // V13.6.9 HOTFIX: queue bù chỉ có hiệu lực trong đúng phiên Manager hiện tại.
+        // Nếu Manager bị đóng/crash/End Task khi còn suất bù dở, phiên sau bỏ toàn bộ
+        // backlog cũ để tránh START/RESUME vô tình giải phóng hàng loạt profile bù.
+        var discardedCount = 0;
+
         try
         {
-            var document = LoadAutoReplacementQueueDocument();
-
-            lock (_autoReplacementQueueLock)
-            {
-                _autoReplacementQueue.Clear();
-
-                foreach (var request in document.Pending
-                             .Where(x => !string.IsNullOrWhiteSpace(x.ClosedProfileName))
-                             .OrderBy(x => x.QueuedUtc))
-                {
-                    request.Id = string.IsNullOrWhiteSpace(request.Id)
-                        ? Guid.NewGuid().ToString("N")
-                        : request.Id.Trim();
-
-                    request.ClosedProfileName = (request.ClosedProfileName ?? "").Trim();
-                    request.Reason = (request.Reason ?? "").Trim();
-                    request.LastError = (request.LastError ?? "").Trim();
-
-                    if (request.NextAttemptUtc == default)
-                        request.NextAttemptUtc = DateTime.UtcNow;
-
-                    if (_autoReplacementQueue.Any(x =>
-                            x.Id.Equals(request.Id, StringComparison.OrdinalIgnoreCase)))
-                    {
-                        continue;
-                    }
-
-                    _autoReplacementQueue.Add(request);
-                }
-
-                SaveAutoReplacementQueueUnsafe();
-            }
-
-            if (GetAutoReplacementPendingCount() > 0)
-            {
-                _log.Warn(
-                    $"[AUTO_REPLACE_RESTORE] pending={GetAutoReplacementPendingCount()} path={AutoReplacementQueuePath}");
-            }
+            var previous = LoadAutoReplacementQueueDocument();
+            discardedCount = previous.Pending
+                .Count(x => !string.IsNullOrWhiteSpace(x.ClosedProfileName));
         }
         catch (Exception ex)
         {
-            _log.Warn($"[AUTO_REPLACE_RESTORE_ERROR] {ex.Message}");
+            // LoadAutoReplacementQueueDocument hiện đã fail-safe, nhưng vẫn giữ lớp bảo vệ
+            // này để việc dọn queue không bao giờ làm Manager lỗi lúc khởi động.
+            _log.Warn($"[AUTO_REPLACE_STARTUP_CLEAR_READ_WARN] {ex.Message}");
         }
 
-        // SAFE START: chỉ khôi phục queue, không tự chạy khi Manager vừa mở.
+        lock (_autoReplacementQueueLock)
+        {
+            _autoReplacementQueue.Clear();
+
+            try
+            {
+                // Ghi lại file rỗng thay vì chỉ xóa file: các hàm retry trong phiên
+                // hiện tại vẫn dùng cùng một định dạng queue và không cần nhánh đặc biệt.
+                SaveAutoReplacementQueueUnsafe();
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"[AUTO_REPLACE_STARTUP_CLEAR_WRITE_WARN] {ex.Message}");
+            }
+        }
+
         _autoReplacementSessionArmed = false;
 
-        if (_autoCloseSettings.OpenReplacementAfterAutoClose
-            && GetAutoReplacementPendingCount() > 0)
+        if (discardedCount > 0)
         {
             _log.Warn(
-                $"[AUTO_REPLACE_STARTUP_HOLD] pending={GetAutoReplacementPendingCount()} armed=false action=wait_for_start_or_new_auto_close");
+                $"[AUTO_REPLACE_QUEUE_CLEARED_ON_STARTUP] discarded={discardedCount} path={AutoReplacementQueuePath} currentPending=0");
+
+            WriteAutoActivityLog(
+                action: "HỆ THỐNG BÙ",
+                result: "ĐÃ XÓA QUEUE CŨ",
+                detail: $"Mở Manager: bỏ {discardedCount} suất bù còn lại từ phiên trước.");
+        }
+        else
+        {
+            _log.Info(
+                $"[AUTO_REPLACE_QUEUE_EMPTY_ON_STARTUP] path={AutoReplacementQueuePath} currentPending=0");
         }
 
         UpdateAutoCloseToolbarButtonText();
@@ -214,8 +210,8 @@ public sealed partial class ManagerForm
                 _log.Info(
                     $"[AUTO_REPLACE_QUEUE_DUPLICATE] closed={closedProfileName} id={duplicate.Id} pending={_autoReplacementQueue.Count}");
 
-                // Nếu đây là một Tự đóng mới của phiên hiện tại nhưng slot cũ đã
-                // tồn tại từ lần chạy trước, vẫn ARM phiên để slot đang chờ được xử lý.
+                // Duplicate chỉ có thể thuộc phiên hiện tại vì backlog của phiên trước
+                // đã được xóa khi Manager khởi động. ARM để request hiện tại tiếp tục xử lý.
                 ArmAutoReplacementSession("new_auto_close_duplicate:" + reason);
                 return;
             }
@@ -235,6 +231,14 @@ public sealed partial class ManagerForm
 
         _log.Info(
             $"[AUTO_REPLACE_QUEUE] id={queued.Id} closed={closedProfileName} reason={reason} pending={GetAutoReplacementPendingCount()} persisted=true");
+
+        WriteAutoActivityLog(
+            action: "SUẤT BÙ",
+            profile: closedProfileName,
+            account: ResolveAutoActivityAccount(closedProfileName),
+            reason: reason,
+            result: "ĐÃ XẾP HÀNG",
+            detail: $"pending={GetAutoReplacementPendingCount()}");
 
         // Sự kiện Tự đóng mới trong phiên hiện tại cho phép bù.
         ArmAutoReplacementSession("new_auto_close:" + reason);
@@ -341,6 +345,13 @@ public sealed partial class ManagerForm
                     lastError = ex.Message;
                     _log.Error(
                         $"[AUTO_REPLACE_ERROR] id={request.Id} closed={request.ClosedProfileName} reason={request.Reason} error={ex}");
+
+                    WriteAutoActivityLog(
+                        action: "TỰ BÙ",
+                        profile: request.ClosedProfileName,
+                        reason: request.Reason,
+                        result: "LỖI",
+                        detail: ex.Message);
                 }
 
                 if (_closing)
@@ -627,6 +638,14 @@ public sealed partial class ManagerForm
                 {
                     _log.Warn(
                         $"[AUTO_REPLACE_CREATE_NONE] closed={request.ClosedProfileName} reason=no_unassigned_account_with_password");
+
+                    WriteAutoActivityLog(
+                        action: "TỰ BÙ",
+                        profile: request.ClosedProfileName,
+                        reason: request.Reason,
+                        result: "CHỜ",
+                        detail: "Không còn tài khoản chưa gán có mật khẩu để tạo profile bù.");
+
                     return false;
                 }
 
@@ -637,6 +656,15 @@ public sealed partial class ManagerForm
                 {
                     _log.Info(
                         $"[AUTO_REPLACE_CREATE_BEGIN] closed={request.ClosedProfileName} profile={item.ProfileName} account={item.Account.Username} attempt={attempt}/{maxCreateAttemptsPerSlot}");
+
+                    WriteAutoActivityLog(
+                        action: "MỞ PROFILE BÙ",
+                        profile: request.ClosedProfileName,
+                        account: item.Account.Username,
+                        reason: request.Reason,
+                        replacementProfile: item.ProfileName,
+                        result: "BẮT ĐẦU",
+                        detail: $"Lần thử {attempt}/{maxCreateAttemptsPerSlot}");
 
                     var outcome = await ProcessAutoProfileQueueItemAsync(
                         item,
@@ -676,6 +704,15 @@ public sealed partial class ManagerForm
                             _log.Warn(
                                 $"[AUTO_REPLACE_CREATE_FAIL] profile={item.ProfileName} step=confirm_running");
 
+                            WriteAutoActivityLog(
+                                action: "MỞ PROFILE BÙ",
+                                profile: request.ClosedProfileName,
+                                account: item.Account.Username,
+                                reason: request.Reason,
+                                replacementProfile: item.ProfileName,
+                                result: "LỖI",
+                                detail: "Profile đã tạo/Start nhưng không xác nhận RUNNING khỏe trong thời gian quy định.");
+
                             if (createdCtx is not null)
                             {
                                 try { await CloseFailedReplacementRuntimeAsync(createdCtx); } catch { }
@@ -690,11 +727,29 @@ public sealed partial class ManagerForm
                         _log.Info(
                             $"[AUTO_REPLACE_CREATE_OK] closed={request.ClosedProfileName} replacement={item.ProfileName} account={item.Account.Username} confirmed=healthy_running");
 
+                        WriteAutoActivityLog(
+                            action: "MỞ PROFILE BÙ",
+                            profile: request.ClosedProfileName,
+                            account: item.Account.Username,
+                            reason: request.Reason,
+                            replacementProfile: item.ProfileName,
+                            result: "THÀNH CÔNG",
+                            detail: $"Profile {item.ProfileName} đã RUNNING khỏe 30 giây.");
+
                         return true;
                     }
 
                     _log.Warn(
                         $"[AUTO_REPLACE_CREATE_FAIL] profile={item.ProfileName} status={outcome.Status} step={outcome.Step} note={outcome.Note}");
+
+                    WriteAutoActivityLog(
+                        action: "MỞ PROFILE BÙ",
+                        profile: request.ClosedProfileName,
+                        account: item.Account.Username,
+                        reason: request.Reason,
+                        replacementProfile: item.ProfileName,
+                        result: "LỖI",
+                        detail: $"status={outcome.Status}; step={outcome.Step}; note={outcome.Note}");
 
                     // Auto Profile đã note checkpoint lỗi/CAPTCHA. Thử account/profile kế tiếp
                     // cho cùng một suất bù, giống tư tưởng lỗi profile nào thì chuyển profile khác.
@@ -703,6 +758,15 @@ public sealed partial class ManagerForm
                 {
                     _log.Warn(
                         $"[AUTO_REPLACE_CREATE_ERROR] profile={item.ProfileName} error={ex.Message}");
+
+                    WriteAutoActivityLog(
+                        action: "MỞ PROFILE BÙ",
+                        profile: request.ClosedProfileName,
+                        account: item.Account.Username,
+                        reason: request.Reason,
+                        replacementProfile: item.ProfileName,
+                        result: "LỖI",
+                        detail: ex.Message);
                 }
                 finally
                 {
@@ -849,6 +913,13 @@ public sealed partial class ManagerForm
 
             _log.Warn(
                 $"[AUTO_REPLACE_SLOT_RETRY] id={request.Id} closed={request.ClosedProfileName} attempt={request.AttemptCount} retryIn={delay:c} next={request.NextAttemptUtc:O} error={request.LastError}");
+
+            WriteAutoActivityLog(
+                action: "TỰ BÙ",
+                profile: request.ClosedProfileName,
+                reason: request.Reason,
+                result: "RETRY",
+                detail: $"Lần {request.AttemptCount}; thử lại sau {delay.TotalMinutes:0} phút; lỗi={request.LastError}");
         }
     }
 

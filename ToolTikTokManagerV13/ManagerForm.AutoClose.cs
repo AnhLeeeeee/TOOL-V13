@@ -166,10 +166,20 @@ public sealed partial class ManagerForm
             MaximizeBox = false,
             MinimizeBox = false,
             ShowInTaskbar = false,
-            Width = 610,
-            Height = 510,
+            ClientSize = new Size(720, 410),
+            MinimumSize = new Size(600, 360),
             BackColor = UiTheme.Canvas,
-            Font = new Font("Segoe UI", 9F)
+            Font = new Font("Segoe UI", 9F),
+            AutoScaleMode = AutoScaleMode.Dpi
+        };
+
+        // Header cố định: không bị cuộn mất.
+        var header = new Panel
+        {
+            Dock = DockStyle.Top,
+            Height = 56,
+            Padding = new Padding(20, 14, 20, 8),
+            BackColor = UiTheme.Canvas
         };
 
         var title = new Label
@@ -178,7 +188,65 @@ public sealed partial class ManagerForm
             AutoSize = true,
             Font = new Font("Segoe UI", 13F, FontStyle.Bold),
             ForeColor = Color.FromArgb(37, 77, 122),
-            Location = new Point(24, 22)
+            Location = new Point(20, 17)
+        };
+        header.Controls.Add(title);
+
+        // Footer cố định: Lưu/Hủy luôn nhìn thấy dù nội dung phải cuộn.
+        var footer = new Panel
+        {
+            Dock = DockStyle.Bottom,
+            Height = 58,
+            Padding = new Padding(12, 10, 12, 10),
+            BackColor = UiTheme.Canvas
+        };
+
+        var save = new Button
+        {
+            Text = "Lưu",
+            Width = 110,
+            Height = 34,
+            Anchor = AnchorStyles.Top | AnchorStyles.Right
+        };
+
+        var cancel = new Button
+        {
+            Text = "Hủy",
+            Width = 110,
+            Height = 34,
+            DialogResult = DialogResult.Cancel,
+            Anchor = AnchorStyles.Top | AnchorStyles.Right
+        };
+
+        void LayoutFooterButtons()
+        {
+            var right = Math.Max(250, footer.ClientSize.Width - 12);
+            cancel.Left = right - cancel.Width;
+            save.Left = cancel.Left - 10 - save.Width;
+            save.Top = cancel.Top = 10;
+        }
+
+        footer.Controls.Add(save);
+        footer.Controls.Add(cancel);
+        footer.Resize += (_, _) => LayoutFooterButtons();
+        LayoutFooterButtons();
+
+        // Toàn bộ cấu hình nằm trong viewport cuộn dọc.
+        // Đây là phần sửa chính: DPI cao/màn hình thấp sẽ có scrollbar thay vì cắt chữ.
+        var contentViewport = new Panel
+        {
+            Dock = DockStyle.Fill,
+            AutoScroll = true,
+            Padding = new Padding(18, 8, 18, 12),
+            BackColor = UiTheme.Canvas
+        };
+
+        var content = new Panel
+        {
+            AutoSize = false,
+            Location = new Point(18, 8),
+            Size = new Size(666, 300),
+            BackColor = UiTheme.Canvas
         };
 
         var closeOnBan = new CheckBox
@@ -186,22 +254,22 @@ public sealed partial class ManagerForm
             Text = "Tự đóng khi tài khoản bị BAN",
             Checked = _autoCloseSettings.CloseOnBan,
             AutoSize = true,
-            Location = new Point(28, 75)
+            Location = new Point(18, 34)
         };
 
         var closeOnTime = new CheckBox
         {
-            Text = "Tự đóng khi Automation chạy đủ",
+            Text = "Tự đóng khi Tổng thời gian Automation chạy đủ",
             Checked = _autoCloseSettings.CloseOnRunTime,
             AutoSize = true,
-            Location = new Point(28, 120)
+            Location = new Point(18, 74)
         };
 
         var hours = new ComboBox
         {
             DropDownStyle = ComboBoxStyle.DropDownList,
-            Width = 100,
-            Location = new Point(280, 116)
+            Width = 105,
+            Location = new Point(420, 70)
         };
 
         foreach (var value in new[] { 3, 4, 5, 6, 7, 8 })
@@ -216,7 +284,7 @@ public sealed partial class ManagerForm
             Text = "Tự đóng nếu 10 phút không trở lại trạng thái RUNNING",
             Checked = _autoCloseSettings.CloseOnNotRunning10Minutes,
             AutoSize = true,
-            Location = new Point(28, 165)
+            Location = new Point(18, 114)
         };
 
         var openReplacement = new CheckBox
@@ -224,43 +292,97 @@ public sealed partial class ManagerForm
             Text = "Sau khi Tự đóng: lấy tài khoản chưa gán và tự tạo profile mới",
             Checked = _autoCloseSettings.OpenReplacementAfterAutoClose,
             AutoSize = true,
-            Location = new Point(28, 205)
+            Location = new Point(18, 154)
         };
 
-        var explanation = new Label
+        var configGroup = new GroupBox
         {
-            AutoSize = false,
-            Width = 540,
-            Height = 175,
-            Location = new Point(28, 242),
+            Text = "Cấu hình Tự đóng & Tự bù",
+            Location = new Point(0, 0),
+            Size = new Size(666, 205),
+            Padding = new Padding(12),
+            ForeColor = Color.FromArgb(45, 67, 94),
+            Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
+        };
+
+        configGroup.Controls.Add(closeOnBan);
+        configGroup.Controls.Add(closeOnTime);
+        configGroup.Controls.Add(hours);
+        configGroup.Controls.Add(closeOnStuck);
+        configGroup.Controls.Add(openReplacement);
+
+        var logGroup = new GroupBox
+        {
+            Text = "Nhật ký tự động",
+            Location = new Point(0, 217),
+            Size = new Size(666, 68),
+            Padding = new Padding(12),
+            ForeColor = Color.FromArgb(45, 67, 94),
+            Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
+        };
+
+        var logHint = new Label
+        {
+            AutoSize = true,
+            Text = "Ghi riêng giờ đóng/mở profile, lý do, tài khoản bù và kết quả.",
             ForeColor = Color.FromArgb(70, 82, 96),
-            Text =
-                "Cách hoạt động:\r\n" +
-                "• BAN: nhận đúng lỗi BAN là đóng ngay; ghi “ban” vào Excel chạy độc lập, Excel lỗi/đang khóa không cản Tự đóng.\r\n" +
-                "• Theo giờ: tính thời gian Automation RUNNING của phiên hiện tại; Pause/Stopped không cộng thời gian.\r\n" +
-                "• Lỗi 10p: profile đang treo mà RECOVERING/STOPPED/UNKNOWN, Chrome mất kết nối, status lỗi hoặc lỗi trang liên tục 10 phút sẽ tự đóng + bù. PAUSED thủ công không tính lỗi.\r\n" +
-                "• Nếu profile trở lại RUNNING khỏe trước 10 phút, đồng hồ lỗi được xóa và tính lại từ đầu nếu lỗi lần sau.\r\n" +
-                "• Tự bù: đóng 1 → bù 1; đóng nhiều → giữ đúng số suất bù. Suất chưa bù được sẽ lưu file và tự thử lại 2→3→5 phút.\r\n" +
-                "• Mỗi suất bù lấy tài khoản chưa gán trong Excel và tạo profile mới; không quét/tái sử dụng profile cũ. Profile bù chỉ tính thành công sau khi RUNNING khỏe 30 giây.\r\n" +
-                "• Hàng đợi bù được lưu lại. Khi vừa mở Manager, queue chỉ được khôi phục ở trạng thái CHỜ và không tự tạo profile. Sau START/RESUME hoặc một sự kiện Tự đóng mới trong phiên hiện tại, queue mới được phép chạy. Đóng profile thủ công không tự mở lại."
+            Location = new Point(16, 29)
         };
 
-        var save = new Button
+        var openLog = new Button
         {
-            Text = "Lưu",
-            Width = 110,
-            Height = 34,
-            Location = new Point(338, 425)
+            Text = "Xem nhật ký",
+            Width = 125,
+            Height = 30,
+            Anchor = AnchorStyles.Top | AnchorStyles.Right
         };
 
-        var cancel = new Button
+        void LayoutLogButton()
         {
-            Text = "Hủy",
-            Width = 110,
-            Height = 34,
-            Location = new Point(458, 425),
-            DialogResult = DialogResult.Cancel
-        };
+            openLog.Left = Math.Max(420, logGroup.ClientSize.Width - openLog.Width - 16);
+            openLog.Top = 23;
+        }
+
+        logGroup.Controls.Add(logHint);
+        logGroup.Controls.Add(openLog);
+        logGroup.Resize += (_, _) => LayoutLogButton();
+        LayoutLogButton();
+
+        openLog.Click += (_, _) => ShowAutoActivityLogDialog(form);
+
+        content.Controls.Add(configGroup);
+        content.Controls.Add(logGroup);
+        contentViewport.Controls.Add(content);
+
+        void LayoutScrollableContent()
+        {
+            // Trừ chiều rộng scrollbar + padding. Không dùng chiều cao viewport để
+            // ép content nhỏ lại; content luôn giữ đủ chiều cao để AutoScroll hoạt động.
+            var availableWidth = Math.Max(
+                520,
+                contentViewport.ClientSize.Width
+                - contentViewport.Padding.Left
+                - contentViewport.Padding.Right
+                - SystemInformation.VerticalScrollBarWidth
+                - 4);
+
+            content.Width = availableWidth;
+            configGroup.Width = availableWidth;
+            logGroup.Width = availableWidth;
+
+            // Nội dung thật cao tới đáy logGroup. AutoScrollMinSize buộc WinForms
+            // sinh thanh cuộn dọc nếu viewport thấp hơn.
+            var requiredHeight = logGroup.Bottom + 14;
+            content.Height = requiredHeight;
+            contentViewport.AutoScrollMinSize = new Size(0, requiredHeight + 16);
+
+            // ComboBox giờ giữ bên phải nhưng không đè chữ khi cửa sổ/DPI thay đổi.
+            hours.Left = Math.Max(360, configGroup.ClientSize.Width - hours.Width - 24);
+            LayoutLogButton();
+        }
+
+        contentViewport.Resize += (_, _) => LayoutScrollableContent();
+        form.Shown += (_, _) => LayoutScrollableContent();
 
         save.Click += (_, _) =>
         {
@@ -288,19 +410,18 @@ public sealed partial class ManagerForm
 
         form.AcceptButton = save;
         form.CancelButton = cancel;
-        form.Controls.Add(title);
-        form.Controls.Add(closeOnBan);
-        form.Controls.Add(closeOnTime);
-        form.Controls.Add(hours);
-        form.Controls.Add(closeOnStuck);
-        form.Controls.Add(openReplacement);
-        form.Controls.Add(explanation);
-        form.Controls.Add(save);
-        form.Controls.Add(cancel);
+
+        // Thứ tự Dock quan trọng: header + footer cố định, viewport chiếm phần còn lại.
+        form.Controls.Add(contentViewport);
+        form.Controls.Add(footer);
+        form.Controls.Add(header);
 
         UiTheme.Apply(form);
+        UiTheme.StyleButton(openLog, UiButtonKind.Neutral);
         UiTheme.StyleButton(save, UiButtonKind.Primary);
         UiTheme.StyleButton(cancel, UiButtonKind.Neutral);
+
+        LayoutScrollableContent();
         form.ShowDialog(this);
     }
 
@@ -411,16 +532,19 @@ public sealed partial class ManagerForm
 
                     if (_autoCloseSettings.CloseOnRunTime)
                     {
-                        var session = ReadStatisticsRuntime(ctx).Session;
-                        if (session >= timeThreshold)
+                        // Dùng TỔNG thời gian Automation RUNNING đã tích lũy của profile,
+                        // không reset theo mỗi lần Start/Resume hay khi mở lại Manager.
+                        // Pause/Stopped không cộng vì runtime_stats chỉ cộng lúc RUNNING.
+                        var total = ReadStatisticsRuntime(ctx).Total;
+                        if (total >= timeThreshold)
                         {
                             _log.Info(
-                                $"[AUTO_CLOSE_TIME_DUE] profile={profileName} session={session:c} threshold={timeThreshold:c} state={state}");
+                                $"[AUTO_CLOSE_TIME_DUE] profile={profileName} total={total:c} threshold={timeThreshold:c} state={state}");
 
                             await AutoCloseProfileAsync(
                                 ctx,
                                 $"TIME_{_autoCloseSettings.RunHours}H",
-                                $"Đạt thời gian chạy {_autoCloseSettings.RunHours} giờ (phiên={session:c}).");
+                                $"Đạt tổng thời gian chạy {_autoCloseSettings.RunHours} giờ (tổng={total:c}).");
 
                             continue;
                         }
@@ -686,6 +810,14 @@ public sealed partial class ManagerForm
             _log.Info(
                 $"[AUTO_CLOSE_BEGIN] profile={ctx.Profile.Name} reason={reason} detail={detail}");
 
+            WriteAutoActivityLog(
+                action: "TỰ ĐÓNG",
+                profile: ctx.Profile.Name,
+                account: ResolveAutoActivityAccount(ctx.Profile.Name),
+                reason: reason,
+                result: "BẮT ĐẦU",
+                detail: detail);
+
             var worker = ctx.Worker;
 
             if (worker is not null && !worker.HasExited)
@@ -800,12 +932,28 @@ public sealed partial class ManagerForm
             _log.Info(
                 $"[AUTO_CLOSE_DONE] profile={ctx.Profile.Name} reason={reason}");
 
+            WriteAutoActivityLog(
+                action: "TỰ ĐÓNG",
+                profile: ctx.Profile.Name,
+                account: ResolveAutoActivityAccount(ctx.Profile.Name),
+                reason: reason,
+                result: "THÀNH CÔNG",
+                detail: "Đã dừng Automation, đóng Chrome/Worker và gỡ tab profile.");
+
             QueueAutoReplacementAfterAutoClose(ctx.Profile.Name, reason);
         }
         catch (Exception ex)
         {
             _log.Error(
                 $"[AUTO_CLOSE_ERROR] profile={ctx.Profile.Name} reason={reason} error={ex}");
+
+            WriteAutoActivityLog(
+                action: "TỰ ĐÓNG",
+                profile: ctx.Profile.Name,
+                account: ResolveAutoActivityAccount(ctx.Profile.Name),
+                reason: reason,
+                result: "LỖI",
+                detail: ex.Message);
         }
         finally
         {

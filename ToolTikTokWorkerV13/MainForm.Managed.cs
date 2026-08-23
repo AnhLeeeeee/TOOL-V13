@@ -101,7 +101,11 @@ public sealed partial class MainForm
                     if (!_chrome.Connected) return "not_connected";
                     try
                     {
-                        return await _chrome.IsTikTokSessionActiveAsync() ? "ready" : "not_logged_in";
+                        // TikTok đôi lúc vào đúng trang cá nhân nhưng SPA/session tạm hiện
+                        // như chưa đăng nhập. Tự F5 tối đa 2 lần trước khi báo not_logged_in.
+                        return await _chrome.EnsureTikTokIdentitySessionReadyAsync()
+                            ? "ready"
+                            : "not_logged_in";
                     }
                     catch (Exception ex)
                     {
@@ -122,8 +126,13 @@ public sealed partial class MainForm
                             json,
                             new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
                             ?? throw new InvalidOperationException("Payload đổi tên/ảnh TikTok không hợp lệ.");
-                        if (!await _chrome.IsTikTokSessionActiveAsync())
-                            throw new InvalidOperationException("TikTok chưa đăng nhập. Hãy đăng nhập tài khoản trên Chrome rồi cập nhật tên/ảnh lại; thao tác này không tự vào LIVE.");
+                        if (!await _chrome.EnsureTikTokIdentitySessionReadyAsync())
+                            throw new InvalidOperationException("TikTok chưa đăng nhập sau khi Tool đã F5 thử lại 2 lần. Hãy kiểm tra tài khoản trên Chrome rồi cập nhật tên/ảnh lại.");
+
+                        // Nếu đã ở /@username nhưng chưa thấy nút Sửa hồ sơ, probe nhanh
+                        // rồi F5 ngay tối đa 2 lần. Hàm này chỉ chuẩn bị trang, không click.
+                        await _chrome.EnsureTikTokEditProfileEntranceReadyAsync();
+
                         var result = await _chrome.UpdateTikTokProfileIdentityAsync(
                             request.Username, request.DisplayName, request.AvatarPath, request.Bio,
                             request.SkipIfNameCooldown, request.KnownDisplayNames, request.VerifyExistingState);
