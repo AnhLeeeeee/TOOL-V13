@@ -116,9 +116,32 @@ public sealed partial class ManagerForm
         {
             Text = DetectNextAutoProfileName(),
             Dock = DockStyle.Fill,
-            Margin = new Padding(0, 3, 16, 3)
+            Margin = new Padding(0, 3, 6, 3)
         };
         ModernDialog.StyleTextInput(nextProfile);
+
+        var saveProfileTemplate = new Button
+        {
+            Text = "Lưu mẫu",
+            Dock = DockStyle.Fill,
+            Margin = new Padding(0, 2, 16, 2)
+        };
+        ModernDialog.StyleSecondaryButton(saveProfileTemplate);
+
+        var profileStartPanel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 1,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty
+        };
+        profileStartPanel.ColumnStyles.Add(
+            new ColumnStyle(SizeType.Percent, 100));
+        profileStartPanel.ColumnStyles.Add(
+            new ColumnStyle(SizeType.Absolute, 92));
+        profileStartPanel.Controls.Add(nextProfile, 0, 0);
+        profileStartPanel.Controls.Add(saveProfileTemplate, 1, 0);
 
         var count = new NumericUpDown
         {
@@ -176,7 +199,7 @@ public sealed partial class ManagerForm
         };
 
         config.Controls.Add(FieldLabel("Profile bắt đầu"), 0, 0);
-        config.Controls.Add(nextProfile, 1, 0);
+        config.Controls.Add(profileStartPanel, 1, 0);
         config.Controls.Add(FieldLabel("Số profile mới"), 2, 0);
         config.Controls.Add(count, 3, 0);
         config.Controls.Add(resumeIncomplete, 0, 1);
@@ -251,6 +274,7 @@ public sealed partial class ManagerForm
         void SetInputsEnabled(bool enabled)
         {
             nextProfile.Enabled = enabled;
+            saveProfileTemplate.Enabled = enabled;
             count.Enabled = enabled;
             resumeIncomplete.Enabled = enabled;
             retryPaused.Enabled = enabled;
@@ -261,6 +285,58 @@ public sealed partial class ManagerForm
             pause.Enabled = !enabled;
             stop.Enabled = !enabled;
         }
+
+        saveProfileTemplate.Click += (_, _) =>
+        {
+            var template =
+                nextProfile.Text.Trim();
+
+            if (!TryParseAutoProfileName(
+                    template,
+                    out var prefix,
+                    out var number,
+                    out var width))
+            {
+                ModernDialog.ShowMessage(
+                    form,
+                    "Mẫu profile không hợp lệ.\r\n\r\n"
+                    + "Ví dụ: 01, 30, 001 hoặc acc01.",
+                    "Lưu mẫu profile",
+                    MessageBoxIcon.Warning);
+
+                nextProfile.Focus();
+                nextProfile.SelectAll();
+                return;
+            }
+
+            try
+            {
+                RememberAutoProfileSequenceStart(
+                    template);
+
+                var nextPreview =
+                    FormatAutoProfileName(
+                        prefix,
+                        number + 1,
+                        width);
+
+                status.Text =
+                    $"Đã lưu mẫu {template} cho {Path.GetFileName(_accountPoolService.CurrentSourcePath)}. "
+                    + $"Tạo {template} thành công xong sẽ tiếp tục {nextPreview}...";
+
+                status.ForeColor =
+                    Color.FromArgb(35, 91, 152);
+            }
+            catch (Exception ex)
+            {
+                ModernDialog.ShowMessage(
+                    form,
+                    "Không lưu được mẫu profile.\r\n\r\n"
+                    + ex.Message,
+                    "Lưu mẫu profile",
+                    MessageBoxIcon.Warning);
+            }
+        };
 
         void UpdateGridRow(AutoProfileQueueItem item, string stepText, string resultText, Color color)
         {
@@ -325,6 +401,12 @@ public sealed partial class ManagerForm
                 var requestedStartName = nextProfile.Text.Trim();
                 var resumeIncompleteValue = resumeIncomplete.Checked;
                 var retryPausedValue = retryPaused.Checked;
+
+                // V13.7.1: ghi nhớ dãy số RIÊNG cho file Excel hiện tại.
+                // Nếu người dùng sửa 73 -> 01 thì lần mở sau sẽ tiếp tục từ dãy 01,02,03...
+                // thay vì quay lại số lớn nhất của toàn bộ catalog.
+                if (requestedNew > 0)
+                    RememberAutoProfileSequenceStart(requestedStartName);
 
                 var queue = await RunAccountPoolIoAsync(
                     () => BuildAutoProfileQueue(
@@ -531,6 +613,11 @@ public sealed partial class ManagerForm
             ctx = ensured.Context;
             if (ensured.CreatedNow)
                 MarkAutoReplacementProfileCreated(item.ProfileName);
+
+            // Chỉ tiến bộ đếm sau khi profile đã tồn tại thật.
+            // Nếu CREATE_PROFILE thất bại và account được trả lại thì số đó vẫn có thể dùng lại.
+            AdvanceAutoProfileSequenceAfterCreated(item.ProfileName);
+
             await SetAutoCheckpointWithRetryAsync(item.Account.Id, "CREATED", step,
                 AutoProfileNote(ensured.CreatedNow ? "Đã tạo profile." : "Profile đã tồn tại; tiếp tục xác minh."), ct);
 
@@ -928,16 +1015,9 @@ public sealed partial class ManagerForm
 
     string DetectNextAutoProfileName()
     {
-        var names = _profileService.Load().Profiles
-            .Select(x => x.Name)
-            .OrderBy(x => x, NaturalProfileNameOrder)
-            .ToList();
-        for (var i = names.Count - 1; i >= 0; i--)
-        {
-            if (!TryParseAutoProfileName(names[i], out var prefix, out var number, out var width)) continue;
-            return FormatAutoProfileName(prefix, number + 1, width);
-        }
-        return "1";
+        // V13.7.1: Excel hiện tại quyết định dãy số.
+        // Catalog toàn hệ thống chỉ dùng để chống trùng tên.
+        return DetectNextAutoProfileNameFromCurrentExcel();
     }
 
     static bool TryParseAutoProfileName(string value, out string prefix, out int number, out int width)

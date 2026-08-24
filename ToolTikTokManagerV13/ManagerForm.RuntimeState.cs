@@ -117,6 +117,7 @@ public sealed partial class ManagerForm
         var confirmedState = (normalizedCommand, normalizedResponse) switch
         {
             ("start", "started") => RuntimeStateRunning,
+            ("start_auto", "started") => RuntimeStateRunning,
             ("resume", "running") => RuntimeStateRunning,
             ("pause", "paused") => RuntimeStatePaused,
             ("stop", "stopped") => RuntimeStateStopped,
@@ -168,6 +169,17 @@ public sealed partial class ManagerForm
 
             var exitCode = "?";
             try { exitCode = process.ExitCode.ToString(); } catch { }
+
+            // Exit code 0 là đường thoát sạch (shutdown/đóng Worker bình thường).
+            // Đây là thao tác kết thúc chủ động, không được giữ expected-running
+            // rồi 10 phút sau sinh FAULT_10M + suất bù.
+            if (exitCode == "0")
+            {
+                ClearAutoCloseExpectedRunning(
+                    ctx.Profile.Name,
+                    "worker_clean_exit");
+            }
+
             ConfirmRuntimeState(ctx, RuntimeStateStopped, $"worker_process_exited:{exitCode}");
             SetStatus(ctx, $"Worker đã thoát ({exitCode}) | STOPPED", Color.Firebrick);
         }

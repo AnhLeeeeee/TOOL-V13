@@ -40,6 +40,7 @@ public sealed partial class ManagerForm
         _autoCloseSettings = LoadAutoCloseSettings();
         InjectAutoCloseToolbarButton();
         InitializeAutoReplacementFeature();
+        InitializeManualRuntimeIntentGuard();
 
         // Dùng chung timer 1 giây hiện có của Manager, không tạo thread/timer mới.
         _refreshTimer.Tick += async (_, _) => await CheckAutoCloseRuntimeAsync();
@@ -521,7 +522,9 @@ public sealed partial class ManagerForm
 
                 if (healthyRunning)
                 {
-                    _autoCloseExpectedRunningProfiles.Add(profileName);
+                    MarkAutoCloseExpectedRunning(
+                        profileName,
+                        "healthy_running");
 
                     if (_autoCloseNotRunningSinceUtc.Remove(profileName, out var faultStartedUtc))
                     {
@@ -704,51 +707,51 @@ public sealed partial class ManagerForm
     {
         var profileName = ctx.Profile.Name;
 
-        // Tín hiệu thực tế luôn mạnh hơn supply-state NEW/TEST.
-        // Đây là phần quan trọng cho profile vừa được Auto Profile tạo nhưng đã Start thật.
-        if (state is RuntimeStateRunning or RuntimeStateRecovering)
-        {
-            _autoCloseExpectedRunningProfiles.Add(profileName);
+        // Luật V13.7.1:
+        // - Không còn suy ra "đáng lẽ phải chạy" chỉ vì supply-state=used,
+        //   NEW/TEST, hay vì profile đã có Tổng thời gian lịch sử.
+        // - Profile mở để xem nhưng chưa Start sẽ không thể tự sinh FAULT_10M.
+        if (_autoCloseExpectedRunningProfiles.Contains(profileName))
             return true;
-        }
 
-        // PAUSE/STOP được Worker xác nhận rõ ràng thì không suy ngược từ tổng runtime
-        // hoặc supply=used để biến thao tác thủ công thành lỗi watchdog.
         if (state == RuntimeStatePaused)
             return false;
 
-        if (state == RuntimeStateStopped
-            && !ctx.RuntimeRecoveryInProgress
-            && !SnapshotIndicatesRecovery(ctx.LastSnapshot)
-            && !RuntimeStatsFileSaysRunning(ctx))
+        var workerAlive = false;
+
+        try
         {
-            return false;
+            workerAlive =
+                ctx.Worker is not null
+                && !ctx.Worker.HasExited;
+        }
+        catch
+        {
+            workerAlive = false;
         }
 
-        // Nếu Worker/crash chết đột ngột, file checkpoint có thể còn isRunning=true.
-        // Manual STOP/Pause sẽ checkpoint false nên không đi vào nhánh này.
-        if (RuntimeStatsFileSaysRunning(ctx))
+        // Sau khi Manager mở lại, một Worker còn sống và đang RUNNING/RECOVERING
+        // là bằng chứng đủ mạnh rằng profile đã Start thật từ trước.
+        if (workerAlive
+            && state is RuntimeStateRunning or RuntimeStateRecovering)
         {
-            _autoCloseExpectedRunningProfiles.Add(profileName);
+            MarkAutoCloseExpectedRunning(
+                profileName,
+                "live_worker_running");
+
             return true;
         }
 
-        var persisted = GetProfileSupplyState(profileName);
-
-        if (persisted is not null
-            && persisted.State.Equals("used", StringComparison.OrdinalIgnoreCase))
+        // Status IPC có thể tạm STOPPED/UNKNOWN trong lúc Worker vẫn sống.
+        // Chỉ dùng runtime_stats.isRunning như tín hiệu phục hồi KHI Worker còn sống.
+        // Không dùng file này để resurrect một Worker đã được người dùng đóng.
+        if (workerAlive
+            && RuntimeStatsFileSaysRunning(ctx))
         {
-            _autoCloseExpectedRunningProfiles.Add(profileName);
-            return true;
-        }
+            MarkAutoCloseExpectedRunning(
+                profileName,
+                "live_worker_runtime_stats_running");
 
-        var runtime = ReadStatisticsRuntime(ctx);
-
-        // NEW/TEST không còn return false ở đầu hàm. Nếu profile thực tế đã treo đủ
-        // ngưỡng lịch sử thì vẫn phải được watchdog bảo vệ.
-        if (runtime.Total >= TimeSpan.FromMinutes(AutoReplacementTreoThresholdMinutes))
-        {
-            _autoCloseExpectedRunningProfiles.Add(profileName);
             return true;
         }
 
@@ -874,21 +877,25 @@ public sealed partial class ManagerForm
         var profileName = ctx.Profile.Name;
         command = (command ?? "").Trim().ToLowerInvariant();
 
-        if (command is "start" or "resume")
+        if (command is "start" or "start_auto" or "resume")
         {
-            _autoCloseExpectedRunningProfiles.Add(profileName);
-            _autoCloseNotRunningSinceUtc.Remove(profileName);
+            MarkAutoCloseExpectedRunning(
+                profileName,
+                $"runtime_command:{command}");
 
-            // Người dùng/Manager vừa chủ động START hoặc RESUME.
-            // Từ thời điểm này mới cho phép xử lý các suất bù đang chờ.
-            ArmAutoReplacementSession($"runtime_command:{command}:{profileName}");
+            // Người dùng/Manager vừa chủ động START/RESUME hoặc Auto Profile
+            // đã gửi start_auto thành công.
+            ArmAutoReplacementSession(
+                $"runtime_command:{command}:{profileName}");
+
             return;
         }
 
         if (command is "pause" or "stop")
         {
-            _autoCloseExpectedRunningProfiles.Remove(profileName);
-            _autoCloseNotRunningSinceUtc.Remove(profileName);
+            ClearAutoCloseExpectedRunning(
+                profileName,
+                $"runtime_command:{command}");
         }
     }
 
@@ -900,8 +907,9 @@ public sealed partial class ManagerForm
         if (!_autoCloseInProgressProfiles.Add(ctx.Profile.Name))
             return;
 
-        _autoCloseExpectedRunningProfiles.Remove(ctx.Profile.Name);
-        _autoCloseNotRunningSinceUtc.Remove(ctx.Profile.Name);
+        ClearAutoCloseExpectedRunning(
+            ctx.Profile.Name,
+            $"auto_close:{reason}");
 
         try
         {
