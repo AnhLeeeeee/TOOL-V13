@@ -252,12 +252,25 @@ public sealed partial class ManagerForm
             if (cycle.OldProfile.Length == 0 && profile.Length > 0)
                 cycle.OldProfile = profile;
 
-            if (cycle.Reason.Length == 0 && reason.Length > 0)
-                cycle.Reason = reason;
+            if (reason.Length > 0)
+            {
+                var incomingReason = NormalizeAutoCloseReason(reason);
+                var currentPriority = GetAutoCloseReasonPriority(cycle.Reason);
+                var incomingPriority = GetAutoCloseReasonPriority(incomingReason);
+
+                // Một event đến sau có lý do ưu tiên cao hơn phải nâng lý do của cả chu trình.
+                // Ví dụ: FAULT_10M đã bắt đầu nhưng sau đó xác nhận BAN -> hiển thị BAN.
+                if (cycle.Reason.Length == 0
+                    || incomingPriority > currentPriority)
+                {
+                    cycle.Reason = incomingReason;
+                }
+            }
 
             if ((action.Equals("TỰ ĐÓNG", StringComparison.OrdinalIgnoreCase)
                  || action.Equals("SUẤT BÙ", StringComparison.OrdinalIgnoreCase)
-                 || action.Equals("GHI EXCEL BAN", StringComparison.OrdinalIgnoreCase))
+                 || action.Equals("GHI EXCEL BAN", StringComparison.OrdinalIgnoreCase)
+                 || action.Equals("GHI EXCEL VÒNG ĐỜI", StringComparison.OrdinalIgnoreCase))
                 && cycle.OldAccount.Length == 0
                 && !string.IsNullOrWhiteSpace(entry.Account))
             {

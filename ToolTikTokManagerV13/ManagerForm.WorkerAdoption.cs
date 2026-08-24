@@ -21,6 +21,20 @@ public sealed partial class ManagerForm
 
         StartManagerUiWatchdog();
 
+        try
+        {
+            InitializeAutoReplacementManualControl();
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                _log.Warn(
+                    $"[AUTO_REPLACE_MANUAL_UI_INIT_WARN] error={ex.Message}");
+            }
+            catch { }
+        }
+
         if (_startupWorkerAdoptionStarted)
             return;
 

@@ -6,6 +6,8 @@ public sealed partial class ManagerForm
 {
     readonly HashSet<string> _banExcelNoteMarkedProfiles = new(StringComparer.OrdinalIgnoreCase);
     readonly HashSet<string> _banExcelNoteWriteInProgressProfiles = new(StringComparer.OrdinalIgnoreCase);
+    readonly HashSet<string> _lifetimeExcelNoteMarkedProfiles = new(StringComparer.OrdinalIgnoreCase);
+    readonly HashSet<string> _lifetimeExcelNoteWriteInProgressProfiles = new(StringComparer.OrdinalIgnoreCase);
     bool _banExcelNoteWatcherInitialized;
 
     protected override void OnHandleCreated(EventArgs e)
@@ -289,6 +291,243 @@ public sealed partial class ManagerForm
 
         _log.Info(
             $"[BAN_EXCEL_NOTE_OK] profile={profileName} user={account.Username} row={account.SourceRow} note=ban verified=true detail={detail}");
+
+        return true;
+    }
+
+    void QueueLifetimeExcelNoteIfNeeded(
+        ProfileContext ctx,
+        string reason,
+        string detail)
+    {
+        reason = NormalizeAutoCloseReason(reason);
+
+        if (!IsAutoCloseLifetimeReason(reason))
+            return;
+
+        var profileName = ctx.Profile.Name;
+
+        if (_lifetimeExcelNoteMarkedProfiles.Contains(profileName)
+            || !_lifetimeExcelNoteWriteInProgressProfiles.Add(profileName))
+        {
+            return;
+        }
+
+        TikTokAccountPoolItem? snapshot = null;
+
+        try
+        {
+            var items = _accountPoolService.Load();
+
+            snapshot = items.FirstOrDefault(x =>
+                x.AssignedProfile.Equals(
+                    profileName,
+                    StringComparison.OrdinalIgnoreCase));
+
+            if (snapshot is null)
+            {
+                var knownUsername =
+                    ResolveAutoActivityAccount(profileName);
+
+                if (!string.IsNullOrWhiteSpace(knownUsername))
+                {
+                    snapshot = items.FirstOrDefault(x =>
+                        x.Username.Equals(
+                            knownUsername,
+                            StringComparison.OrdinalIgnoreCase));
+                }
+            }
+
+            if (snapshot is null)
+            {
+                _lifetimeExcelNoteWriteInProgressProfiles.Remove(profileName);
+
+                _log.Warn(
+                    $"[LIFETIME_EXCEL_NOTE_SNAPSHOT_MISSING] profile={profileName} reason={reason}");
+
+                return;
+            }
+
+            _log.Info(
+                $"[LIFETIME_EXCEL_NOTE_SNAPSHOT] profile={profileName} user={snapshot.Username} row={snapshot.SourceRow} reason={reason}");
+        }
+        catch (Exception ex)
+        {
+            _lifetimeExcelNoteWriteInProgressProfiles.Remove(profileName);
+
+            _log.Warn(
+                $"[LIFETIME_EXCEL_NOTE_SNAPSHOT_ERROR] profile={profileName} reason={reason} error={ex.Message}");
+
+            return;
+        }
+
+        _ = MarkAccountSnapshotWithLifetimeNoteInBackgroundAsync(
+            profileName,
+            snapshot,
+            reason,
+            detail);
+    }
+
+    async Task MarkAccountSnapshotWithLifetimeNoteInBackgroundAsync(
+        string profileName,
+        TikTokAccountPoolItem accountSnapshot,
+        string reason,
+        string detail)
+    {
+        const int maxAttempts = 5;
+        Exception? lastError = null;
+
+        try
+        {
+            for (var attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                try
+                {
+                    var result = await RunAccountPoolIoAsync(
+                        () => MarkAccountSnapshotWithLifetimeNoteCore(
+                            profileName,
+                            accountSnapshot,
+                            reason,
+                            detail),
+                        CancellationToken.None);
+
+                    if (result)
+                    {
+                        _lifetimeExcelNoteMarkedProfiles.Add(profileName);
+
+                        WriteAutoActivityLog(
+                            action: "GHI EXCEL VÒNG ĐỜI",
+                            profile: profileName,
+                            account: accountSnapshot.Username,
+                            reason: reason,
+                            result: "THÀNH CÔNG",
+                            detail:
+                                $"Đã ghi {reason} và xác minh lại dòng {accountSnapshot.SourceRow} trong Excel.");
+
+                        return;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex;
+
+                    _log.Warn(
+                        $"[LIFETIME_EXCEL_NOTE_RETRY] profile={profileName} user={accountSnapshot.Username} row={accountSnapshot.SourceRow} reason={reason} attempt={attempt}/{maxAttempts} error={ex.Message}");
+                }
+
+                if (attempt < maxAttempts)
+                    await Task.Delay(700 * attempt);
+            }
+
+            var finalMessage =
+                lastError?.Message
+                ?? $"Không xác minh được ghi chú {reason} sau khi ghi.";
+
+            _log.Warn(
+                $"[LIFETIME_EXCEL_NOTE_FAILED] profile={profileName} user={accountSnapshot.Username} row={accountSnapshot.SourceRow} reason={reason} attempts={maxAttempts} error={finalMessage}");
+
+            WriteAutoActivityLog(
+                action: "GHI EXCEL VÒNG ĐỜI",
+                profile: profileName,
+                account: accountSnapshot.Username,
+                reason: reason,
+                result: "LỖI",
+                detail:
+                    $"Không ghi/xác minh được {reason} sau {maxAttempts} lần: {finalMessage}");
+        }
+        finally
+        {
+            _lifetimeExcelNoteWriteInProgressProfiles.Remove(profileName);
+        }
+    }
+
+    bool MarkAccountSnapshotWithLifetimeNoteCore(
+        string profileName,
+        TikTokAccountPoolItem snapshot,
+        string reason,
+        string detail)
+    {
+        reason = NormalizeAutoCloseReason(reason);
+
+        if (!IsAutoCloseLifetimeReason(reason))
+            return true;
+
+        var items = _accountPoolService.Load();
+
+        var account = items.FirstOrDefault(x =>
+            !string.IsNullOrWhiteSpace(snapshot.Id)
+            && x.Id.Equals(
+                snapshot.Id,
+                StringComparison.OrdinalIgnoreCase));
+
+        account ??= items.FirstOrDefault(x =>
+            x.SourceRow == snapshot.SourceRow
+            && x.Username.Equals(
+                snapshot.Username,
+                StringComparison.OrdinalIgnoreCase));
+
+        account ??= items.FirstOrDefault(x =>
+            x.Username.Equals(
+                snapshot.Username,
+                StringComparison.OrdinalIgnoreCase));
+
+        if (account is null)
+        {
+            throw new InvalidOperationException(
+                $"Không còn tìm thấy account hết vòng đời {snapshot.Username} (row={snapshot.SourceRow}).");
+        }
+
+        // BAN luôn có ưu tiên cao hơn TIME_xH.
+        // Nếu BAN đã được ghi trước thì tuyệt đối không ghi đè bằng TIME_xH.
+        if (string.Equals(
+                (account.Note ?? "").Trim(),
+                "ban",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            _log.Info(
+                $"[LIFETIME_EXCEL_NOTE_SKIP_BAN] profile={profileName} user={account.Username} requested={reason} current=ban");
+
+            return true;
+        }
+
+        _accountPoolService.Upsert(
+            account with { Note = reason });
+
+        _accountPoolService.ReloadCurrentExcel();
+
+        var verified = _accountPoolService.Load()
+            .FirstOrDefault(x =>
+                x.Id.Equals(
+                    account.Id,
+                    StringComparison.OrdinalIgnoreCase));
+
+        verified ??= _accountPoolService.Load()
+            .FirstOrDefault(x =>
+                x.SourceRow == account.SourceRow
+                && x.Username.Equals(
+                    account.Username,
+                    StringComparison.OrdinalIgnoreCase));
+
+        var verifiedNote =
+            (verified?.Note ?? "").Trim();
+
+        // Nếu BAN xuất hiện đúng lúc TIME đang ghi thì BAN vẫn được coi là kết quả đúng,
+        // vì BAN có priority cao hơn và không được TIME ghi đè ngược lại.
+        if (!string.Equals(
+                verifiedNote,
+                reason,
+                StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(
+                verifiedNote,
+                "ban",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"Đã ghi nhưng đọc lại chưa thấy note={reason} (user={account.Username}, row={account.SourceRow}, actual={verifiedNote}).");
+        }
+
+        _log.Info(
+            $"[LIFETIME_EXCEL_NOTE_OK] profile={profileName} user={account.Username} row={account.SourceRow} note={verifiedNote} requested={reason} detail={detail}");
 
         return true;
     }

@@ -2413,7 +2413,40 @@ public sealed partial class ChromeController : IAsyncDisposable
     async Task OpenTikTokLiveReadyAsync(CancellationToken ct)
     {
         const string liveUrl = "https://www.tiktok.com/live";
-        await NavigateAndWaitAsync(liveUrl, 900, 15000, ct);
+
+        // Startup V13.7.2:
+        // Chrome/CDP ổn định -> tiktok.com -> PAGE_READY -> nghỉ 3-5s -> mới vào LIVE.
+        await WarmUpTikTokHomeAsync(ct);
+
+        _log.Info(
+            "[TIKTOK_LIVE_NAVIGATE_AFTER_HOME_READY] target=https://www.tiktok.com/live");
+
+        await NavigateAndWaitAsync(
+            liveUrl,
+            900,
+            15000,
+            ct);
+
+        var health =
+            await WaitForHealthyPageAfterNavigateAsync(
+                25000,
+                ct);
+
+        if (health.Reason.Equals(
+                "HTTP_403",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            // Lúc này Page.Url thường đã là /@user/live; Recover sẽ giữ đúng URL đó.
+            await RecoverHttp403ViaHomeAsync(
+                Page?.Url ?? liveUrl,
+                ct);
+        }
+        else if (!health.Healthy)
+        {
+            throw new InvalidOperationException(
+                $"TikTok LIVE chưa khỏe sau navigation: {health.Reason}");
+        }
+
         await EnsureTikTokLivePlaybackStartedAsync(ct);
     }
 
@@ -3103,6 +3136,13 @@ public sealed partial class ChromeController : IAsyncDisposable
             if (!string.IsNullOrWhiteSpace(href)) url = href;
 
             var visibleText = title + "\n" + bodyText;
+
+            // HTTP 403 không phải renderer crash, nhưng phải đi vào nhánh tự cứu ngay.
+            // Đánh dấu CrashLike=true để engine khóa workflow và gọi RecoverCurrentPageAsync;
+            // RecoverCurrentPageAsync sẽ nhận HTTP_403 và dùng HOME -> READY -> LIVE, KHÔNG F5.
+            if (LooksLikeHttp403Text(visibleText))
+                return new PageHealthSnapshot(false, true, "HTTP_403", url);
+
             if (LooksLikeCrashUrl(href) || LooksLikeRendererCrashText(visibleText))
                 return new PageHealthSnapshot(false, true, "CRASH_PAGE_DOM_TEXT", url);
 
@@ -3145,6 +3185,271 @@ public sealed partial class ChromeController : IAsyncDisposable
 
             return new PageHealthSnapshot(false, false, "PROBE_ERROR", url);
         }
+    }
+
+    static bool LooksLikeHttp403Text(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return false;
+
+        return text.Contains("HTTP ERROR 403", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("403 Forbidden", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("HTTP 403", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("Quyền truy cập www.tiktok.com bị từ chối", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("Bạn không có quyền xem trang này", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("Access to www.tiktok.com was denied", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("You don't have authorization to view this page", StringComparison.OrdinalIgnoreCase);
+    }
+
+    static bool IsTikTokLiveRecoveryUrl(string url)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+            return false;
+
+        if (!(uri.Host.Equals("tiktok.com", StringComparison.OrdinalIgnoreCase)
+              || uri.Host.EndsWith(".tiktok.com", StringComparison.OrdinalIgnoreCase)))
+            return false;
+
+        var path = uri.AbsolutePath.TrimEnd('/');
+        return path.Equals("/live", StringComparison.OrdinalIgnoreCase)
+            || (path.StartsWith("/@", StringComparison.OrdinalIgnoreCase)
+                && path.EndsWith("/live", StringComparison.OrdinalIgnoreCase));
+    }
+
+    async Task<bool> WaitForTikTokHomePageReadyAsync(
+        int timeoutMs,
+        CancellationToken ct)
+    {
+        var started = Environment.TickCount64;
+        var stable = 0;
+
+        while (Environment.TickCount64 - started < timeoutMs)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            try
+            {
+                var r = await EvalAsync("""
+(() => {
+  const ready = String(document.readyState || '');
+  const href = String(location.href || '');
+  const title = String(document.title || '');
+  const bodyText = String(document.body?.innerText || document.body?.textContent || '').slice(0, 1600);
+  const bodyChildren = Number(document.body?.childElementCount || 0);
+  return { ready, href, title, bodyText, bodyChildren };
+})()
+""", ct: ct);
+
+                var v = r.GetProperty("value");
+                var ready = v.TryGetProperty("ready", out var readyEl) ? readyEl.GetString() ?? "" : "";
+                var href = v.TryGetProperty("href", out var hrefEl) ? hrefEl.GetString() ?? "" : "";
+                var title = v.TryGetProperty("title", out var titleEl) ? titleEl.GetString() ?? "" : "";
+                var bodyText = v.TryGetProperty("bodyText", out var bodyEl) ? bodyEl.GetString() ?? "" : "";
+                var bodyChildren = v.TryGetProperty("bodyChildren", out var childEl)
+                                   && childEl.TryGetInt32(out var childCount)
+                    ? childCount
+                    : 0;
+
+                if (LooksLikeHttp403Text(title + "\n" + bodyText))
+                {
+                    stable = 0;
+                }
+                else if (IsSafeTikTokRecoveryUrl(href)
+                         && ready is "interactive" or "complete"
+                         && bodyChildren > 0)
+                {
+                    stable++;
+                    if (stable >= 3)
+                        return true;
+                }
+                else
+                {
+                    stable = 0;
+                }
+            }
+            catch (Exception ex) when (IsTransientDocumentContextError(ex))
+            {
+                stable = 0;
+            }
+
+            await Task.Delay(300, ct);
+        }
+
+        return false;
+    }
+
+    async Task WarmUpTikTokHomeAsync(CancellationToken ct)
+    {
+        const int attempts = 2;
+
+        for (var attempt = 1; attempt <= attempts; attempt++)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            _log.Info(
+                $"[TIKTOK_HOME_WARMUP] attempt={attempt}/{attempts} action=NAVIGATE_HOME");
+
+            await NavigateAndWaitAsync(
+                TikTokUrl,
+                700,
+                15000,
+                ct);
+
+            var ready = await WaitForTikTokHomePageReadyAsync(
+                25000,
+                ct);
+
+            if (!ready)
+            {
+                _log.Warn(
+                    $"[TIKTOK_HOME_WARMUP_NOT_READY] attempt={attempt}/{attempts}");
+
+                if (attempt < attempts)
+                {
+                    await Task.Delay(1500, ct);
+                    continue;
+                }
+
+                throw new TimeoutException(
+                    "TikTok trang chủ chưa PAGE_READY sau khi chờ.");
+            }
+
+            var settleMs = Random.Shared.Next(3000, 5001);
+
+            _log.Info(
+                $"[TIKTOK_HOME_WARMUP_READY] attempt={attempt}/{attempts} settleMs={settleMs}");
+
+            await Task.Delay(
+                settleMs,
+                ct);
+
+            return;
+        }
+    }
+
+    async Task<PageHealthSnapshot> WaitForHealthyPageAfterNavigateAsync(
+        int timeoutMs,
+        CancellationToken ct)
+    {
+        var started = Environment.TickCount64;
+        var last = new PageHealthSnapshot(
+            false,
+            false,
+            "NOT_PROBED",
+            Page?.Url ?? "");
+
+        while (Environment.TickCount64 - started < timeoutMs)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            last = await ProbePageHealthAsync(ct);
+
+            if (last.Healthy)
+                return last;
+
+            // 403 là lỗi xác định được ngay, không chờ đủ timeout.
+            if (last.Reason.Equals(
+                    "HTTP_403",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return last;
+            }
+
+            await Task.Delay(500, ct);
+        }
+
+        return last;
+    }
+
+    async Task RecoverHttp403ViaHomeAsync(
+        string requestedLiveUrl,
+        CancellationToken ct)
+    {
+        const int attempts = 2;
+
+        var target =
+            IsTikTokLiveRecoveryUrl(Page?.Url ?? "")
+                ? Page!.Url
+                : requestedLiveUrl;
+
+        if (!IsTikTokLiveRecoveryUrl(target))
+            target = "https://www.tiktok.com/live";
+
+        Exception? last = null;
+
+        for (var attempt = 1; attempt <= attempts; attempt++)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            _log.Warn(
+                $"[PAGE_RECOVERY_403] attempt={attempt}/{attempts} action=NO_F5 target={TrimForLog(target)}");
+
+            try
+            {
+                if (!Connected)
+                    await ReconnectAsync(ct);
+
+                // Luồng 403: tuyệt đối không F5 trang lỗi.
+                // Về trang chủ -> PAGE_READY -> chờ 3-5s -> vào lại đúng LIVE.
+                await WarmUpTikTokHomeAsync(ct);
+
+                _log.Warn(
+                    $"[PAGE_RECOVERY_403_RENAVIGATE] attempt={attempt}/{attempts} target={TrimForLog(target)}");
+
+                await NavigateAndWaitAsync(
+                    target,
+                    900,
+                    18000,
+                    ct);
+
+                var health =
+                    await WaitForHealthyPageAfterNavigateAsync(
+                        25000,
+                        ct);
+
+                if (health.Healthy)
+                {
+                    _log.Warn(
+                        $"[PAGE_RECOVERY_403_OK] attempt={attempt}/{attempts} method=HOME_READY_THEN_RENAVIGATE url={TrimForLog(health.Url)}");
+
+                    return;
+                }
+
+                // Nếu /live redirect sang /@user/live rồi chính URL đó bị 403,
+                // giữ lại URL cụ thể để lần thử sau quay đúng LIVE đó.
+                if (health.Reason.Equals(
+                        "HTTP_403",
+                        StringComparison.OrdinalIgnoreCase)
+                    && IsTikTokLiveRecoveryUrl(Page?.Url ?? ""))
+                {
+                    target = Page!.Url;
+                }
+
+                last = new InvalidOperationException(
+                    $"Trang chưa khỏe sau phục hồi 403: {health.Reason}");
+
+                _log.Warn(
+                    $"[PAGE_RECOVERY_403_NOT_HEALTHY] attempt={attempt}/{attempts} reason={health.Reason} target={TrimForLog(target)}");
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                last = ex;
+
+                _log.Warn(
+                    $"[PAGE_RECOVERY_403_FAILED] attempt={attempt}/{attempts} reason={ex.Message}");
+            }
+
+            if (attempt < attempts)
+                await Task.Delay(2000, ct);
+        }
+
+        throw new InvalidOperationException(
+            "Phục hồi HTTP 403 thất bại sau 2 lần về TikTok trang chủ rồi vào lại LIVE.",
+            last);
     }
 
     static bool IsSafeTikTokRecoveryUrl(string url)
@@ -3190,6 +3495,38 @@ public sealed partial class ChromeController : IAsyncDisposable
 
     public async Task RecoverCurrentPageAsync(string fallbackUrl, CancellationToken ct = default)
     {
+        // HTTP 403: KHÔNG F5. Chrome error page thường giữ nguyên URL LIVE;
+        // về tiktok.com cho session ổn định rồi mới navigate lại đúng URL đó.
+        try
+        {
+            var initialHealth = await ProbePageHealthAsync(ct);
+
+            if (initialHealth.Reason.Equals(
+                    "HTTP_403",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                var liveTarget =
+                    IsTikTokLiveRecoveryUrl(Page?.Url ?? "")
+                        ? Page!.Url
+                        : fallbackUrl;
+
+                await RecoverHttp403ViaHomeAsync(
+                    liveTarget,
+                    ct);
+
+                return;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn(
+                $"[PAGE_RECOVERY_403_PROBE_WARN] reason={ex.Message}");
+        }
+
         Exception? last = null;
         var recoveryUrl = IsSafeTikTokRecoveryUrl(fallbackUrl)
             ? fallbackUrl

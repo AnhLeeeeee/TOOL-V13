@@ -25,6 +25,16 @@ public sealed partial class ManagerForm
     readonly HashSet<string> _autoCloseBanHandledProfiles = new(StringComparer.OrdinalIgnoreCase);
     readonly HashSet<string> _autoCloseExpectedRunningProfiles = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, DateTime> _autoCloseNotRunningSinceUtc = new(StringComparer.OrdinalIgnoreCase);
+
+    sealed record AutoCloseReasonDecision(
+        string Reason,
+        string Detail,
+        int Priority,
+        DateTime UpdatedUtc);
+
+    readonly object _autoCloseReasonLock = new();
+    readonly Dictionary<string, AutoCloseReasonDecision> _autoCloseReasonByProfile =
+        new(StringComparer.OrdinalIgnoreCase);
     bool _autoCloseFeatureInitialized;
     bool _autoCloseRuntimeCheckBusy;
     AutoCloseSettingsDocument _autoCloseSettings = new();
@@ -426,12 +436,145 @@ public sealed partial class ManagerForm
         form.ShowDialog(this);
     }
 
+    static string NormalizeAutoCloseReason(string? reason)
+    {
+        reason = (reason ?? "").Trim().ToUpperInvariant();
+
+        if (reason == "BAN")
+            return "BAN";
+
+        if (reason == "FAULT_10M")
+            return "FAULT_10M";
+
+        if (reason.StartsWith("TIME_", StringComparison.OrdinalIgnoreCase)
+            && reason.EndsWith("H", StringComparison.OrdinalIgnoreCase))
+        {
+            return reason;
+        }
+
+        return reason;
+    }
+
+    static int GetAutoCloseReasonPriority(string? reason)
+    {
+        reason = NormalizeAutoCloseReason(reason);
+
+        if (reason == "BAN")
+            return 300;
+
+        if (reason.StartsWith("TIME_", StringComparison.OrdinalIgnoreCase)
+            && reason.EndsWith("H", StringComparison.OrdinalIgnoreCase))
+        {
+            return 200;
+        }
+
+        if (reason == "FAULT_10M")
+            return 100;
+
+        return 0;
+    }
+
+    static bool IsAutoCloseLifetimeReason(string? reason)
+    {
+        reason = NormalizeAutoCloseReason(reason);
+        return reason.StartsWith("TIME_", StringComparison.OrdinalIgnoreCase)
+            && reason.EndsWith("H", StringComparison.OrdinalIgnoreCase);
+    }
+
+    AutoCloseReasonDecision PromoteAutoCloseReason(
+        string profileName,
+        string reason,
+        string detail)
+    {
+        profileName = (profileName ?? "").Trim();
+        reason = NormalizeAutoCloseReason(reason);
+        detail = (detail ?? "").Trim();
+
+        var incoming = new AutoCloseReasonDecision(
+            reason,
+            detail,
+            GetAutoCloseReasonPriority(reason),
+            DateTime.UtcNow);
+
+        lock (_autoCloseReasonLock)
+        {
+            if (!_autoCloseReasonByProfile.TryGetValue(profileName, out var current)
+                || incoming.Priority > current.Priority
+                || (incoming.Priority == current.Priority
+                    && current.Detail.Length == 0
+                    && incoming.Detail.Length > 0))
+            {
+                _autoCloseReasonByProfile[profileName] = incoming;
+
+                if (current is not null
+                    && incoming.Priority > current.Priority)
+                {
+                    _log.Warn(
+                        $"[AUTO_CLOSE_REASON_PROMOTED] profile={profileName} from={current.Reason} to={incoming.Reason}");
+                }
+
+                return incoming;
+            }
+
+            return current;
+        }
+    }
+
+    AutoCloseReasonDecision ResolveAutoCloseReasonDecision(
+        string profileName,
+        string fallbackReason,
+        string fallbackDetail)
+    {
+        profileName = (profileName ?? "").Trim();
+
+        lock (_autoCloseReasonLock)
+        {
+            if (_autoCloseReasonByProfile.TryGetValue(profileName, out var current))
+                return current;
+        }
+
+        return PromoteAutoCloseReason(
+            profileName,
+            fallbackReason,
+            fallbackDetail);
+    }
+
+    void ClearAutoCloseReasonDecision(string profileName, string source)
+    {
+        profileName = (profileName ?? "").Trim();
+        if (profileName.Length == 0)
+            return;
+
+        AutoCloseReasonDecision? removed = null;
+
+        lock (_autoCloseReasonLock)
+        {
+            if (_autoCloseReasonByProfile.Remove(profileName, out var value))
+                removed = value;
+        }
+
+        if (removed is not null)
+        {
+            _log.Info(
+                $"[AUTO_CLOSE_REASON_RESET] profile={profileName} old={removed.Reason} source={source}");
+        }
+    }
+
     void QueueAutoCloseForBan(ProfileContext ctx, string detail)
     {
         if (!_autoCloseFeatureInitialized || !_autoCloseSettings.CloseOnBan)
             return;
 
         var profileName = ctx.Profile.Name;
+
+        // BAN là lý do ưu tiên cao nhất: chốt ngay trước mọi watchdog khác.
+        PromoteAutoCloseReason(
+            profileName,
+            "BAN",
+            string.IsNullOrWhiteSpace(detail) ? "TikTok account ban" : detail);
+
+        // BAN không được tiếp tục mang đồng hồ FAULT_10M.
+        _autoCloseNotRunningSinceUtc.Remove(profileName);
 
         if (!_autoCloseBanHandledProfiles.Add(profileName))
             return;
@@ -879,6 +1022,11 @@ public sealed partial class ManagerForm
 
         if (command is "start" or "start_auto" or "resume")
         {
+            // Một lần Start/Resume mới mở một vòng đời mới cho profile.
+            ClearAutoCloseReasonDecision(
+                profileName,
+                $"runtime_command:{command}");
+
             MarkAutoCloseExpectedRunning(
                 profileName,
                 $"runtime_command:{command}");
@@ -904,8 +1052,23 @@ public sealed partial class ManagerForm
         if (_closing || IsDisposed || Disposing)
             return;
 
+        var initialDecision = PromoteAutoCloseReason(
+            ctx.Profile.Name,
+            reason,
+            detail);
+
+        reason = initialDecision.Reason;
+        detail = initialDecision.Detail;
+
         if (!_autoCloseInProgressProfiles.Add(ctx.Profile.Name))
             return;
+
+        // Chỉ TIME_xH cần ghi Ghi chú tại đây. BAN có watcher riêng,
+        // FAULT_10M/OOM/403/lỗi khác tuyệt đối không ghi Ghi chú Excel.
+        QueueLifetimeExcelNoteIfNeeded(
+            ctx,
+            reason,
+            detail);
 
         ClearAutoCloseExpectedRunning(
             ctx.Profile.Name,
@@ -913,6 +1076,16 @@ public sealed partial class ManagerForm
 
         try
         {
+            // Đọc lại quyết định lần cuối trước khi ghi log bắt đầu;
+            // nếu BAN vừa được phát hiện thì BAN thắng TIME/FAULT.
+            var beginDecision = ResolveAutoCloseReasonDecision(
+                ctx.Profile.Name,
+                reason,
+                detail);
+
+            reason = beginDecision.Reason;
+            detail = beginDecision.Detail;
+
             _log.Info(
                 $"[AUTO_CLOSE_BEGIN] profile={ctx.Profile.Name} reason={reason} detail={detail}");
 
@@ -1034,6 +1207,20 @@ public sealed partial class ManagerForm
 
             if (ctx.Tab is not null && !ctx.Tab.IsDisposed && ctx.Tab.Parent == _tabs)
                 RemoveTab(ctx);
+
+            // Reason có thể được nâng cấp trong lúc đang đóng (ví dụ FAULT -> BAN).
+            var finalDecision = ResolveAutoCloseReasonDecision(
+                ctx.Profile.Name,
+                reason,
+                detail);
+
+            reason = finalDecision.Reason;
+            detail = finalDecision.Detail;
+
+            QueueLifetimeExcelNoteIfNeeded(
+                ctx,
+                reason,
+                detail);
 
             _log.Info(
                 $"[AUTO_CLOSE_DONE] profile={ctx.Profile.Name} reason={reason}");

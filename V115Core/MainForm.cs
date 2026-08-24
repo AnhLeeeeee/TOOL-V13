@@ -1780,6 +1780,39 @@ public sealed partial class MainForm : Form
             return false;
         }
 
+        // Nếu Chrome đang đứng đúng /@user/live nhưng là trang HTTP 403,
+        // không chờ PAGE_READY 25s x2 và không F5 trang 403.
+        try
+        {
+            var health = await _chrome.ProbePageHealthAsync();
+
+            if (health.Reason.Equals(
+                    "HTTP_403",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                _log.Warn(
+                    $"[TIKTOK_STARTUP_403] url={ShortText(url, 160)} action=HOME_READY_THEN_RENAVIGATE_NO_F5");
+
+                SetChromeStatus(
+                    "Trạng thái Chrome: 🟡 Đang phục hồi HTTP 403...", Color.Goldenrod,
+                    "TikTok: 🟡 Về trang chủ → PAGE_READY → vào lại LIVE", Color.Goldenrod);
+
+                await _chrome.RecoverCurrentPageAsync(url);
+
+                url = _chrome.Page?.Url ?? url;
+
+                _log.Warn(
+                    $"[TIKTOK_STARTUP_403_RECOVERED] url={ShortText(url, 160)}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Warn(
+                $"[TIKTOK_STARTUP_403_RECOVERY_FAILED] reason={ShortText(ex.Message, 160)}");
+
+            return false;
+        }
+
         var ready = await WaitForStartupLivePageReadyAsync("giữ LIVE hiện tại");
         _log.Info($"[TIKTOK_STARTUP_LIVE_PROBE] ready={ready} mode=conditional-wait url={ShortText(url, 140)}");
         return ready;
