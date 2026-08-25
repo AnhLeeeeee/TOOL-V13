@@ -4165,30 +4165,56 @@ public sealed partial class ManagerForm : Form
 
     async Task CloseChromeForProfileAsync(ProfileContext selected)
     {
-        SetStatus(selected, "Đang đóng Chrome theo profilePath/CDP/PID đã xác minh...", Color.DarkOrange);
-        var result = await SendCloseChromeCommandAsync(selected);
+        SetStatus(selected, "Đang đóng Chrome theo đúng ProfilePath...", Color.DarkOrange);
 
-        switch (result)
+        var workerReply = "worker_unavailable";
+        try
         {
-            case "closed":
-                SetStatus(selected, "Đã đóng Chrome của đúng profile.", Color.DarkGreen);
-                _log.Info($"[CHROME_CLOSE] profile={selected.Profile.Name} result=closed profilePath={selected.Profile.ProfilePath} port={selected.Profile.CdpPort}");
-                break;
-            case "not_running":
-                SetStatus(selected, "Chrome của profile này chưa chạy.", Color.DimGray);
-                _log.Info($"[CHROME_CLOSE] profile={selected.Profile.Name} result=not_running profilePath={selected.Profile.ProfilePath} port={selected.Profile.CdpPort}");
-                break;
-            case "automation_running":
+            var workerAlive = false;
+            try { workerAlive = selected.Worker is not null && !selected.Worker.HasExited; }
+            catch { workerAlive = selected.Worker is not null; }
+
+            if (workerAlive)
+            {
+                try
+                {
+                    workerReply = await SendCloseChromeCommandAsync(selected);
+                    _log.Info($"[CHROME_CLOSE_WORKER] profile={selected.Profile.Name} reply={workerReply}");
+                }
+                catch (Exception ex)
+                {
+                    // Worker/IPC chết không được làm nút Đóng Chrome mất tác dụng.
+                    // Fallback phía dưới sẽ probe + kill đúng ProfilePath.
+                    workerReply = "worker_close_failed";
+                    _log.Warn($"[CHROME_CLOSE_WORKER_WARN] profile={selected.Profile.Name} error={ex.Message}");
+                }
+            }
+
+            if (workerReply == "automation_running")
+            {
                 SetStatus(selected, "Hãy dừng automation trước khi đóng Chrome.", Color.DarkOrange);
                 _log.Warn($"[CHROME_CLOSE] profile={selected.Profile.Name} result=automation_running");
-                break;
-            default:
-                SetStatus(selected, "Không thể xác nhận Chrome đã đóng hoàn toàn.", Color.Firebrick);
-                _log.Warn($"[CHROME_CLOSE] profile={selected.Profile.Name} result={result} profilePath={selected.Profile.ProfilePath} port={selected.Profile.CdpPort}");
-                break;
-        }
+                return;
+            }
 
-        try { await RefreshStatusAsync(selected); } catch (Exception ex) { _log.Warn($"[{selected.Profile.Name}] refresh status sau close Chrome: {ex.Message}"); }
+            // Dù Worker báo closed/not_running vẫn xác minh lại process thật theo ProfilePath.
+            // Nếu Worker đã chết/CDP hỏng, hàm này vẫn đóng được Chrome mồ côi đúng profile.
+            await EnsureAutoCloseChromeStoppedAsync(selected);
+
+            SetStatus(selected, "Đã xác minh Chrome của đúng profile đã đóng.", Color.DarkGreen);
+            _log.Info($"[CHROME_CLOSE] profile={selected.Profile.Name} result=verified_closed workerReply={workerReply} profilePath={selected.Profile.ProfilePath} port={selected.Profile.CdpPort}");
+        }
+        catch (Exception ex)
+        {
+            SetStatus(selected, "Không thể xác nhận Chrome đã đóng hoàn toàn.", Color.Firebrick);
+            _log.Warn($"[CHROME_CLOSE] profile={selected.Profile.Name} result=verify_failed error={ex.Message} profilePath={selected.Profile.ProfilePath} port={selected.Profile.CdpPort}");
+            throw;
+        }
+        finally
+        {
+            try { await RefreshStatusAsync(selected); }
+            catch (Exception ex) { _log.Warn($"[{selected.Profile.Name}] refresh status sau close Chrome: {ex.Message}"); }
+        }
     }
 
     void SetStatus(ProfileContext ctx, string text, Color color)

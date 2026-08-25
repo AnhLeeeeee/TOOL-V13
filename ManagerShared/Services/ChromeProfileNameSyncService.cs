@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Diagnostics;
 using System.Text.RegularExpressions;
@@ -13,6 +13,7 @@ namespace ToolTikTokV12.Services;
 public sealed class ChromeProfileNameSyncService
 {
     public sealed record SyncResult(bool Updated, string PreferencesPath, string Detail);
+    public sealed record ProfileProcessProbe(bool Succeeded, IReadOnlyList<int> ProcessIds, string Error);
     sealed record ChromeProcessInfo(int ProcessId, string ProcessName, string CommandLine);
 
     public SyncResult SyncBeforeLaunch(string userDataDir, string profileName, string? profileDirectory = null)
@@ -142,6 +143,25 @@ public sealed class ChromeProfileNameSyncService
     }
 
     /// <summary>
+    /// Reliable probe used by AutoClose cleanup barrier. Unlike IsProfileInUse(),
+    /// this does NOT turn a PowerShell/CIM timeout into "no Chrome".
+    /// Succeeded=false means UNKNOWN and callers must fail closed.
+    /// </summary>
+    public static ProfileProcessProbe ProbeProfileProcesses(string userDataDir)
+    {
+        if (!TryGetCanonicalUserDataDir(userDataDir, out var target))
+            return new ProfileProcessProbe(false, Array.Empty<int>(), "invalid_profile_path");
+
+        if (!TryFindChromeProcessesUsingProfile(target, out var items, out var error))
+            return new ProfileProcessProbe(false, Array.Empty<int>(), error);
+
+        return new ProfileProcessProbe(
+            true,
+            items.Select(x => x.ProcessId).Distinct().ToArray(),
+            "");
+    }
+
+    /// <summary>
     /// Stops Chrome/Crashpad processes that reference the exact persisted profile path.
     /// The profile path, never a display name, is used so another profile is not
     /// terminated by mistake.  This also catches late Crashpad helpers that no longer
@@ -169,7 +189,26 @@ public sealed class ChromeProfileNameSyncService
 
     static List<ChromeProcessInfo> FindChromeProcessesUsingProfile(string userDataDir)
     {
-        if (!TryGetCanonicalUserDataDir(userDataDir, out var target)) return [];
+        return TryFindChromeProcessesUsingProfile(userDataDir, out var items, out _)
+            ? items
+            : [];
+    }
+
+    static bool TryFindChromeProcessesUsingProfile(
+        string userDataDir,
+        out List<ChromeProcessInfo> result,
+        out string error)
+    {
+        result = [];
+        error = "";
+        var found = new List<ChromeProcessInfo>();
+
+        if (!TryGetCanonicalUserDataDir(userDataDir, out var target))
+        {
+            error = "invalid_profile_path";
+            return false;
+        }
+
         using var process = new Process
         {
             StartInfo = new ProcessStartInfo("powershell.exe",
@@ -181,69 +220,156 @@ public sealed class ChromeProfileNameSyncService
                 RedirectStandardError = true
             }
         };
+
         process.StartInfo.Environment["TOOL_TIKTOK_PROFILE_TARGET"] = target;
-        process.Start();
-        if (!process.WaitForExit(4000))
+
+        try
+        {
+            process.Start();
+        }
+        catch (Exception ex)
+        {
+            error = "powershell_start:" + ex.Message;
+            return false;
+        }
+
+        if (!process.WaitForExit(5000))
         {
             try { process.Kill(true); } catch { }
-            return [];
+            error = "powershell_cim_timeout";
+            return false;
+        }
+
+        var stderr = "";
+        try { stderr = process.StandardError.ReadToEnd().Trim(); } catch { }
+
+        if (process.ExitCode != 0)
+        {
+            error = "powershell_exit_" + process.ExitCode + (stderr.Length > 0 ? ":" + stderr : "");
+            return false;
         }
 
         var output = process.StandardOutput.ReadToEnd();
-        if (string.IsNullOrWhiteSpace(output)) return [];
+        if (string.IsNullOrWhiteSpace(output))
+            return true;
+
         try
         {
             using var doc = JsonDocument.Parse(output);
-            var result = new List<ChromeProcessInfo>();
+
             void Read(JsonElement item)
             {
-                if (!item.TryGetProperty("ProcessId", out var id) || !id.TryGetInt32(out var pid) || pid <= 0) return;
-                var processName = item.TryGetProperty("Name", out var name) ? name.GetString() ?? "" : "";
-                var commandLine = item.TryGetProperty("CommandLine", out var command) ? command.GetString() ?? "" : "";
+                if (!item.TryGetProperty("ProcessId", out var id)
+                    || !id.TryGetInt32(out var pid)
+                    || pid <= 0)
+                {
+                    return;
+                }
 
-                // Main Chrome normally exposes --user-data-dir.  Detached helper / Crashpad
-                // processes may only reference a file below the profile directory (for example
-                // CrashpadMetrics-active.pma), so accepting an exact profile-path reference here
-                // is required to release those late file handles before profile deletion.
-                if (ProfileArgumentMatches(commandLine, target) || CommandLineReferencesProfile(commandLine, target))
-                    result.Add(new ChromeProcessInfo(pid, processName, commandLine));
+                var processName = item.TryGetProperty("Name", out var name)
+                    ? name.GetString() ?? ""
+                    : "";
+
+                var commandLine = item.TryGetProperty("CommandLine", out var command)
+                    ? command.GetString() ?? ""
+                    : "";
+
+                if (ProfileArgumentMatches(commandLine, target)
+                    || CommandLineReferencesProfile(commandLine, target))
+                {
+                    found.Add(new ChromeProcessInfo(pid, processName, commandLine));
+                }
             }
+
             if (doc.RootElement.ValueKind == JsonValueKind.Array)
-                foreach (var item in doc.RootElement.EnumerateArray()) Read(item);
+            {
+                foreach (var item in doc.RootElement.EnumerateArray())
+                    Read(item);
+            }
             else if (doc.RootElement.ValueKind == JsonValueKind.Object)
+            {
                 Read(doc.RootElement);
-            return result;
+            }
+
+            result = found;
+            return true;
         }
-        catch { return []; }
+        catch (Exception ex)
+        {
+            result = [];
+            error = "powershell_json:" + ex.Message;
+            return false;
+        }
     }
 
     static bool CommandLineReferencesProfile(string commandLine, string target)
     {
-        if (string.IsNullOrWhiteSpace(commandLine) || string.IsNullOrWhiteSpace(target)) return false;
-        var normalizedCommand = commandLine.Replace('/', '\\');
-        var normalizedTarget = target.Replace('/', '\\').TrimEnd('\\');
-        var index = normalizedCommand.IndexOf(normalizedTarget, StringComparison.OrdinalIgnoreCase);
-        if (index < 0) return false;
+        if (string.IsNullOrWhiteSpace(commandLine)
+            || string.IsNullOrWhiteSpace(target))
+        {
+            return false;
+        }
 
-        // Avoid treating a profile path that is only a prefix of another directory as a match.
-        // A real reference is either the exact path or continues into a child path / argument end.
-        var end = index + normalizedTarget.Length;
-        if (end >= normalizedCommand.Length) return true;
-        var next = normalizedCommand[end];
-        return next is '\\' or '\"' or '\'' or ' ' or '\t' or ';' or ',';
+        var normalizedCommand =
+            commandLine.Replace('/', '\\');
+
+        var normalizedTarget =
+            target.Replace('/', '\\').TrimEnd('\\');
+
+        var index =
+            normalizedCommand.IndexOf(
+                normalizedTarget,
+                StringComparison.OrdinalIgnoreCase);
+
+        if (index < 0)
+            return false;
+
+        // Tránh match nhầm khi target chỉ là prefix của một profile khác.
+        var end =
+            index + normalizedTarget.Length;
+
+        if (end >= normalizedCommand.Length)
+            return true;
+
+        var next =
+            normalizedCommand[end];
+
+        return next is '\\'
+            or '"'
+            or '\''
+            or ' '
+            or '\t'
+            or ';'
+            or ',';
     }
 
-    static bool TryGetCanonicalUserDataDir(string? userDataDir, out string target)
+    static bool TryGetCanonicalUserDataDir(
+        string? userDataDir,
+        out string target)
     {
         target = "";
-        if (string.IsNullOrWhiteSpace(userDataDir)) return false;
+
+        if (string.IsNullOrWhiteSpace(userDataDir))
+            return false;
+
         try
         {
-            target = Path.GetFullPath(userDataDir.Trim()).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            target =
+                Path.GetFullPath(userDataDir.Trim())
+                    .TrimEnd(
+                        Path.DirectorySeparatorChar,
+                        Path.AltDirectorySeparatorChar);
+
             return true;
         }
-        catch (ArgumentException) { return false; }
-        catch (NotSupportedException) { return false; }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+        catch (NotSupportedException)
+        {
+            return false;
+        }
     }
 
     static bool ProfileArgumentMatches(string commandLine, string target)

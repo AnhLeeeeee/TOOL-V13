@@ -327,14 +327,61 @@ public sealed partial class ManagerForm
                     continue;
                 }
 
-                // Cho tiến trình đóng cũ nhả hẳn Worker/Chrome trước khi mở profile bù.
-                await Task.Delay(650);
+                // CLEANUP BARRIER: profile cũ phải sạch thật trước khi được phép bù.
+                // Không dùng delay cố định để đoán Chrome đã đóng.
+                var cleanup = await EnsureAutoReplacementSourceCleanupAsync(request);
+
+                if (!cleanup.Succeeded)
+                {
+                    _log.Warn(
+                        $"[AUTO_REPLACE_CLEANUP_BLOCKED] id={request.Id} closed={request.ClosedProfileName} detail={cleanup.Detail}");
+
+                    WriteAutoActivityLog(
+                        action: "TỰ BÙ",
+                        profile: request.ClosedProfileName,
+                        reason: request.Reason,
+                        result: "CHỜ DỌN PROFILE CŨ",
+                        detail: cleanup.Detail);
+
+                    ScheduleAutoReplacementRetry(
+                        request.Id,
+                        "Cleanup chưa hoàn tất: " + cleanup.Detail);
+
+                    continue;
+                }
 
                 if (_closing
                     || !_autoReplacementSessionArmed
                     || !_autoCloseSettings.OpenReplacementAfterAutoClose)
                 {
                     return;
+                }
+
+                var slotGate = EvaluateAutoReplacementFixedSlotGate(request);
+
+                if (slotGate.AlreadySatisfied)
+                {
+                    RemoveAutoReplacementRequest(request.Id);
+
+                    _log.Warn(
+                        $"[AUTO_REPLACE_SLOT_SUPPRESSED] id={request.Id} closed={request.ClosedProfileName} target={slotGate.TargetSlots} occupied={slotGate.OccupiedSlots} detail={slotGate.Detail}");
+
+                    WriteAutoActivityLog(
+                        action: "SUẤT BÙ",
+                        profile: request.ClosedProfileName,
+                        reason: request.Reason,
+                        result: "BỎ QUA - ĐỦ SUẤT",
+                        detail: slotGate.Detail);
+
+                    continue;
+                }
+
+                if (!slotGate.CanOpenReplacement)
+                {
+                    ScheduleAutoReplacementRetry(
+                        request.Id,
+                        slotGate.Detail);
+                    continue;
                 }
 
                 var filled = false;

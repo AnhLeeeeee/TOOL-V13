@@ -619,11 +619,16 @@ public sealed partial class ManagerForm
             && !ctx.Tab.IsDisposed
             && ctx.Tab.Parent == _tabs;
 
-        if (workerRunning || tabOpen || ctx.Opening)
+        // Không chỉ nhìn Worker/Tab. Chrome mồ côi theo đúng ProfilePath hoặc
+        // trạng thái probe UNKNOWN cũng phải re-arm BAN để cleanup được thử lại.
+        var runtimeStillPresent =
+            IsAutoCloseRuntimeStillPresentStrict(ctx);
+
+        if (runtimeStillPresent)
         {
             _autoCloseBanHandledProfiles.Remove(profileName);
             _log.Warn(
-                $"[BAN_AUTO_CLOSE_RETRY_ARMED] profile={profileName} worker={workerRunning} tab={tabOpen} opening={ctx.Opening}");
+                $"[BAN_AUTO_CLOSE_RETRY_ARMED] profile={profileName} worker={workerRunning} tab={tabOpen} opening={ctx.Opening} runtimeStillPresent={runtimeStillPresent}");
         }
         else
         {
@@ -683,6 +688,24 @@ public sealed partial class ManagerForm
                         profileName,
                         "healthy_running");
 
+                    // Priority runtime: TIME luôn thắng FAULT_10M nếu cả hai cùng đến hạn.
+                    if (_autoCloseSettings.CloseOnRunTime)
+                    {
+                        var total = ReadStatisticsRuntime(ctx).Total;
+                        if (total >= timeThreshold)
+                        {
+                            _log.Info(
+                                $"[AUTO_CLOSE_TIME_DUE] profile={profileName} total={total:c} threshold={timeThreshold:c} state={state}");
+
+                            await AutoCloseProfileAsync(
+                                ctx,
+                                $"TIME_{_autoCloseSettings.RunHours}H",
+                                $"Đạt tổng thời gian chạy {_autoCloseSettings.RunHours} giờ (tổng={total:c}).");
+
+                            continue;
+                        }
+                    }
+
                     // RUNNING/CONNECTED chưa đủ để coi là khỏe:
                     // nếu Rounds + Step không thay đổi suốt 10 phút thì luồng thật đã treo.
                     if (_autoCloseSettings.CloseOnNotRunning10Minutes)
@@ -720,26 +743,6 @@ public sealed partial class ManagerForm
                             $"[AUTO_CLOSE_STUCK_RECOVERED] profile={profileName} after={recoveredAfter:c}");
                     }
 
-                    if (_autoCloseSettings.CloseOnRunTime)
-                    {
-                        // Dùng TỔNG thời gian Automation RUNNING đã tích lũy của profile,
-                        // không reset theo mỗi lần Start/Resume hay khi mở lại Manager.
-                        // Pause/Stopped không cộng vì runtime_stats chỉ cộng lúc RUNNING.
-                        var total = ReadStatisticsRuntime(ctx).Total;
-                        if (total >= timeThreshold)
-                        {
-                            _log.Info(
-                                $"[AUTO_CLOSE_TIME_DUE] profile={profileName} total={total:c} threshold={timeThreshold:c} state={state}");
-
-                            await AutoCloseProfileAsync(
-                                ctx,
-                                $"TIME_{_autoCloseSettings.RunHours}H",
-                                $"Đạt tổng thời gian chạy {_autoCloseSettings.RunHours} giờ (tổng={total:c}).");
-
-                            continue;
-                        }
-                    }
-
                     continue;
                 }
 
@@ -757,17 +760,37 @@ public sealed partial class ManagerForm
                     continue;
                 }
 
+                // Chỉ xét TIME/FAULT cho profile từng được xác nhận là đang chạy.
+                // Khi Worker chết, hàm này probe đúng ProfilePath thay vì dựa HWND cache.
+                var expectedToRun =
+                    _autoCloseExpectedRunningProfiles.Contains(profileName)
+                    || IsAutoCloseProfileExpectedToRun(ctx, state);
+
+                // TIME vẫn phải thắng FAULT_10M nếu profile vừa đủ giờ đúng lúc runtime lỗi.
+                if (_autoCloseSettings.CloseOnRunTime && expectedToRun)
+                {
+                    var total = ReadStatisticsRuntime(ctx).Total;
+                    if (total >= timeThreshold)
+                    {
+                        _log.Info(
+                            $"[AUTO_CLOSE_TIME_DUE] profile={profileName} total={total:c} threshold={timeThreshold:c} state={state} healthy=false");
+
+                        await AutoCloseProfileAsync(
+                            ctx,
+                            $"TIME_{_autoCloseSettings.RunHours}H",
+                            $"Đạt tổng thời gian chạy {_autoCloseSettings.RunHours} giờ (tổng={total:c}) trong lúc runtime không khỏe.");
+
+                        continue;
+                    }
+                }
+
                 if (!_autoCloseSettings.CloseOnNotRunning10Minutes)
                 {
                     _autoCloseNotRunningSinceUtc.Remove(profileName);
                     continue;
                 }
 
-                // Chỉ giám sát profile từng được xác nhận là đang chạy/đang treo.
-                // Khi Manager vừa mở lại giữa lúc profile đang lỗi, dùng runtime lịch sử
-                // hoặc trạng thái supply=used làm tín hiệu đây là profile đã treo thật.
-                if (!_autoCloseExpectedRunningProfiles.Contains(profileName)
-                    && !IsAutoCloseProfileExpectedToRun(ctx, state))
+                if (!expectedToRun)
                 {
                     _autoCloseNotRunningSinceUtc.Remove(profileName);
                     continue;
@@ -953,14 +976,36 @@ public sealed partial class ManagerForm
         // runtime_stats còn isRunning=true VÀ Chrome thật của ProfilePath vẫn tồn tại.
         // Profile chỉ mở xem rồi đóng bình thường sẽ không thỏa điều kiện này.
         if (!workerAlive
-            && RuntimeStatsFileSaysRunning(ctx)
-            && HasAutoCloseCachedLiveChromeWindow(ctx))
+            && RuntimeStatsFileSaysRunning(ctx))
         {
-            MarkAutoCloseExpectedRunning(
+            var chromePresence = ProbeAutoCloseChromePresence(
                 profileName,
-                "orphan_chrome_runtime_stats_running");
+                ctx.Profile.ProfilePath,
+                "expected_to_run_orphan_check",
+                out var chromeDetail);
 
-            return true;
+            if (chromePresence == AutoCloseChromePresence.Alive)
+            {
+                MarkAutoCloseExpectedRunning(
+                    profileName,
+                    "orphan_chrome_runtime_stats_running");
+
+                _log.Warn(
+                    $"[AUTO_CLOSE_ORPHAN_CHROME_DETECTED] profile={profileName} pids={chromeDetail}");
+
+                return true;
+            }
+
+            if (chromePresence == AutoCloseChromePresence.Unknown)
+            {
+                // UNKNOWN không được coi như CLOSED. Giữ profile trong watchdog
+                // để lần cleanup sau fail-closed thay vì bỏ sót Chrome mồ côi.
+                MarkAutoCloseExpectedRunning(
+                    profileName,
+                    "orphan_chrome_probe_unknown");
+
+                return true;
+            }
         }
 
         return false;
@@ -1100,6 +1145,10 @@ public sealed partial class ManagerForm
                 profileName,
                 $"runtime_command:{command}");
 
+            TrackAutoReplacementTargetRuntimeCommand(
+                ctx,
+                command);
+
             // Người dùng/Manager vừa chủ động START/RESUME hoặc Auto Profile
             // đã gửi start_auto thành công.
             ArmAutoReplacementSession(
@@ -1117,7 +1166,158 @@ public sealed partial class ManagerForm
             ResetAutoCloseProgressWatch(
                 profileName,
                 $"runtime_command:{command}");
+
+            TrackAutoReplacementTargetRuntimeCommand(
+                ctx,
+                command);
         }
+    }
+
+    enum AutoCloseChromePresence
+    {
+        Closed,
+        Alive,
+        Unknown
+    }
+
+    AutoCloseChromePresence ProbeAutoCloseChromePresence(
+        string profileName,
+        string profilePath,
+        string source,
+        out string detail)
+    {
+        profileName = (profileName ?? "").Trim();
+        profilePath = (profilePath ?? "").Trim();
+        source = (source ?? "").Trim();
+
+        try
+        {
+            var probe = ChromeProfileNameSyncService.ProbeProfileProcesses(profilePath);
+
+            if (!probe.Succeeded)
+            {
+                detail = probe.Error.Length > 0 ? probe.Error : "probe_failed";
+                _log.Warn(
+                    $"[AUTO_CLOSE_CHROME_PRESENCE_UNKNOWN] profile={profileName} source={source} error={detail} action=FAIL_CLOSED");
+                return AutoCloseChromePresence.Unknown;
+            }
+
+            if (probe.ProcessIds.Count > 0)
+            {
+                detail = string.Join(",", probe.ProcessIds);
+                return AutoCloseChromePresence.Alive;
+            }
+
+            detail = "";
+            return AutoCloseChromePresence.Closed;
+        }
+        catch (Exception ex)
+        {
+            detail = ex.Message;
+            _log.Warn(
+                $"[AUTO_CLOSE_CHROME_PRESENCE_UNKNOWN] profile={profileName} source={source} error={detail} action=FAIL_CLOSED");
+            return AutoCloseChromePresence.Unknown;
+        }
+    }
+
+    bool IsAutoCloseRuntimeStillPresentStrict(ProfileContext ctx)
+    {
+        try
+        {
+            if (ctx.Worker is not null && !ctx.Worker.HasExited)
+                return true;
+        }
+        catch
+        {
+            if (ctx.Worker is not null)
+                return true;
+        }
+
+        var tabOpen =
+            ctx.Tab is not null
+            && !ctx.Tab.IsDisposed
+            && ctx.Tab.Parent == _tabs;
+
+        if (tabOpen || ctx.Opening)
+            return true;
+
+        var chromePresence = ProbeAutoCloseChromePresence(
+            ctx.Profile.Name,
+            ctx.Profile.ProfilePath,
+            "runtime_still_present",
+            out _);
+
+        // UNKNOWN không bao giờ được xem là CLOSED.
+        return chromePresence != AutoCloseChromePresence.Closed;
+    }
+
+    async Task EnsureAutoCloseWorkerStoppedAsync(ProfileContext ctx)
+    {
+        var worker = ctx.Worker;
+        if (worker is null)
+            return;
+
+        bool IsExited()
+        {
+            try { return worker.HasExited; }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException(
+                    $"Không xác minh được trạng thái Worker profile {ctx.Profile.Name}: {ex.Message}",
+                    ex);
+            }
+        }
+
+        if (!IsExited())
+        {
+            try
+            {
+                await SendPipeAsync(
+                    ctx.Profile.Name,
+                    "shutdown",
+                    TimeSpan.FromSeconds(5));
+            }
+            catch (Exception ex)
+            {
+                _log.Warn(
+                    $"[AUTO_CLOSE_WORKER_SHUTDOWN_WARN] profile={ctx.Profile.Name} error={ex.Message}");
+            }
+
+            if (!await WaitForProcessExitAsync(worker, TimeSpan.FromSeconds(7)))
+            {
+                try
+                {
+                    worker.Kill(true);
+                    _log.Warn(
+                        $"[AUTO_CLOSE_WORKER_FORCE_KILL] profile={ctx.Profile.Name}");
+                }
+                catch (Exception ex)
+                {
+                    throw new InvalidOperationException(
+                        $"Không kill được Worker profile {ctx.Profile.Name}: {ex.Message}",
+                        ex);
+                }
+
+                if (!await WaitForProcessExitAsync(worker, TimeSpan.FromSeconds(3)))
+                {
+                    throw new InvalidOperationException(
+                        $"Worker profile {ctx.Profile.Name} vẫn còn sống sau shutdown + force kill. Cleanup Barrier chặn Tự bù.");
+                }
+            }
+        }
+
+        if (!IsExited())
+        {
+            throw new InvalidOperationException(
+                $"Worker profile {ctx.Profile.Name} chưa thoát hoàn toàn. Cleanup Barrier chặn Tự bù.");
+        }
+
+        _log.Info(
+            $"[AUTO_CLOSE_WORKER_VERIFIED_EXITED] profile={ctx.Profile.Name}");
+
+        try { worker.Dispose(); } catch { }
+        if (ReferenceEquals(ctx.Worker, worker))
+            ctx.Worker = null;
     }
 
     async Task AutoCloseProfileAsync(ProfileContext ctx, string reason, string detail)
@@ -1135,6 +1335,10 @@ public sealed partial class ManagerForm
 
         if (!_autoCloseInProgressProfiles.Add(ctx.Profile.Name))
             return;
+
+        // Chốt số suất mục tiêu TRƯỚC khi profile lỗi bị gỡ khỏi expected-running.
+        // Ví dụ đang chạy 6 profile thì Tự bù chỉ được duy trì tối đa 6 suất.
+        CaptureAutoReplacementTargetBeforeAutoClose(ctx, reason);
 
         // Chỉ TIME_xH cần ghi Ghi chú tại đây. BAN có watcher riêng,
         // FAULT_10M/OOM/403/lỗi khác tuyệt đối không ghi Ghi chú Excel.
@@ -1241,46 +1445,12 @@ public sealed partial class ManagerForm
             // Xác minh bằng đúng ProfilePath và retry/kill đúng Chrome đó.
             await EnsureAutoCloseChromeStoppedAsync(ctx);
 
-            worker = ctx.Worker;
-            if (worker is not null && !worker.HasExited)
-            {
-                try
-                {
-                    await SendPipeAsync(
-                        ctx.Profile.Name,
-                        "shutdown",
-                        TimeSpan.FromSeconds(5));
-                }
-                catch (Exception ex)
-                {
-                    _log.Warn(
-                        $"[AUTO_CLOSE_WORKER_SHUTDOWN_WARN] profile={ctx.Profile.Name} error={ex.Message}");
-                }
+            // Worker phải chết THẬT trước khi được phép báo AUTO_CLOSE_DONE.
+            await EnsureAutoCloseWorkerStoppedAsync(ctx);
 
-                try
-                {
-                    if (!await WaitForProcessExitAsync(worker, TimeSpan.FromSeconds(7)))
-                        worker.Kill(true);
-                }
-                catch (Exception ex)
-                {
-                    _log.Warn(
-                        $"[AUTO_CLOSE_WORKER_KILL_WARN] profile={ctx.Profile.Name} error={ex.Message}");
-                }
-            }
-
-            worker = ctx.Worker;
-            if (worker is not null)
-            {
-                var exited = false;
-                try { exited = worker.HasExited; } catch { }
-                if (exited)
-                {
-                    try { worker.Dispose(); } catch { }
-                    if (ReferenceEquals(ctx.Worker, worker))
-                        ctx.Worker = null;
-                }
-            }
+            // Worker shutdown/kill có thể để lại helper Chrome muộn. Probe đúng
+            // ProfilePath thêm một lần sau khi Worker đã chết.
+            await EnsureAutoCloseChromeStoppedAsync(ctx);
 
             if (ctx.Tab is not null && !ctx.Tab.IsDisposed && ctx.Tab.Parent == _tabs)
                 RemoveTab(ctx);
@@ -1323,7 +1493,7 @@ public sealed partial class ManagerForm
 
             // Nếu đóng chưa xong thì không Queue bù. Re-arm để vòng watchdog sau
             // tiếp tục cố đóng thay vì bỏ mặc Chrome/Worker lỗi.
-            if (IsAutoCloseRuntimeStillPresent(ctx))
+            if (IsAutoCloseRuntimeStillPresentStrict(ctx))
             {
                 MarkAutoCloseExpectedRunning(
                     ctx.Profile.Name,
