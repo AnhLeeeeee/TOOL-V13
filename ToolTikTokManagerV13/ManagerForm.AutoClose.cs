@@ -16,6 +16,10 @@ public sealed partial class ManagerForm
         public int RunHours { get; set; } = 3;
         public bool CloseOnNotRunning10Minutes { get; set; } = true;
         public bool OpenReplacementAfterAutoClose { get; set; } = true;
+
+        // Chỉ xóa profile sau khi Excel đã ghi/xác minh:
+        // BAN -> note=ban; hết vòng đời -> note=TIME_xH.
+        public bool DeleteProfileAfterBanOrLifetime { get; set; }
     }
 
     const int AutoCloseNotRunningMinutes = 10;
@@ -56,7 +60,7 @@ public sealed partial class ManagerForm
         _refreshTimer.Tick += async (_, _) => await CheckAutoCloseRuntimeAsync();
 
         _log.Info(
-            $"[AUTO_CLOSE_INIT] ban={_autoCloseSettings.CloseOnBan} time={_autoCloseSettings.CloseOnRunTime} hours={_autoCloseSettings.RunHours} stuck10m={_autoCloseSettings.CloseOnNotRunning10Minutes} replace={_autoCloseSettings.OpenReplacementAfterAutoClose}");
+            $"[AUTO_CLOSE_INIT] ban={_autoCloseSettings.CloseOnBan} time={_autoCloseSettings.CloseOnRunTime} hours={_autoCloseSettings.RunHours} stuck10m={_autoCloseSettings.CloseOnNotRunning10Minutes} replace={_autoCloseSettings.OpenReplacementAfterAutoClose} deleteRetired={_autoCloseSettings.DeleteProfileAfterBanOrLifetime}");
     }
 
     AutoCloseSettingsDocument LoadAutoCloseSettings()
@@ -80,7 +84,7 @@ public sealed partial class ManagerForm
 
     static AutoCloseSettingsDocument NormalizeAutoCloseSettings(AutoCloseSettingsDocument settings)
     {
-        settings.Version = 3;
+        settings.Version = 4;
         settings.RunHours = Math.Clamp(settings.RunHours, 3, 8);
         return settings;
     }
@@ -101,7 +105,7 @@ public sealed partial class ManagerForm
         NotifyAutoReplacementSettingsChanged();
 
         _log.Info(
-            $"[AUTO_CLOSE_SETTINGS_SAVE] ban={_autoCloseSettings.CloseOnBan} time={_autoCloseSettings.CloseOnRunTime} hours={_autoCloseSettings.RunHours} stuck10m={_autoCloseSettings.CloseOnNotRunning10Minutes} replace={_autoCloseSettings.OpenReplacementAfterAutoClose}");
+            $"[AUTO_CLOSE_SETTINGS_SAVE] ban={_autoCloseSettings.CloseOnBan} time={_autoCloseSettings.CloseOnRunTime} hours={_autoCloseSettings.RunHours} stuck10m={_autoCloseSettings.CloseOnNotRunning10Minutes} replace={_autoCloseSettings.OpenReplacementAfterAutoClose} deleteRetired={_autoCloseSettings.DeleteProfileAfterBanOrLifetime}");
     }
 
     void InjectAutoCloseToolbarButton()
@@ -292,7 +296,7 @@ public sealed partial class ManagerForm
 
         var closeOnStuck = new CheckBox
         {
-            Text = "Tự đóng nếu 10 phút không trở lại trạng thái RUNNING",
+            Text = "Tự đóng nếu 10 phút lỗi / không RUNNING / không có tiến triển",
             Checked = _autoCloseSettings.CloseOnNotRunning10Minutes,
             AutoSize = true,
             Location = new Point(18, 114)
@@ -306,11 +310,19 @@ public sealed partial class ManagerForm
             Location = new Point(18, 154)
         };
 
+        var deleteRetiredProfile = new CheckBox
+        {
+            Text = "Tự xóa profile sau khi đã ghi Excel (BAN + hết vòng đời TIME_xH)",
+            Checked = _autoCloseSettings.DeleteProfileAfterBanOrLifetime,
+            AutoSize = true,
+            Location = new Point(18, 194)
+        };
+
         var configGroup = new GroupBox
         {
             Text = "Cấu hình Tự đóng & Tự bù",
             Location = new Point(0, 0),
-            Size = new Size(666, 205),
+            Size = new Size(666, 245),
             Padding = new Padding(12),
             ForeColor = Color.FromArgb(45, 67, 94),
             Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
@@ -321,11 +333,12 @@ public sealed partial class ManagerForm
         configGroup.Controls.Add(hours);
         configGroup.Controls.Add(closeOnStuck);
         configGroup.Controls.Add(openReplacement);
+        configGroup.Controls.Add(deleteRetiredProfile);
 
         var logGroup = new GroupBox
         {
             Text = "Nhật ký tự động",
-            Location = new Point(0, 217),
+            Location = new Point(0, 257),
             Size = new Size(666, 68),
             Padding = new Padding(12),
             ForeColor = Color.FromArgb(45, 67, 94),
@@ -402,6 +415,7 @@ public sealed partial class ManagerForm
             _autoCloseSettings.RunHours = Math.Clamp(hours.SelectedIndex + 3, 3, 8);
             _autoCloseSettings.CloseOnNotRunning10Minutes = closeOnStuck.Checked;
             _autoCloseSettings.OpenReplacementAfterAutoClose = openReplacement.Checked;
+            _autoCloseSettings.DeleteProfileAfterBanOrLifetime = deleteRetiredProfile.Checked;
 
             try
             {
@@ -669,6 +683,36 @@ public sealed partial class ManagerForm
                         profileName,
                         "healthy_running");
 
+                    // RUNNING/CONNECTED chưa đủ để coi là khỏe:
+                    // nếu Rounds + Step không thay đổi suốt 10 phút thì luồng thật đã treo.
+                    if (_autoCloseSettings.CloseOnNotRunning10Minutes)
+                    {
+                        var progressFault =
+                            ObserveAutoCloseProgressFault(
+                                ctx,
+                                nowUtc,
+                                stuckThreshold);
+
+                        if (progressFault.Length > 0)
+                        {
+                            _log.Warn(
+                                $"[AUTO_CLOSE_PROGRESS_STUCK_DUE] profile={profileName} state={state} threshold={stuckThreshold:c} fault={progressFault}");
+
+                            await AutoCloseProfileAsync(
+                                ctx,
+                                "FAULT_10M",
+                                $"Không có tiến triển thực tế trong {AutoCloseNotRunningMinutes} phút dù Worker vẫn RUNNING. {progressFault}");
+
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        ResetAutoCloseProgressWatch(
+                            profileName,
+                            "watchdog_disabled");
+                    }
+
                     if (_autoCloseNotRunningSinceUtc.Remove(profileName, out var faultStartedUtc))
                     {
                         var recoveredAfter = nowUtc - faultStartedUtc;
@@ -698,6 +742,12 @@ public sealed partial class ManagerForm
 
                     continue;
                 }
+
+                // Không còn ở RUNNING khỏe: watchdog trạng thái lỗi bên dưới sẽ đếm riêng.
+                // Reset bộ đếm "không tiến triển khi vẫn RUNNING" để tránh cộng dồn sai.
+                ResetAutoCloseProgressWatch(
+                    profileName,
+                    "not_healthy_running");
 
                 // PAUSED là trạng thái hợp lệ. Nếu người dùng tạm dừng thì không coi là lỗi
                 // và cũng không giữ đồng hồ lỗi cũ.
@@ -898,6 +948,21 @@ public sealed partial class ManagerForm
             return true;
         }
 
+        // Worker có thể crash/mất hẳn trong khi Chrome của đúng ProfilePath vẫn còn.
+        // Đây chính là kiểu làm Chrome rác tích tụ. Chỉ phục hồi expected-running khi:
+        // runtime_stats còn isRunning=true VÀ Chrome thật của ProfilePath vẫn tồn tại.
+        // Profile chỉ mở xem rồi đóng bình thường sẽ không thỏa điều kiện này.
+        if (!workerAlive
+            && RuntimeStatsFileSaysRunning(ctx)
+            && HasAutoCloseCachedLiveChromeWindow(ctx))
+        {
+            MarkAutoCloseExpectedRunning(
+                profileName,
+                "orphan_chrome_runtime_stats_running");
+
+            return true;
+        }
+
         return false;
     }
 
@@ -1031,6 +1096,10 @@ public sealed partial class ManagerForm
                 profileName,
                 $"runtime_command:{command}");
 
+            ResetAutoCloseProgressWatch(
+                profileName,
+                $"runtime_command:{command}");
+
             // Người dùng/Manager vừa chủ động START/RESUME hoặc Auto Profile
             // đã gửi start_auto thành công.
             ArmAutoReplacementSession(
@@ -1042,6 +1111,10 @@ public sealed partial class ManagerForm
         if (command is "pause" or "stop")
         {
             ClearAutoCloseExpectedRunning(
+                profileName,
+                $"runtime_command:{command}");
+
+            ResetAutoCloseProgressWatch(
                 profileName,
                 $"runtime_command:{command}");
         }
@@ -1164,6 +1237,10 @@ public sealed partial class ManagerForm
                 }
             }
 
+            // Không được sinh suất bù nếu Chrome cũ vẫn còn sống.
+            // Xác minh bằng đúng ProfilePath và retry/kill đúng Chrome đó.
+            await EnsureAutoCloseChromeStoppedAsync(ctx);
+
             worker = ctx.Worker;
             if (worker is not null && !worker.HasExited)
             {
@@ -1222,6 +1299,10 @@ public sealed partial class ManagerForm
                 reason,
                 detail);
 
+            ResetAutoCloseProgressWatch(
+                ctx.Profile.Name,
+                $"auto_close_done:{reason}");
+
             _log.Info(
                 $"[AUTO_CLOSE_DONE] profile={ctx.Profile.Name} reason={reason}");
 
@@ -1239,6 +1320,21 @@ public sealed partial class ManagerForm
         {
             _log.Error(
                 $"[AUTO_CLOSE_ERROR] profile={ctx.Profile.Name} reason={reason} error={ex}");
+
+            // Nếu đóng chưa xong thì không Queue bù. Re-arm để vòng watchdog sau
+            // tiếp tục cố đóng thay vì bỏ mặc Chrome/Worker lỗi.
+            if (IsAutoCloseRuntimeStillPresent(ctx))
+            {
+                MarkAutoCloseExpectedRunning(
+                    ctx.Profile.Name,
+                    "auto_close_failed_retry");
+
+                if (NormalizeAutoCloseReason(reason) == "FAULT_10M")
+                {
+                    _autoCloseNotRunningSinceUtc[ctx.Profile.Name] =
+                        DateTime.UtcNow.AddMinutes(-AutoCloseNotRunningMinutes);
+                }
+            }
 
             WriteAutoActivityLog(
                 action: "TỰ ĐÓNG",

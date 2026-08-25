@@ -190,6 +190,12 @@ public sealed partial class ManagerForm
                             detail:
                                 $"Đã ghi ban và xác minh lại dòng {accountSnapshot.SourceRow} trong Excel.");
 
+                        // CHỈ sau khi note=ban đã được đọc lại/xác minh thành công
+                        // mới được phép xóa profile BAN.
+                        QueueAutoDeleteRetiredProfileAfterExcelNote(
+                            profileName,
+                            "BAN");
+
                         return;
                     }
                 }
@@ -403,6 +409,12 @@ public sealed partial class ManagerForm
                             result: "THÀNH CÔNG",
                             detail:
                                 $"Đã ghi {reason} và xác minh lại dòng {accountSnapshot.SourceRow} trong Excel.");
+
+                        // CHỈ sau khi TIME_xH đã được ghi/xác minh (hoặc BAN thắng TIME)
+                        // mới được phép xóa profile hết vòng đời.
+                        QueueAutoDeleteRetiredProfileAfterExcelNote(
+                            profileName,
+                            reason);
 
                         return;
                     }
