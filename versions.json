@@ -1,32 +1,16 @@
-<<<<<<< HEAD
-﻿{
-    "schemaVersion":  1,
-    "versions":  [
-                     {
-                         "version":  "13.7.6",
-                         "setupUrl":  "https://github.com/AnhLeeeeee/TOOL-V13/releases/download/v13.7.6/ToolTikTok_V13.7.6_Setup.exe",
-                         "sha256":  "84f1d5016dbd81f79685c1b7fd508f650c367ecaf703c417cf3c8d996478cf84",
-                         "notes":  "Cáº­p nháº­t Tool TikTok V13.7.6.",
-                         "channel":  "stable",
-                         "status":  "stable",
-                         "releaseDate":  "2026-08-28",
-                         "allowInstall":  true
-                     },
-                     {
-                         "version":  "13.7.5",
-                         "setupUrl":  "https://github.com/AnhLeeeeee/TOOL-V13/releases/download/v13.7.5/ToolTikTok_V13.7.5_Setup.exe",
-                         "sha256":  "7189130c2a81cf1fcca4904d28feeff3aa9849061f4d3c359d0cd7b34605f017",
-                         "notes":  "Cáº­p nháº­t Tool TikTok V13.7.5.",
-                         "channel":  "stable",
-                         "status":  "stable",
-                         "releaseDate":  "2026-08-28",
-                         "allowInstall":  true
-                     }
-                 ]
-=======
 {
   "schemaVersion": 1,
   "versions": [
+    {
+      "version": "13.7.6",
+      "setupUrl": "https://github.com/AnhLeeeeee/TOOL-V13/releases/download/v13.7.6/ToolTikTok_V13.7.6_Setup.exe",
+      "sha256": "84f1d5016dbd81f79685c1b7fd508f650c367ecaf703c417cf3c8d996478cf84",
+      "notes": "Cập nhật Tool TikTok V13.7.6.",
+      "channel": "stable",
+      "status": "stable",
+      "releaseDate": "2026-08-28",
+      "allowInstall": true
+    },
     {
       "version": "13.7.5",
       "setupUrl": "https://github.com/AnhLeeeeee/TOOL-V13/releases/download/v13.7.5/ToolTikTok_V13.7.5_Setup.exe",
@@ -158,5 +142,4 @@
       "allowInstall": true
     }
   ]
->>>>>>> 2c2425f8f7bf1dcc7b5801062530f4397f13a607
 }
