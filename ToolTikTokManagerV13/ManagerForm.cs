@@ -134,11 +134,15 @@ public sealed partial class ManagerForm : Form
         _accountPoolService = new TikTokAccountPoolService(_baseDir);
         _log = new Logger(_baseDir, "manager", "manager-v13.log");
         Text = $"Tool TikTok Manager {AppVersionInfo.Display} — VM Optimized Multi Worker";
+        // Phải bật DPI scaling trước khi tạo layout/handle để kéo qua màn hình
+        // có Scale khác (100%/125%/150%) không giữ kích thước cache cũ.
+        AutoScaleMode = AutoScaleMode.Dpi;
         Width = 1440;
         Height = 900;
-        MinimumSize = new Size(1120, 720);
+        MinimumSize = new Size(980, 620);
         StartPosition = FormStartPosition.CenterScreen;
         BuildLayout();
+        InitializeMonitorRelayoutHooks();
         ReloadCatalog();
         EnsureAddTab();
         InitializeDashboardAndUpdater();
@@ -156,10 +160,15 @@ public sealed partial class ManagerForm : Form
 
         // Manager V13.5: cố định toolbar thành đúng 2 hàng để các nút không bị dồn/lệch
         // theo độ rộng cửa sổ hoặc DPI của máy ảo.
+        // Không dùng AutoSize cho hàng toolbar có AutoScroll. WinForms có thể
+        // tính chiều cao trước khi horizontal scrollbar xuất hiện, làm cắt nửa
+        // hàng nút khi cửa sổ mở ở kích thước hẹp. Chiều cao 2 hàng sẽ được
+        // UpdateMainToolbarLayout() tính lại theo DPI + nhu cầu scrollbar.
         var toolbarHost = new TableLayoutPanel
         {
             Dock = DockStyle.Top,
-            AutoSize = true,
+            AutoSize = false,
+            Height = 92,
             ColumnCount = 1,
             RowCount = 2,
             Padding = new Padding(10, 6, 10, 6),
@@ -167,13 +176,14 @@ public sealed partial class ManagerForm : Form
             BackColor = UiTheme.Card
         };
         toolbarHost.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-        toolbarHost.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        toolbarHost.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        toolbarHost.RowStyles.Add(new RowStyle(SizeType.Absolute, 40F));
+        toolbarHost.RowStyles.Add(new RowStyle(SizeType.Absolute, 40F));
 
         FlowLayoutPanel ToolbarRow() => new()
         {
-            Dock = DockStyle.Top,
-            AutoSize = true,
+            Dock = DockStyle.Fill,
+            AutoSize = false,
+            Height = 40,
             WrapContents = false,
             AutoScroll = true,
             FlowDirection = FlowDirection.LeftToRight,
@@ -203,6 +213,7 @@ public sealed partial class ManagerForm : Form
 
         toolbarHost.Controls.Add(toolbarRow1, 0, 0);
         toolbarHost.Controls.Add(toolbarRow2, 0, 1);
+        RegisterResponsiveToolbar(toolbarHost, toolbarRow1, toolbarRow2);
 
         _tabs.DrawItem += DrawTabs;
         _tabs.MouseDown += OnTabsMouseDown;
@@ -425,7 +436,17 @@ public sealed partial class ManagerForm : Form
             TextAlign = ContentAlignment.MiddleLeft,
             AutoEllipsis = true
         };
-        var status = new Label { AutoSize = true, Text = "Worker: đang khởi động", Margin = new Padding(8, 8, 12, 0) };
+        // Status không được phép đẩy nút Tách Worker ra ngoài khi cửa sổ vừa
+        // chuyển từ màn nhỏ sang màn lớn và vẫn đang ở gần MinimumSize.
+        var status = new Label
+        {
+            AutoSize = false,
+            Size = new Size(210, 32),
+            Text = "Worker: đang khởi động",
+            TextAlign = ContentAlignment.MiddleLeft,
+            AutoEllipsis = true,
+            Margin = new Padding(8, 4, 12, 0)
+        };
         var openChrome = Button("Mở Chrome", async (_, _) => { try { await OpenChromeForProfileAsync(ctx); } catch (Exception ex) { ShowError(ex); } }, UiButtonKind.Primary);
         var closeChrome = Button("Đóng Chrome", async (_, _) => { try { await CloseChromeForProfileAsync(ctx); } catch (Exception ex) { ShowError(ex); } }, UiButtonKind.Danger);
         var viewChrome = Button("👁 View", async (_, _) => { try { await ViewChromeForProfileAsync(ctx); } catch (Exception ex) { ShowError(ex); } }, UiButtonKind.Neutral);
@@ -436,8 +457,8 @@ public sealed partial class ManagerForm : Form
         top.Controls.Add(closeChrome);
         top.Controls.Add(viewChrome);
         top.Controls.Add(account);
-        top.Controls.Add(status);
         top.Controls.Add(detach);
+        top.Controls.Add(status);
         var host = new Panel { Dock = DockStyle.Fill, BackColor = Color.White };
         host.Resize += (_, _) => { if (!ctx.Detached) WorkerWindowEmbedder.Resize(ctx.WorkerWindow, host.ClientSize); };
         page.Controls.Add(host);

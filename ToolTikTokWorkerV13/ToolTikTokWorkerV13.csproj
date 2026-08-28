@@ -17,6 +17,7 @@
 
   <ItemGroup>
     <Compile Include="..\V115Core\MainForm.cs" Link="V115Core\MainForm.cs" />
+    <Compile Include="..\V115Core\MainForm.DpiRelayout.cs" Link="V115Core\MainForm.DpiRelayout.cs" />
     <Compile Include="..\V115Core\MainForm.V13InputGuard.cs" Link="V115Core\MainForm.V13InputGuard.cs" />
     <Compile Include="..\V115Core\MainForm.V13VmOptimization.cs" Link="V115Core\MainForm.V13VmOptimization.cs" />
     <Compile Include="..\V115Core\Models\*.cs" Link="V115Core\Models\%(Filename)%(Extension)" />

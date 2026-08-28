@@ -1,4 +1,4 @@
-﻿using System.IO.Pipes;
+using System.IO.Pipes;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -7,9 +7,14 @@ namespace ToolTikTokV11;
 internal static class Program
 {
     [STAThread]
-    static async Task Main(string[] args)
+    static void Main(string[] args)
     {
         ApplicationConfiguration.Initialize();
+
+        // File picker helper chạy trong process Worker sạch, không tạo MainForm/IPC.
+        // Mục đích: cách ly native Windows file dialog khỏi Worker automation.
+        if (TryRunConfigFilePickerHelper(args))
+            return;
         var options = StartupOptions.Parse(args);
 
         Mutex? workerMutex = null;
@@ -18,9 +23,9 @@ internal static class Program
         {
             // Tương thích cả Worker cũ chưa có mutex:
             // nếu pipe của profile đã trả lời thì KHÔNG tạo form/Worker thứ hai.
-            if (await ExistingWorkerRespondsAsync(options, initialProbe: true))
+            if (ExistingWorkerRespondsAsync(options, initialProbe: true).GetAwaiter().GetResult())
             {
-                await RunExistingWorkerLeaseProxyAsync(options);
+                RunExistingWorkerLeaseProxyAsync(options).GetAwaiter().GetResult();
                 return;
             }
 
@@ -34,9 +39,9 @@ internal static class Program
             {
                 // Một Worker bản mới khác đang khởi động/đang chạy.
                 // Chờ pipe của Worker đó rồi chuyển thành process lease proxy nhẹ.
-                if (await WaitForExistingWorkerPipeAsync(options, TimeSpan.FromSeconds(12)))
+                if (WaitForExistingWorkerPipeAsync(options, TimeSpan.FromSeconds(12)).GetAwaiter().GetResult())
                 {
-                    await RunExistingWorkerLeaseProxyAsync(options);
+                    RunExistingWorkerLeaseProxyAsync(options).GetAwaiter().GetResult();
                 }
 
                 workerMutex.Dispose();
@@ -76,6 +81,83 @@ internal static class Program
                 workerMutex.Dispose();
             }
         }
+    }
+
+    static bool TryRunConfigFilePickerHelper(string[] args)
+    {
+        var openMode = args.Any(a => string.Equals(a, "--config-picker-open", StringComparison.OrdinalIgnoreCase));
+        var saveMode = args.Any(a => string.Equals(a, "--config-picker-save", StringComparison.OrdinalIgnoreCase));
+        if (!openMode && !saveMode)
+            return false;
+
+        var resultFile = GetArgValue(args, "--result-file");
+        if (string.IsNullOrWhiteSpace(resultFile))
+            return true;
+
+        try
+        {
+            string? selected = null;
+
+            if (openMode)
+            {
+                using var dialog = new OpenFileDialog
+                {
+                    Title = "Nhập cấu hình V13",
+                    Filter = "Gói cấu hình ZIP|*.zip|Tất cả file|*.*",
+                    CheckFileExists = true,
+                    Multiselect = false,
+                    RestoreDirectory = true,
+                    // Giữ giao diện File Dialog hiện đại của Windows; helper process riêng vẫn tránh treo Worker chính.
+                    AutoUpgradeEnabled = true
+                };
+
+                if (dialog.ShowDialog() == DialogResult.OK)
+                    selected = dialog.FileName;
+            }
+            else
+            {
+                using var dialog = new SaveFileDialog
+                {
+                    Title = "Xuất cấu hình V13",
+                    Filter = "Gói cấu hình ZIP|*.zip",
+                    FileName = $"TikTok_V13_Config_{DateTime.Now:yyyyMMdd_HHmm}.zip",
+                    AddExtension = true,
+                    DefaultExt = "zip",
+                    RestoreDirectory = true,
+                    AutoUpgradeEnabled = true
+                };
+
+                if (dialog.ShowDialog() == DialogResult.OK)
+                    selected = dialog.FileName;
+            }
+
+            if (!string.IsNullOrWhiteSpace(selected))
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(resultFile))!);
+                File.WriteAllText(resultFile, selected, new UTF8Encoding(false));
+            }
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                File.WriteAllText(resultFile + ".error", ex.ToString(), new UTF8Encoding(false));
+            }
+            catch { }
+        }
+
+        return true;
+    }
+
+    static string? GetArgValue(string[] args, string name)
+    {
+        for (var i = 0; i + 1 < args.Length; i++)
+        {
+            if (string.Equals(args[i], name, StringComparison.OrdinalIgnoreCase))
+                return args[i + 1];
+        }
+
+        return null;
     }
 
     static string BuildWorkerMutexName(StartupOptions options)

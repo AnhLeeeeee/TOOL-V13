@@ -9,5 +9,8 @@
     <FileVersion>$(AppVersion).0</FileVersion>
     <AssemblyVersion>$(AppVersion).0</AssemblyVersion>
     <InformationalVersion>$(AppVersion)</InformationalVersion>
+
+    <!-- DPI: dùng Per-Monitor V2 cho cả Manager và Worker. -->
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
   </PropertyGroup>
 </Project>

@@ -538,11 +538,21 @@ public sealed partial class ManagerForm
                 var startName = DetectNextAutoProfileName();
 
                 var queue = await RunAccountPoolIoAsync(
-                    () => BuildAutoProfileQueue(
-                        requestedNew: 1,
-                        requestedStartName: startName,
-                        resumeIncomplete: false,
-                        retryPaused: false),
+                    () =>
+                    {
+                        // Tự bù cũng phải đọc Excel mới nhất trước khi chọn account.
+                        // Nếu người dùng vừa note BAN / AutoPrf=DONE thì không lấy lại
+                        // account đó chỉ vì catalog JSON vẫn còn snapshot cũ.
+                        if (!string.IsNullOrWhiteSpace(_accountPoolService.CurrentSourcePath))
+                            _accountPoolService.ReloadCurrentExcel();
+                        _accountPoolService.EnsureAutoColumns();
+
+                        return BuildAutoProfileQueue(
+                            requestedNew: 1,
+                            requestedStartName: startName,
+                            resumeIncomplete: false,
+                            retryPaused: false);
+                    },
                     CancellationToken.None);
 
                 if (queue.Count == 0)
@@ -648,6 +658,25 @@ public sealed partial class ManagerForm
                             detail: $"Profile {item.ProfileName} đã RUNNING khỏe 30 giây.");
 
                         return true;
+                    }
+
+                    if (outcome.Skipped)
+                    {
+                        _log.Info(
+                            $"[AUTO_REPLACE_CREATE_SKIP_EXCEL] profile={item.ProfileName} account={item.Account.Username} status={outcome.Status} step={outcome.Step} note={outcome.Note}");
+
+                        WriteAutoActivityLog(
+                            action: "MỞ PROFILE BÙ",
+                            profile: request.ClosedProfileName,
+                            account: item.Account.Username,
+                            reason: request.Reason,
+                            replacementProfile: item.ProfileName,
+                            result: "BỎ QUA",
+                            detail: outcome.Note);
+
+                        // Excel vừa thay đổi sau lúc dựng queue (BAN/DONE/đổi mapping).
+                        // Không coi đây là lỗi tài khoản; thử lấy ứng viên mới ở vòng kế tiếp.
+                        continue;
                     }
 
                     _log.Warn(

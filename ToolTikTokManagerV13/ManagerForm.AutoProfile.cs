@@ -9,7 +9,13 @@ namespace ToolTikTokManagerV13;
 public sealed partial class ManagerForm
 {
     sealed record AutoProfileQueueItem(TikTokAccountPoolItem Account, string ProfileName, bool ResumeExisting);
-    sealed record AutoProfileProcessOutcome(bool Success, bool Paused, string Status, string Step, string Note);
+    sealed record AutoProfileProcessOutcome(
+        bool Success,
+        bool Paused,
+        string Status,
+        string Step,
+        string Note,
+        bool Skipped = false);
 
     sealed class AutoProfilePauseException : Exception
     {
@@ -56,12 +62,20 @@ public sealed partial class ManagerForm
 
         var initialAccounts = _accountPoolService.Load();
         var initialStates = _accountPoolService.LoadAutoStates();
-        var initialAvailable = initialAccounts.Count(x => !x.IsAssigned && !string.IsNullOrWhiteSpace(x.Password));
-        var initialResume = initialAccounts.Count(x =>
-            x.IsAssigned
+        var initialStartName = DetectNextAutoProfileName();
+        var initialAvailable = initialAccounts.Count(x =>
+            !x.IsAssigned
+            && !string.IsNullOrWhiteSpace(x.Password)
+            && !TikTokAccountPoolService.IsBanNoteValue(x.Note)
             && (!initialStates.TryGetValue(x.Id, out var state)
-                || state.IsEmpty
-                || (!state.IsReady && !state.IsPausedOrError)));
+                || (!state.IsReady && !state.IsInProgress)));
+        var initialResume = initialAccounts.Count(x =>
+            ShouldResumeAutoProfileAccount(
+                x,
+                initialStates,
+                initialStartName,
+                retryPaused: false,
+                out _));
 
         var form = new Form
         {
@@ -114,7 +128,7 @@ public sealed partial class ManagerForm
 
         var nextProfile = new TextBox
         {
-            Text = DetectNextAutoProfileName(),
+            Text = initialStartName,
             Dock = DockStyle.Fill,
             Margin = new Padding(0, 3, 6, 3)
         };
@@ -167,6 +181,25 @@ public sealed partial class ManagerForm
             AutoSize = true,
             Margin = new Padding(0, 8, 14, 0)
         };
+
+        void RefreshResumeEstimate()
+        {
+            var estimated = initialAccounts.Count(x =>
+                ShouldResumeAutoProfileAccount(
+                    x,
+                    initialStates,
+                    nextProfile.Text.Trim(),
+                    retryPaused.Checked,
+                    out _));
+
+            resumeIncomplete.Text =
+                $"Tiếp tục profile tạo dở hợp lệ ({estimated})";
+        }
+
+        nextProfile.TextChanged += (_, _) => RefreshResumeEstimate();
+        retryPaused.CheckedChanged += (_, _) => RefreshResumeEstimate();
+        RefreshResumeEstimate();
+
         var autoRename = new CheckBox
         {
             Text = "Tự đổi tên bằng cấu hình Tên & ảnh TikTok",
@@ -439,6 +472,7 @@ public sealed partial class ManagerForm
 
                 await _autoProfileQueueGate.WaitAsync(runCts.Token);
                 var success = 0;
+                var skippedByExcel = 0;
                 var pausedOrError = 0;
                 try
                 {
@@ -467,6 +501,7 @@ public sealed partial class ManagerForm
                         }
 
                         if (outcome.Success) success++;
+                        else if (outcome.Skipped) skippedByExcel++;
                         else pausedOrError++;
 
                         if (i + 1 < queue.Count)
@@ -477,7 +512,7 @@ public sealed partial class ManagerForm
                         }
                     }
 
-                    status.Text = $"Hoàn tất. DONE: {success} | FAIL: {pausedOrError}. Excel chỉ ghi kết quả cuối DONE/FAIL.";
+                    status.Text = $"Hoàn tất. DONE: {success} | BỎ QUA EXCEL: {skippedByExcel} | FAIL: {pausedOrError}. Excel ghi PROCESSING/DONE/FAIL để phân biệt profile đang dở với tài khoản cũ.";
                 }
                 finally
                 {
@@ -521,22 +556,37 @@ public sealed partial class ManagerForm
 
     List<AutoProfileQueueItem> BuildAutoProfileQueue(int requestedNew, string requestedStartName, bool resumeIncomplete, bool retryPaused)
     {
+        // Hàm này luôn được gọi bên trong _accountPoolBackgroundIoGate.
+        // Caller đã ReloadCurrentExcel() ngay trước đó, vì vậy Note/Profile đã gán
+        // trong account và Auto Profile trong states phản ánh file Excel mới nhất.
         var accounts = _accountPoolService.Load().OrderBy(x => x.SourceRow).ToList();
         var states = _accountPoolService.LoadAutoStates();
         var queue = new List<AutoProfileQueueItem>();
+
+        bool IsDone(TikTokAccountPoolItem account)
+            => states.TryGetValue(account.Id, out var state) && state.IsReady;
+
+        bool IsBan(TikTokAccountPoolItem account)
+            => TikTokAccountPoolService.IsBanNoteValue(account.Note);
 
         if (resumeIncomplete)
         {
             foreach (var account in accounts.Where(x => x.IsAssigned))
             {
-                if (states.TryGetValue(account.Id, out var state))
+                if (!ShouldResumeAutoProfileAccount(
+                        account,
+                        states,
+                        requestedStartName,
+                        retryPaused,
+                        out var resumeReason))
                 {
-                    if (state.IsReady)
-                        continue;
-
-                    if (state.IsPausedOrError && !retryPaused)
-                        continue;
+                    _log.Info(
+                        $"[AUTO_PROFILE_RESUME_SKIP] user={account.Username} row={account.SourceRow} profile={account.AssignedProfile} auto={(states.TryGetValue(account.Id, out var skippedState) ? skippedState.Status : "")} reason={resumeReason} note={account.Note}");
+                    continue;
                 }
+
+                _log.Info(
+                    $"[AUTO_PROFILE_RESUME_ALLOW] user={account.Username} row={account.SourceRow} profile={account.AssignedProfile} auto={(states.TryGetValue(account.Id, out var allowedState) ? allowedState.Status : "")} reason={resumeReason}");
 
                 queue.Add(new AutoProfileQueueItem(
                     account,
@@ -551,9 +601,40 @@ public sealed partial class ManagerForm
 
         if (requestedNew <= 0) return queue;
 
-        var candidates = accounts
+        // Với profile MỚI, Excel là gate bắt buộc:
+        // - Ghi chú=ban => tuyệt đối không gán.
+        // - Auto Profile/AutoPrf=DONE => không tạo lại dù Profile đã gán đang trống.
+        var eligible = accounts
             .Where(x => !x.IsAssigned && !string.IsNullOrWhiteSpace(x.Password))
             .OrderBy(x => x.SourceRow)
+            .ToList();
+
+        foreach (var account in eligible.Where(IsBan))
+        {
+            _log.Info(
+                $"[AUTO_PROFILE_EXCEL_SKIP] mode=new user={account.Username} row={account.SourceRow} reason=NOTE_BAN note={account.Note}");
+        }
+
+        foreach (var account in eligible.Where(x => !IsBan(x) && IsDone(x)))
+        {
+            _log.Info(
+                $"[AUTO_PROFILE_EXCEL_SKIP] mode=new user={account.Username} row={account.SourceRow} reason=AUTOPRF_DONE");
+        }
+
+        foreach (var account in eligible.Where(x =>
+                     !IsBan(x)
+                     && states.TryGetValue(x.Id, out var state)
+                     && state.IsInProgress))
+        {
+            _log.Info(
+                $"[AUTO_PROFILE_EXCEL_SKIP] mode=new user={account.Username} row={account.SourceRow} reason=AUTOPRF_PROCESSING");
+        }
+
+        var candidates = eligible
+            .Where(x =>
+                !IsBan(x)
+                && !IsDone(x)
+                && (!states.TryGetValue(x.Id, out var state) || !state.IsInProgress))
             .Take(requestedNew)
             .ToList();
         if (candidates.Count == 0) return queue;
@@ -567,6 +648,107 @@ public sealed partial class ManagerForm
         for (var i = 0; i < candidates.Count; i++)
             queue.Add(new AutoProfileQueueItem(candidates[i], generatedNames[i], ResumeExisting: false));
         return queue;
+    }
+
+    static bool ShouldResumeAutoProfileAccount(
+        TikTokAccountPoolItem account,
+        IReadOnlyDictionary<string, TikTokAccountPoolService.TikTokAccountAutoState> states,
+        string requestedStartName,
+        bool retryPaused,
+        out string reason)
+    {
+        reason = "";
+
+        if (!account.IsAssigned)
+        {
+            reason = "NOT_ASSIGNED";
+            return false;
+        }
+
+        if (TikTokAccountPoolService.IsBanNoteValue(account.Note))
+        {
+            reason = "NOTE_BAN";
+            return false;
+        }
+
+        if (states.TryGetValue(account.Id, out var state))
+        {
+            if (state.IsReady)
+            {
+                reason = "AUTOPRF_DONE";
+                return false;
+            }
+
+            if (state.IsPausedOrError)
+            {
+                reason = retryPaused
+                    ? "RETRY_FAIL_ALLOWED"
+                    : "AUTOPRF_FAIL_RETRY_DISABLED";
+                return retryPaused;
+            }
+
+            // PROCESSING là checkpoint rõ ràng do Auto Profile mới ghi.
+            // Đây mới là profile tạo dở thật sự, nên được resume kể cả số profile
+            // nhỏ hơn ô "Profile bắt đầu".
+            if (state.IsInProgress)
+            {
+                reason = "AUTOPRF_PROCESSING";
+                return true;
+            }
+
+            if (!state.IsEmpty)
+            {
+                reason = "AUTOPRF_NONFINAL";
+                return true;
+            }
+        }
+
+        // Tương thích dữ liệu cũ: trước V13.7.5 patch, checkpoint kỹ thuật không
+        // được lưu thành PROCESSING. Khi +auto trống, chỉ coi là profile tạo dở
+        // nếu nó nằm trong dãy hiện tại (>= Profile bắt đầu). Account cũ đã dùng
+        // như 22/23 trong khi người dùng bắt đầu từ 30 sẽ bị bỏ qua, không chạy lại.
+        if (IsAssignedProfileBeforeRequestedStart(
+                account.AssignedProfile,
+                requestedStartName))
+        {
+            reason = "LEGACY_ASSIGNED_BEFORE_START_NO_CHECKPOINT";
+            return false;
+        }
+
+        reason = "LEGACY_NO_CHECKPOINT_AT_OR_AFTER_START";
+        return true;
+    }
+
+    static bool IsAssignedProfileBeforeRequestedStart(
+        string assignedProfile,
+        string requestedStartName)
+    {
+        if (!TryParseAutoProfileName(
+                (assignedProfile ?? "").Trim(),
+                out var assignedPrefix,
+                out var assignedNumber,
+                out _))
+        {
+            return false;
+        }
+
+        if (!TryParseAutoProfileName(
+                (requestedStartName ?? "").Trim(),
+                out var startPrefix,
+                out var startNumber,
+                out _))
+        {
+            return false;
+        }
+
+        if (!assignedPrefix.Equals(
+                startPrefix,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return assignedNumber < startNumber;
     }
 
     async Task<AutoProfileProcessOutcome> ProcessAutoProfileQueueItemAsync(
@@ -585,6 +767,81 @@ public sealed partial class ManagerForm
         try
         {
             await WaitAutoProfilePausePointAsync(isPaused, ct);
+
+            // RE-CHECK ngay trước hành động đầu tiên. Hàng đợi có thể đã được dựng
+            // vài giây/phút trước và người dùng có thể sửa Excel trong thời gian đó.
+            // Đọc trực tiếp file Excel, không dùng snapshot JSON trong RAM.
+            var freshExcel = await RunAccountPoolIoAsync(
+                () => _accountPoolService.ReadFreshExcelSnapshot(item.Account.Id),
+                ct);
+
+            var gateDecision = "ALLOW";
+            var gateReason = "";
+
+            if (freshExcel.IsBanBlocked)
+            {
+                gateDecision = "SKIP";
+                gateReason = "NOTE_BAN";
+            }
+            else if (freshExcel.IsAutoProfileDone)
+            {
+                gateDecision = "SKIP";
+                gateReason = "AUTOPRF_DONE";
+            }
+            else if (!item.ResumeExisting
+                     && freshExcel.IsAutoProfileInProgress)
+            {
+                gateDecision = "SKIP";
+                gateReason = "AUTOPRF_PROCESSING";
+            }
+            else if (!item.ResumeExisting
+                     && !string.IsNullOrWhiteSpace(freshExcel.AssignedProfile)
+                     && !freshExcel.AssignedProfile.Equals(
+                         item.ProfileName,
+                         StringComparison.OrdinalIgnoreCase))
+            {
+                gateDecision = "SKIP";
+                gateReason = "ALREADY_ASSIGNED";
+            }
+            else if (item.ResumeExisting
+                     && !freshExcel.AssignedProfile.Equals(
+                         item.ProfileName,
+                         StringComparison.OrdinalIgnoreCase))
+            {
+                gateDecision = "SKIP";
+                gateReason = string.IsNullOrWhiteSpace(freshExcel.AssignedProfile)
+                    ? "ASSIGNMENT_CLEARED"
+                    : "ASSIGNMENT_CHANGED";
+            }
+
+            _log.Info(
+                $"[AUTO_PROFILE_EXCEL_GATE] profile={item.ProfileName} user={freshExcel.Username} row={freshExcel.SourceRow} note={freshExcel.Note} auto={freshExcel.AutoProfileResult} assigned={freshExcel.AssignedProfile} decision={gateDecision} reason={gateReason}");
+
+            if (gateDecision == "SKIP")
+            {
+                var message = gateReason switch
+                {
+                    "NOTE_BAN" => "Bỏ qua: Excel đang ghi chú BAN; không gán tài khoản vào profile.",
+                    "AUTOPRF_DONE" => "Bỏ qua: cột Auto Profile/AutoPrf đã DONE; không tạo lại profile.",
+                    "AUTOPRF_PROCESSING" => "Bỏ qua: cột Auto Profile/AutoPrf đang PROCESSING; account đang thuộc một luồng Auto Profile khác.",
+                    "ALREADY_ASSIGNED" => $"Bỏ qua: Excel đã gán tài khoản cho profile {freshExcel.AssignedProfile}.",
+                    "ASSIGNMENT_CLEARED" => "Bỏ qua: mapping Profile đã gán đã bị xóa trong Excel.",
+                    "ASSIGNMENT_CHANGED" => $"Bỏ qua: Excel đã đổi mapping sang profile {freshExcel.AssignedProfile}.",
+                    _ => "Bỏ qua theo trạng thái Excel mới nhất."
+                };
+
+                ui("EXCEL_GATE", message, Color.DarkOrange);
+                _log.Info(
+                    $"[AUTO_PROFILE_SKIPPED_BY_EXCEL] profile={item.ProfileName} user={freshExcel.Username} row={freshExcel.SourceRow} reason={gateReason}");
+
+                return new AutoProfileProcessOutcome(
+                    false,
+                    false,
+                    "SKIPPED_EXCEL",
+                    "EXCEL_GATE",
+                    message,
+                    Skipped: true);
+            }
 
             if (!item.ResumeExisting)
             {

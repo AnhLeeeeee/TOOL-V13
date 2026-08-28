@@ -215,8 +215,8 @@ public sealed partial class MainForm : Form
         ConfigureRunControlButton(_runStopButton, async (_, _) => await HandleStartStopAsync());
         ConfigureRunControlButton(_pauseResumeButton, (_, _) => HandlePauseResume());
         var save = Btn("💾 Lưu", (_, _) => SaveFromUi());
-        var export = Btn("Xuất", (_, _) => ExportConfig());
-        var import = Btn("Nhập", (_, _) => ImportConfig());
+        var export = Btn("Xuất", async (_, _) => await ExportConfigAsync());
+        var import = Btn("Nhập", async (_, _) => await ImportConfigAsync());
         actions.Controls.AddRange([_runStopButton, _pauseResumeButton, save, export, import]);
 
         var status = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 8, Margin = new Padding(10, 0, 0, 0) };
@@ -1530,32 +1530,113 @@ public sealed partial class MainForm : Form
         catch (Exception ex) { ShowUiProblem("OLDLIVE_MANUAL_CLEAR", "Xóa Live cũ", ex); }
     }
 
-    void ExportConfig()
+    async Task ExportConfigAsync()
     {
-        if (_engine.Running && !_engine.Paused) { MessageBox.Show("Hãy bấm F9 tạm dừng hoặc Dừng tool trước khi xuất cấu hình để file được nhất quán."); return; }
-        SaveFromUi();
-        using var dlg = new SaveFileDialog { Title = "Xuất cấu hình V13", Filter = "Gói cấu hình ZIP|*.zip", FileName = $"TikTok_V13_Config_{DateTime.Now:yyyyMMdd_HHmm}.zip" };
-        if (dlg.ShowDialog(this) != DialogResult.OK) return;
-        try { _settingsService.ExportPackage(dlg.FileName); _log.Info("Đã xuất cấu hình: " + dlg.FileName); MessageBox.Show("Đã xuất cấu hình + nội dung.\nKhông xuất Chrome profile/cookie.", "Xuất cấu hình"); }
-        catch (Exception ex) { MessageBox.Show(ex.Message, "Xuất cấu hình", MessageBoxButtons.OK, MessageBoxIcon.Error); }
-    }
+        if (_engine.Running && !_engine.Paused)
+        {
+            MessageBox.Show("Hãy bấm F9 tạm dừng hoặc Dừng tool trước khi xuất cấu hình để file được nhất quán.");
+            return;
+        }
 
-    void ImportConfig()
-    {
-        if (_engine.Running) { MessageBox.Show("Hãy Dừng tool trước khi nhập cấu hình."); return; }
-        using var dlg = new OpenFileDialog { Title = "Nhập cấu hình V13", Filter = "Gói cấu hình ZIP|*.zip" };
-        if (dlg.ShowDialog(this) != DialogResult.OK) return;
-        if (MessageBox.Show("Nhập cấu hình sẽ thay cấu hình hiện tại. Tool sẽ tự sao lưu INI/nội dung trước khi thay. Tiếp tục?", "Nhập cấu hình", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        SaveFromUi();
+        var target = await PickConfigFileOutOfProcessAsync(save: true);
+        if (string.IsNullOrWhiteSpace(target)) return;
+
         try
         {
-            var backup = _settingsService.ImportPackage(dlg.FileName);
+            _settingsService.ExportPackage(target);
+            _log.Info("Đã xuất cấu hình: " + target);
+            MessageBox.Show("Đã xuất cấu hình + nội dung.\nKhông xuất Chrome profile/cookie.", "Xuất cấu hình");
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(ex.Message, "Xuất cấu hình", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    async Task ImportConfigAsync()
+    {
+        if (_engine.Running)
+        {
+            MessageBox.Show("Hãy Dừng tool trước khi nhập cấu hình.");
+            return;
+        }
+
+        _log.Info("[CONFIG_IMPORT_PICKER] mở picker process riêng");
+        var source = await PickConfigFileOutOfProcessAsync(save: false);
+        if (string.IsNullOrWhiteSpace(source))
+        {
+            _log.Info("[CONFIG_IMPORT_PICKER] hủy/chưa chọn file");
+            return;
+        }
+
+        if (MessageBox.Show(
+                "Nhập cấu hình sẽ thay cấu hình hiện tại. Tool sẽ tự sao lưu INI/nội dung trước khi thay. Tiếp tục?",
+                "Nhập cấu hình",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question) != DialogResult.Yes)
+            return;
+
+        try
+        {
+            var backup = _settingsService.ImportPackage(source);
             _settings = _settingsService.Load();
             ApplyManagedStartupOverrides();
             LoadToUi();
-            _log.Info("Đã nhập cấu hình: " + dlg.FileName + "; backup=" + backup);
+            _log.Info("Đã nhập cấu hình: " + source + "; backup=" + backup);
             MessageBox.Show("Đã nhập cấu hình.\nBản cũ được sao lưu tại:\n" + backup, "Nhập cấu hình");
         }
-        catch (Exception ex) { MessageBox.Show(ex.Message, "Nhập cấu hình", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+        catch (Exception ex)
+        {
+            MessageBox.Show(ex.Message, "Nhập cấu hình", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    async Task<string?> PickConfigFileOutOfProcessAsync(bool save)
+    {
+        var resultFile = Path.Combine(Path.GetTempPath(), $"ToolTikTokV13_picker_{Environment.ProcessId}_{Guid.NewGuid():N}.txt");
+        var errorFile = resultFile + ".error";
+
+        try
+        {
+            var workerExe = Path.Combine(AppContext.BaseDirectory, "ToolTikTokWorkerV13.exe");
+            if (!File.Exists(workerExe))
+                workerExe = Environment.ProcessPath ?? Application.ExecutablePath;
+
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = workerExe,
+                WorkingDirectory = AppContext.BaseDirectory,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            psi.ArgumentList.Add(save ? "--config-picker-save" : "--config-picker-open");
+            psi.ArgumentList.Add("--result-file");
+            psi.ArgumentList.Add(resultFile);
+
+            using var process = System.Diagnostics.Process.Start(psi)
+                ?? throw new InvalidOperationException("Không khởi động được cửa sổ chọn file cấu hình.");
+
+            // Không block UI Worker: chờ helper bất đồng bộ.
+            await process.WaitForExitAsync();
+
+            if (File.Exists(errorFile))
+            {
+                var error = File.ReadAllText(errorFile);
+                throw new InvalidOperationException("Không mở được cửa sổ chọn file.\n" + error);
+            }
+
+            if (!File.Exists(resultFile))
+                return null;
+
+            var selected = File.ReadAllText(resultFile).Trim();
+            return string.IsNullOrWhiteSpace(selected) ? null : selected;
+        }
+        finally
+        {
+            try { if (File.Exists(resultFile)) File.Delete(resultFile); } catch { }
+            try { if (File.Exists(errorFile)) File.Delete(errorFile); } catch { }
+        }
     }
 
     async Task HandleStartStopAsync()

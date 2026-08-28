@@ -33,6 +33,28 @@ public sealed record TikTokAccountImportResult(
     int Skipped,
     int TotalRows);
 
+public sealed record TikTokAccountExcelSnapshot(
+    string Id,
+    string Username,
+    int SourceRow,
+    string Note,
+    string AssignedProfile,
+    string AutoProfileResult)
+{
+    public bool IsBanBlocked
+        => TikTokAccountPoolService.IsBanNoteValue(Note);
+
+    public bool IsAutoProfileDone
+        => (AutoProfileResult ?? "").Trim().Equals(
+            "DONE",
+            StringComparison.OrdinalIgnoreCase);
+
+    public bool IsAutoProfileInProgress
+        => (AutoProfileResult ?? "").Trim().Equals(
+            "PROCESSING",
+            StringComparison.OrdinalIgnoreCase);
+}
+
 public sealed class TikTokAccountPoolService
 {
     sealed class StoredCatalog
@@ -86,6 +108,154 @@ public sealed class TikTokAccountPoolService
 
     public string CurrentSourcePath
         => LoadStoredCatalog().SourceFilePath ?? "";
+
+    // Excel là nguồn trạng thái cuối cùng trước các hành động Auto Profile.
+    // Tool vẫn được phép ghi đè trạng thái sau khi xử lý, nhưng trước khi gán/tạo
+    // phải đọc trực tiếp file nguồn thay vì chỉ tin snapshot JSON đã cache.
+    public static bool IsBanNoteValue(string? value)
+    {
+        var normalized = NormalizeGateText(value);
+
+        if (normalized.Length == 0)
+            return false;
+
+        return normalized.Equals("BAN", StringComparison.OrdinalIgnoreCase)
+            || normalized.Equals("BANNED", StringComparison.OrdinalIgnoreCase)
+            || normalized.Equals("BI BAN", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("BAN ", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("BAN:", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("BAN-", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("BAN_", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("BANNED ", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith("BI BAN ", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public TikTokAccountExcelSnapshot ReadFreshExcelSnapshot(string accountId)
+    {
+        accountId = (accountId ?? "").Trim();
+
+        if (accountId.Length == 0)
+            throw new InvalidOperationException(
+                "AccountId trống; không thể kiểm tra trạng thái Excel trước Auto Profile.");
+
+        var account = Load().FirstOrDefault(x =>
+            x.Id.Equals(
+                accountId,
+                StringComparison.OrdinalIgnoreCase));
+
+        if (account is null)
+            throw new InvalidOperationException(
+                "Tài khoản không còn tồn tại trong Kho khi kiểm tra trạng thái Excel.");
+
+        var path = CurrentSourcePath;
+
+        if (string.IsNullOrWhiteSpace(path))
+            throw new InvalidOperationException(
+                "Kho tài khoản chưa chọn file Excel nguồn.");
+
+        if (!File.Exists(path))
+            throw new FileNotFoundException(
+                "File Excel đang dùng không còn tồn tại.",
+                path);
+
+        var rows = ReadSourceRows(path);
+        var sourceColumns = ResolveSourceColumns(
+            rows,
+            allocateManagedColumns: false);
+        var autoColumns = ResolveAutoColumns(
+            rows,
+            allocateManagedColumns: false);
+
+        if (sourceColumns.HeaderRow < 0)
+            throw new InvalidOperationException(
+                "Không tìm thấy hàng tiêu đề trong file Excel.");
+
+        var rowIndex = account.SourceRow - 1;
+        var rowMatches =
+            rowIndex > sourceColumns.HeaderRow
+            && rowIndex >= 0
+            && rowIndex < rows.Count
+            && GetCell(rows[rowIndex], sourceColumns.User)
+                .Trim()
+                .Equals(
+                    account.Username,
+                    StringComparison.OrdinalIgnoreCase);
+
+        if (!rowMatches)
+        {
+            var matches = new List<int>();
+
+            for (var i = sourceColumns.HeaderRow + 1; i < rows.Count; i++)
+            {
+                if (GetCell(rows[i], sourceColumns.User)
+                    .Trim()
+                    .Equals(
+                        account.Username,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    matches.Add(i);
+                }
+            }
+
+            if (matches.Count == 0)
+                throw new InvalidOperationException(
+                    $"Không tìm thấy tài khoản {account.Username} trong Excel để kiểm tra trạng thái mới nhất.");
+
+            if (matches.Count > 1)
+                throw new InvalidOperationException(
+                    $"Tài khoản {account.Username} xuất hiện {matches.Count} dòng trong Excel; không tự gán để tránh đọc nhầm trạng thái.");
+
+            rowIndex = matches[0];
+        }
+
+        var note = sourceColumns.Note >= 0
+            ? GetCell(rows[rowIndex], sourceColumns.Note).Trim()
+            : "";
+
+        var assigned = sourceColumns.Assigned >= 0
+            ? GetCell(rows[rowIndex], sourceColumns.Assigned).Trim()
+            : "";
+
+        var autoResult =
+            autoColumns.HeaderRow >= 0
+            && autoColumns.Result >= 0
+                ? NormalizeAutoProfileResult(
+                    GetCell(rows[rowIndex], autoColumns.Result))
+                : "";
+
+        return new TikTokAccountExcelSnapshot(
+            account.Id,
+            account.Username,
+            rowIndex + 1,
+            note,
+            assigned,
+            autoResult);
+    }
+
+    static string NormalizeGateText(string? value)
+    {
+        value = (value ?? "").Trim();
+
+        if (value.Length == 0)
+            return "";
+
+        var decomposed = value.Normalize(NormalizationForm.FormD);
+        var sb = new StringBuilder(decomposed.Length);
+
+        foreach (var ch in decomposed)
+        {
+            var category = CharUnicodeInfo.GetUnicodeCategory(ch);
+            if (category != UnicodeCategory.NonSpacingMark)
+                sb.Append(ch);
+        }
+
+        return Regex.Replace(
+                sb.ToString().Normalize(NormalizationForm.FormC),
+                @"\s+",
+                " ")
+            .Trim()
+            .ToUpperInvariant();
+    }
 
     public Dictionary<string, string> GetIdentityResults()
     {
@@ -2674,6 +2844,18 @@ public sealed class TikTokAccountPoolService
             }
         }
 
+        public bool IsInProgress
+        {
+            get
+            {
+                var s = (Status ?? "").Trim();
+
+                return s.Equals(
+                    "PROCESSING",
+                    StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
         public bool IsPausedOrError
         {
             get
@@ -2844,8 +3026,11 @@ public sealed class TikTokAccountPoolService
         string step,
         string note)
     {
-        // Excel chỉ giữ kết quả cuối DONE / FAIL.
-        // Checkpoint kỹ thuật không còn ghi ra Excel.
+        // Excel giữ 3 trạng thái đủ để ra quyết định trước hành động:
+        // PROCESSING = Auto Profile đang tạo dở / có checkpoint hợp lệ;
+        // DONE = đã hoàn tất; FAIL = đã dừng/lỗi và chỉ retry khi người dùng cho phép.
+        // Nhờ vậy account cũ chỉ có "Profile đã gán" nhưng +auto trống sẽ không
+        // bị hiểu nhầm thành profile tạo dở ở các lần chạy sau.
         var finalResult =
             MapAutoProfileCheckpointToResult(status);
 
@@ -2875,7 +3060,7 @@ public sealed class TikTokAccountPoolService
 
             if (result.Length == 0)
                 throw new InvalidOperationException(
-                    "Auto Profile chỉ cho phép DONE hoặc FAIL.");
+                    "Auto Profile chỉ cho phép PROCESSING, DONE hoặc FAIL.");
         }
 
         var account =
@@ -2937,16 +3122,6 @@ public sealed class TikTokAccountPoolService
         }
 
         if (value.Equals(
-                "RESERVED",
-                StringComparison.OrdinalIgnoreCase)
-            || value.Equals(
-                "RESUMING",
-                StringComparison.OrdinalIgnoreCase))
-        {
-            return "";
-        }
-
-        if (value.Equals(
                 "FAIL",
                 StringComparison.OrdinalIgnoreCase)
             || value.StartsWith(
@@ -2968,6 +3143,24 @@ public sealed class TikTokAccountPoolService
             return "FAIL";
         }
 
+        // Mọi checkpoint kỹ thuật còn lại của Auto Profile đều là trạng thái
+        // đang làm dở. Ghi PROCESSING để lần mở sau chỉ resume đúng account
+        // thực sự do Auto Profile đang xử lý, thay vì resume mọi account cũ
+        // vốn chỉ có cột "Profile đã gán".
+        if (value.Equals("RESERVED", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("RESUMING", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("CREATING", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("CREATED", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("WAIT_LOGIN", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("LOGIN_OK", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("RENAMING", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("RENAMED", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("STARTING", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("PROCESSING", StringComparison.OrdinalIgnoreCase))
+        {
+            return "PROCESSING";
+        }
+
         return null;
     }
 
@@ -2984,6 +3177,28 @@ public sealed class TikTokAccountPoolService
                 StringComparison.OrdinalIgnoreCase))
         {
             return "DONE";
+        }
+
+        if (value.Equals(
+                "PROCESSING",
+                StringComparison.OrdinalIgnoreCase)
+            || value.Equals(
+                "IN_PROGRESS",
+                StringComparison.OrdinalIgnoreCase)
+            || value.Equals(
+                "IN PROGRESS",
+                StringComparison.OrdinalIgnoreCase)
+            || value.Equals(
+                "RUNNING",
+                StringComparison.OrdinalIgnoreCase)
+            || value.Equals(
+                "RESERVED",
+                StringComparison.OrdinalIgnoreCase)
+            || value.Equals(
+                "RESUMING",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return "PROCESSING";
         }
 
         if (value.Equals(
@@ -3043,6 +3258,11 @@ public sealed class TikTokAccountPoolService
             headers,
             "Auto Profile",
             "auto profile",
+            "AutoPrf",
+            "autoprf",
+            "auto prf",
+            "+autoprf",
+            "+auto prf",
             "+auto trạng thái",
             "auto trạng thái",
             "auto status",
