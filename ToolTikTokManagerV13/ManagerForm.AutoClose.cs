@@ -619,10 +619,10 @@ public sealed partial class ManagerForm
             && !ctx.Tab.IsDisposed
             && ctx.Tab.Parent == _tabs;
 
-        // Không chỉ nhìn Worker/Tab. Chrome mồ côi theo đúng ProfilePath hoặc
-        // trạng thái probe UNKNOWN cũng phải re-arm BAN để cleanup được thử lại.
-        var runtimeStillPresent =
-            IsAutoCloseRuntimeStillPresentStrict(ctx);
+        // FIX 13.7.5/13.7.6 UI FREEZE:
+        // AutoCloseProfileAsync đã xác minh Chrome bằng Task.Run trước khi trả về thành công.
+        // Không gọi ProbeProfileProcesses/PowerShell đồng bộ trên UI thread ở đây nữa.
+        var runtimeStillPresent = workerRunning || tabOpen || ctx.Opening;
 
         if (runtimeStillPresent)
         {
@@ -971,41 +971,15 @@ public sealed partial class ManagerForm
             return true;
         }
 
-        // Worker có thể crash/mất hẳn trong khi Chrome của đúng ProfilePath vẫn còn.
-        // Đây chính là kiểu làm Chrome rác tích tụ. Chỉ phục hồi expected-running khi:
-        // runtime_stats còn isRunning=true VÀ Chrome thật của ProfilePath vẫn tồn tại.
-        // Profile chỉ mở xem rồi đóng bình thường sẽ không thỏa điều kiện này.
+        // FIX 13.7.5/13.7.6 UI FREEZE:
+        // Không chạy PowerShell/CIM đồng bộ trên UI thread chỉ vì runtime_stats cũ còn isRunning=true.
+        // 13.7.4 không có bước orphan probe đồng bộ này. Nếu Worker đã mất thì không resurrect
+        // expected-running từ runtime_stats; cleanup thật sự vẫn xác minh Chrome ở luồng async/Task.Run.
         if (!workerAlive
             && RuntimeStatsFileSaysRunning(ctx))
         {
-            var chromePresence = ProbeAutoCloseChromePresence(
-                profileName,
-                ctx.Profile.ProfilePath,
-                "expected_to_run_orphan_check",
-                out var chromeDetail);
-
-            if (chromePresence == AutoCloseChromePresence.Alive)
-            {
-                MarkAutoCloseExpectedRunning(
-                    profileName,
-                    "orphan_chrome_runtime_stats_running");
-
-                _log.Warn(
-                    $"[AUTO_CLOSE_ORPHAN_CHROME_DETECTED] profile={profileName} pids={chromeDetail}");
-
-                return true;
-            }
-
-            if (chromePresence == AutoCloseChromePresence.Unknown)
-            {
-                // UNKNOWN không được coi như CLOSED. Giữ profile trong watchdog
-                // để lần cleanup sau fail-closed thay vì bỏ sót Chrome mồ côi.
-                MarkAutoCloseExpectedRunning(
-                    profileName,
-                    "orphan_chrome_probe_unknown");
-
-                return true;
-            }
+            _log.Info(
+                $"[AUTO_CLOSE_STALE_RUNTIME_STATS_IGNORED] profile={profileName} reason=worker_not_alive action=NO_SYNC_CHROME_PROBE");
         }
 
         return false;
@@ -1491,19 +1465,18 @@ public sealed partial class ManagerForm
             _log.Error(
                 $"[AUTO_CLOSE_ERROR] profile={ctx.Profile.Name} reason={reason} error={ex}");
 
-            // Nếu đóng chưa xong thì không Queue bù. Re-arm để vòng watchdog sau
-            // tiếp tục cố đóng thay vì bỏ mặc Chrome/Worker lỗi.
-            if (IsAutoCloseRuntimeStillPresentStrict(ctx))
-            {
-                MarkAutoCloseExpectedRunning(
-                    ctx.Profile.Name,
-                    "auto_close_failed_retry");
+            // Nếu đóng lỗi thì luôn re-arm để watchdog thử lại.
+            // Không probe Chrome đồng bộ ở catch vì PowerShell/CIM có thể chặn UI nhiều giây
+            // (và với nhiều profile tạo cảm giác Not Responding). Cleanup lần sau sẽ kiểm tra
+            // Chrome ở Task.Run trong EnsureAutoCloseChromeStoppedByPathAsync.
+            MarkAutoCloseExpectedRunning(
+                ctx.Profile.Name,
+                "auto_close_failed_retry");
 
-                if (NormalizeAutoCloseReason(reason) == "FAULT_10M")
-                {
-                    _autoCloseNotRunningSinceUtc[ctx.Profile.Name] =
-                        DateTime.UtcNow.AddMinutes(-AutoCloseNotRunningMinutes);
-                }
+            if (NormalizeAutoCloseReason(reason) == "FAULT_10M")
+            {
+                _autoCloseNotRunningSinceUtc[ctx.Profile.Name] =
+                    DateTime.UtcNow.AddMinutes(-AutoCloseNotRunningMinutes);
             }
 
             WriteAutoActivityLog(
