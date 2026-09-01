@@ -132,6 +132,24 @@ public sealed partial class ManagerForm
         {
             var state = GetEffectiveRuntimeState(ctx);
             if (state is RuntimeStateRunning or RuntimeStateRecovering)
+            {
+                names.Add(ctx.Profile.Name);
+                continue;
+            }
+
+            // Safety net: profile bù lỗi có thể đang STOPPED/DISCONNECTED nhưng
+            // Worker/tab/Opening vẫn còn. Nếu không tính các runtime vật lý này,
+            // slot gate tưởng còn chỗ trống và tiếp tục mở Chrome mới.
+            var workerAlive = false;
+            try { workerAlive = ctx.Worker is not null && !ctx.Worker.HasExited; }
+            catch { workerAlive = ctx.Worker is not null; }
+
+            var tabOpen =
+                ctx.Tab is not null
+                && !ctx.Tab.IsDisposed
+                && ctx.Tab.Parent == _tabs;
+
+            if (workerAlive || tabOpen || ctx.Opening)
                 names.Add(ctx.Profile.Name);
         }
 

@@ -466,54 +466,81 @@ public sealed partial class ManagerForm
 
     async Task CloseFailedReplacementRuntimeAsync(ProfileContext ctx)
     {
-        var chromeClosed = false;
+        // IMPORTANT: một profile bù thất bại KHÔNG được phép chỉ gỡ claim rồi
+        // chuyển sang profile kế tiếp. Nếu Chrome/Worker/tab của lần thử cũ còn sống,
+        // queue sẽ tiếp tục mở thêm profile và số Chrome thực tế sẽ phình vượt target.
+        var chromeClosedByWorker = false;
 
-        try
+        if (ctx.Worker is not null && !ctx.Worker.HasExited)
         {
-            if (ctx.Worker is not null && !ctx.Worker.HasExited)
+            try { await SendCommandAsync(ctx, "stop", TimeSpan.FromSeconds(5)); }
+            catch (Exception ex)
             {
-                try { await SendCommandAsync(ctx, "stop", TimeSpan.FromSeconds(5)); } catch { }
-
-                try
-                {
-                    var closeReply = await SendCloseChromeCommandAsync(ctx);
-                    chromeClosed = closeReply is "closed" or "not_running";
-                }
-                catch { }
+                _log.Warn($"[AUTO_REPLACE_FAILED_STOP_WARN] profile={ctx.Profile.Name} error={ex.Message}");
             }
 
-            if (!chromeClosed)
+            try
             {
-                try
-                {
-                    await Task.Run(
-                        () => ChromeProfileNameSyncService.StopChromeUsingProfile(
-                            ctx.Profile.ProfilePath));
-                }
-                catch { }
+                var closeReply = await SendCloseChromeCommandAsync(ctx);
+                chromeClosedByWorker = closeReply is "closed" or "not_running";
+                _log.Info($"[AUTO_REPLACE_FAILED_CHROME] profile={ctx.Profile.Name} reply={closeReply}");
             }
-
-            if (ctx.Worker is not null && !ctx.Worker.HasExited)
+            catch (Exception ex)
             {
-                try { await SendPipeAsync(ctx.Profile.Name, "shutdown", TimeSpan.FromSeconds(5)); } catch { }
-
-                var worker = ctx.Worker;
-                if (worker is not null && !worker.HasExited)
-                {
-                    try
-                    {
-                        if (!await WaitForProcessExitAsync(worker, TimeSpan.FromSeconds(5)))
-                            worker.Kill(true);
-                    }
-                    catch { }
-                }
+                _log.Warn($"[AUTO_REPLACE_FAILED_CHROME_WARN] profile={ctx.Profile.Name} error={ex.Message}");
             }
         }
-        finally
+
+        if (!chromeClosedByWorker)
         {
-            if (ctx.Tab is not null && !ctx.Tab.IsDisposed && ctx.Tab.Parent == _tabs)
-                RemoveTab(ctx);
+            try
+            {
+                var stopped = await Task.Run(
+                    () => ChromeProfileNameSyncService.StopChromeUsingProfile(
+                        ctx.Profile.ProfilePath));
+
+                _log.Info($"[AUTO_REPLACE_FAILED_CHROME_FALLBACK] profile={ctx.Profile.Name} stopped={stopped.Count} pids={string.Join(",", stopped)}");
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"[AUTO_REPLACE_FAILED_CHROME_FALLBACK_WARN] profile={ctx.Profile.Name} error={ex.Message}");
+            }
         }
+
+        // Dùng cùng cleanup barrier với AutoClose chính: phải xác minh Chrome và
+        // Worker đã chết THẬT rồi mới gỡ tab và cho phép thử profile bù kế tiếp.
+        await EnsureAutoCloseChromeStoppedAsync(ctx);
+        await EnsureAutoCloseWorkerStoppedAsync(ctx);
+        await EnsureAutoCloseChromeStoppedAsync(ctx);
+
+        if (ctx.Tab is not null && !ctx.Tab.IsDisposed && ctx.Tab.Parent == _tabs)
+            RemoveTab(ctx);
+
+        _log.Info($"[AUTO_REPLACE_FAILED_CLEANUP_DONE] profile={ctx.Profile.Name} chrome=0 worker=closed tab=removed");
+    }
+
+    async Task CleanupCreatedReplacementAttemptAsync(string profileName, string source)
+    {
+        profileName = (profileName ?? "").Trim();
+        if (profileName.Length == 0)
+            return;
+
+        if (!_contexts.TryGetValue(profileName, out var ctx))
+        {
+            try
+            {
+                var catalog = _profileService.Load();
+                RefreshContextsFromCatalog(catalog);
+                _contexts.TryGetValue(profileName, out ctx);
+            }
+            catch { }
+        }
+
+        if (ctx is null)
+            return;
+
+        _log.Warn($"[AUTO_REPLACE_FAILED_CLEANUP_BEGIN] profile={profileName} source={source}");
+        await CloseFailedReplacementRuntimeAsync(ctx);
     }
 
     async Task<bool> TryCreateReplacementAsync(AutoReplacementRequest request)
@@ -691,8 +718,13 @@ public sealed partial class ManagerForm
                         result: "LỖI",
                         detail: $"status={outcome.Status}; step={outcome.Step}; note={outcome.Note}");
 
-                    // Auto Profile đã note checkpoint lỗi/CAPTCHA. Thử account/profile kế tiếp
-                    // cho cùng một suất bù, giống tư tưởng lỗi profile nào thì chuyển profile khác.
+                    // FIX: ProcessAutoProfileQueueItemAsync có thể thất bại SAU khi đã mở
+                    // Worker/Chrome (LOGIN/RENAME/START...). Trước đây nhánh này không dọn
+                    // runtime, rồi lập tức thử profile khác => Chrome/tab tích tụ 5 -> 9...
+                    // Phải cleanup + verify xong mới được chuyển ứng viên.
+                    await CleanupCreatedReplacementAttemptAsync(
+                        item.ProfileName,
+                        $"outcome_fail:{outcome.Status}:{outcome.Step}");
                 }
                 catch (Exception ex)
                 {
@@ -707,6 +739,23 @@ public sealed partial class ManagerForm
                         replacementProfile: item.ProfileName,
                         result: "LỖI",
                         detail: ex.Message);
+
+                    // Exception cũng có thể xảy ra sau khi Chrome đã mở. Không được
+                    // nuốt lỗi rồi bỏ claim vì như vậy queue sẽ mở thêm profile mới.
+                    try
+                    {
+                        await CleanupCreatedReplacementAttemptAsync(
+                            item.ProfileName,
+                            "exception:" + ex.GetType().Name);
+                    }
+                    catch (Exception cleanupEx)
+                    {
+                        _log.Error(
+                            $"[AUTO_REPLACE_CREATE_CLEANUP_ERROR] profile={item.ProfileName} error={cleanupEx}");
+                        throw new InvalidOperationException(
+                            $"Profile bù {item.ProfileName} lỗi và cleanup chưa hoàn tất; chặn mở profile kế tiếp.",
+                            cleanupEx);
+                    }
                 }
                 finally
                 {
