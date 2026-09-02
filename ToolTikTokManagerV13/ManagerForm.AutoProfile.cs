@@ -62,6 +62,7 @@ public sealed partial class ManagerForm
 
         var initialAccounts = _accountPoolService.Load();
         var initialStates = _accountPoolService.LoadAutoStates();
+        var initialIdentityDone = _accountPoolService.GetIdentityDoneUsernames();
         var initialStartName = DetectNextAutoProfileName();
         var initialAvailable = initialAccounts.Count(x =>
             !x.IsAssigned
@@ -73,6 +74,7 @@ public sealed partial class ManagerForm
             ShouldResumeAutoProfileAccount(
                 x,
                 initialStates,
+                initialIdentityDone,
                 initialStartName,
                 retryPaused: false,
                 out _));
@@ -176,7 +178,7 @@ public sealed partial class ManagerForm
         };
         var retryPaused = new CheckBox
         {
-            Text = "Thử lại cả profile lỗi/CAPTCHA đã ghi",
+            Text = "Thử lại CAPTCHA / lỗi cần xử lý",
             Checked = false,
             AutoSize = true,
             Margin = new Padding(0, 8, 14, 0)
@@ -188,6 +190,7 @@ public sealed partial class ManagerForm
                 ShouldResumeAutoProfileAccount(
                     x,
                     initialStates,
+                    initialIdentityDone,
                     nextProfile.Text.Trim(),
                     retryPaused.Checked,
                     out _));
@@ -224,7 +227,7 @@ public sealed partial class ManagerForm
         };
         var vmHint = new Label
         {
-            Text = "VM chậm: chạy tuần tự 1 profile; chờ điều kiện thay vì delay cứng; lỗi/CAPTCHA được ghi Excel rồi bỏ qua profile đó.",
+            Text = "VM chậm: chạy tuần tự 1 profile. FAIL cũ có Tên/ảnh DONE sẽ tự phục hồi; CAPTCHA/cooldown/config chỉ thử lại khi bạn bật tùy chọn.",
             AutoSize = true,
             MaximumSize = new Size(780, 0),
             ForeColor = Color.DimGray,
@@ -512,7 +515,7 @@ public sealed partial class ManagerForm
                         }
                     }
 
-                    status.Text = $"Hoàn tất. DONE: {success} | BỎ QUA EXCEL: {skippedByExcel} | FAIL: {pausedOrError}. Excel ghi PROCESSING/DONE/FAIL để phân biệt profile đang dở với tài khoản cũ.";
+                    status.Text = $"Hoàn tất. DONE: {success} | BỎ QUA EXCEL: {skippedByExcel} | CHƯA XONG: {pausedOrError}. Lỗi tạm thời giữ PROCESSING; CAPTCHA/cooldown/config mới giữ FAIL.";
                 }
                 finally
                 {
@@ -561,6 +564,7 @@ public sealed partial class ManagerForm
         // trong account và Auto Profile trong states phản ánh file Excel mới nhất.
         var accounts = _accountPoolService.Load().OrderBy(x => x.SourceRow).ToList();
         var states = _accountPoolService.LoadAutoStates();
+        var identityDoneUsers = _accountPoolService.GetIdentityDoneUsernames();
         var queue = new List<AutoProfileQueueItem>();
 
         bool IsDone(TikTokAccountPoolItem account)
@@ -576,6 +580,7 @@ public sealed partial class ManagerForm
                 if (!ShouldResumeAutoProfileAccount(
                         account,
                         states,
+                        identityDoneUsers,
                         requestedStartName,
                         retryPaused,
                         out var resumeReason))
@@ -650,9 +655,10 @@ public sealed partial class ManagerForm
         return queue;
     }
 
-    static bool ShouldResumeAutoProfileAccount(
+    bool ShouldResumeAutoProfileAccount(
         TikTokAccountPoolItem account,
         IReadOnlyDictionary<string, TikTokAccountPoolService.TikTokAccountAutoState> states,
+        IReadOnlySet<string> identityDoneUsers,
         string requestedStartName,
         bool retryPaused,
         out string reason)
@@ -681,9 +687,19 @@ public sealed partial class ManagerForm
 
             if (state.IsPausedOrError)
             {
+                // Self-heal: FAIL cũ không còn là khóa vĩnh viễn. Nếu cột Tên/ảnh
+                // đã DONE thì profile đủ căn cứ để tiếp tục từ trạng thái thực tế.
+                // CAPTCHA/cooldown/config chưa có Tên/ảnh DONE vẫn chỉ retry khi
+                // người dùng chủ động bật checkbox.
+                if (IsAutoProfileFailAutoRecoverable(account, identityDoneUsers))
+                {
+                    reason = "AUTOPRF_FAIL_SELF_HEAL";
+                    return true;
+                }
+
                 reason = retryPaused
-                    ? "RETRY_FAIL_ALLOWED"
-                    : "AUTOPRF_FAIL_RETRY_DISABLED";
+                    ? "RETRY_BLOCKED_FAIL_ALLOWED"
+                    : "AUTOPRF_FAIL_NEEDS_MANUAL_RETRY";
                 return retryPaused;
             }
 
@@ -717,6 +733,19 @@ public sealed partial class ManagerForm
 
         reason = "LEGACY_NO_CHECKPOINT_AT_OR_AFTER_START";
         return true;
+    }
+
+    static bool IsAutoProfileFailAutoRecoverable(
+        TikTokAccountPoolItem account,
+        IReadOnlySet<string> identityDoneUsers)
+    {
+        if (!account.IsAssigned)
+            return false;
+
+        // Đây là tín hiệu bền vững nhất trong Excel: tên/ảnh đã được xác minh
+        // thực tế. Khi Auto Profile còn FAIL vì lỗi bước sau (START/ghi trạng thái),
+        // cho phép tự tiếp tục để sửa FAIL -> DONE.
+        return identityDoneUsers.Contains((account.Username ?? "").Trim());
     }
 
     static bool IsAssignedProfileBeforeRequestedStart(
@@ -777,6 +806,9 @@ public sealed partial class ManagerForm
 
             var gateDecision = "ALLOW";
             var gateReason = "";
+            var wasAutoProfileFail = freshExcel.AutoProfileResult.Equals(
+                "FAIL",
+                StringComparison.OrdinalIgnoreCase);
 
             if (freshExcel.IsBanBlocked)
             {
@@ -889,13 +921,38 @@ public sealed partial class ManagerForm
                 throw new AutoProfilePauseException("PAUSED_ERROR", step, "Không mở được Worker của profile.");
 
             await Task.Delay(TimeSpan.FromMilliseconds(1200), ct);
-            try { await RefreshStatusAsync(ctx); } catch { }
+            var workerHealthy = await IsAutoProfileWorkerHealthyAsync(ctx);
+            var identityDone = !autoRename || await RunAccountPoolIoAsync(
+                () => _accountPoolService.IsIdentityDone(item.Account.Username),
+                ct);
+
+            // SELF-HEAL nhanh: lần trước Excel còn FAIL nhưng trạng thái thực tế
+            // đã hoàn tất (Tên/ảnh DONE + Worker RUNNING/RECOVERING). Không login,
+            // không đổi tên, không START lại; chỉ sửa Auto Profile -> DONE và verify.
+            if (item.ResumeExisting
+                && wasAutoProfileFail
+                && identityDone
+                && (!autoStart || workerHealthy))
+            {
+                await SetAutoProfileDoneVerifiedAsync(
+                    item.Account.Id,
+                    AutoProfileNote("Self-heal: trạng thái thực tế đã hoàn tất; sửa FAIL cũ thành DONE."),
+                    ct);
+                _autoIdentityHandledSession.Add(item.ProfileName);
+                _autoIdentityHandledSession.Add("account:" + item.Account.Username.Trim().ToLowerInvariant());
+                ui("DONE", workerHealthy
+                    ? "SELF-HEAL — trạng thái thực tế đã RUNNING; Auto Profile đã sửa FAIL → DONE."
+                    : "SELF-HEAL — các bước bắt buộc đã hoàn tất; Auto Profile đã sửa FAIL → DONE.",
+                    Color.DarkGreen);
+                _log.Info($"[AUTO_PROFILE_SELF_HEAL_DONE] profile={item.ProfileName} account={item.Account.Username} workerHealthy={workerHealthy} identityDone={identityDone}");
+                return new AutoProfileProcessOutcome(true, false, "READY", "DONE", "Self-heal FAIL -> DONE");
+            }
 
             await WaitAutoProfilePausePointAsync(isPaused, ct);
             step = "WAIT_LOGIN";
-            ui(step, "Đang mở Chrome và chờ đăng nhập...", Color.RoyalBlue);
+            ui(step, "Đang mở Chrome và xác minh đăng nhập...", Color.RoyalBlue);
             await SetAutoCheckpointWithRetryAsync(item.Account.Id, "WAIT_LOGIN", step,
-                AutoProfileNote("Chrome/đăng nhập đang được xử lý; CAPTCHA sẽ dừng riêng profile này."), ct);
+                AutoProfileNote("Chrome/đăng nhập đang được xác minh; CAPTCHA sẽ dừng riêng profile này."), ct);
 
             await EnsureAutoProfileLoggedInAsync(ctx, item, ct);
             await SetAutoCheckpointWithRetryAsync(item.Account.Id, "LOGIN_OK", step,
@@ -905,29 +962,54 @@ public sealed partial class ManagerForm
 
             if (autoRename)
             {
-                await WaitAutoProfilePausePointAsync(isPaused, ct);
-                step = "RENAME";
-                ui(step, "Đang đổi tên / áp dụng Tên & ảnh TikTok...", Color.RoyalBlue);
-                await SetAutoCheckpointWithRetryAsync(item.Account.Id, "RENAMING", step,
-                    AutoProfileNote("Bắt đầu luồng Tên & ảnh TikTok."), ct);
-                await ApplyAutoProfileIdentityAsync(ctx, item, ct);
-                await SetAutoCheckpointWithRetryAsync(item.Account.Id, "RENAMED", step,
-                    AutoProfileNote("Tên/ảnh đã xử lý; trang đã được refresh ổn định theo luồng hiện tại."), ct);
-                ui("RENAMED", "Đổi tên/ảnh hoàn tất.", Color.DarkGreen);
+                identityDone = await RunAccountPoolIoAsync(
+                    () => _accountPoolService.IsIdentityDone(item.Account.Username),
+                    ct);
+
+                if (identityDone)
+                {
+                    ui("RENAMED", "Tên/ảnh trong Excel đã DONE — bỏ qua đổi lại.", Color.DarkGreen);
+                    _log.Info($"[AUTO_PROFILE_IDENTITY_ALREADY_DONE] profile={item.ProfileName} account={item.Account.Username}");
+                }
+                else
+                {
+                    await WaitAutoProfilePausePointAsync(isPaused, ct);
+                    step = "RENAME";
+                    ui(step, "Đang đổi tên / áp dụng Tên & ảnh TikTok...", Color.RoyalBlue);
+                    await SetAutoCheckpointWithRetryAsync(item.Account.Id, "RENAMING", step,
+                        AutoProfileNote("Bắt đầu luồng Tên & ảnh TikTok."), ct);
+                    await ApplyAutoProfileIdentityAsync(ctx, item, ct);
+                    await SetAutoCheckpointWithRetryAsync(item.Account.Id, "RENAMED", step,
+                        AutoProfileNote("Tên/ảnh đã xử lý và Excel đã xác minh DONE."), ct);
+                    identityDone = true;
+                    ui("RENAMED", "Đổi tên/ảnh hoàn tất.", Color.DarkGreen);
+                }
             }
 
             if (autoStart)
             {
-                await WaitAutoProfilePausePointAsync(isPaused, ct);
-                step = "START_TOOL";
-                ui(step, "Đang Bắt đầu tool...", Color.RoyalBlue);
-                await SetAutoCheckpointWithRetryAsync(item.Account.Id, "STARTING", step,
-                    AutoProfileNote("Đang chuẩn bị LIVE/PAGE_READY và Bắt đầu Worker."), ct);
-                await StartAutoProfileWorkerWithRetryAsync(ctx, item, ct);
+                // Nếu Worker đã RUNNING thì đây cũng là self-heal: không gửi START lần nữa.
+                workerHealthy = await IsAutoProfileWorkerHealthyAsync(ctx);
+                if (workerHealthy)
+                {
+                    ui("START_TOOL", "Worker đã RUNNING/RECOVERING — bỏ qua Start lại.", Color.DarkGreen);
+                    _log.Info($"[AUTO_PROFILE_START_SKIP_ALREADY_RUNNING] profile={item.ProfileName}");
+                }
+                else
+                {
+                    await WaitAutoProfilePausePointAsync(isPaused, ct);
+                    step = "START_TOOL";
+                    ui(step, "Đang Bắt đầu tool...", Color.RoyalBlue);
+                    await SetAutoCheckpointWithRetryAsync(item.Account.Id, "STARTING", step,
+                        AutoProfileNote("Đang chuẩn bị LIVE/PAGE_READY và Bắt đầu Worker."), ct);
+                    await StartAutoProfileWorkerWithRetryAsync(ctx, item, ct, requireIdentityDone: autoRename);
+                }
             }
 
-            await SetAutoCheckpointWithRetryAsync(item.Account.Id, "READY", "DONE",
-                AutoProfileNote($"Hoàn tất Auto Profile sau {(int)stopwatch.Elapsed.TotalMinutes:00}:{stopwatch.Elapsed.Seconds:00}."), ct);
+            await SetAutoProfileDoneVerifiedAsync(
+                item.Account.Id,
+                AutoProfileNote($"Hoàn tất Auto Profile sau {(int)stopwatch.Elapsed.TotalMinutes:00}:{stopwatch.Elapsed.Seconds:00}."),
+                ct);
             _autoIdentityHandledSession.Add(item.ProfileName);
             _autoIdentityHandledSession.Add("account:" + item.Account.Username.Trim().ToLowerInvariant());
             ui("DONE", autoStart ? "READY — tool đang chạy." : "READY — chưa tự Bắt đầu theo cấu hình.", Color.DarkGreen);
@@ -936,16 +1018,10 @@ public sealed partial class ManagerForm
         }
         catch (AutoProfilePauseException ex)
         {
-            _autoIdentityHandledSession.Add(item.ProfileName);
-
-            if (ex.Step.Equals(
-                    "RENAME",
-                    StringComparison.OrdinalIgnoreCase))
-            {
-                await TryMarkIdentityFailAsync(
-                    item.Account.Username,
-                    CancellationToken.None);
-            }
+            if (!ex.Step.Equals("RENAME", StringComparison.OrdinalIgnoreCase))
+                _autoIdentityHandledSession.Add(item.ProfileName);
+            else
+                _log.Warn($"[AUTO_PROFILE_IDENTITY_RETRYABLE] profile={item.ProfileName} account={item.Account.Username} status={ex.Status}; giữ nguyên cột Tên/ảnh, không ghi FAIL và không khóa scheduler để lần sau xác minh lại TikTok.");
 
             await TryWriteAutoPauseCheckpointAsync(item.Account.Id, ex.Status, ex.Step, ex.Message, ct);
             ui(ex.Step, ex.Status + " — " + ex.Message, Color.DarkOrange);
@@ -956,21 +1032,15 @@ public sealed partial class ManagerForm
         {
             _autoIdentityHandledSession.Add(item.ProfileName);
             await TryWriteAutoPauseCheckpointAsync(item.Account.Id, "STOPPED", step,
-                "Người dùng dừng hàng đợi; có thể tiếp tục profile này ở lần sau.", CancellationToken.None);
+                "Người dùng dừng hàng đợi; giữ PROCESSING để tự tiếp tục ở lần sau, không coi là FAIL.", CancellationToken.None);
             throw;
         }
         catch (Exception ex)
         {
-            _autoIdentityHandledSession.Add(item.ProfileName);
-
-            if (step.Equals(
-                    "RENAME",
-                    StringComparison.OrdinalIgnoreCase))
-            {
-                await TryMarkIdentityFailAsync(
-                    item.Account.Username,
-                    CancellationToken.None);
-            }
+            if (!step.Equals("RENAME", StringComparison.OrdinalIgnoreCase))
+                _autoIdentityHandledSession.Add(item.ProfileName);
+            else
+                _log.Warn($"[AUTO_PROFILE_IDENTITY_RETRYABLE] profile={item.ProfileName} account={item.Account.Username}; lỗi RENAME chưa đủ căn cứ ghi FAIL, không khóa scheduler để kiểm tra/retry sau.");
 
             var captcha = ctx is not null && await TryIsCaptchaVisibleAsync(ctx);
             var status = captcha
@@ -1166,20 +1236,42 @@ public sealed partial class ManagerForm
         if (reply.Skipped && !reply.AlreadyConfigured)
             throw new AutoProfilePauseException("PAUSED_RENAME", "RENAME", string.IsNullOrWhiteSpace(reply.Message) ? "TikTok bỏ qua thao tác đổi tên." : reply.Message);
 
-        await RunAccountPoolIoAsync(
-            () => _accountPoolService.MarkIdentityDone(item.Account.Username),
-            ct);
+        var excelDone = await MarkIdentityDoneVerifiedAsync(
+            item.Account.Username, item.ProfileName, ct);
+        if (!excelDone.Ok)
+            throw new AutoProfilePauseException(
+                "PAUSED_RENAME_EXCEL",
+                "RENAME",
+                "TikTok đã xử lý tên/ảnh nhưng Excel chưa ghi/xác minh được DONE: " + excelDone.Error);
 
         if (reply.AvatarChanged && !string.IsNullOrWhiteSpace(avatarPath))
         {
             state.LastAvatarByProfile[ctx.Profile.Name] = avatarPath;
             SaveIdentityToolState(state);
         }
-        _log.Info($"[AUTO_PROFILE_RENAME_DONE] profile={item.ProfileName} account={item.Account.Username} nameChanged={reply.NameChanged} alreadyConfigured={reply.AlreadyConfigured}");
+        _log.Info($"[AUTO_PROFILE_RENAME_DONE] profile={item.ProfileName} account={item.Account.Username} nameChanged={reply.NameChanged} alreadyConfigured={reply.AlreadyConfigured} Excel=DONE verified=true");
     }
 
-    async Task StartAutoProfileWorkerWithRetryAsync(ProfileContext ctx, AutoProfileQueueItem item, CancellationToken ct)
+    async Task StartAutoProfileWorkerWithRetryAsync(
+        ProfileContext ctx,
+        AutoProfileQueueItem item,
+        CancellationToken ct,
+        bool requireIdentityDone = true)
     {
+        // Khi tùy chọn Tên/ảnh bật, START chỉ được phép sau khi Excel đọc lại DONE.
+        // Nếu người dùng chủ động tắt Tên/ảnh thì không ép cột này, đúng nghĩa checkbox.
+        if (requireIdentityDone)
+        {
+            var identityDone = await RunAccountPoolIoAsync(
+                () => _accountPoolService.IsIdentityDone(item.Account.Username),
+                ct);
+            if (!identityDone)
+                throw new AutoProfilePauseException(
+                    "PAUSED_IDENTITY_NOT_DONE",
+                    "START_TOOL",
+                    "Chặn Bắt đầu: cột Tên/ảnh trong Excel chưa xác nhận DONE.");
+        }
+
         string last = "";
         for (var attempt = 1; attempt <= 2; attempt++)
         {
@@ -1188,8 +1280,10 @@ public sealed partial class ManagerForm
             last = await SendCommandAsync(ctx, "start_auto", TimeSpan.FromSeconds(95));
             if (string.Equals(last, "started", StringComparison.OrdinalIgnoreCase))
             {
-                try { await RefreshStatusAsync(ctx); } catch { }
-                return;
+                if (await IsAutoProfileWorkerHealthyAsync(ctx))
+                    return;
+
+                last = "Worker trả started nhưng status chưa xác nhận RUNNING/RECOVERING.";
             }
             if (await TryIsCaptchaVisibleAsync(ctx))
                 throw new AutoProfilePauseException("PAUSED_CAPTCHA_START", "START_TOOL", "Phát hiện CAPTCHA trước khi Bắt đầu tool.");
@@ -1197,6 +1291,59 @@ public sealed partial class ManagerForm
                 await Task.Delay(TimeSpan.FromSeconds(5), ct);
         }
         throw new AutoProfilePauseException("PAUSED_START", "START_TOOL", "Worker chưa Bắt đầu được sau 2 lần thử. Phản hồi cuối: " + last);
+    }
+
+    async Task<bool> IsAutoProfileWorkerHealthyAsync(ProfileContext ctx)
+    {
+        try
+        {
+            if (ctx.Worker is null || ctx.Worker.HasExited)
+                return false;
+
+            await RefreshStatusAsync(ctx);
+            var state = GetEffectiveRuntimeState(ctx);
+            return state is RuntimeStateRunning or RuntimeStateRecovering;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"[AUTO_PROFILE_HEALTH_CHECK] profile={ctx.Profile.Name} healthy=false error={ex.Message}");
+            return false;
+        }
+    }
+
+    async Task SetAutoProfileDoneVerifiedAsync(string accountId, string note, CancellationToken ct)
+    {
+        Exception? last = null;
+        for (var attempt = 1; attempt <= 3; attempt++)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                await SetAutoCheckpointWithRetryAsync(accountId, "READY", "DONE", note, ct);
+                var fresh = await RunAccountPoolIoAsync(
+                    () => _accountPoolService.ReadFreshExcelSnapshot(accountId),
+                    ct);
+                if (fresh.IsAutoProfileDone)
+                {
+                    _log.Info($"[AUTO_PROFILE_DONE_VERIFIED] user={fresh.Username} profile={fresh.AssignedProfile} row={fresh.SourceRow} attempt={attempt}/3");
+                    return;
+                }
+
+                last = new InvalidOperationException(
+                    $"Excel đọc lại Auto Profile='{fresh.AutoProfileResult}' thay vì DONE.");
+            }
+            catch (Exception ex)
+            {
+                last = ex;
+            }
+
+            if (attempt < 3)
+                await Task.Delay(700, ct);
+        }
+
+        throw new InvalidOperationException(
+            "Đã hoàn tất Auto Profile nhưng không ghi/xác minh được Auto Profile = DONE trong Excel sau 3 lần thử: " + last?.Message,
+            last);
     }
 
     async Task<bool> TryIsCaptchaVisibleAsync(ProfileContext ctx)
@@ -1207,23 +1354,6 @@ public sealed partial class ManagerForm
             return string.Equals(result, "captcha", StringComparison.OrdinalIgnoreCase);
         }
         catch { return false; }
-    }
-
-    async Task TryMarkIdentityFailAsync(
-        string username,
-        CancellationToken ct)
-    {
-        try
-        {
-            await RunAccountPoolIoAsync(
-                () => _accountPoolService.MarkIdentityFail(username),
-                ct);
-        }
-        catch (Exception ex)
-        {
-            _log.Warn(
-                $"[AUTO_PROFILE_IDENTITY_FAIL_WRITE] user={username} error={ex.Message}");
-        }
     }
 
     async Task SetAutoCheckpointWithRetryAsync(string accountId, string status, string step, string note, CancellationToken ct)

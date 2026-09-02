@@ -40,11 +40,11 @@ public sealed partial class ManagerForm
         TimeSpan TotalRuntime,
         bool IsManual);
 
-    const double ReusableProfileRecoveryProofSeconds = 60.0;
-
     readonly object _reusableProfileQueueLock = new();
     readonly SemaphoreSlim _reusableProfileRefreshGate = new(1, 1);
     ReusableProfileQueueDocument _reusableProfileQueueCache = new();
+    Dictionary<string, string> _reusableProfileReasonCache =
+        new(StringComparer.OrdinalIgnoreCase);
     bool _reusableProfileQueueLoaded;
 
     string ReusableProfileQueuePath
@@ -61,8 +61,10 @@ public sealed partial class ManagerForm
             ? "unknown"
             : source.Trim();
 
-        if (!await _reusableProfileRefreshGate.WaitAsync(0, ct))
-            return;
+        // Mọi lượt quét được xếp hàng tuần tự. Trước đây WaitAsync(0) làm nút
+        // "Quét chờ" có thể thoát ngay nếu quét nền đang chạy nhưng UI vẫn báo
+        // "Đã quét xong". Chờ gate giúp lượt quét thủ công luôn thực sự chạy.
+        await _reusableProfileRefreshGate.WaitAsync(ct);
 
         try
         {
@@ -98,20 +100,6 @@ public sealed partial class ManagerForm
             var catalog = await Task.Run(
                 () => _profileService.Load(),
                 ct);
-
-            Dictionary<string, string> supplyStates;
-
-            lock (_profileSupplyStateLock)
-            {
-                var supplyDocument =
-                    LoadProfileSupplyStateDocumentUnsafe();
-
-                supplyStates =
-                    supplyDocument.Profiles.ToDictionary(
-                        x => x.Key,
-                        x => (x.Value.State ?? "").Trim(),
-                        StringComparer.OrdinalIgnoreCase);
-            }
 
             var runtimeByProfile = await Task.Run(
                 () =>
@@ -191,6 +179,10 @@ public sealed partial class ManagerForm
             var eligible =
                 new List<ReusableProfileQueueEntry>();
 
+            var reasons =
+                new Dictionary<string, string>(
+                    StringComparer.OrdinalIgnoreCase);
+
             foreach (var profile in catalog.Profiles)
             {
                 ct.ThrowIfCancellationRequested();
@@ -201,35 +193,24 @@ public sealed partial class ManagerForm
                 if (profileName.Length == 0)
                     continue;
 
-                if (!IsReusableProfileActuallyCreated(profile))
-                    continue;
-
-                // Xác định entry thủ công TRƯỚC khi xét retired.
-                // Entry thủ công được phép override retired; tự quét thì vẫn chặn retired.
+                // Xác định entry thủ công từ queue cũ trước khi đánh giá điều kiện.
                 var isManual =
                     previousByProfile.TryGetValue(
                         profileName,
                         out var oldEntry)
                     && oldEntry.IsManual;
 
-                if (!isManual)
+                if (!IsReusableProfileActuallyCreated(profile))
                 {
-                    if (_autoReplacementRetiredProfiles.Contains(profileName))
-                        continue;
-
-                    if (supplyStates.TryGetValue(profileName, out var supplyState)
-                        && supplyState.Equals(
-                            "retired",
-                            StringComparison.OrdinalIgnoreCase))
-                    {
-                        continue;
-                    }
+                    reasons[profileName] = "CHƯA KHỞI TẠO CHROME";
+                    continue;
                 }
 
                 if (!accountsByProfile.TryGetValue(
                         profileName,
                         out var account))
                 {
+                    reasons[profileName] = "CHƯA GÁN TÀI KHOẢN";
                     continue;
                 }
 
@@ -247,17 +228,21 @@ public sealed partial class ManagerForm
 
                 if (isManual)
                 {
-                    // Thêm thủ công: không giới hạn theo số giờ và không yêu cầu note trống.
-                    // Retired được phép override. Chỉ vẫn chặn Ghi chú=ban và profile chưa tạo thật.
+                    // Queue thủ công giữ nguyên ưu tiên. Chỉ Ghi chú=ban là chặn tuyệt đối.
                     if (string.Equals(
                             (account.Note ?? "").Trim(),
                             "ban",
                             StringComparison.OrdinalIgnoreCase))
                     {
+                        reasons[profileName] = "GHI CHÚ: ban";
                         continue;
                     }
 
                     failedProfiles.Remove(profileName);
+                    reasons[profileName] =
+                        busyProfiles.Contains(profileName)
+                            ? "ĐANG CHỜ · THỦ CÔNG · PROFILE ĐANG MỞ"
+                            : "ĐANG CHỜ · THỦ CÔNG";
 
                     eligible.Add(
                         new ReusableProfileQueueEntry
@@ -276,36 +261,38 @@ public sealed partial class ManagerForm
                     continue;
                 }
 
+                // retired và FailedProfiles KHÔNG còn là điều kiện khóa ngầm.
+                // Một profile tự quét chỉ cần thỏa đúng các điều kiện nhìn thấy bên dưới.
                 if (excludedProfiles.Contains(profileName))
+                {
+                    reasons[profileName] = "ĐÃ BỎ CHỜ";
                     continue;
+                }
 
                 if (busyProfiles.Contains(profileName))
+                {
+                    reasons[profileName] = "ĐANG MỞ/CHẠY";
                     continue;
+                }
 
-                if (!string.IsNullOrWhiteSpace(account.Note))
+                var note = (account.Note ?? "").Trim();
+                if (note.Length > 0)
+                {
+                    reasons[profileName] = $"GHI CHÚ: {note}";
                     continue;
+                }
 
                 if (totalSeconds >= automaticMaxTotalSeconds)
                 {
+                    reasons[profileName] = $"TỔNG >= {automaticMaxHours}H";
                     continue;
                 }
 
-                if (failedProfiles.TryGetValue(
-                        profileName,
-                        out var failed))
-                {
-                    if (totalSeconds
-                        <= failed.FailedAtTotalRunSeconds
-                           + ReusableProfileRecoveryProofSeconds)
-                    {
-                        continue;
-                    }
-
-                    failedProfiles.Remove(profileName);
-
-                    _log.Info(
-                        $"[REUSE_QUEUE_RECOVERED] profile={profileName} total={TimeSpan.FromSeconds(totalSeconds):c} previousFailTotal={TimeSpan.FromSeconds(failed.FailedAtTotalRunSeconds):c}");
-                }
+                var wasFailed = failedProfiles.Remove(profileName);
+                reasons[profileName] =
+                    wasFailed
+                        ? "ĐỦ ĐIỀU KIỆN · THỬ LẠI"
+                        : "ĐỦ ĐIỀU KIỆN";
 
                 eligible.Add(
                     new ReusableProfileQueueEntry
@@ -320,6 +307,24 @@ public sealed partial class ManagerForm
                             ?? DateTime.UtcNow,
                         LastCheckedUtc = DateTime.UtcNow
                     });
+            }
+
+            // Tài khoản có AssignedProfile nhưng profile không còn trong catalog cũng cần
+            // hiện lý do rõ ràng trên Kho tài khoản, thay vì để ô trống khó đoán.
+            var catalogProfileNames =
+                new HashSet<string>(
+                    catalog.Profiles
+                        .Select(x => (x.Name ?? "").Trim())
+                        .Where(x => x.Length > 0),
+                    StringComparer.OrdinalIgnoreCase);
+
+            foreach (var profileName in accountsByProfile.Keys)
+            {
+                if (!catalogProfileNames.Contains(profileName)
+                    && !reasons.ContainsKey(profileName))
+                {
+                    reasons[profileName] = "KHÔNG TÌM THẤY PROFILE";
+                }
             }
 
             eligible =
@@ -346,6 +351,10 @@ public sealed partial class ManagerForm
                         updated);
 
                 _reusableProfileQueueLoaded = true;
+                _reusableProfileReasonCache =
+                    new Dictionary<string, string>(
+                        reasons,
+                        StringComparer.OrdinalIgnoreCase);
                 SaveReusableProfileQueueUnsafe(updated);
             }
 
@@ -360,6 +369,14 @@ public sealed partial class ManagerForm
         {
             _log.Warn(
                 $"[REUSE_QUEUE_REFRESH_WARN] source={source} error={ex.Message}");
+
+            // Với nút Quét chờ, đẩy lỗi ra UI để không báo "Đã quét xong" giả.
+            if (source.Equals(
+                    "account_pool_manual",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                throw;
+            }
         }
         finally
         {
@@ -403,6 +420,16 @@ public sealed partial class ManagerForm
             }
 
             return result;
+        }
+    }
+
+    Dictionary<string, string> GetReusableProfileQueueReasonSnapshot()
+    {
+        lock (_reusableProfileQueueLock)
+        {
+            return new Dictionary<string, string>(
+                _reusableProfileReasonCache,
+                StringComparer.OrdinalIgnoreCase);
         }
     }
 
@@ -795,10 +822,11 @@ public sealed partial class ManagerForm
                 }
 
                 var reply =
-                    await SendCommandAsync(
+                    await StartWithNameGuardAsync(
                         ctx,
                         "start_auto",
-                        TimeSpan.FromSeconds(100));
+                        TimeSpan.FromSeconds(100),
+                        suppressStatus: true);
 
                 if (!string.Equals(
                         reply,
@@ -951,7 +979,7 @@ public sealed partial class ManagerForm
             replacementProfile: profileName,
             result: "LỖI",
             detail:
-                $"Profile dùng lại thất bại: {reason}. Chỉ tự quay lại queue khi tổng runtime tăng thêm >{ReusableProfileRecoveryProofSeconds:0}s.");
+                $"Profile dùng lại thất bại: {reason}. Lượt quét sau sẽ tự đánh giá lại; nếu profile vẫn đủ điều kiện thì được đưa lại vào queue.");
     }
 
     void RemoveReusableProfileQueueEntry(

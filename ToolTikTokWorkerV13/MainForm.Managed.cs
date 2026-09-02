@@ -29,6 +29,13 @@ public sealed partial class MainForm
         public bool SkipIfNameCooldown { get; set; }
         public string[] KnownDisplayNames { get; set; } = Array.Empty<string>();
         public bool VerifyExistingState { get; set; }
+        public bool FastNameGuardMode { get; set; }
+    }
+
+    sealed class ManagedNameGuardProbeRequest
+    {
+        public string Username { get; set; } = "";
+        public string[] AllowedDisplayNames { get; set; } = Array.Empty<string>();
     }
 
     public Task<string> HandleManagedCommandAsync(string rawCommand)
@@ -113,6 +120,40 @@ public sealed partial class MainForm
                         return "probe_error";
                     }
                 }
+                case "identity_name_probe":
+                {
+                    try
+                    {
+                        if (!_chrome.Connected)
+                            return JsonSerializer.Serialize(new { ok = false, currentName = "", matched = false, currentHandle = "", source = "", message = "Chrome chưa kết nối." });
+                        if (string.IsNullOrWhiteSpace(commandPayload))
+                            throw new InvalidOperationException("Thiếu payload Name Guard.");
+
+                        var json = Encoding.UTF8.GetString(Convert.FromBase64String(commandPayload));
+                        var request = JsonSerializer.Deserialize<ManagedNameGuardProbeRequest>(
+                            json,
+                            new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+                            ?? throw new InvalidOperationException("Payload Name Guard không hợp lệ.");
+
+                        var result = await _chrome.ProbeCurrentAccountDisplayNameAsync(
+                            request.Username,
+                            request.AllowedDisplayNames);
+                        return JsonSerializer.Serialize(new
+                        {
+                            ok = result.Ok,
+                            currentName = result.CurrentName,
+                            matched = result.Matched,
+                            currentHandle = result.CurrentHandle,
+                            source = result.Source,
+                            message = result.Message
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.Warn("[NAME_GUARD_PROBE] " + ex.Message);
+                        return JsonSerializer.Serialize(new { ok = false, currentName = "", matched = false, currentHandle = "", source = "", message = ex.Message });
+                    }
+                }
                 case "update_tiktok_identity":
                 {
                     try
@@ -126,16 +167,20 @@ public sealed partial class MainForm
                             json,
                             new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
                             ?? throw new InvalidOperationException("Payload đổi tên/ảnh TikTok không hợp lệ.");
-                        if (!await _chrome.EnsureTikTokIdentitySessionReadyAsync())
-                            throw new InvalidOperationException("TikTok chưa đăng nhập sau khi Tool đã F5 thử lại 2 lần. Hãy kiểm tra tài khoản trên Chrome rồi cập nhật tên/ảnh lại.");
+                        if (!request.FastNameGuardMode)
+                        {
+                            if (!await _chrome.EnsureTikTokIdentitySessionReadyAsync())
+                                throw new InvalidOperationException("TikTok chưa đăng nhập sau khi Tool đã F5 thử lại 2 lần. Hãy kiểm tra tài khoản trên Chrome rồi cập nhật tên/ảnh lại.");
 
-                        // Nếu đã ở /@username nhưng chưa thấy nút Sửa hồ sơ, probe nhanh
-                        // rồi F5 ngay tối đa 2 lần. Hàm này chỉ chuẩn bị trang, không click.
-                        await _chrome.EnsureTikTokEditProfileEntranceReadyAsync();
+                            // Luồng Tên/ảnh đầy đủ giữ recovery cũ. Name Guard nhanh đã đứng
+                            // ở trang Hồ sơ nên bỏ các bước chuẩn bị/F5 lặp này.
+                            await _chrome.EnsureTikTokEditProfileEntranceReadyAsync();
+                        }
 
                         var result = await _chrome.UpdateTikTokProfileIdentityAsync(
                             request.Username, request.DisplayName, request.AvatarPath, request.Bio,
-                            request.SkipIfNameCooldown, request.KnownDisplayNames, request.VerifyExistingState);
+                            request.SkipIfNameCooldown, request.KnownDisplayNames, request.VerifyExistingState,
+                            request.FastNameGuardMode);
                         return JsonSerializer.Serialize(new
                         {
                             ok = true,

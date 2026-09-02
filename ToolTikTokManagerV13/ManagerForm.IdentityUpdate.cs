@@ -67,6 +67,178 @@ public sealed partial class ManagerForm
         catch (Exception ex) { _log.Warn("[IDENTITY_TOOL_STATE_SAVE] " + ex.Message); }
     }
 
+    async Task<(bool Ok, string Error)> MarkIdentityDoneVerifiedAsync(
+        string username, string profileName, CancellationToken ct)
+    {
+        username = (username ?? "").Trim();
+        if (username.Length == 0)
+            return (false, "Không xác định được tài khoản để ghi DONE.");
+
+        Exception? lastError = null;
+        for (var attempt = 1; attempt <= 3; attempt++)
+        {
+            try
+            {
+                await RunAccountPoolIoAsync(
+                    () => _accountPoolService.MarkIdentityDone(username),
+                    ct);
+
+                var verified = await RunAccountPoolIoAsync(
+                    () => _accountPoolService.IsIdentityDone(username),
+                    ct);
+                if (!verified)
+                    throw new InvalidOperationException("Đã ghi nhưng đọc lại Excel chưa thấy DONE.");
+
+                _log.Info($"[IDENTITY_EXCEL_DONE_VERIFIED] profile={profileName} account={username} attempt={attempt}/3 verified=true");
+                return (true, "");
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                lastError = ex;
+                _log.Warn($"[IDENTITY_EXCEL_DONE_RETRY] profile={profileName} account={username} attempt={attempt}/3 error={ex.Message}");
+                if (attempt < 3) await Task.Delay(450 * attempt, ct);
+            }
+        }
+
+        return (false, lastError?.Message ?? "Không ghi được DONE vào Excel.");
+    }
+
+    async Task ResumeAutomationAfterIdentityDoneAsync(ProfileContext ctx, string previousRunState)
+    {
+        if (previousRunState != "RUNNING" && previousRunState != "PAUSED") return;
+        try
+        {
+            var started = await SendCommandAsync(ctx, "start", TimeSpan.FromSeconds(35));
+            if (!string.Equals(started, "started", StringComparison.OrdinalIgnoreCase))
+            {
+                _log.Warn($"[AUTO_IDENTITY_RESUME_BLOCKED] profile={ctx.Profile.Name} state={previousRunState} reply={started}");
+                return;
+            }
+
+            if (previousRunState == "PAUSED")
+            {
+                await Task.Delay(300);
+                await SendCommandAsync(ctx, "pause", TimeSpan.FromSeconds(8));
+            }
+            _log.Info($"[AUTO_IDENTITY_RESUME_AFTER_DONE] profile={ctx.Profile.Name} restored={previousRunState}");
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"[AUTO_IDENTITY_RESUME_FAILED] profile={ctx.Profile.Name} {ex.Message}");
+        }
+    }
+
+    async Task<(bool Ok, string Username, string Error)> MarkManualIdentityDoneAsync(ProfileContext ctx)
+    {
+        string authUsername = "";
+        try
+        {
+            var dataRoot = _profileService.ResolveDataRoot(ctx.Profile);
+            authUsername = (_tiktokAuthService.Load(dataRoot).Username ?? "").Trim();
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"[MANUAL_IDENTITY_EXCEL_AUTH_READ_WARN] profile={ctx.Profile.Name} error={ex.Message}");
+        }
+
+        List<ToolTikTokV12.Services.TikTokAccountPoolItem> accounts;
+        try
+        {
+            accounts = await RunAccountPoolIoAsync(
+                () => _accountPoolService.Load(),
+                CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            return (false, authUsername, "Không đọc được Kho tài khoản: " + ex.Message);
+        }
+
+        // Ưu tiên username đang lưu trong chính profile vì đây là tài khoản mà
+        // Worker vừa cập nhật trên TikTok. Chỉ fallback sang AssignedProfile khi
+        // auth local chưa có username để tránh ghi DONE nhầm sang tài khoản cũ.
+        var account = !string.IsNullOrWhiteSpace(authUsername)
+            ? accounts.FirstOrDefault(x => x.Username.Equals(authUsername, StringComparison.OrdinalIgnoreCase))
+            : null;
+        account ??= accounts.FirstOrDefault(x =>
+            (x.AssignedProfile ?? "").Trim().Equals(ctx.Profile.Name, StringComparison.OrdinalIgnoreCase));
+
+        if (account is null)
+        {
+            var detail = string.IsNullOrWhiteSpace(authUsername)
+                ? $"Không tìm thấy tài khoản đang gán cho profile {ctx.Profile.Name}."
+                : $"Không tìm thấy tài khoản {authUsername} trong file Excel hiện tại.";
+            return (false, authUsername, detail);
+        }
+
+        var done = await MarkIdentityDoneVerifiedAsync(account.Username, ctx.Profile.Name, CancellationToken.None);
+        if (done.Ok)
+            _log.Info($"[MANUAL_IDENTITY_EXCEL_DONE] profile={ctx.Profile.Name} account={account.Username} verified=true");
+        return (done.Ok, account.Username, done.Error);
+    }
+
+    async Task<bool> AcquireManualIdentitySlotAsync(string profileName, TimeSpan timeout)
+    {
+        profileName = (profileName ?? "").Trim();
+        if (profileName.Length == 0) return false;
+
+        var deadline = DateTime.UtcNow + timeout;
+        while (_autoIdentityInFlight.Contains(profileName))
+        {
+            if (DateTime.UtcNow >= deadline) return false;
+            await Task.Delay(250);
+        }
+
+        // ShowTikTokIdentityDialog và scheduler chạy trên UI context. Không có await
+        // giữa lần kiểm tra cuối và Add nên Auto Identity nền không thể chen vào.
+        _autoIdentityInFlight.Add(profileName);
+        return true;
+    }
+
+    async Task<(bool Ok, bool Done, string Username, string Error)> ReadManualIdentityDoneStateAsync(ProfileContext ctx)
+    {
+        string authUsername = "";
+        try
+        {
+            var dataRoot = _profileService.ResolveDataRoot(ctx.Profile);
+            authUsername = (_tiktokAuthService.Load(dataRoot).Username ?? "").Trim();
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"[MANUAL_IDENTITY_DONE_READ_AUTH_WARN] profile={ctx.Profile.Name} error={ex.Message}");
+        }
+
+        try
+        {
+            var accounts = await RunAccountPoolIoAsync(
+                () => _accountPoolService.Load(),
+                CancellationToken.None);
+
+            var account = !string.IsNullOrWhiteSpace(authUsername)
+                ? accounts.FirstOrDefault(x => x.Username.Equals(authUsername, StringComparison.OrdinalIgnoreCase))
+                : null;
+            account ??= accounts.FirstOrDefault(x =>
+                (x.AssignedProfile ?? "").Trim().Equals(ctx.Profile.Name, StringComparison.OrdinalIgnoreCase));
+
+            if (account is null)
+            {
+                var detail = string.IsNullOrWhiteSpace(authUsername)
+                    ? $"Không tìm thấy tài khoản đang gán cho profile {ctx.Profile.Name}."
+                    : $"Không tìm thấy tài khoản {authUsername} trong file Excel hiện tại.";
+                return (false, false, authUsername, detail);
+            }
+
+            var done = await RunAccountPoolIoAsync(
+                () => _accountPoolService.IsIdentityDone(account.Username),
+                CancellationToken.None);
+            return (true, done, account.Username, "");
+        }
+        catch (Exception ex)
+        {
+            return (false, false, authUsername, ex.Message);
+        }
+    }
+
     void ShowTikTokIdentityDialog()
     {
         const string gridName = "TikTokIdentityGrid";
@@ -174,7 +346,7 @@ public sealed partial class ManagerForm
         };
         var autoHint = new Label
         {
-            Text = "Nếu TikTok báo tên đang chờ 7 ngày thì bỏ qua tài khoản đó trong phiên hiện tại, không ghi DONE và automation vẫn tiếp tục.",
+            Text = "Mỗi lần mở Chrome chỉ kiểm tra/đổi một lượt. Tên đúng hoặc đổi thành công = DONE; lỗi/cooldown = FAIL và đóng Chrome, không tự lặp.",
             AutoSize = true,
             ForeColor = Color.DimGray,
             Margin = new Padding(8, 8, 0, 0)
@@ -529,6 +701,7 @@ public sealed partial class ManagerForm
                 var success = 0;
                 var skipped = 0;
                 var failed = 0;
+                var excelWarnings = 0;
                 foreach (var row in selectedRows)
                 {
                     if (row.Tag is not ProfileContext ctx || !previews.TryGetValue(ctx.Profile.Name, out var preview)) continue;
@@ -538,36 +711,118 @@ public sealed partial class ManagerForm
                     if (profileCell is not null) grid.CurrentCell = profileCell;
                     grid.FirstDisplayedScrollingRowIndex = Math.Max(0, row.Index);
                     Application.DoEvents();
+                    var manualIdentitySlotAcquired = false;
+                    var identityDoneBeforeKnown = false;
+                    var identityDoneBefore = false;
                     try
                     {
+                        // Manual và Auto Identity phải dùng chung một khóa theo profile.
+                        // Nếu Auto nền đang làm dở thì chờ nó kết thúc; sau khi manual giữ
+                        // khóa, scheduler sẽ bỏ qua profile này cho tới khi finally nhả khóa.
+                        manualIdentitySlotAcquired = await AcquireManualIdentitySlotAsync(
+                            ctx.Profile.Name, TimeSpan.FromSeconds(45));
+                        if (!manualIdentitySlotAcquired)
+                        {
+                            updateResults[ctx.Profile.Name] = "Bỏ qua: profile đang được Auto Tên/ảnh xử lý";
+                            TrySetGridCellValue(row, resultColumn, updateResults[ctx.Profile.Name], "ShowTikTokIdentityDialog.Apply");
+                            SetRowColorIfAttached(row, Color.DarkOrange);
+                            skipped++;
+                            _log.Warn($"[MANUAL_IDENTITY_SLOT_TIMEOUT] profile={ctx.Profile.Name} waited=45s");
+                            continue;
+                        }
+
+                        // Chụp trạng thái DONE trước khi chạy để phần đối soát cuối không
+                        // nhầm một DONE cũ thành thành công của lượt cập nhật hiện tại.
+                        var before = await ReadManualIdentityDoneStateAsync(ctx);
+                        identityDoneBeforeKnown = before.Ok;
+                        identityDoneBefore = before.Done;
+
                         var reply = await UpdateTikTokIdentityAsync(ctx,
                             updateName.Checked ? preview.DisplayName : "",
                             updateAvatar.Checked ? preview.AvatarPath : "",
                             updateBio.Checked ? preview.Bio : "");
                         if (!reply.Ok) throw new InvalidOperationException(string.IsNullOrWhiteSpace(reply.Error) ? reply.Message : reply.Error);
-                        updateResults[ctx.Profile.Name] = reply.Message.Length > 0 ? reply.Message : "Đã cập nhật";
-                        TrySetGridCellValue(row, resultColumn, updateResults[ctx.Profile.Name], "ShowTikTokIdentityDialog.Apply");
-                        if (reply.Skipped || reply.NameCooldown)
+
+                        var resultText = reply.Message.Length > 0 ? reply.Message : "Đã cập nhật";
+                        var identityCompleted = reply.AlreadyConfigured || (!reply.Skipped && !reply.NameCooldown);
+
+                        if (!identityCompleted)
                         {
+                            updateResults[ctx.Profile.Name] = resultText + " • Không ghi Excel=DONE";
+                            TrySetGridCellValue(row, resultColumn, updateResults[ctx.Profile.Name], "ShowTikTokIdentityDialog.Apply");
                             SetRowColorIfAttached(row, Color.DarkOrange);
                             skipped++;
                         }
                         else
                         {
-                            SetRowColorIfAttached(row, Color.DarkGreen);
-                            success++;
                             if (reply.AvatarChanged && !string.IsNullOrWhiteSpace(preview.AvatarPath))
                                 state.LastAvatarByProfile[ctx.Profile.Name] = preview.AvatarPath;
+
+                            var excel = await MarkManualIdentityDoneAsync(ctx);
+                            if (excel.Ok)
+                            {
+                                updateResults[ctx.Profile.Name] = resultText + " • Excel=DONE";
+                                SetRowColorIfAttached(row, Color.DarkGreen);
+                                success++;
+
+                                _autoIdentityHandledSession.Add(ctx.Profile.Name);
+                                if (!string.IsNullOrWhiteSpace(excel.Username))
+                                    _autoIdentityHandledSession.Add("account:" + excel.Username.ToLowerInvariant());
+                                _autoIdentityNextProbeUtc.Remove(ctx.Profile.Name);
+                            }
+                            else
+                            {
+                                // TikTok đã đổi thành công nhưng không được giả vờ rằng Excel
+                                // cũng đã xong. Hiển thị cảnh báo rõ để người dùng biết cần xử lý.
+                                updateResults[ctx.Profile.Name] = resultText + " • Chưa ghi Excel: " + excel.Error;
+                                SetRowColorIfAttached(row, Color.DarkOrange);
+                                success++;
+                                excelWarnings++;
+                                _log.Warn($"[MANUAL_IDENTITY_EXCEL_DONE_FAILED] profile={ctx.Profile.Name} account={excel.Username} error={excel.Error}");
+                            }
+                            TrySetGridCellValue(row, resultColumn, updateResults[ctx.Profile.Name], "ShowTikTokIdentityDialog.Apply");
                         }
                         SaveIdentityToolState(state);
                     }
                     catch (Exception ex)
                     {
-                        failed++;
-                        updateResults[ctx.Profile.Name] = "Lỗi: " + ex.Message;
-                        TrySetGridCellValue(row, resultColumn, updateResults[ctx.Profile.Name], "ShowTikTokIdentityDialog.Apply");
-                        SetRowColorIfAttached(row, Color.Firebrick);
-                        _log.Warn($"[TIKTOK_IDENTITY_UPDATE] profile={ctx.Profile.Name} result=failed message={ex.Message}");
+                        // Không tăng failed ngay. Trước hết đối soát trạng thái cuối cùng.
+                        // Chỉ chuyển lỗi -> thành công khi DONE vừa xuất hiện trong chính lượt
+                        // này (trước đó chưa DONE), tránh lấy DONE cũ để che một lỗi thật.
+                        var recoveredByFinalState = false;
+                        string recoveredUsername = "";
+                        if (identityDoneBeforeKnown && !identityDoneBefore)
+                        {
+                            var after = await ReadManualIdentityDoneStateAsync(ctx);
+                            recoveredByFinalState = after.Ok && after.Done;
+                            recoveredUsername = after.Username;
+                        }
+
+                        if (recoveredByFinalState)
+                        {
+                            success++;
+                            updateResults[ctx.Profile.Name] = "Đã hoàn tất • Excel=DONE (đối soát sau lỗi tạm thời)";
+                            TrySetGridCellValue(row, resultColumn, updateResults[ctx.Profile.Name], "ShowTikTokIdentityDialog.Apply");
+                            SetRowColorIfAttached(row, Color.DarkGreen);
+                            _autoIdentityHandledSession.Add(ctx.Profile.Name);
+                            if (!string.IsNullOrWhiteSpace(recoveredUsername))
+                                _autoIdentityHandledSession.Add("account:" + recoveredUsername.ToLowerInvariant());
+                            _autoIdentityNextProbeUtc.Remove(ctx.Profile.Name);
+                            _log.Info($"[MANUAL_IDENTITY_RECONCILED_DONE] profile={ctx.Profile.Name} account={recoveredUsername} originalError={ex.Message}");
+                        }
+                        else
+                        {
+                            failed++;
+                            updateResults[ctx.Profile.Name] = "Lỗi: " + ex.Message;
+                            TrySetGridCellValue(row, resultColumn, updateResults[ctx.Profile.Name], "ShowTikTokIdentityDialog.Apply");
+                            SetRowColorIfAttached(row, Color.Firebrick);
+                            _log.Warn($"[TIKTOK_IDENTITY_UPDATE] profile={ctx.Profile.Name} result=failed message={ex.Message}");
+                        }
+                    }
+                    finally
+                    {
+                        if (manualIdentitySlotAcquired)
+                            _autoIdentityInFlight.Remove(ctx.Profile.Name);
                     }
                 }
 
@@ -577,10 +832,10 @@ public sealed partial class ManagerForm
                     .Take(8)
                     .Select(item => $"{item.Key}: {item.Value}")
                     .ToList();
-                var summary = $"Hoàn tất.\nThành công: {success}\nBỏ qua: {skipped}\nLỗi: {failed}";
+                var summary = $"Hoàn tất.\nThành công: {success}\nBỏ qua: {skipped}\nLỗi: {failed}\nCảnh báo ghi Excel: {excelWarnings}";
                 if (failedDetails.Count > 0) summary += "\n\n" + string.Join("\n", failedDetails);
                 summary += "\n\nProfile lỗi không làm dừng các profile còn lại.";
-                ModernDialog.ShowMessage(form, summary, "Tên & ảnh TikTok", failed == 0 ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+                ModernDialog.ShowMessage(form, summary, "Tên & ảnh TikTok", failed == 0 && excelWarnings == 0 ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
             }
             finally
             {
@@ -623,7 +878,7 @@ public sealed partial class ManagerForm
         ProfileContext ctx, string displayName, string avatarPath, string bio = "",
         bool skipIfNameCooldown = false, bool resumeAutomation = false,
         IReadOnlyList<string>? knownDisplayNames = null, bool verifyExistingState = false,
-        TimeSpan? workerTimeout = null)
+        TimeSpan? workerTimeout = null, bool nameGuardFastMode = false)
     {
         if (_messageReplyProfilesInFlight.Contains(ctx.Profile.Name))
             throw new InvalidOperationException("Profile đang được mục Tin nhắn TikTok xử lý. Hãy dừng/đợi Tin nhắn hoàn tất rồi cập nhật tên/ảnh.");
@@ -644,11 +899,14 @@ public sealed partial class ManagerForm
         if (!string.Equals(ctx.LastSnapshot?.Chrome, "CONNECTED", StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("Chrome chưa kết nối. Hãy mở Chrome của profile rồi thử lại.");
 
-        // Đổi tên/ảnh là luồng setup tài khoản độc lập với LIVE. Chỉ cần TikTok
-        // đã đăng nhập; không gọi startup gate và không điều hướng sang /live.
-        var identityReady = await SendCommandAsync(ctx, "identity_ready", TimeSpan.FromSeconds(6));
-        if (!string.Equals(identityReady, "ready", StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("TikTok chưa đăng nhập trên profile này. Chrome đã được giữ ở trang chủ; hãy đăng nhập tài khoản rồi cập nhật tên/ảnh lại.");
+        // Luồng Tên/ảnh bình thường vẫn dùng readiness đầy đủ. Riêng Name Guard nhanh
+        // vừa đi vào trang Hồ sơ và đọc được tên bằng CDP nên không chạy lại gate/F5 ở đây.
+        if (!nameGuardFastMode)
+        {
+            var identityReady = await SendCommandAsync(ctx, "identity_ready", TimeSpan.FromSeconds(6));
+            if (!string.Equals(identityReady, "ready", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("TikTok chưa đăng nhập trên profile này. Chrome đã được giữ ở trang chủ; hãy đăng nhập tài khoản rồi cập nhật tên/ảnh lại.");
+        }
 
         var username = "";
         try
@@ -671,10 +929,11 @@ public sealed partial class ManagerForm
                 Bio = bio,
                 SkipIfNameCooldown = skipIfNameCooldown,
                 KnownDisplayNames = knownDisplayNames ?? Array.Empty<string>(),
-                VerifyExistingState = verifyExistingState
+                VerifyExistingState = verifyExistingState,
+                FastNameGuardMode = nameGuardFastMode
             });
             var payload = Convert.ToBase64String(Encoding.UTF8.GetBytes(request));
-            var raw = await SendCommandAsync(ctx, "update_tiktok_identity|" + payload, workerTimeout ?? TimeSpan.FromSeconds(100));
+            var raw = await SendCommandAsync(ctx, "update_tiktok_identity|" + payload, workerTimeout ?? TimeSpan.FromSeconds(150));
             var reply = JsonSerializer.Deserialize<IdentityUpdateReply>(raw, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
             return reply ?? new IdentityUpdateReply { Ok = false, Error = "Worker trả về kết quả không hợp lệ." };
         }
@@ -708,148 +967,98 @@ public sealed partial class ManagerForm
         if (!state.AutoOnReady) return;
         if (string.IsNullOrWhiteSpace(_accountPoolService.CurrentSourcePath)) return;
 
-        foreach (var ctx in _contexts.Values.ToList())
-        {
-            var snapshot = ctx.LastSnapshot;
-            if (snapshot is null) continue;
-            if (!string.Equals(snapshot.Chrome, "CONNECTED", StringComparison.OrdinalIgnoreCase)) continue;
-            if (snapshot.MessageReplyRunning || _messageReplyProfilesInFlight.Contains(ctx.Profile.Name)) continue; // Không tranh điều hướng với module Tin nhắn TikTok.
+        // Chỉ cho phép MỘT PRF Tên/ảnh chạy tại một thời điểm. Timer tick sau sẽ lấy
+        // profile kế tiếp sau khi lượt hiện tại kết thúc.
+        if (_autoIdentityInFlight.Count > 0) return;
 
-            // READY ở V13.5 mới chỉ có nghĩa là gate mở Chrome/đăng nhập đã hoàn tất.
-            // Khi mở profile để setup, READY vẫn dừng ở trang chủ và KHÔNG vào LIVE.
-            // Chờ READY trước khi Auto Identity chạy để tránh tranh điều hướng với
-            // luồng tự đăng nhập/đưa về trang chủ vừa được thực hiện trong Worker.
-            if (!string.Equals(snapshot.TikTokStartupState, "READY", StringComparison.OrdinalIgnoreCase)) continue;
+        var ctx = _contexts.Values
+            .OrderBy(x => x.Profile.Name, NaturalProfileNameOrder)
+            .FirstOrDefault(candidate =>
+            {
+                var snapshot = candidate.LastSnapshot;
+                if (snapshot is null) return false;
+                if (!string.Equals(snapshot.Chrome, "CONNECTED", StringComparison.OrdinalIgnoreCase)) return false;
+                if (snapshot.MessageReplyRunning || _messageReplyProfilesInFlight.Contains(candidate.Profile.Name)) return false;
+                if (!string.Equals(snapshot.TikTokStartupState, "READY", StringComparison.OrdinalIgnoreCase)) return false;
+                if (_autoIdentityHandledSession.Contains(candidate.Profile.Name)) return false;
+                return true;
+            });
 
-            if (_autoIdentityNextProbeUtc.TryGetValue(ctx.Profile.Name, out var nextProbeUtc)
-                && DateTime.UtcNow < nextProbeUtc) continue;
-            if (_autoIdentityHandledSession.Contains(ctx.Profile.Name) || _autoIdentityInFlight.Contains(ctx.Profile.Name)) continue;
-            _autoIdentityInFlight.Add(ctx.Profile.Name);
-            _ = RunAutoIdentityForProfileAsync(ctx);
-        }
+        if (ctx is null) return;
+        _autoIdentityInFlight.Add(ctx.Profile.Name);
+        _ = RunAutoIdentityForProfileAsync(ctx);
     }
 
     async Task RunAutoIdentityForProfileAsync(ProfileContext ctx)
     {
+        await _autoIdentityQueueGate.WaitAsync();
         try
         {
-            // Gate riêng cho setup hồ sơ: có Chrome + có session TikTok là đủ.
-            // Nếu người dùng đang đăng nhập thủ công, thử lại sau vài giây mà không
-            // đánh dấu profile là đã xử lý và không ép Chrome vào LIVE.
-            var readiness = await SendCommandAsync(ctx, "identity_ready", TimeSpan.FromSeconds(6));
-            if (!string.Equals(readiness, "ready", StringComparison.OrdinalIgnoreCase))
+            var state = LoadIdentityToolState();
+            if (!state.AutoOnReady) return;
+
+            var names = SplitIdentityNames(state.NamesText);
+            if (!state.UpdateName || names.Count == 0)
             {
-                _autoIdentityNextProbeUtc[ctx.Profile.Name] = DateTime.UtcNow.AddSeconds(4);
+                _autoIdentityHandledSession.Add(ctx.Profile.Name);
+                _log.Info($"[AUTO_IDENTITY_SKIP_NAME_CONFIG] profile={ctx.Profile.Name} không có danh sách tên để kiểm tra.");
                 return;
             }
-            _autoIdentityNextProbeUtc.Remove(ctx.Profile.Name);
 
-            await _autoIdentityQueueGate.WaitAsync();
-            try
+            var account = await ResolveNameGuardAccountAsync(ctx);
+            var username = account.Username;
+            if (string.IsNullOrWhiteSpace(username))
             {
-                var state = LoadIdentityToolState();
-                if (!state.AutoOnReady) return;
+                _autoIdentityHandledSession.Add(ctx.Profile.Name);
+                _log.Warn($"[AUTO_IDENTITY_SKIP_ACCOUNT] profile={ctx.Profile.Name} không xác định được tài khoản.");
+                return;
+            }
 
-                string username = "";
-                try
-                {
-                    var dataRoot = _profileService.ResolveDataRoot(ctx.Profile);
-                    username = _tiktokAuthService.Load(dataRoot).Username.Trim();
-                }
-                catch { }
-                if (string.IsNullOrWhiteSpace(username)) return;
-                var accountSessionKey = "account:" + username.ToLowerInvariant();
-                if (_autoIdentityHandledSession.Contains(accountSessionKey))
-                {
-                    _autoIdentityHandledSession.Add(ctx.Profile.Name);
-                    return;
-                }
-
-                var account = _accountPoolService.Load().FirstOrDefault(x =>
-                    x.AssignedProfile.Equals(ctx.Profile.Name, StringComparison.OrdinalIgnoreCase))
-                    ?? _accountPoolService.Load().FirstOrDefault(x => x.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
-                if (account is null) return;
-
-                if (_accountPoolService.IsIdentityDone(account.Username))
-                {
-                    _autoIdentityHandledSession.Add(ctx.Profile.Name);
-                    _autoIdentityHandledSession.Add(accountSessionKey);
-                    _log.Info($"[AUTO_IDENTITY_SKIP_DONE] profile={ctx.Profile.Name} account={account.Username}");
-                    return;
-                }
-
-                var names = (state.NamesText ?? "").Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
-                    .Select(x => x.Trim()).Where(x => x.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-                var images = Directory.Exists(state.ImageFolder)
-                    ? Directory.EnumerateFiles(state.ImageFolder, "*.*", SearchOption.TopDirectoryOnly)
-                        .Where(x => new[] { ".jpg", ".jpeg", ".png", ".webp", ".bmp" }.Contains(Path.GetExtension(x), StringComparer.OrdinalIgnoreCase)).ToList()
-                    : new List<string>();
-
-                var displayName = !state.UpdateName || names.Count == 0 ? "" : names.Count == 1 ? names[0] : names[Random.Shared.Next(names.Count)];
-                var avatarPath = "";
-                if (state.UpdateAvatar && images.Count > 0)
-                {
-                    var candidates = images;
-                    if (state.AvoidLastAvatar && images.Count > 1 && state.LastAvatarByProfile.TryGetValue(ctx.Profile.Name, out var previous))
-                        candidates = images.Where(x => !string.Equals(Path.GetFullPath(x), Path.GetFullPath(previous), StringComparison.OrdinalIgnoreCase)).ToList();
-                    avatarPath = candidates[Random.Shared.Next(candidates.Count)];
-                }
-                var bio = state.UpdateBio ? (state.BioText ?? "").Trim() : "";
-
-                if (displayName.Length == 0 && avatarPath.Length == 0 && bio.Length == 0)
-                {
-                    _log.Warn($"[AUTO_IDENTITY_SKIP_CONFIG] profile={ctx.Profile.Name} không có tên/ảnh/tiểu sử để áp dụng.");
-                    _autoIdentityHandledSession.Add(ctx.Profile.Name);
-                    return;
-                }
-
-                _log.Info($"[AUTO_IDENTITY_START] profile={ctx.Profile.Name} account={account.Username}");
-                var reply = await UpdateTikTokIdentityAsync(
-                    ctx, displayName, avatarPath, bio,
-                    skipIfNameCooldown: true,
-                    resumeAutomation: true,
-                    knownDisplayNames: names,
-                    verifyExistingState: true);
-
-                if (!reply.Ok)
-                {
-                    // Lỗi tạm thời không được khóa profile cho cả session. Cho phép
-                    // Auto Identity thử lại sau, thay vì coi là đã xử lý xong.
-                    _autoIdentityNextProbeUtc[ctx.Profile.Name] = DateTime.UtcNow.AddSeconds(20);
-                    _log.Warn($"[AUTO_IDENTITY_FAILED] profile={ctx.Profile.Name} account={account.Username} {reply.Error}");
-                    return;
-                }
-
+            var accountSessionKey = "account:" + username.ToLowerInvariant();
+            var alreadyDone = await RunAccountPoolIoAsync(
+                () => _accountPoolService.IsIdentityDone(username),
+                CancellationToken.None);
+            if (alreadyDone)
+            {
                 _autoIdentityHandledSession.Add(ctx.Profile.Name);
                 _autoIdentityHandledSession.Add(accountSessionKey);
-                if (reply.AlreadyConfigured)
-                {
-                    _accountPoolService.MarkIdentityDone(account.Username);
-                    _log.Info($"[AUTO_IDENTITY_ALREADY_CONFIGURED] profile={ctx.Profile.Name} account={account.Username}; trạng thái TikTok đã phù hợp, ghi Excel=F:DONE và bỏ qua cập nhật.");
-                    return;
-                }
-                if (reply.NameCooldown || reply.Skipped)
-                {
-                    _log.Info($"[AUTO_IDENTITY_SKIP_COOLDOWN] profile={ctx.Profile.Name} account={account.Username}; không ghi DONE.");
-                    return;
-                }
-
-                _accountPoolService.MarkIdentityDone(account.Username);
-                if (reply.AvatarChanged && !string.IsNullOrWhiteSpace(avatarPath))
-                {
-                    state.LastAvatarByProfile[ctx.Profile.Name] = avatarPath;
-                    SaveIdentityToolState(state);
-                }
-                _log.Info($"[AUTO_IDENTITY_DONE] profile={ctx.Profile.Name} account={account.Username} ghi Excel=F:DONE");
+                _log.Info($"[AUTO_IDENTITY_SKIP_DONE] profile={ctx.Profile.Name} account={username}");
+                return;
             }
-            finally { _autoIdentityQueueGate.Release(); }
+
+            var previousRunState = GetLastConfirmedRuntimeState(ctx);
+            _log.Info($"[AUTO_IDENTITY_ONE_SHOT_BEGIN] profile={ctx.Profile.Name} account={username} previousRunState={previousRunState}");
+
+            var result = await ProcessNameGuardOnceAsync(ctx, username, state, names);
+            if (!result.Allowed)
+            {
+                // ProcessNameGuardOnceAsync đã ghi FAIL + đóng Chrome + đánh dấu handled
+                // cho phiên Chrome hiện tại. Không có retry 20 giây nữa.
+                _log.Warn($"[AUTO_IDENTITY_ONE_SHOT_FAIL] profile={ctx.Profile.Name} account={username} reason={result.Message}");
+                return;
+            }
+
+            _log.Info($"[AUTO_IDENTITY_ONE_SHOT_DONE] profile={ctx.Profile.Name} account={username} changed={result.ChangedName}");
+            await ResumeAutomationAfterIdentityDoneAsync(ctx, previousRunState);
         }
         catch (Exception ex)
         {
-            _autoIdentityNextProbeUtc[ctx.Profile.Name] = DateTime.UtcNow.AddSeconds(20);
-            _log.Warn($"[AUTO_IDENTITY_ERROR] profile={ctx.Profile.Name} {ex.Message}");
+            _autoIdentityHandledSession.Add(ctx.Profile.Name);
+            _autoIdentityNextProbeUtc.Remove(ctx.Profile.Name);
+            _log.Warn($"[AUTO_IDENTITY_ONE_SHOT_ERROR] profile={ctx.Profile.Name} {ex.Message}");
+            try
+            {
+                var account = await ResolveNameGuardAccountAsync(ctx);
+                if (!string.IsNullOrWhiteSpace(account.Username))
+                    await FailNameGuardAndCloseAsync(ctx, account.Username, ex.Message);
+            }
+            catch { }
         }
-        finally { _autoIdentityInFlight.Remove(ctx.Profile.Name); }
+        finally
+        {
+            _autoIdentityQueueGate.Release();
+            _autoIdentityInFlight.Remove(ctx.Profile.Name);
+        }
     }
 
 }

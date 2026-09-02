@@ -434,7 +434,7 @@ public sealed partial class ManagerForm
         flow.Controls.Add(ActionButton("▶ Start", UiButtonKind.Primary, async ctx =>
         {
             await OpenProfileAsync(ctx);
-            await SendCommandAsync(ctx, "start", TimeSpan.FromSeconds(30));
+            await StartWithNameGuardAsync(ctx, "start", TimeSpan.FromSeconds(30));
         }));
         flow.Controls.Add(ActionButton("⏯ Pause/Resume", UiButtonKind.Neutral, async ctx =>
         {

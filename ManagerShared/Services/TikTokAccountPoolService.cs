@@ -318,6 +318,9 @@ public sealed class TikTokAccountPoolService
     public void MarkIdentityFail(string username)
         => MarkIdentityResult(username, "FAIL");
 
+    public void MarkIdentityProcessing(string username)
+        => MarkIdentityResult(username, "PROCESSING");
+
     public void MarkIdentityResult(
         string username,
         string result)
@@ -332,7 +335,7 @@ public sealed class TikTokAccountPoolService
 
         if (result.Length == 0)
             throw new InvalidOperationException(
-                "Tên/ảnh chỉ cho phép DONE hoặc FAIL.");
+                "Tên/ảnh chỉ cho phép DONE, PROCESSING hoặc FAIL.");
 
         var path = CurrentSourcePath;
 
@@ -1530,6 +1533,19 @@ public sealed class TikTokAccountPoolService
 
         if (IsDoneValue(value))
             return "DONE";
+
+        if (value.Equals(
+                "PROCESSING",
+                StringComparison.OrdinalIgnoreCase)
+            || value.Equals(
+                "PROCESS",
+                StringComparison.OrdinalIgnoreCase)
+            || value.Equals(
+                "RUNNING",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return "PROCESSING";
+        }
 
         if (value.Equals(
                 "FAIL",
@@ -3027,8 +3043,8 @@ public sealed class TikTokAccountPoolService
         string note)
     {
         // Excel giữ 3 trạng thái đủ để ra quyết định trước hành động:
-        // PROCESSING = Auto Profile đang tạo dở / có checkpoint hợp lệ;
-        // DONE = đã hoàn tất; FAIL = đã dừng/lỗi và chỉ retry khi người dùng cho phép.
+        // PROCESSING = đang tạo dở / lỗi kỹ thuật có thể tự tiếp tục;
+        // DONE = đã hoàn tất; FAIL = CAPTCHA/cooldown/config hoặc lỗi cần người dùng cho phép retry.
         // Nhờ vậy account cũ chỉ có "Profile đã gán" nhưng +auto trống sẽ không
         // bị hiểu nhầm thành profile tạo dở ở các lần chạy sau.
         var finalResult =
@@ -3121,10 +3137,30 @@ public sealed class TikTokAccountPoolService
             return "DONE";
         }
 
+        // FAIL chỉ dành cho tình huống cần người dùng can thiệp hoặc chủ động
+        // cho phép retry: CAPTCHA, 2FA/config, cooldown, hoặc explicit FAIL.
         if (value.Equals(
                 "FAIL",
                 StringComparison.OrdinalIgnoreCase)
-            || value.StartsWith(
+            || value.Contains(
+                "CAPTCHA",
+                StringComparison.OrdinalIgnoreCase)
+            || value.Contains(
+                "2FA",
+                StringComparison.OrdinalIgnoreCase)
+            || value.Contains(
+                "CONFIG",
+                StringComparison.OrdinalIgnoreCase)
+            || value.Contains(
+                "COOLDOWN",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return "FAIL";
+        }
+
+        // STOP hoặc lỗi kỹ thuật thông thường là trạng thái có thể tự phục hồi.
+        // Không biến chúng thành FAIL vĩnh viễn; lần Auto Profile sau sẽ resume.
+        if (value.StartsWith(
                 "PAUSED",
                 StringComparison.OrdinalIgnoreCase)
             || value.StartsWith(
@@ -3135,12 +3171,9 @@ public sealed class TikTokAccountPoolService
                 StringComparison.OrdinalIgnoreCase)
             || value.StartsWith(
                 "STOPPED",
-                StringComparison.OrdinalIgnoreCase)
-            || value.Contains(
-                "CAPTCHA",
                 StringComparison.OrdinalIgnoreCase))
         {
-            return "FAIL";
+            return "PROCESSING";
         }
 
         // Mọi checkpoint kỹ thuật còn lại của Auto Profile đều là trạng thái

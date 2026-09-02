@@ -950,6 +950,7 @@ public sealed partial class ChromeController : IAsyncDisposable
         bool skipAllIfNameCooldown = false,
         IReadOnlyCollection<string>? knownDisplayNames = null,
         bool verifyExistingState = false,
+        bool fastNameGuardMode = false,
         CancellationToken ct = default)
     {
         username = (username ?? "").Trim();
@@ -973,7 +974,7 @@ public sealed partial class ChromeController : IAsyncDisposable
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
         if (displayName.Length > 0 && !knownNames.Contains(displayName, StringComparer.OrdinalIgnoreCase)) knownNames.Add(displayName);
-        _log.Info($"[TIKTOK_IDENTITY_UPDATE_START] name={(displayName.Length > 0 ? "yes" : "no")} avatar={(avatarPath.Length > 0 ? Path.GetFileName(avatarPath) : "no")} bio={(bio.Length > 0 ? "yes" : "no")} cooldownCheck={skipAllIfNameCooldown} verifyExisting={verifyExistingState} knownNames={knownNames.Count}");
+        _log.Info($"[TIKTOK_IDENTITY_UPDATE_START] name={(displayName.Length > 0 ? "yes" : "no")} avatar={(avatarPath.Length > 0 ? Path.GetFileName(avatarPath) : "no")} bio={(bio.Length > 0 ? "yes" : "no")} cooldownCheck={skipAllIfNameCooldown} verifyExisting={verifyExistingState} fastNameGuard={fastNameGuardMode} knownNames={knownNames.Count}");
 
         async Task<JsonElement> Eval(string js) => await EvalAsync(js, ct: ct);
         static bool IsTrue(JsonElement result)
@@ -1040,13 +1041,74 @@ public sealed partial class ChromeController : IAsyncDisposable
         var profileHref = "";
         var directHandle = NormalizeTikTokHandle(username);
         var usedDirectProfileHref = false;
-        if (!string.IsNullOrWhiteSpace(directHandle))
+
+        static string NormalizeIdentityDisplayName(string value)
+            => Regex.Replace((value ?? "").Trim(), @"\s+", " ");
+
+        bool IsExpectedDisplayName(string currentName, bool acceptAnyKnownName)
+        {
+            var current = NormalizeIdentityDisplayName(currentName);
+            if (current.Length == 0) return false;
+
+            if (!acceptAnyKnownName)
+                return string.Equals(current, NormalizeIdentityDisplayName(displayName), StringComparison.OrdinalIgnoreCase);
+
+            return knownNames.Any(x =>
+                string.Equals(current, NormalizeIdentityDisplayName(x), StringComparison.OrdinalIgnoreCase));
+        }
+
+        async Task<string> ReadProfileDisplayNameAsync()
+        {
+            var result = await Eval($$"""
+(() => {
+  const wantedHandle = {{JsString(directHandle)}}.toLowerCase();
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+  const visible = el => {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    return r.width > 2 && r.height > 2 && cs.display !== 'none' && cs.visibility !== 'hidden';
+  };
+
+  const selectors = [
+    '[data-e2e="user-title"]'
+  ];
+  for (const selector of selectors) {
+    const el = document.querySelector(selector);
+    if (!visible(el)) continue;
+    const text = norm(el.innerText || el.textContent || '');
+    if (text) return text;
+  }
+
+  const headings = [...document.querySelectorAll('main h1, main h2, h1[data-e2e*="user"], h2[data-e2e*="user"]')]
+    .filter(visible)
+    .map(el => norm(el.innerText || el.textContent || ''))
+    .filter(t => t && t.length <= 100)
+    .filter(t => {
+      const low = t.toLowerCase().replace(/^@/, '');
+      return !wantedHandle || low !== wantedHandle;
+    });
+  return headings[0] || '';
+})()
+""");
+            return ReadString(result);
+        }
+        if (fastNameGuardMode
+            && !string.IsNullOrWhiteSpace(Page?.Url)
+            && (Page?.Url ?? "").StartsWith("https://www.tiktok.com/@", StringComparison.OrdinalIgnoreCase))
+        {
+            // Name Guard vừa đi vào đúng href Hồ sơ để đọc tên. Tận dụng luôn trang
+            // hiện tại, không navigate lại lần nữa trước khi mở Edit profile.
+            profileHref = Page!.Url;
+            _log.Info($"[TIKTOK_IDENTITY_FAST_REUSE_PROFILE] href={profileHref}");
+        }
+        else if (!string.IsNullOrWhiteSpace(directHandle))
         {
             profileHref = "https://www.tiktok.com/@" + Uri.EscapeDataString(directHandle);
             try
             {
                 _log.Info($"[TIKTOK_IDENTITY_PROFILE_DIRECT] username={directHandle} href={profileHref}");
-                await NavigateAndWaitAsync(profileHref, 900, 18000, ct);
+                await NavigateAndWaitAsync(profileHref, fastNameGuardMode ? 250 : 900, fastNameGuardMode ? 7000 : 18000, ct);
                 usedDirectProfileHref = true;
             }
             catch (Exception ex)
@@ -1063,7 +1125,59 @@ public sealed partial class ChromeController : IAsyncDisposable
                 throw new InvalidOperationException("Không xác định được trang Hồ sơ TikTok. Username của profile đang trống/không hợp lệ và cũng không tìm thấy link Hồ sơ/Profile trong DOM.");
 
             _log.Info($"[TIKTOK_IDENTITY_PROFILE_DOM_FALLBACK] href={profileHref}");
-            await NavigateAndWaitAsync(profileHref, 900, 18000, ct);
+            await NavigateAndWaitAsync(profileHref, fastNameGuardMode ? 250 : 900, fastNameGuardMode ? 7000 : 18000, ct);
+        }
+
+        // 1.4) TikTok là SPA nên ngay sau lần đổi tên trước, trang hồ sơ có thể vẫn
+        // giữ nickname cũ trong cache. Với Auto Identity, nếu Excel chưa DONE thì
+        // kiểm tra tên hiện tại; nếu chưa khớp, chờ rồi F5 đúng trang hồ sơ một lần
+        // trước khi mở Sửa hồ sơ/cooldown. Nhờ vậy tài khoản đã tự đổi hoặc lần trước
+        // đổi thành công nhưng chưa kịp ghi Excel sẽ được công nhận là thành công.
+        if (verifyExistingState && displayName.Length > 0)
+        {
+            for (var verifyAttempt = 1; verifyAttempt <= 2; verifyAttempt++)
+            {
+                string currentName = "";
+                try { currentName = await ReadProfileDisplayNameAsync(); }
+                catch (Exception ex)
+                {
+                    _log.Warn($"[TIKTOK_IDENTITY_NAME_PRECHECK_READ_WARN] attempt={verifyAttempt}/2 {ex.Message}");
+                }
+
+                var matched = IsExpectedDisplayName(currentName, acceptAnyKnownName: true);
+                _log.Info($"[TIKTOK_IDENTITY_NAME_PRECHECK] attempt={verifyAttempt}/2 currentName={currentName} matched={matched}");
+                if (matched)
+                {
+                    try
+                    {
+                        if (!string.IsNullOrWhiteSpace(originalUrl)
+                            && originalUrl.StartsWith("https://www.tiktok.com/", StringComparison.OrdinalIgnoreCase))
+                            await NavigateAndWaitAsync(originalUrl, 700, 12000, ct);
+                    }
+                    catch { }
+
+                    _log.Info($"[TIKTOK_IDENTITY_NAME_ALREADY_MATCHED] currentName={currentName}; xác nhận trên profile page sau reload nếu cần, cho phép Manager ghi DONE.");
+                    return new TikTokProfileIdentityUpdateResult(
+                        false, false, false, false, true, true,
+                        $"Tên TikTok hiện tại đã đúng ({currentName}). Không đổi lại; ghi DONE vào Excel.");
+                }
+
+                if (verifyAttempt < 2)
+                {
+                    try
+                    {
+                        _log.Info("[TIKTOK_IDENTITY_NAME_PRECHECK_RELOAD] delayMs=2500 attempt=1/1");
+                        await Task.Delay(2500, ct);
+                        await ReloadAndWaitAsync(1000, 18000, ct);
+                        await Task.Delay(1200, ct);
+                    }
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception ex)
+                    {
+                        _log.Warn("[TIKTOK_IDENTITY_NAME_PRECHECK_RELOAD_WARN] " + ex.Message);
+                    }
+                }
+            }
         }
 
         // 1.5) Với Auto Identity, xác nhận trạng thái ngay trên TRANG HỒ SƠ trước.
@@ -1097,13 +1211,10 @@ public sealed partial class ChromeController : IAsyncDisposable
     return '';
   };
 
-  // TikTok thường đặt nickname ở user-subtitle. Có thêm fallback heading nhưng
-  // loại @username/handle để không nhầm TikTok ID thành tên hiển thị.
+  // Tên hiển thị TikTok nằm ở data-e2e="user-title".
+  // Không dùng user-subtitle vì đó là @username/handle.
   let currentName = firstText([
-    '[data-e2e="user-subtitle"]',
-    '[data-e2e="user-nickname"]',
-    '[data-e2e="profile-nickname"]',
-    '[data-e2e*="nickname"]'
+    '[data-e2e="user-title"]'
   ]);
   if (!currentName) {
     const headings = [...document.querySelectorAll('main h1, main h2, h1[data-e2e*="user"], h2[data-e2e*="user"]')]
@@ -1241,7 +1352,7 @@ public sealed partial class ChromeController : IAsyncDisposable
 })()
 """, timeoutMs, 350);
 
-        var editClicked = await TryClickEditProfileAsync();
+        var editClicked = await TryClickEditProfileAsync(fastNameGuardMode ? 5000 : 10000);
         if (!editClicked && usedDirectProfileHref)
         {
             // Nếu Username cũ/sai, thử lấy link Hồ sơ thật từ sidebar trước khi báo lỗi.
@@ -1251,8 +1362,8 @@ public sealed partial class ChromeController : IAsyncDisposable
             {
                 _log.Warn($"[TIKTOK_IDENTITY_PROFILE_DIRECT_NO_EDIT] fallback={domProfileHref}");
                 profileHref = domProfileHref;
-                await NavigateAndWaitAsync(profileHref, 900, 18000, ct);
-                editClicked = await TryClickEditProfileAsync(8000);
+                await NavigateAndWaitAsync(profileHref, fastNameGuardMode ? 250 : 900, fastNameGuardMode ? 7000 : 18000, ct);
+                editClicked = await TryClickEditProfileAsync(fastNameGuardMode ? 5000 : 8000);
             }
         }
         if (!editClicked)
@@ -1260,7 +1371,7 @@ public sealed partial class ChromeController : IAsyncDisposable
             // TikTok đôi lúc vừa đăng nhập xong nhưng session/UI trên profile page chưa đồng bộ:
             // URL đã đúng /@username nhưng nút Edit profile chưa render. Thực tế F5 là đủ.
             // Vì vậy reload trang rồi thử lại trước khi kết luận lỗi.
-            const int editProfileReloadRetries = 2;
+            var editProfileReloadRetries = fastNameGuardMode ? 1 : 2;
 
             for (var refreshAttempt = 1;
                  refreshAttempt <= editProfileReloadRetries && !editClicked;
@@ -1271,10 +1382,10 @@ public sealed partial class ChromeController : IAsyncDisposable
                     _log.Warn(
                         $"[TIKTOK_IDENTITY_EDIT_MISSING_RELOAD] href={profileHref} attempt={refreshAttempt}/{editProfileReloadRetries}");
 
-                    await ReloadAndWaitAsync(1200, 18000, ct);
-                    await Task.Delay(700, ct);
+                    await ReloadAndWaitAsync(fastNameGuardMode ? 500 : 1200, fastNameGuardMode ? 9000 : 18000, ct);
+                    await Task.Delay(fastNameGuardMode ? 250 : 700, ct);
 
-                    editClicked = await TryClickEditProfileAsync(10000);
+                    editClicked = await TryClickEditProfileAsync(fastNameGuardMode ? 5000 : 10000);
 
                     if (editClicked)
                     {
@@ -1309,7 +1420,7 @@ public sealed partial class ChromeController : IAsyncDisposable
         // Chỉ cần có câu "Bạn có thể tiếp tục thay đổi biệt danh sau ..." (hoặc bản tiếng Anh)
         // thì KHÔNG chạm vào bất kỳ ô Tên/Ảnh/Tiểu sử nào. Trả NameCooldown để Manager
         // bỏ qua profile trong phiên hiện tại nhưng KHÔNG ghi DONE vào Excel.
-        if (verifyExistingState && skipAllIfNameCooldown)
+        if (skipAllIfNameCooldown)
         {
             var hasNicknameCooldownHint = false;
             try
@@ -1820,7 +1931,7 @@ public sealed partial class ChromeController : IAsyncDisposable
   }
   return false;
 })()
-""", 12000, 300);
+""", fastNameGuardMode ? 8000 : 12000, fastNameGuardMode ? 250 : 300);
         if (!profileSaved)
             throw new InvalidOperationException("Không tìm thấy nút Lưu/Save đang khả dụng trong form Sửa hồ sơ.");
 
@@ -1855,11 +1966,13 @@ public sealed partial class ChromeController : IAsyncDisposable
   }
   return false;
 })()
-""", 5000, 200);
+""", fastNameGuardMode ? 1500 : 5000, 200);
 
         if (nameChanged && !saveConfirmPresent)
         {
-            throw new InvalidOperationException("Đã bấm Lưu sau khi đổi tên nhưng không thấy bảng Xác nhận / Đặt biệt danh của TikTok.");
+            // TikTok không phải lúc nào cũng hiện popup Xác nhận. Không kết luận FAIL
+            // ở đây; bước xác minh sau reload bên dưới mới là nguồn sự thật.
+            _log.Warn("[TIKTOK_IDENTITY_FINAL_CONFIRM_NOT_SHOWN] Đã bấm Lưu nhưng không thấy popup Xác nhận; tiếp tục reload + đọc tên thực tế trước khi kết luận.");
         }
 
         if (saveConfirmPresent)
@@ -1897,53 +2010,81 @@ public sealed partial class ChromeController : IAsyncDisposable
 """));
             if (!finalSaved)
             {
-                throw new InvalidOperationException("Đã mở bảng xác nhận sau khi Lưu nhưng không bấm được nút Xác nhận/Confirm.");
+                // Popup Xác nhận đã xuất hiện rõ ràng nhưng tool không bấm được nút.
+                // Đây là một bước bắt buộc của lần Save này: không được trả success/DONE giả.
+                _log.Warn("[TIKTOK_IDENTITY_FINAL_CONFIRM_CLICK_MISS] thấy popup nhưng không bấm được Xác nhận; kết luận FAIL cho lần xử lý này.");
+                throw new InvalidOperationException(
+                    "TikTok đã hiện popup Xác nhận sau khi Lưu nhưng tool không bấm được nút Xác nhận/Confirm.");
             }
-
-            _log.Info("[TIKTOK_IDENTITY_FINAL_CONFIRM_CLICKED] action=Xác nhận/Confirm");
-            await Task.Delay(700, ct);
+            else
+            {
+                _log.Info("[TIKTOK_IDENTITY_FINAL_CONFIRM_CLICKED] action=Xác nhận/Confirm");
+                await Task.Delay(fastNameGuardMode ? 300 : 700, ct);
+            }
         }
 
-        await Task.Delay(1800, ct);
-        _log.Info($"[TIKTOK_IDENTITY_UPDATE_SAVED] name={nameChanged} avatar={avatarChanged} bio={bioChanged} cooldown=false finalConfirm={saveConfirmPresent}");
+        await Task.Delay(fastNameGuardMode ? 450 : 1800, ct);
+        _log.Info($"[TIKTOK_IDENTITY_UPDATE_SAVED] name={nameChanged} avatar={avatarChanged} bio={bioChanged} cooldown=false finalConfirm={saveConfirmPresent} fastNameGuard={fastNameGuardMode}");
 
-        // Trả người dùng về trang trước đó nếu trước khi cập nhật đang ở TikTok.
-        // Sau khi đổi TÊN, TikTok đôi khi đã quay lại trang chủ nhưng header/sidebar vẫn
-        // giữ nickname cũ trong state/cache của SPA. Một F5 quá sớm cũng có thể vẫn lấy
-        // state cũ, nên phải chờ trang quay về ổn định trước, nghỉ thêm 3 giây rồi mới
-        // reload đúng 1 lần để nickname mới được nhận đầy đủ.
-        var returnPageStable = true;
-        if (!string.IsNullOrWhiteSpace(originalUrl)
+        // Tên TikTok có thể chưa đổi ngay trên SPA dù Save/Confirm đã chạy.
+        // Vì vậy không dùng kết quả click làm điều kiện DONE. Với mọi lần có thao tác tên,
+        // bắt buộc quay lại profile, chờ 3 giây, F5, chờ DOM ổn định rồi đọc nickname thực tế.
+        // Nếu lần đầu chưa cập nhật, lặp thêm một vòng trước khi kết luận lỗi.
+        if (!fastNameGuardMode && displayName.Length > 0 && nameChanged)
+        {
+            var verifiedName = false;
+            var lastSeenName = "";
+            const int verifyAttempts = 2;
+
+            for (var attempt = 1; attempt <= verifyAttempts; attempt++)
+            {
+                ct.ThrowIfCancellationRequested();
+                try
+                {
+                    await NavigateAndWaitAsync(profileHref, 1000, 18000, ct);
+                    _log.Info($"[TIKTOK_IDENTITY_NAME_VERIFY_WAIT] attempt={attempt}/{verifyAttempts} delayMs=3000");
+                    await Task.Delay(3000, ct);
+
+                    await ReloadAndWaitAsync(1100, 18000, ct);
+                    await Task.Delay(2200, ct);
+
+                    lastSeenName = await ReadProfileDisplayNameAsync();
+                    verifiedName = IsExpectedDisplayName(lastSeenName, acceptAnyKnownName: false);
+                    _log.Info($"[TIKTOK_IDENTITY_NAME_VERIFY] attempt={attempt}/{verifyAttempts} currentName={lastSeenName} ok={verifiedName}");
+                    if (verifiedName) break;
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    _log.Warn($"[TIKTOK_IDENTITY_NAME_VERIFY_WARN] attempt={attempt}/{verifyAttempts} message={ex.Message}");
+                }
+
+                if (attempt < verifyAttempts)
+                    await Task.Delay(2500, ct);
+            }
+
+            if (!verifiedName)
+                throw new InvalidOperationException(
+                    $"TikTok chưa hiển thị tên mới sau {verifyAttempts} lần chờ + F5. Tên đọc được: '{lastSeenName}'. Giữ trạng thái để retry, không ghi DONE/FAIL giả.");
+
+            _log.Info($"[TIKTOK_IDENTITY_NAME_VERIFIED_AFTER_RELOAD] currentName={lastSeenName} result=success");
+        }
+
+        // Chỉ sau khi verify xong mới trả trang về vị trí trước đó.
+        if (!fastNameGuardMode
+            && !string.IsNullOrWhiteSpace(originalUrl)
             && originalUrl.StartsWith("https://www.tiktok.com/", StringComparison.OrdinalIgnoreCase)
-            && !string.Equals(originalUrl.TrimEnd('/'), profileHref.TrimEnd('/'), StringComparison.OrdinalIgnoreCase))
+            && !string.Equals(originalUrl.TrimEnd('/'), (Page?.Url ?? "").TrimEnd('/'), StringComparison.OrdinalIgnoreCase))
         {
             try
             {
                 await NavigateAndWaitAsync(originalUrl, 900, 15000, ct);
-                _log.Info("[TIKTOK_IDENTITY_RETURN_URL_READY] page=stable");
+                _log.Info("[TIKTOK_IDENTITY_RETURN_URL_READY] page=stable-after-verify");
             }
             catch (Exception ex)
             {
-                returnPageStable = false;
+                // Trả trang chỉ là thao tác phụ; trạng thái tên đã được verify ở profile page.
                 _log.Warn("[TIKTOK_IDENTITY_RETURN_URL] " + ex.Message);
-            }
-        }
-
-        if (nameChanged && returnPageStable)
-        {
-            try
-            {
-                _log.Info("[TIKTOK_IDENTITY_NAME_REFRESH_WAIT] delayMs=3000 reason=wait-after-return-page-stable");
-                await Task.Delay(3000, ct);
-                await ReloadAndWaitAsync(900, 15000, ct);
-                _log.Info("[TIKTOK_IDENTITY_NAME_REFRESH_OK] action=reload-once-after-3s");
-            }
-            catch (OperationCanceledException) { throw; }
-            catch (Exception ex)
-            {
-                // Việc đổi tên đã được lưu thành công ở TikTok; F5 bổ sung chỉ để
-                // đồng bộ phần hiển thị. Không biến lỗi refresh phụ thành lỗi đổi tên.
-                _log.Warn("[TIKTOK_IDENTITY_NAME_REFRESH_FAILED] " + ex.Message);
             }
         }
 
@@ -1952,7 +2093,9 @@ public sealed partial class ChromeController : IAsyncDisposable
         if (avatarChanged) pieces.Add("ảnh");
         if (bioChanged) pieces.Add("tiểu sử");
         var message = pieces.Count > 0 ? string.Join(" + ", pieces) : "Không có thay đổi";
-        return new TikTokProfileIdentityUpdateResult(nameChanged, avatarChanged, bioChanged, false, false, false, "Đã xử lý: " + message);
+        return new TikTokProfileIdentityUpdateResult(
+            nameChanged, avatarChanged, bioChanged, false, false, false,
+            fastNameGuardMode ? "Đã lưu thành công: " + message : "Đã xử lý và xác minh: " + message);
     }
 
     public async Task BringToFrontAsync(CancellationToken ct = default)

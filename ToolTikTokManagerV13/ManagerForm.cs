@@ -602,6 +602,10 @@ public sealed partial class ManagerForm : Form
 
     async Task OpenChromeForProfileAsync(ProfileContext ctx)
     {
+        // Mỗi lần mở Chrome mới cho phép đúng một lượt kiểm tra Tên/ảnh mới.
+        // Excel DONE vẫn được bỏ qua ngay ở Name Guard nên không phát sinh điều hướng.
+        _autoIdentityHandledSession.Remove(ctx.Profile.Name);
+        _autoIdentityNextProbeUtc.Remove(ctx.Profile.Name);
         SetStatus(ctx, "Đang mở Chrome của profile này...", Color.DarkOrange);
         var result = await SendCommandAsync(ctx, "launch", TimeSpan.FromSeconds(75));
         if (string.Equals(result, "captcha_required", StringComparison.OrdinalIgnoreCase))
@@ -913,9 +917,20 @@ public sealed partial class ManagerForm : Form
 
     async Task RefreshStatusAsync(ProfileContext ctx)
     {
+        var previousChrome = ctx.LastSnapshot?.Chrome ?? "DISCONNECTED";
         var s = await ReadStatusAsync(ctx);
         ctx.LastStatusRefreshUtc = DateTime.UtcNow;
         ctx.LastSnapshot = s;
+
+        // FAIL chỉ khóa đúng phiên Chrome hiện tại để tránh loop. Khi Chrome thật sự
+        // đóng/disconnect, nhả cờ profile để lần mở Chrome mới được kiểm tra lại 1 lần.
+        if (string.Equals(previousChrome, "CONNECTED", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(s.Chrome, "CONNECTED", StringComparison.OrdinalIgnoreCase))
+        {
+            _autoIdentityHandledSession.Remove(ctx.Profile.Name);
+            _autoIdentityNextProbeUtc.Remove(ctx.Profile.Name);
+            _log.Info($"[NAME_GUARD_CHROME_SESSION_RESET] profile={ctx.Profile.Name}");
+        }
         ctx.ConsecutiveStatusPollFailures = 0;
         ctx.LastStatusPollFailure = "";
         ApplyWorkerSnapshotRuntimeState(ctx, s);
@@ -1030,7 +1045,7 @@ public sealed partial class ManagerForm : Form
                 // Tab đã mở nhưng Worker có thể vừa thoát; OpenProfileAsync sẽ bảo đảm
                 // Worker của đúng profile sẵn sàng rồi mới gửi lệnh start.
                 await OpenProfileAsync(ctx);
-                await SendCommandAsync(ctx, "start", TimeSpan.FromSeconds(30));
+                await StartWithNameGuardAsync(ctx, "start", TimeSpan.FromSeconds(30));
             }
             catch (Exception ex)
             {
@@ -1841,11 +1856,17 @@ public sealed partial class ManagerForm : Form
             HeaderText = "Chờ dùng lại",
             Width = 155
         });
+        grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            Name = "reuseReason",
+            HeaderText = "Lý do chờ",
+            Width = 205
+        });
         LogGridSchema(
             grid,
             "AccountPoolGrid",
             "row", "assigned", "user", "note", "identity",
-            "autoProfile", "reuseQueue");
+            "autoProfile", "reuseQueue", "reuseReason");
 
         var detailInfo = new Label
         {
@@ -1863,6 +1884,8 @@ public sealed partial class ManagerForm : Form
         Dictionary<string, TikTokAccountPoolService.TikTokAccountAutoState> autoStates =
             new(StringComparer.OrdinalIgnoreCase);
         DateTime lastSourceWriteUtc = DateTime.MinValue;
+        DateTime lastReuseQueueScanUtc = DateTime.MinValue;
+        bool reuseQueueScanRunning = false;
 
         void CaptureSourceWriteTime()
         {
@@ -1916,20 +1939,32 @@ public sealed partial class ManagerForm : Form
 
             var reuseQueue =
                 GetReusableProfileQueueSnapshot();
+            var reuseReasons =
+                GetReusableProfileQueueReasonSnapshot();
+
+            var assignedProfile =
+                (item.AssignedProfile ?? "").Trim();
 
             var reuseText =
-                !string.IsNullOrWhiteSpace(item.AssignedProfile)
+                assignedProfile.Length > 0
                 && reuseQueue.TryGetValue(
-                    item.AssignedProfile.Trim(),
+                    assignedProfile,
                     out var reuseItem)
                     ? reuseItem.IsManual
                         ? $"#{reuseItem.Position} (THỦ CÔNG · {FormatReusableRuntime(reuseItem.TotalRuntime)})"
                         : $"#{reuseItem.Position} ({FormatReusableRuntime(reuseItem.TotalRuntime)})"
                     : "—";
 
+            var reuseReasonText =
+                assignedProfile.Length == 0
+                    ? "CHƯA GÁN PROFILE"
+                    : reuseReasons.TryGetValue(assignedProfile, out var reason)
+                        ? reason
+                        : "CHƯA QUÉT";
+
             detailInfo.Text =
-                $"Profile {(string.IsNullOrWhiteSpace(item.AssignedProfile) ? "—" : item.AssignedProfile)}  •  {item.Username}  •  Dòng {item.SourceRow}\n"
-                + $"Ghi chú: {noteText}    |    Tên/ảnh: {identityText}    |    Auto Profile: {autoProfileText}    |    Chờ dùng lại: {reuseText}";
+                $"Profile {(assignedProfile.Length == 0 ? "—" : assignedProfile)}  •  {item.Username}  •  Dòng {item.SourceRow}\n"
+                + $"Ghi chú: {noteText}    |    Tên/ảnh: {identityText}    |    Auto Profile: {autoProfileText}    |    Chờ: {reuseText}    |    Lý do: {reuseReasonText}";
         }
 
         void RefreshGrid()
@@ -1956,6 +1991,7 @@ public sealed partial class ManagerForm : Form
             grid.Rows.Clear();
             var identityResults = _accountPoolService.GetIdentityResults();
             var reuseQueue = GetReusableProfileQueueSnapshot();
+            var reuseReasons = GetReusableProfileQueueReasonSnapshot();
             DataGridViewRow? rowToSelect = null;
 
             foreach (var item in items)
@@ -1978,7 +2014,12 @@ public sealed partial class ManagerForm : Form
                         ? reuseItem.IsManual
                             ? $"#{reuseItem.Position} · THỦ CÔNG"
                             : $"#{reuseItem.Position} · {FormatReusableRuntime(reuseItem.TotalRuntime)}"
-                        : "");
+                        : "",
+                    string.IsNullOrWhiteSpace(item.AssignedProfile)
+                        ? "CHƯA GÁN PROFILE"
+                        : reuseReasons.TryGetValue(item.AssignedProfile.Trim(), out var reuseReason)
+                            ? reuseReason
+                            : "CHƯA QUÉT");
 
                 var row = grid.Rows[index];
                 row.Tag = item.Id;
@@ -2033,6 +2074,27 @@ public sealed partial class ManagerForm : Form
                         Color.FromArgb(32, 83, 145);
                     row.Cells["reuseQueue"].Style.Font =
                         new Font(grid.Font, FontStyle.Bold);
+                }
+
+                var reasonText =
+                    Convert.ToString(row.Cells["reuseReason"].Value)?.Trim() ?? "";
+
+                if (reasonText.StartsWith("ĐỦ ĐIỀU KIỆN", StringComparison.OrdinalIgnoreCase)
+                    || reasonText.StartsWith("ĐANG CHỜ", StringComparison.OrdinalIgnoreCase))
+                {
+                    row.Cells["reuseReason"].Style.BackColor = Color.Honeydew;
+                    row.Cells["reuseReason"].Style.ForeColor = Color.DarkGreen;
+                }
+                else if (reasonText.Equals("ĐANG MỞ/CHẠY", StringComparison.OrdinalIgnoreCase))
+                {
+                    row.Cells["reuseReason"].Style.BackColor = Color.FromArgb(255, 248, 225);
+                    row.Cells["reuseReason"].Style.ForeColor = Color.FromArgb(145, 94, 0);
+                }
+                else if (reasonText.Length > 0
+                         && !reasonText.Equals("CHƯA QUÉT", StringComparison.OrdinalIgnoreCase))
+                {
+                    row.Cells["reuseReason"].Style.BackColor = Color.MistyRose;
+                    row.Cells["reuseReason"].Style.ForeColor = Color.Firebrick;
                 }
 
                 if (!string.IsNullOrWhiteSpace(selectedId)
@@ -2150,6 +2212,7 @@ public sealed partial class ManagerForm : Form
             {
                 await RefreshReusableProfileQueueAsync(
                     "account_pool_manual");
+                lastReuseQueueScanUtc = DateTime.UtcNow;
 
                 RefreshGrid();
 
@@ -2322,24 +2385,50 @@ public sealed partial class ManagerForm : Form
             Interval = 5000,
             Enabled = false
         };
-        autoRefreshTimer.Tick += (_, _) =>
+        autoRefreshTimer.Tick += async (_, _) =>
         {
             try
             {
+                var needsGridRefresh = false;
                 var currentPath = _accountPoolService.CurrentSourcePath;
-                if (string.IsNullOrWhiteSpace(currentPath) || !File.Exists(currentPath))
-                    return;
 
-                var currentWriteUtc = File.GetLastWriteTimeUtc(currentPath);
-                if (currentWriteUtc == lastSourceWriteUtc)
-                    return;
+                if (!string.IsNullOrWhiteSpace(currentPath) && File.Exists(currentPath))
+                {
+                    var currentWriteUtc = File.GetLastWriteTimeUtc(currentPath);
+                    if (currentWriteUtc != lastSourceWriteUtc)
+                    {
+                        _accountPoolService.ReloadCurrentExcel();
+                        needsGridRefresh = true;
+                    }
+                }
 
-                _accountPoolService.ReloadCurrentExcel();
-                RefreshGrid();
+                // Khi cửa sổ Kho tài khoản đang mở, tự quét queue mỗi 15 giây.
+                // Nhờ vậy profile vừa đóng / vừa đủ điều kiện sẽ tự xuất hiện,
+                // không cần người dùng bấm "Quét chờ" hoặc "+ Vào chờ".
+                if (!reuseQueueScanRunning
+                    && (DateTime.UtcNow - lastReuseQueueScanUtc) >= TimeSpan.FromSeconds(15))
+                {
+                    reuseQueueScanRunning = true;
+                    try
+                    {
+                        await RefreshReusableProfileQueueAsync(
+                            "account_pool_periodic");
+                        lastReuseQueueScanUtc = DateTime.UtcNow;
+                        needsGridRefresh = true;
+                    }
+                    finally
+                    {
+                        reuseQueueScanRunning = false;
+                    }
+                }
+
+                if (needsGridRefresh)
+                    RefreshGrid();
             }
             catch
             {
-                // Nếu Excel đang khóa thì giữ dữ liệu hiện tại và tự thử lại ở vòng sau.
+                // Nếu Excel đang khóa hoặc một lượt quét lỗi tạm thời thì giữ dữ liệu
+                // hiện tại và tự thử lại ở vòng sau.
             }
         };
 
@@ -2396,6 +2485,7 @@ public sealed partial class ManagerForm : Form
             {
                 await RefreshReusableProfileQueueAsync(
                     "account_pool_open");
+                lastReuseQueueScanUtc = DateTime.UtcNow;
             }
             catch { }
 
