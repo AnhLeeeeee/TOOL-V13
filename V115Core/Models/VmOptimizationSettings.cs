@@ -20,11 +20,12 @@ public sealed class VmOptimizationSettings
     public bool PauseVideo => Mode != VmOptimizationMode.Normal;
     public bool SuppressDetailedPerfLogs => Mode != VmOptimizationMode.Normal;
     public bool DisableCssAnimations => Mode == VmOptimizationMode.VmMax;
-    // V13.8.3 VM longevity: cả VM Safe và VM Max đều chặn luồng video phổ biến
-    // và để Chrome tự throttle khi cửa sổ/tab nằm nền. Workflow/CDP/XPath vẫn chạy
-    // từ Worker; chỉ workload nền của trang được phép giảm CPU.
+    // V13.8.4 hotfix: vẫn chặn luồng video phổ biến để giảm CPU, nhưng KHÔNG cho
+    // Chrome background throttle. Automation phụ thuộc timer/renderer của tab TikTok
+    // tiếp tục hoạt động ngay cả khi cửa sổ nằm nền/minimize; nếu throttle thì Manager
+    // có thể vẫn thấy RUNNING trong khi vòng automation bị đứng hoặc tăng rất chậm.
     public bool BlockCommonMedia => Mode != VmOptimizationMode.Normal;
-    public bool AllowChromeBackgroundThrottling => Mode != VmOptimizationMode.Normal;
+    public bool AllowChromeBackgroundThrottling => false;
 
     public int WorkerUiRefreshMs => Mode switch
     {
