@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 ﻿{
     "schemaVersion":  1,
     "versions":  [
@@ -53,7 +52,6 @@
                          "allowInstall":  true
                      }
                  ]
-=======
 {
   "schemaVersion": 1,
   "versions": [
@@ -228,5 +226,4 @@
       "allowInstall": true
     }
   ]
->>>>>>> 2c99110599f52818c7f6cce6a53354e6ace1bf0e
 }
