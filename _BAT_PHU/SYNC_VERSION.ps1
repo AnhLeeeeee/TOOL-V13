@@ -50,10 +50,19 @@ function Ensure-JsonProperty($obj, [string]$name, $defaultValue) {
     }
 }
 
-function Write-JsonBom([string]$path, $obj) {
+function Write-JsonUtf8NoBom([string]$path, $obj) {
     $jsonText = $obj | ConvertTo-Json -Depth 20
-    $utf8Bom = New-Object System.Text.UTF8Encoding($true)
-    [System.IO.File]::WriteAllText($path, $jsonText + [Environment]::NewLine, $utf8Bom)
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($path, $jsonText + [Environment]::NewLine, $utf8NoBom)
+}
+
+function New-DefaultNotes([string]$value) {
+    # ASCII-only source text de Windows PowerShell 5.1 khong lam hong tieng Viet
+    # khi file .ps1 duoc doc voi code page legacy.
+    $prefix = [System.Text.Encoding]::UTF8.GetString(
+        [System.Convert]::FromBase64String('Q+G6rXAgbmjhuq10IFRvb2wgVGlrVG9rIFY=')
+    )
+    return $prefix + $value + '.'
 }
 
 function Normalize-Version([string]$value) {
@@ -83,7 +92,7 @@ $preservedStatus = 'stable'
 $preservedChannel = 'stable'
 $preservedReleaseDate = $today
 $preservedAllowInstall = $true
-$preservedNotes = "Cập nhật Tool TikTok V$version."
+$preservedNotes = New-DefaultNotes $version
 
 if ($null -ne $currentHistory) {
     if (-not [string]::IsNullOrWhiteSpace([string]$currentHistory.status)) { $preservedStatus = [string]$currentHistory.status }
@@ -143,7 +152,7 @@ if (-not [string]::IsNullOrWhiteSpace($SetupPath)) {
     $latest.sha256 = $setupSha
 }
 
-Write-JsonBom $latestManifestFile $latest
+Write-JsonUtf8NoBom $latestManifestFile $latest
 
 # ------------------------------------------------------------
 # 3) Khi da co Setup + SHA thi upsert vao versions.json
@@ -171,7 +180,7 @@ if (-not [string]::IsNullOrWhiteSpace($setupSha)) {
 
     $history.schemaVersion = 1
     $history.versions = $sorted
-    Write-JsonBom $historyManifestFile $history
+    Write-JsonUtf8NoBom $historyManifestFile $history
 }
 
 Write-Host "[VERSION] Da dong bo version = $version"
