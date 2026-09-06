@@ -858,6 +858,8 @@ public sealed partial class ChromeController : IAsyncDisposable
             var blocked = _vmOptimization.BlockCommonMedia
                 ? new[]
                 {
+                    // Chỉ chặn payload video/segment nặng; không chặn ảnh, API, JS hay websocket
+                    // để DOM TikTok và automation vẫn hoạt động bình thường.
                     "*://*/*.m3u8*", "*://*/*.m4s*", "*://*/*.mp4*", "*://*/*.webm*", "*://*/*.flv*",
                     "*://*/*.ts?*", "*://*/*.ts#*"
                 }
@@ -876,15 +878,29 @@ public sealed partial class ChromeController : IAsyncDisposable
   const enabled = {{enabled}};
   const disableAnimations = {{disableAnimations}};
   const stateKey = '__ttVmSaverV132State';
-  const old = window[stateKey];
+  const policyVersion = 2;
+  let old = window[stateKey];
+
+  const disposeOld = state => {
+    try { state?.observer?.disconnect?.(); } catch (_) {}
+    try { if (state?.timer) clearInterval(state.timer); } catch (_) {}
+    try { if (state?.pendingTimer) clearTimeout(state.pendingTimer); } catch (_) {}
+    try { if (state?.playHandler) document.removeEventListener('play', state.playHandler, true); } catch (_) {}
+  };
 
   if (!enabled) {
-    try { old?.observer?.disconnect?.(); } catch (_) {}
-    try { if (old?.timer) clearInterval(old.timer); } catch (_) {}
-    try { if (old?.playHandler) document.removeEventListener('play', old.playHandler, true); } catch (_) {}
+    disposeOld(old);
     try { document.getElementById('__tt_vm_v132_style')?.remove(); } catch (_) {}
     try { delete window[stateKey]; } catch (_) {}
     return true;
+  }
+
+  // Nếu policy cũ đang sống trong cùng document thì hủy nó trước.
+  // Bản cũ gọi querySelectorAll('video') trên MỌI mutation của TikTok, dễ tăng CPU sau nhiều giờ.
+  if (old && old.version !== policyVersion) {
+    disposeOld(old);
+    try { delete window[stateKey]; } catch (_) {}
+    old = null;
   }
 
   const apply = () => {
@@ -914,15 +930,39 @@ public sealed partial class ChromeController : IAsyncDisposable
 
   apply();
   if (!old) {
-    let observer = null;
+    const state = { version: policyVersion, observer: null, timer: null, pendingTimer: null, playHandler: null };
+
+    // MutationObserver giờ chỉ schedule một lần quét sau 800ms. Hàng trăm mutation
+    // liên tiếp của TikTok sẽ gộp thành một querySelectorAll thay vì hàng trăm lần.
+    const scheduleApply = () => {
+      try {
+        if (state.pendingTimer) return;
+        state.pendingTimer = setTimeout(() => {
+          state.pendingTimer = null;
+          apply();
+        }, 800);
+      } catch (_) {}
+    };
+
     try {
-      observer = new MutationObserver(apply);
-      observer.observe(document.documentElement || document, { childList: true, subtree: true });
+      state.observer = new MutationObserver(scheduleApply);
+      state.observer.observe(document.documentElement || document, { childList: true, subtree: true });
     } catch (_) {}
-    const playHandler = e => { try { if (e?.target?.tagName === 'VIDEO') e.target.pause(); } catch (_) {} };
-    try { document.addEventListener('play', playHandler, true); } catch (_) {}
-    const timer = setInterval(apply, 1500);
-    window[stateKey] = { observer, timer, playHandler };
+
+    state.playHandler = e => {
+      try {
+        if (e?.target?.tagName === 'VIDEO') {
+          e.target.muted = true;
+          e.target.volume = 0;
+          e.target.pause();
+        }
+      } catch (_) {}
+    };
+    try { document.addEventListener('play', state.playHandler, true); } catch (_) {}
+
+    // Safety sweep thưa hơn; play event vẫn chặn video ngay lập tức.
+    state.timer = setInterval(apply, 4000);
+    window[stateKey] = state;
   }
   return true;
 })()

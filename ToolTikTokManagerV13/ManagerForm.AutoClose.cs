@@ -29,6 +29,8 @@ public sealed partial class ManagerForm
     readonly HashSet<string> _autoCloseBanHandledProfiles = new(StringComparer.OrdinalIgnoreCase);
     readonly HashSet<string> _autoCloseExpectedRunningProfiles = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, DateTime> _autoCloseNotRunningSinceUtc = new(StringComparer.OrdinalIgnoreCase);
+    static readonly TimeSpan AutoCloseCleanupRetryDelay = TimeSpan.FromSeconds(20);
+    readonly Dictionary<string, DateTime> _autoCloseCleanupRetryUtc = new(StringComparer.OrdinalIgnoreCase);
 
     sealed record AutoCloseReasonDecision(
         string Reason,
@@ -605,7 +607,8 @@ public sealed partial class ManagerForm
         await AutoCloseProfileAsync(
             ctx,
             "BAN",
-            detail);
+            detail,
+            source: "ban_watcher");
 
         var workerRunning = false;
         try
@@ -671,12 +674,25 @@ public sealed partial class ManagerForm
                     break;
 
                 var profileName = ctx.Profile.Name;
+                var nowUtc = DateTime.UtcNow;
 
                 if (_autoCloseInProgressProfiles.Contains(profileName))
                     continue;
 
+                // Cleanup bị UNKNOWN (thường powershell_cim_timeout) không được giữ
+                // cả watchdog 40-45 giây hoặc retry mỗi giây. Giữ riêng profile này
+                // ở CLEANUP_PENDING 20s; các profile khác vẫn được xét bình thường.
+                if (_autoCloseCleanupRetryUtc.TryGetValue(profileName, out var cleanupRetryUtc))
+                {
+                    if (nowUtc < cleanupRetryUtc)
+                        continue;
+
+                    _autoCloseCleanupRetryUtc.Remove(profileName);
+                    _log.Info(
+                        $"[AUTO_CLOSE_CLEANUP_RETRY_DUE] profile={profileName} retryAt={cleanupRetryUtc:O}");
+                }
+
                 var state = GetEffectiveRuntimeState(ctx);
-                var nowUtc = DateTime.UtcNow;
 
                 // RUNNING khỏe = Automation đang RUNNING + status còn tươi + Chrome CONNECTED
                 // + không có chuỗi lỗi status/recovery.
@@ -700,7 +716,8 @@ public sealed partial class ManagerForm
                             await AutoCloseProfileAsync(
                                 ctx,
                                 $"TIME_{_autoCloseSettings.RunHours}H",
-                                $"Đạt tổng thời gian chạy {_autoCloseSettings.RunHours} giờ (tổng={total:c}).");
+                                $"Đạt tổng thời gian chạy {_autoCloseSettings.RunHours} giờ (tổng={total:c}).",
+                                source: "runtime_watchdog_time_healthy");
 
                             continue;
                         }
@@ -724,7 +741,8 @@ public sealed partial class ManagerForm
                             await AutoCloseProfileAsync(
                                 ctx,
                                 "FAULT_10M",
-                                $"Không có tiến triển thực tế trong {AutoCloseNotRunningMinutes} phút dù Worker vẫn RUNNING. {progressFault}");
+                                $"Không có tiến triển thực tế trong {AutoCloseNotRunningMinutes} phút dù Worker vẫn RUNNING. {progressFault}",
+                                source: "runtime_watchdog_progress_stuck");
 
                             continue;
                         }
@@ -778,7 +796,8 @@ public sealed partial class ManagerForm
                         await AutoCloseProfileAsync(
                             ctx,
                             $"TIME_{_autoCloseSettings.RunHours}H",
-                            $"Đạt tổng thời gian chạy {_autoCloseSettings.RunHours} giờ (tổng={total:c}) trong lúc runtime không khỏe.");
+                            $"Đạt tổng thời gian chạy {_autoCloseSettings.RunHours} giờ (tổng={total:c}) trong lúc runtime không khỏe.",
+                            source: "runtime_watchdog_time_unhealthy");
 
                         continue;
                     }
@@ -824,7 +843,8 @@ public sealed partial class ManagerForm
                 await AutoCloseProfileAsync(
                     ctx,
                     "FAULT_10M",
-                    $"Không trở lại RUNNING trong {AutoCloseNotRunningMinutes} phút. state={state}; fault={fault}");
+                    $"Không trở lại RUNNING trong {AutoCloseNotRunningMinutes} phút. state={state}; fault={fault}",
+                    source: "runtime_watchdog_fault_10m");
             }
         }
         catch (Exception ex)
@@ -1104,6 +1124,13 @@ public sealed partial class ManagerForm
         var profileName = ctx.Profile.Name;
         command = (command ?? "").Trim().ToLowerInvariant();
 
+        WriteAutoDiagnosticEvent(
+            ctx,
+            "runtime_command",
+            command.ToUpperInvariant(),
+            "CONFIRMED",
+            $"confirmedState={confirmedState}");
+
         if (command is "start" or "start_auto" or "resume")
         {
             // Một lần Start/Resume mới mở một vòng đời mới cho profile.
@@ -1294,7 +1321,7 @@ public sealed partial class ManagerForm
             ctx.Worker = null;
     }
 
-    async Task AutoCloseProfileAsync(ProfileContext ctx, string reason, string detail)
+    async Task AutoCloseProfileAsync(ProfileContext ctx, string reason, string detail, string source = "unknown")
     {
         if (_closing || IsDisposed || Disposing)
             return;
@@ -1348,6 +1375,13 @@ public sealed partial class ManagerForm
                 result: "BẮT ĐẦU",
                 detail: detail);
 
+            WriteAutoDiagnosticEvent(
+                ctx,
+                source,
+                reason,
+                "TRIGGER",
+                $"decisionDetail={detail}");
+
             var worker = ctx.Worker;
 
             if (worker is not null && !worker.HasExited)
@@ -1357,6 +1391,9 @@ public sealed partial class ManagerForm
                 var state = GetEffectiveRuntimeState(ctx);
                 if (state is RuntimeStateRunning or RuntimeStatePaused or RuntimeStateRecovering)
                 {
+                    WriteAutoDiagnosticEvent(
+                        ctx, source, reason, "STEP", "step=STOP_AUTOMATION");
+
                     try
                     {
                         var stopReply = await SendCommandAsync(
@@ -1381,6 +1418,9 @@ public sealed partial class ManagerForm
 
             if (ctx.Worker is not null && !ctx.Worker.HasExited)
             {
+                WriteAutoDiagnosticEvent(
+                    ctx, source, reason, "STEP", "step=CLOSE_CHROME_BY_WORKER");
+
                 try
                 {
                     var closeReply = await SendCloseChromeCommandAsync(ctx);
@@ -1396,35 +1436,30 @@ public sealed partial class ManagerForm
                 }
             }
 
-            // Fallback theo đúng ProfilePath đã lưu. Không đụng Chrome của profile khác.
+            // V13.7.9 HOTFIX:
+            // Không chạy PowerShell/CIM trước rồi lại chạy lần hai sau khi Worker chết.
+            // close_chrome của Worker đã Browser.close + verify CDP/PID. Dù bước đó
+            // thành công hay không, shutdown Worker trước để không còn nguồn tái sinh
+            // Chrome; sau đó chỉ chạy MỘT cleanup probe theo đúng ProfilePath.
             if (!chromeClosedByWorker)
             {
-                try
-                {
-                    var stoppedPids = await Task.Run(
-                        () => ChromeProfileNameSyncService.StopChromeUsingProfile(
-                            ctx.Profile.ProfilePath));
-
-                    _log.Info(
-                        $"[AUTO_CLOSE_CHROME_FALLBACK] profile={ctx.Profile.Name} stopped={stoppedPids.Count} pids={string.Join(",", stoppedPids)}");
-                }
-                catch (Exception ex)
-                {
-                    _log.Warn(
-                        $"[AUTO_CLOSE_CHROME_FALLBACK_WARN] profile={ctx.Profile.Name} error={ex.Message}");
-                }
+                _log.Warn(
+                    $"[AUTO_CLOSE_CHROME_NEEDS_FINAL_CLEANUP] profile={ctx.Profile.Name} workerCloseVerified=false");
             }
 
-            // Không được sinh suất bù nếu Chrome cũ vẫn còn sống.
-            // Xác minh bằng đúng ProfilePath và retry/kill đúng Chrome đó.
-            await EnsureAutoCloseChromeStoppedAsync(ctx);
-
-            // Worker phải chết THẬT trước khi được phép báo AUTO_CLOSE_DONE.
+            // Worker phải chết THẬT trước khi cleanup Chrome cuối cùng.
+            WriteAutoDiagnosticEvent(
+                ctx, source, reason, "STEP", "step=SHUTDOWN_WORKER");
             await EnsureAutoCloseWorkerStoppedAsync(ctx);
 
-            // Worker shutdown/kill có thể để lại helper Chrome muộn. Probe đúng
-            // ProfilePath thêm một lần sau khi Worker đã chết.
+            // Một probe duy nhất. CIM timeout => CLEANUP_PENDING, chưa sinh suất bù.
+            // Nếu tìm thấy PID đúng ProfilePath thì kill trực tiếp PID đã xác minh.
+            WriteAutoDiagnosticEvent(
+                ctx, source, reason, "STEP", "step=FINAL_CHROME_CLEANUP");
             await EnsureAutoCloseChromeStoppedAsync(ctx);
+
+            WriteAutoDiagnosticEvent(
+                ctx, source, reason, "STEP", "step=REMOVE_TAB");
 
             if (ctx.Tab is not null && !ctx.Tab.IsDisposed && ctx.Tab.Parent == _tabs)
                 RemoveTab(ctx);
@@ -1447,6 +1482,8 @@ public sealed partial class ManagerForm
                 ctx.Profile.Name,
                 $"auto_close_done:{reason}");
 
+            _autoCloseCleanupRetryUtc.Remove(ctx.Profile.Name);
+
             _log.Info(
                 $"[AUTO_CLOSE_DONE] profile={ctx.Profile.Name} reason={reason}");
 
@@ -1458,20 +1495,36 @@ public sealed partial class ManagerForm
                 result: "THÀNH CÔNG",
                 detail: "Đã dừng Automation, đóng Chrome/Worker và gỡ tab profile.");
 
+            WriteAutoDiagnosticEvent(
+                ctx, source, reason, "DONE", "cleanup=success; replacementQueue=next");
+
             QueueAutoReplacementAfterAutoClose(ctx.Profile.Name, reason);
         }
         catch (Exception ex)
         {
-            _log.Error(
-                $"[AUTO_CLOSE_ERROR] profile={ctx.Profile.Name} reason={reason} error={ex}");
+            var cleanupPending = ex is AutoCloseCleanupPendingException;
+            var retryUtc = DateTime.UtcNow.Add(AutoCloseCleanupRetryDelay);
+            _autoCloseCleanupRetryUtc[ctx.Profile.Name] = retryUtc;
 
-            // Nếu đóng lỗi thì luôn re-arm để watchdog thử lại.
-            // Không probe Chrome đồng bộ ở catch vì PowerShell/CIM có thể chặn UI nhiều giây
-            // (và với nhiều profile tạo cảm giác Not Responding). Cleanup lần sau sẽ kiểm tra
-            // Chrome ở Task.Run trong EnsureAutoCloseChromeStoppedByPathAsync.
+            if (cleanupPending)
+            {
+                _log.Warn(
+                    $"[AUTO_CLOSE_CLEANUP_PENDING] profile={ctx.Profile.Name} reason={reason} retry={retryUtc:O} error={ex.Message}");
+            }
+            else
+            {
+                _log.Error(
+                    $"[AUTO_CLOSE_ERROR] profile={ctx.Profile.Name} reason={reason} retry={retryUtc:O} error={ex}");
+            }
+
+            // Chưa cleanup xong => tuyệt đối chưa QueueAutoReplacementAfterAutoClose.
+            // Re-arm profile để watchdog thử lại sau thời điểm retry, nhưng không giữ
+            // vòng hiện tại 40-45 giây và không retry mỗi 1 giây.
             MarkAutoCloseExpectedRunning(
                 ctx.Profile.Name,
-                "auto_close_failed_retry");
+                cleanupPending
+                    ? "auto_close_cleanup_pending"
+                    : "auto_close_failed_retry");
 
             if (NormalizeAutoCloseReason(reason) == "FAULT_10M")
             {
@@ -1479,13 +1532,22 @@ public sealed partial class ManagerForm
                     DateTime.UtcNow.AddMinutes(-AutoCloseNotRunningMinutes);
             }
 
+            WriteAutoDiagnosticEvent(
+                ctx,
+                source,
+                reason,
+                cleanupPending ? "CLEANUP_PENDING" : "ERROR",
+                $"exception={ex.GetType().Name}; retry={retryUtc:O}; message={ex.Message}");
+
             WriteAutoActivityLog(
                 action: "TỰ ĐÓNG",
                 profile: ctx.Profile.Name,
                 account: ResolveAutoActivityAccount(ctx.Profile.Name),
                 reason: reason,
-                result: "LỖI",
-                detail: ex.Message);
+                result: cleanupPending ? "CHỜ DỌN" : "LỖI",
+                detail: cleanupPending
+                    ? $"{ex.Message} Thử lại sau {AutoCloseCleanupRetryDelay.TotalSeconds:0}s."
+                    : ex.Message);
         }
         finally
         {

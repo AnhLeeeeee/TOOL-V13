@@ -602,35 +602,45 @@ public sealed partial class ManagerForm : Form
 
     async Task OpenChromeForProfileAsync(ProfileContext ctx)
     {
+        var autoDiagTrace = BeginAutoDiagnosticOpenChrome(ctx, "manual_open_chrome");
+
         // Mỗi lần mở Chrome mới cho phép đúng một lượt kiểm tra Tên/ảnh mới.
         // Excel DONE vẫn được bỏ qua ngay ở Name Guard nên không phát sinh điều hướng.
         _autoIdentityHandledSession.Remove(ctx.Profile.Name);
         _autoIdentityNextProbeUtc.Remove(ctx.Profile.Name);
+        _nameGuardVerifiedSessionAccount.Remove(ctx.Profile.Name);
         SetStatus(ctx, "Đang mở Chrome của profile này...", Color.DarkOrange);
         var result = await SendCommandAsync(ctx, "launch", TimeSpan.FromSeconds(75));
         if (string.Equals(result, "captcha_required", StringComparison.OrdinalIgnoreCase))
         {
             SetStatus(ctx, "Chrome đã mở — cần xử lý CAPTCHA trên TikTok.", Color.DarkOrange);
             ModernDialog.ShowMessage(this, $"Profile {ctx.Profile.Name} đang gặp CAPTCHA. Hãy xử lý CAPTCHA trực tiếp trên Chrome; tool sẽ chờ và tự tiếp tục khi CAPTCHA biến mất.", "TikTok CAPTCHA", MessageBoxIcon.Warning);
+            FinishAutoDiagnosticOpenChrome(ctx, "manual_open_chrome", autoDiagTrace, "CAPTCHA", $"workerReply={result}");
             return;
         }
         if (string.Equals(result, "totp_required", StringComparison.OrdinalIgnoreCase))
         {
             SetStatus(ctx, "Chrome đã mở — thiếu secret 2FA/TOTP.", Color.DarkOrange);
             ModernDialog.ShowMessage(this, $"Profile {ctx.Profile.Name} cần 2FA nhưng chưa có secret TOTP. Hãy bấm ‘🔐 Tài khoản’ ngay trong profile này để cấu hình.", "TikTok 2FA", MessageBoxIcon.Warning);
+            FinishAutoDiagnosticOpenChrome(ctx, "manual_open_chrome", autoDiagTrace, "TOTP_REQUIRED", $"workerReply={result}");
             return;
         }
         if (string.Equals(result, "login_required", StringComparison.OrdinalIgnoreCase))
         {
             SetStatus(ctx, "Chrome đã mở — chưa cấu hình tự đăng nhập.", Color.DarkOrange);
+            FinishAutoDiagnosticOpenChrome(ctx, "manual_open_chrome", autoDiagTrace, "LOGIN_REQUIRED", $"workerReply={result}");
             return;
         }
         if (!string.Equals(result, "opened", StringComparison.OrdinalIgnoreCase))
+        {
+            FinishAutoDiagnosticOpenChrome(ctx, "manual_open_chrome", autoDiagTrace, "OPEN_FAILED", $"workerReply={result}");
             throw new InvalidOperationException($"Chrome chưa mở/kết nối thành công cho profile “{ctx.Profile.Name}” (worker: {result}).");
+        }
 
         SetStatus(ctx, "Chrome đã kết nối — TikTok trang chủ, chưa vào LIVE.", Color.DarkGreen);
         _log.Info($"[CHROME_OPEN] profile={ctx.Profile.Name} profilePath={ctx.Profile.ProfilePath} port={ctx.Profile.CdpPort}");
         try { await RefreshStatusAsync(ctx); } catch (Exception ex) { _log.Warn($"[{ctx.Profile.Name}] refresh status sau mở Chrome: {ex.Message}"); }
+        FinishAutoDiagnosticOpenChrome(ctx, "manual_open_chrome", autoDiagTrace, "OPENED", $"workerReply={result}");
     }
 
     async Task ViewChromeForProfileAsync(ProfileContext ctx)
@@ -929,6 +939,7 @@ public sealed partial class ManagerForm : Form
         {
             _autoIdentityHandledSession.Remove(ctx.Profile.Name);
             _autoIdentityNextProbeUtc.Remove(ctx.Profile.Name);
+            _nameGuardVerifiedSessionAccount.Remove(ctx.Profile.Name);
             _log.Info($"[NAME_GUARD_CHROME_SESSION_RESET] profile={ctx.Profile.Name}");
         }
         ctx.ConsecutiveStatusPollFailures = 0;

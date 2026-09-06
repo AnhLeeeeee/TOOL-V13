@@ -4,6 +4,15 @@ namespace ToolTikTokManagerV13;
 
 public sealed partial class ManagerForm
 {
+    sealed class AutoCloseCleanupPendingException : InvalidOperationException
+    {
+        public AutoCloseCleanupPendingException(string message)
+            : base(message) { }
+
+        public AutoCloseCleanupPendingException(string message, Exception inner)
+            : base(message, inner) { }
+    }
+
     sealed record AutoCloseProgressWatchState(
         long Rounds,
         int Step,
@@ -143,71 +152,113 @@ public sealed partial class ManagerForm
         profileName = (profileName ?? "").Trim();
         profilePath = (profilePath ?? "").Trim();
 
-        var delaysMs =
-            new[] { 250, 450, 700, 1000, 1400, 1800 };
+        // V13.7.9 HOTFIX:
+        // Chỉ chạy MỘT lượt CIM để xác định chính xác process thuộc ProfilePath.
+        // Bản cũ chạy 6 lượt + final; trên VM WMI/CIM chậm, mỗi lượt timeout 5s
+        // khiến một profile giữ watchdog khoảng 40-45 giây.
+        var probe = await Task.Run(
+            () => ChromeProfileNameSyncService.ProbeProfileProcesses(profilePath));
 
-        string lastProbeError = "";
-
-        for (var attempt = 1; attempt <= delaysMs.Length; attempt++)
+        if (!probe.Succeeded)
         {
-            var probe = await Task.Run(
-                () => ChromeProfileNameSyncService.ProbeProfileProcesses(profilePath));
+            var error = string.IsNullOrWhiteSpace(probe.Error)
+                ? "probe_failed"
+                : probe.Error;
 
-            if (!probe.Succeeded)
+            _log.Warn(
+                $"[AUTO_CLOSE_CHROME_CLEANUP_PENDING] profile={profileName} error={error} action=RETRY_LATER");
+
+            throw new AutoCloseCleanupPendingException(
+                $"Chưa xác minh được Chrome profile {profileName} đã đóng (probe={error}). "
+                + "Chuyển CLEANUP_PENDING để thử lại sau; chưa tạo suất bù.");
+        }
+
+        if (probe.ProcessIds.Count == 0)
+        {
+            _log.Info(
+                $"[AUTO_CLOSE_CHROME_VERIFIED_CLOSED] profile={profileName} processCount=0 probe=single");
+            return;
+        }
+
+        // Probe đã trả đúng PID theo ProfilePath, vì vậy kill trực tiếp các PID đã
+        // được xác minh. Không gọi StopChromeUsingProfile() lần nữa vì hàm đó lại
+        // chạy thêm một vòng PowerShell/CIM.
+        var detectedPids = probe.ProcessIds
+            .Where(pid => pid > 0)
+            .Distinct()
+            .ToArray();
+
+        var killSent = new List<int>();
+
+        foreach (var pid in detectedPids)
+        {
+            try
             {
-                lastProbeError = probe.Error;
-                _log.Warn(
-                    $"[AUTO_CLOSE_CHROME_VERIFY_UNKNOWN] profile={profileName} attempt={attempt}/{delaysMs.Length} error={probe.Error} action=FAIL_CLOSED");
+                using var process = System.Diagnostics.Process.GetProcessById(pid);
+                if (process.HasExited)
+                    continue;
 
-                await Task.Delay(delaysMs[attempt - 1]);
-                continue;
+                process.Kill(entireProcessTree: true);
+                killSent.Add(pid);
             }
+            catch (ArgumentException) { }
+            catch (InvalidOperationException) { }
+            catch (System.ComponentModel.Win32Exception ex)
+            {
+                _log.Warn(
+                    $"[AUTO_CLOSE_CHROME_FORCE_WARN] profile={profileName} pid={pid} error={ex.Message}");
+            }
+        }
 
-            if (probe.ProcessIds.Count == 0)
+        _log.Warn(
+            $"[AUTO_CLOSE_CHROME_FORCE_KNOWN_PIDS] profile={profileName} detected={string.Join(",", detectedPids)} killSent={string.Join(",", killSent)}");
+
+        static bool IsPidAlive(int pid)
+        {
+            try
+            {
+                using var process = System.Diagnostics.Process.GetProcessById(pid);
+                return !process.HasExited;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        var deadlineUtc = DateTime.UtcNow.AddSeconds(2.5);
+        int[] remaining;
+
+        do
+        {
+            remaining = detectedPids
+                .Where(IsPidAlive)
+                .ToArray();
+
+            if (remaining.Length == 0)
             {
                 _log.Info(
-                    $"[AUTO_CLOSE_CHROME_VERIFIED_CLOSED] profile={profileName} attempt={attempt}/{delaysMs.Length} processCount=0");
+                    $"[AUTO_CLOSE_CHROME_VERIFIED_CLOSED] profile={profileName} processCount=0 method=known_pid_kill");
                 return;
             }
 
-            IReadOnlyList<int> stoppedPids = Array.Empty<int>();
-
-            try
-            {
-                stoppedPids = await Task.Run(
-                    () => ChromeProfileNameSyncService.StopChromeUsingProfile(profilePath));
-            }
-            catch (Exception ex)
-            {
-                _log.Warn(
-                    $"[AUTO_CLOSE_CHROME_FORCE_WARN] profile={profileName} attempt={attempt}/{delaysMs.Length} error={ex.Message}");
-            }
-
-            _log.Warn(
-                $"[AUTO_CLOSE_CHROME_FORCE] profile={profileName} attempt={attempt}/{delaysMs.Length} detected={string.Join(",", probe.ProcessIds)} stopped={string.Join(",", stoppedPids)}");
-
-            await Task.Delay(delaysMs[attempt - 1]);
+            await Task.Delay(150);
         }
+        while (DateTime.UtcNow < deadlineUtc);
 
-        var finalProbe = await Task.Run(
-            () => ChromeProfileNameSyncService.ProbeProfileProcesses(profilePath));
+        remaining = detectedPids
+            .Where(IsPidAlive)
+            .ToArray();
 
-        if (!finalProbe.Succeeded)
+        if (remaining.Length > 0)
         {
-            throw new InvalidOperationException(
-                $"Không xác minh được Chrome profile {profileName} đã đóng (probe={(finalProbe.Error.Length > 0 ? finalProbe.Error : lastProbeError)}). "
-                + "Cleanup Barrier chặn Tự bù để tránh mở thêm Chrome.");
-        }
-
-        if (finalProbe.ProcessIds.Count > 0)
-        {
-            throw new InvalidOperationException(
-                $"Chrome profile {profileName} vẫn còn process [{string.Join(",", finalProbe.ProcessIds)}]. "
-                + "Cleanup Barrier chặn Tự bù để tránh tích tụ Chrome.");
+            throw new AutoCloseCleanupPendingException(
+                $"Chrome profile {profileName} vẫn còn process [{string.Join(",", remaining)}] sau force-kill. "
+                + "Chuyển CLEANUP_PENDING; chưa tạo suất bù.");
         }
 
         _log.Info(
-            $"[AUTO_CLOSE_CHROME_VERIFIED_CLOSED] profile={profileName} attempt=final processCount=0");
+            $"[AUTO_CLOSE_CHROME_VERIFIED_CLOSED] profile={profileName} processCount=0 method=known_pid_kill_final");
     }
 
     bool IsAutoCloseRuntimeStillPresent(

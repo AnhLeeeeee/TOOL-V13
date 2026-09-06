@@ -13,9 +13,60 @@ public sealed partial class ManagerForm
         public string CurrentHandle { get; set; } = "";
         public string Source { get; set; } = "";
         public string Message { get; set; } = "";
+        public bool Transient { get; set; }
     }
 
-    sealed record NameGuardResult(bool Allowed, string Message, bool ChangedName = false);
+    sealed record NameGuardResult(
+        bool Allowed,
+        string Message,
+        bool ChangedName = false,
+        bool Transient = false);
+
+    static readonly TimeSpan NameGuardTransientRetryDelay = TimeSpan.FromSeconds(15);
+
+    // Phân biệt "đã xử lý trong phiên" với "đã xác minh tên đúng".
+    // _autoIdentityHandledSession còn được dùng để khóa loop sau FAIL, nên tuyệt đối
+    // không thể dùng nó làm bằng chứng tên đã đúng khi Start.
+    readonly Dictionary<string, string> _nameGuardVerifiedSessionAccount = new(StringComparer.OrdinalIgnoreCase);
+
+    void MarkNameGuardVerifiedForCurrentChromeSession(ProfileContext ctx, string username)
+    {
+        username = (username ?? "").Trim();
+        if (username.Length > 0)
+            _nameGuardVerifiedSessionAccount[ctx.Profile.Name] = username;
+
+        _autoIdentityHandledSession.Add(ctx.Profile.Name);
+        if (username.Length > 0)
+            _autoIdentityHandledSession.Add("account:" + username.ToLowerInvariant());
+        _autoIdentityNextProbeUtc.Remove(ctx.Profile.Name);
+    }
+
+    NameGuardResult RegisterNameGuardPersistenceWarning(
+        ProfileContext ctx,
+        string username,
+        string operation,
+        string error,
+        bool changedName = false)
+    {
+        MarkNameGuardVerifiedForCurrentChromeSession(ctx, username);
+
+        var message = operation + " nhưng không lưu được Tên/ảnh=DONE vào Excel: " + error;
+        _log.Warn(
+            $"[NAME_GUARD_PERSIST_WARNING] profile={ctx.Profile.Name} account={username} " +
+            $"operation={operation} action=ALLOW_KEEP_OPEN error={error}");
+
+        WriteAutoDiagnosticEvent(
+            ctx,
+            "name_guard_persist",
+            "NAME_GUARD_PERSIST_WARNING",
+            "ALLOW_KEEP_OPEN",
+            $"account={username}; operation={operation}; error={error}");
+
+        // Excel chỉ là persistence/cache trạng thái. Khi tên thực tế đã được xác minh
+        // đúng (hoặc TikTok đã Save/Confirm đổi thành công), lỗi ghi Excel không được
+        // phép biến một tài khoản tốt thành FAIL hay kích hoạt cleanup.
+        return new NameGuardResult(true, message, ChangedName: changedName);
+    }
 
     async Task<string> StartWithNameGuardAsync(
         ProfileContext ctx,
@@ -51,6 +102,17 @@ public sealed partial class ManagerForm
         var username = account.Username;
         if (username.Length == 0)
             return new NameGuardResult(false, "Không xác định được tài khoản đang gán cho profile.");
+
+        // Nếu chính phiên Chrome hiện tại đã xác minh tên đúng thì Start phải đi tiếp
+        // ngay cả khi Excel nguồn đang mất/khóa. Chỉ tin cache này khi Chrome hiện vẫn
+        // CONNECTED và đúng cùng username, tránh mang kết quả sang phiên/account khác.
+        if (string.Equals(ctx.LastSnapshot?.Chrome, "CONNECTED", StringComparison.OrdinalIgnoreCase)
+            && _nameGuardVerifiedSessionAccount.TryGetValue(ctx.Profile.Name, out var verifiedUsername)
+            && verifiedUsername.Equals(username, StringComparison.OrdinalIgnoreCase))
+        {
+            _log.Info($"[NAME_GUARD_SKIP_SESSION_VERIFIED] profile={ctx.Profile.Name} account={username}");
+            return new NameGuardResult(true, "Tên đã được xác minh đúng trong phiên Chrome hiện tại.");
+        }
 
         // DONE trong Excel là nguồn bỏ qua nhanh: không mở trang Hồ sơ, không kiểm tra tên.
         try
@@ -108,17 +170,23 @@ public sealed partial class ManagerForm
 
             if (!string.Equals(ctx.LastSnapshot?.Chrome, "CONNECTED", StringComparison.OrdinalIgnoreCase))
             {
-                await FailNameGuardAndCloseAsync(ctx, username, "Chrome chưa kết nối.");
-                return new NameGuardResult(false, "Chrome chưa kết nối.");
+                return RegisterNameGuardTransientFailure(
+                    ctx,
+                    username,
+                    "Chrome chưa kết nối.",
+                    "chrome_not_connected_before_probe");
             }
 
             return await ProcessNameGuardOnceAsync(ctx, username, state, names);
         }
         catch (Exception ex)
         {
-            await FailNameGuardAndCloseAsync(ctx, username, ex.Message);
-            _log.Warn($"[NAME_GUARD_ERROR] profile={ctx.Profile.Name} account={username} {ex.Message}");
-            return new NameGuardResult(false, ex.Message);
+            return RegisterNameGuardTransientFailure(
+                ctx,
+                username,
+                ex.Message,
+                "ensure_before_start_exception",
+                ex);
         }
         finally
         {
@@ -142,24 +210,35 @@ public sealed partial class ManagerForm
             var reason = string.IsNullOrWhiteSpace(probe.Message)
                 ? "Không đọc được tên trên trang Hồ sơ TikTok."
                 : probe.Message;
-            await FailNameGuardAndCloseAsync(ctx, username, reason);
-            return new NameGuardResult(false, reason);
+
+            // Probe chỉ là bước ĐỌC. Không đọc được tên, IPC rỗng, JSON lỗi,
+            // Worker vừa thoát, CDP/DOM tạm lỗi... đều là lỗi kỹ thuật. Tuyệt đối
+            // không được biến lỗi này thành Tên/ảnh=FAIL rồi đóng Chrome/Worker.
+            return RegisterNameGuardTransientFailure(
+                ctx,
+                username,
+                reason,
+                string.IsNullOrWhiteSpace(probe.Source)
+                    ? "profile_name_probe_failed"
+                    : "profile_name_probe_failed:" + probe.Source);
         }
 
-        // 2) Tên trùng BẤT KỲ tên mẫu => coi là đúng, ghi DONE rồi cho chạy.
+        // 2) Tên trùng BẤT KỲ tên mẫu => bằng chứng thực tế đã đủ để cho chạy.
+        // Ghi Excel DONE chỉ là persistence; ghi lỗi KHÔNG được đóng Chrome/Worker.
         if (probe.Matched)
         {
+            MarkNameGuardVerifiedForCurrentChromeSession(ctx, username);
+
             var done = await MarkIdentityDoneVerifiedAsync(username, ctx.Profile.Name, CancellationToken.None);
             if (!done.Ok)
             {
-                var reason = "Tên đúng nhưng không ghi được Tên/ảnh=DONE: " + done.Error;
-                await FailNameGuardAndCloseAsync(ctx, username, reason);
-                return new NameGuardResult(false, reason);
+                return RegisterNameGuardPersistenceWarning(
+                    ctx,
+                    username,
+                    "Tên hiện tại đã đúng mẫu",
+                    done.Error);
             }
 
-            _autoIdentityHandledSession.Add(ctx.Profile.Name);
-            _autoIdentityHandledSession.Add("account:" + username.ToLowerInvariant());
-            _autoIdentityNextProbeUtc.Remove(ctx.Profile.Name);
             _log.Info($"[NAME_GUARD_NAME_OK] profile={ctx.Profile.Name} account={username} currentName={probe.CurrentName} source={probe.Source}");
             return new NameGuardResult(true, "Tên hiện tại đúng mẫu.");
         }
@@ -196,23 +275,27 @@ public sealed partial class ManagerForm
             return new NameGuardResult(false, reason);
         }
 
-        var excelDone = await MarkIdentityDoneVerifiedAsync(username, ctx.Profile.Name, CancellationToken.None);
-        if (!excelDone.Ok)
-        {
-            var reason = "Đổi Tên/ảnh thành công nhưng không ghi được Tên/ảnh=DONE: " + excelDone.Error;
-            await FailNameGuardAndCloseAsync(ctx, username, reason);
-            return new NameGuardResult(false, reason);
-        }
-
+        // TikTok đã Save/Confirm thành công: cập nhật state local trước. Excel DONE lỗi
+        // không được làm mất kết quả avatar vừa đổi hoặc biến lượt này thành FAIL.
         if (reply.AvatarChanged && !string.IsNullOrWhiteSpace(avatarPath))
         {
             state.LastAvatarByProfile[ctx.Profile.Name] = avatarPath;
             SaveIdentityToolState(state);
         }
 
-        _autoIdentityHandledSession.Add(ctx.Profile.Name);
-        _autoIdentityHandledSession.Add("account:" + username.ToLowerInvariant());
-        _autoIdentityNextProbeUtc.Remove(ctx.Profile.Name);
+        MarkNameGuardVerifiedForCurrentChromeSession(ctx, username);
+
+        var excelDone = await MarkIdentityDoneVerifiedAsync(username, ctx.Profile.Name, CancellationToken.None);
+        if (!excelDone.Ok)
+        {
+            return RegisterNameGuardPersistenceWarning(
+                ctx,
+                username,
+                "Đổi Tên/ảnh đã Save/Confirm thành công",
+                excelDone.Error,
+                changedName: reply.NameChanged);
+        }
+
         _log.Info($"[NAME_GUARD_UPDATE_DONE_NO_RECHECK] profile={ctx.Profile.Name} account={username} target={targetName} nameChanged={reply.NameChanged} avatarChanged={reply.AvatarChanged}");
         return new NameGuardResult(true, "Đổi Tên/ảnh thành công.", ChangedName: reply.NameChanged);
     }
@@ -262,16 +345,106 @@ public sealed partial class ManagerForm
                 ctx,
                 "identity_name_probe|" + payload,
                 TimeSpan.FromSeconds(10));
-            return JsonSerializer.Deserialize<NameGuardProbeReply>(
-                       raw,
-                       new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
-                   ?? new NameGuardProbeReply { Ok = false, Message = "Worker trả kết quả Name Guard không hợp lệ." };
+
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                _log.Warn($"[NAME_GUARD_PROFILE_PROBE_EMPTY] profile={ctx.Profile.Name} account={username} workerAlive={IsNameGuardWorkerAlive(ctx)}");
+                return new NameGuardProbeReply
+                {
+                    Ok = false,
+                    Transient = true,
+                    Source = "ipc_empty_response",
+                    Message = "Worker không trả dữ liệu Name Guard (IPC response rỗng)."
+                };
+            }
+
+            try
+            {
+                var reply = JsonSerializer.Deserialize<NameGuardProbeReply>(
+                    raw,
+                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+
+                if (reply is null)
+                {
+                    return new NameGuardProbeReply
+                    {
+                        Ok = false,
+                        Transient = true,
+                        Source = "ipc_null_json",
+                        Message = "Worker trả kết quả Name Guard không hợp lệ."
+                    };
+                }
+
+                // Một response JSON hợp lệ nhưng ok=false ở bước PROBE vẫn chỉ có
+                // nghĩa là chưa đọc được tên. Đây không phải bằng chứng tên sai.
+                if (!reply.Ok)
+                    reply.Transient = true;
+
+                return reply;
+            }
+            catch (JsonException ex)
+            {
+                _log.Warn($"[NAME_GUARD_PROFILE_PROBE_JSON_INVALID] profile={ctx.Profile.Name} account={username} rawLength={raw.Length} {ex.Message}");
+                return new NameGuardProbeReply
+                {
+                    Ok = false,
+                    Transient = true,
+                    Source = "ipc_invalid_json",
+                    Message = "Worker trả dữ liệu Name Guard không phải JSON hợp lệ: " + ex.Message
+                };
+            }
         }
         catch (Exception ex)
         {
-            _log.Warn($"[NAME_GUARD_PROFILE_PROBE_FAILED] profile={ctx.Profile.Name} account={username} {ex.Message}");
-            return new NameGuardProbeReply { Ok = false, Message = ex.Message };
+            _log.Warn($"[NAME_GUARD_PROFILE_PROBE_FAILED] profile={ctx.Profile.Name} account={username} workerAlive={IsNameGuardWorkerAlive(ctx)} {ex.Message}");
+            return new NameGuardProbeReply
+            {
+                Ok = false,
+                Transient = true,
+                Source = "ipc_or_worker_exception",
+                Message = ex.Message
+            };
         }
+    }
+
+    bool IsNameGuardWorkerAlive(ProfileContext ctx)
+    {
+        try { return ctx.Worker is not null && !ctx.Worker.HasExited; }
+        catch { return false; }
+    }
+
+    NameGuardResult RegisterNameGuardTransientFailure(
+        ProfileContext ctx,
+        string username,
+        string reason,
+        string stage,
+        Exception? exception = null)
+    {
+        reason = string.IsNullOrWhiteSpace(reason)
+            ? "Lỗi kỹ thuật tạm thời khi kiểm tra Tên/ảnh."
+            : reason.Trim();
+
+        var retryUtc = DateTime.UtcNow.Add(NameGuardTransientRetryDelay);
+
+        // Không đánh dấu handled vĩnh viễn: AutoOnReady được phép thử lại sau
+        // khoảng nghỉ. Đồng thời KHÔNG ghi Excel FAIL và KHÔNG cleanup Chrome/Worker.
+        _autoIdentityHandledSession.Remove(ctx.Profile.Name);
+        _autoIdentityNextProbeUtc[ctx.Profile.Name] = retryUtc;
+
+        var workerAlive = IsNameGuardWorkerAlive(ctx);
+        _log.Warn(
+            $"[NAME_GUARD_TRANSIENT_KEEP_OPEN] profile={ctx.Profile.Name} account={username} " +
+            $"stage={stage} workerAlive={workerAlive} retryAt={retryUtc:O} reason={reason}" +
+            (exception is null ? "" : $" exception={exception.GetType().Name}"));
+
+        WriteAutoDiagnosticEvent(
+            ctx,
+            "name_guard_transient",
+            "NAME_GUARD_TRANSIENT",
+            "KEEP_OPEN_RETRY",
+            $"account={username}; stage={stage}; workerAlive={workerAlive}; retryAt={retryUtc:O}; reason={reason}");
+
+        return new NameGuardResult(false, reason, Transient: true);
     }
 
     string ChooseNameGuardTargetName(
@@ -331,6 +504,15 @@ public sealed partial class ManagerForm
 
     async Task FailNameGuardAndCloseAsync(ProfileContext ctx, string username, string reason)
     {
+        _nameGuardVerifiedSessionAccount.Remove(ctx.Profile.Name);
+
+        WriteAutoDiagnosticEvent(
+            ctx,
+            "name_guard",
+            "NAME_GUARD_FAIL",
+            "CLOSE_REQUEST",
+            $"account={username}; reason={reason}");
+
         await TrySetNameGuardExcelStatusAsync(username, "FAIL", ctx.Profile.Name);
 
         // Một lần mở Chrome chỉ xử lý Name Guard một lượt. Đánh dấu handled trước khi
@@ -362,12 +544,24 @@ public sealed partial class ManagerForm
                 RemoveTab(ctx);
 
             _log.Info($"[NAME_GUARD_FAIL_CLEANUP_DONE] profile={ctx.Profile.Name} chrome=closed worker=closed tab=removed");
+            WriteAutoDiagnosticEvent(
+                ctx,
+                "name_guard",
+                "NAME_GUARD_FAIL",
+                "CLOSED",
+                $"account={username}; reason={reason}");
         }
         catch (Exception ex)
         {
             // Không gỡ tab nếu Worker chưa được xác minh là đã chết. Như vậy UI vẫn
             // phản ánh đúng trạng thái và người dùng còn có thể xử lý thủ công.
             _log.Error($"[NAME_GUARD_FAIL_WORKER_CLOSE_ERROR] profile={ctx.Profile.Name} error={ex}");
+            WriteAutoDiagnosticEvent(
+                ctx,
+                "name_guard",
+                "NAME_GUARD_FAIL",
+                "CLOSE_ERROR",
+                $"account={username}; exception={ex.GetType().Name}; message={ex.Message}");
         }
     }
 

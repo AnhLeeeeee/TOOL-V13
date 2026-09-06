@@ -981,6 +981,9 @@ public sealed partial class ManagerForm
                 if (snapshot.MessageReplyRunning || _messageReplyProfilesInFlight.Contains(candidate.Profile.Name)) return false;
                 if (!string.Equals(snapshot.TikTokStartupState, "READY", StringComparison.OrdinalIgnoreCase)) return false;
                 if (_autoIdentityHandledSession.Contains(candidate.Profile.Name)) return false;
+                if (_autoIdentityNextProbeUtc.TryGetValue(candidate.Profile.Name, out var nextProbeUtc)
+                    && DateTime.UtcNow < nextProbeUtc)
+                    return false;
                 return true;
             });
 
@@ -1032,8 +1035,16 @@ public sealed partial class ManagerForm
             var result = await ProcessNameGuardOnceAsync(ctx, username, state, names);
             if (!result.Allowed)
             {
-                // ProcessNameGuardOnceAsync đã ghi FAIL + đóng Chrome + đánh dấu handled
-                // cho phiên Chrome hiện tại. Không có retry 20 giây nữa.
+                if (result.Transient)
+                {
+                    // Lỗi kỹ thuật ở bước đọc tên/IPC: giữ nguyên Chrome/Worker.
+                    // Scheduler đã được hẹn retry, không được ghi FAIL/cleanup.
+                    _log.Warn($"[AUTO_IDENTITY_ONE_SHOT_TRANSIENT] profile={ctx.Profile.Name} account={username} reason={result.Message}");
+                    return;
+                }
+
+                // Lỗi nghiệp vụ đã được ProcessNameGuardOnceAsync xử lý theo policy
+                // hiện có (ví dụ đổi tên thật sự thất bại/cooldown).
                 _log.Warn($"[AUTO_IDENTITY_ONE_SHOT_FAIL] profile={ctx.Profile.Name} account={username} reason={result.Message}");
                 return;
             }
@@ -1043,16 +1054,23 @@ public sealed partial class ManagerForm
         }
         catch (Exception ex)
         {
-            _autoIdentityHandledSession.Add(ctx.Profile.Name);
-            _autoIdentityNextProbeUtc.Remove(ctx.Profile.Name);
-            _log.Warn($"[AUTO_IDENTITY_ONE_SHOT_ERROR] profile={ctx.Profile.Name} {ex.Message}");
+            var username = "";
             try
             {
                 var account = await ResolveNameGuardAccountAsync(ctx);
-                if (!string.IsNullOrWhiteSpace(account.Username))
-                    await FailNameGuardAndCloseAsync(ctx, account.Username, ex.Message);
+                username = account.Username;
             }
             catch { }
+
+            // Exception ngoài dự kiến ở AutoOnReady là lỗi kỹ thuật. Không được
+            // dùng FailNameGuardAndCloseAsync vì như vậy một lỗi IPC/JSON sẽ biến
+            // thành Tên/ảnh=FAIL và tự đóng Chrome + Worker.
+            RegisterNameGuardTransientFailure(
+                ctx,
+                username,
+                ex.Message,
+                "auto_on_ready_exception",
+                ex);
         }
         finally
         {

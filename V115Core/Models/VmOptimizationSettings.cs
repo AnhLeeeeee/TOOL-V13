@@ -1,4 +1,4 @@
-namespace ToolTikTokV11.Models;
+﻿namespace ToolTikTokV11.Models;
 
 public enum VmOptimizationMode
 {
@@ -20,8 +20,11 @@ public sealed class VmOptimizationSettings
     public bool PauseVideo => Mode != VmOptimizationMode.Normal;
     public bool SuppressDetailedPerfLogs => Mode != VmOptimizationMode.Normal;
     public bool DisableCssAnimations => Mode == VmOptimizationMode.VmMax;
-    public bool BlockCommonMedia => Mode == VmOptimizationMode.VmMax;
-    public bool AllowChromeBackgroundThrottling => Mode == VmOptimizationMode.VmMax;
+    // V13.8.3 VM longevity: cả VM Safe và VM Max đều chặn luồng video phổ biến
+    // và để Chrome tự throttle khi cửa sổ/tab nằm nền. Workflow/CDP/XPath vẫn chạy
+    // từ Worker; chỉ workload nền của trang được phép giảm CPU.
+    public bool BlockCommonMedia => Mode != VmOptimizationMode.Normal;
+    public bool AllowChromeBackgroundThrottling => Mode != VmOptimizationMode.Normal;
 
     public int WorkerUiRefreshMs => Mode switch
     {

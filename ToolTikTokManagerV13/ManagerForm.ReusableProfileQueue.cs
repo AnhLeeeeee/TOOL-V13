@@ -183,6 +183,16 @@ public sealed partial class ManagerForm
                 new Dictionary<string, string>(
                     StringComparer.OrdinalIgnoreCase);
 
+            // Snapshot supply-state một lần cho cả lượt quét. Tránh đọc JSON từ đĩa
+            // lặp lại theo từng profile khi VM đang chạy nhiều Chrome.
+            ProfileSupplyStateDocument supplyStateSnapshot;
+            lock (_profileSupplyStateLock)
+            {
+                supplyStateSnapshot = LoadProfileSupplyStateDocumentUnsafe();
+            }
+
+            var refreshUtc = DateTime.UtcNow;
+
             foreach (var profile in catalog.Profiles)
             {
                 ct.ThrowIfCancellationRequested();
@@ -261,8 +271,23 @@ public sealed partial class ManagerForm
                     continue;
                 }
 
-                // retired và FailedProfiles KHÔNG còn là điều kiện khóa ngầm.
-                // Một profile tự quét chỉ cần thỏa đúng các điều kiện nhìn thấy bên dưới.
+                // Queue TỰ ĐỘNG không được lấy lại profile vừa bị AutoClose loại/retired.
+                // Nếu người dùng thật sự muốn dùng lại thì nút thêm THỦ CÔNG ở dưới vẫn
+                // có quyền override retired một cách có chủ đích.
+                supplyStateSnapshot.Profiles.TryGetValue(profileName, out var supplyState);
+                var retired =
+                    _autoReplacementRetiredProfiles.Contains(profileName)
+                    || (supplyState is not null
+                        && (supplyState.State ?? "").Trim().Equals(
+                            "retired",
+                            StringComparison.OrdinalIgnoreCase));
+
+                if (retired)
+                {
+                    reasons[profileName] = "RETIRED · CHỈ DÙNG LẠI THỦ CÔNG";
+                    continue;
+                }
+
                 if (excludedProfiles.Contains(profileName))
                 {
                     reasons[profileName] = "ĐÃ BỎ CHỜ";
@@ -288,11 +313,30 @@ public sealed partial class ManagerForm
                     continue;
                 }
 
-                var wasFailed = failedProfiles.Remove(profileName);
-                reasons[profileName] =
-                    wasFailed
-                        ? "ĐỦ ĐIỀU KIỆN · THỬ LẠI"
-                        : "ĐỦ ĐIỀU KIỆN";
+                // Profile bù vừa lỗi phải có cooldown thật. Giữ FailedProfiles trong
+                // toàn bộ cửa sổ cooldown để restart Manager cũng không làm mất hàng rào.
+                if (failedProfiles.TryGetValue(profileName, out var failedEntry))
+                {
+                    var failedUntilUtc = failedEntry.FailedUtc + AutoReplacementFailedProfileCooldown;
+                    if (refreshUtc < failedUntilUtc)
+                    {
+                        var remain = failedUntilUtc - refreshUtc;
+                        reasons[profileName] =
+                            $"COOLDOWN SAU LỖI · CÒN {Math.Max(1, (int)Math.Ceiling(remain.TotalMinutes))}P";
+                        continue;
+                    }
+
+                    failedProfiles.Remove(profileName);
+                }
+
+                // Đồng thời kiểm tra cooldown runtime để chặn race giữa hai lượt refresh.
+                if (IsReplacementProfileCoolingDown(profileName))
+                {
+                    reasons[profileName] = "COOLDOWN SAU LỖI";
+                    continue;
+                }
+
+                reasons[profileName] = "ĐỦ ĐIỀU KIỆN";
 
                 eligible.Add(
                     new ReusableProfileQueueEntry
@@ -748,6 +792,36 @@ public sealed partial class ManagerForm
             if (_autoReplacementClaimedProfiles.Contains(profileName))
                 continue;
 
+            // Re-check ngay trước khi mở vì candidates là snapshot. Không cho profile
+            // auto vừa bị retired/cooldown lọt qua do state thay đổi sau refresh.
+            if (!candidate.IsManual)
+            {
+                var supplyState = GetProfileSupplyState(profileName);
+                var retired =
+                    _autoReplacementRetiredProfiles.Contains(profileName)
+                    || (supplyState is not null
+                        && (supplyState.State ?? "").Trim().Equals(
+                            "retired",
+                            StringComparison.OrdinalIgnoreCase));
+
+                if (retired)
+                {
+                    RemoveReusableProfileQueueEntry(
+                        profileName,
+                        "retired_before_open");
+                    _log.Info(
+                        $"[REUSE_QUEUE_SKIP_RETIRED] closed={request.ClosedProfileName} profile={profileName}");
+                    continue;
+                }
+
+                if (IsReplacementProfileCoolingDown(profileName))
+                {
+                    _log.Info(
+                        $"[REUSE_QUEUE_SKIP_COOLDOWN] closed={request.ClosedProfileName} profile={profileName}");
+                    continue;
+                }
+            }
+
             if (!_contexts.TryGetValue(profileName, out var ctx))
             {
                 RemoveReusableProfileQueueEntry(
@@ -815,9 +889,13 @@ public sealed partial class ManagerForm
                         || ctx.Worker.HasExited))
                 {
                     await MarkReusableProfileFailedAsync(
+                        request,
                         candidate,
                         "open_worker");
 
+                    // Dù Worker không mở được vẫn phải dọn tab/Chrome mồ côi nếu có.
+                    // Cleanup fail sẽ ném barrier và tuyệt đối không sang candidate khác.
+                    await CloseFailedReplacementRuntimeAsync(ctx);
                     continue;
                 }
 
@@ -834,6 +912,7 @@ public sealed partial class ManagerForm
                         StringComparison.OrdinalIgnoreCase))
                 {
                     await MarkReusableProfileFailedAsync(
+                        request,
                         candidate,
                         "start:" + reply);
 
@@ -850,6 +929,7 @@ public sealed partial class ManagerForm
                 if (!healthy)
                 {
                     await MarkReusableProfileFailedAsync(
+                        request,
                         candidate,
                         "started_but_not_healthy");
 
@@ -899,17 +979,29 @@ public sealed partial class ManagerForm
             catch (Exception ex)
             {
                 await MarkReusableProfileFailedAsync(
+                    request,
                     candidate,
                     "exception:" + ex.Message);
 
                 _log.Warn(
                     $"[REUSE_QUEUE_OPEN_ERROR] profile={profileName} error={ex.Message}");
 
+                // Nếu cleanup vừa fail thì đây là barrier thật: không được nuốt lỗi
+                // rồi foreach sang candidate kế tiếp.
+                if (ex is AutoReplacementCleanupBarrierException)
+                    throw;
+
                 try
                 {
                     await CloseFailedReplacementRuntimeAsync(ctx);
                 }
-                catch { }
+                catch (AutoReplacementCleanupBarrierException cleanupEx)
+                {
+                    throw new AutoReplacementCleanupBarrierException(
+                        profileName,
+                        $"Profile bù {profileName} lỗi và cleanup chưa hoàn tất; chặn mở profile bù kế tiếp.",
+                        cleanupEx);
+                }
             }
             finally
             {
@@ -921,6 +1013,7 @@ public sealed partial class ManagerForm
     }
 
     async Task MarkReusableProfileFailedAsync(
+        AutoReplacementRequest request,
         ReusableProfileQueueEntry candidate,
         string reason)
     {
@@ -975,11 +1068,13 @@ public sealed partial class ManagerForm
 
         WriteAutoActivityLog(
             action: "MỞ PROFILE BÙ",
+            profile: request.ClosedProfileName,
             account: candidate.Username,
+            reason: request.Reason,
             replacementProfile: profileName,
             result: "LỖI",
             detail:
-                $"Profile dùng lại thất bại: {reason}. Lượt quét sau sẽ tự đánh giá lại; nếu profile vẫn đủ điều kiện thì được đưa lại vào queue.");
+                $"Profile dùng lại thất bại: {reason}. Đã vào cooldown {AutoReplacementFailedProfileCooldown.TotalMinutes:0} phút; nếu cleanup sạch và hết cooldown thì lượt bù sau mới được đánh giá lại.");
     }
 
     void RemoveReusableProfileQueueEntry(

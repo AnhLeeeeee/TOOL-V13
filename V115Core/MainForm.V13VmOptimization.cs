@@ -69,8 +69,8 @@ public sealed partial class MainForm
         {
             AutoSize = true,
             MaximumSize = new Size(1000, 0),
-            Text = "VM Safe: giảm refresh UI/log và pause video bằng DOM; vẫn giữ các cờ chống Chrome background throttling để workflow phản hồi như trước.\n" +
-                   "VM Max: thêm block các media URL phổ biến, tắt animation CSS và cho Chrome background throttling hoạt động trở lại. Đây là mức tiết kiệm mạnh, nên test trên từng VM.\n" +
+            Text = "VM Safe: giảm refresh UI/log, pause video, block luồng video phổ biến và cho Chrome background throttling hoạt động để giảm CPU khi treo nhiều profile.\n" +
+                   "VM Max: như VM Safe, đồng thời tắt animation CSS và giảm tần suất UI/log mạnh hơn.\n" +
                    "Không thay đổi XPath, delay nghiệp vụ, Viewer, InputGuard, Live cũ, F5 hoặc flow chuyển LIVE."
         });
 
@@ -117,8 +117,8 @@ public sealed partial class MainForm
         };
         _vmModeSummary.Text = mode switch
         {
-            VmOptimizationMode.VmSafe => "VM Safe: UI nền 2s, log UI 250ms, ẩn log PERF/CDP chi tiết, pause video liên tục. Không bật background throttling.",
-            VmOptimizationMode.VmMax => "VM Max: UI nền 5s, log UI 750ms, pause video, tắt animation, block media phổ biến và bật lại background throttling của Chrome.",
+            VmOptimizationMode.VmSafe => "VM Safe: UI nền 2s, log UI 250ms, pause video, block video/segment phổ biến và cho Chrome background throttling để giảm CPU khi chạy lâu.",
+            VmOptimizationMode.VmMax => "VM Max: như VM Safe, thêm tắt animation và giảm tần suất UI/log mạnh hơn.",
             _ => "Bình thường: giữ hành vi Chrome/UI đầy đủ như chế độ thường và ghi đầy đủ log chẩn đoán."
         };
     }
