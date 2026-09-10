@@ -28,6 +28,11 @@ public sealed partial class ManagerForm
         }
     }
 
+    sealed class AutoProfileLoginBanException : Exception
+    {
+        public AutoProfileLoginBanException(string message) : base(message) { }
+    }
+
     readonly SemaphoreSlim _autoProfileQueueGate = new(1, 1);
     Form? _autoProfileDialog;
 
@@ -76,6 +81,7 @@ public sealed partial class ManagerForm
                 initialStates,
                 initialIdentityDone,
                 initialStartName,
+                resumeIncomplete: true,
                 retryPaused: false,
                 out _));
 
@@ -172,35 +178,52 @@ public sealed partial class ManagerForm
         var resumeIncomplete = new CheckBox
         {
             Text = $"Tiếp tục profile tạo dở ({initialResume})",
-            Checked = true,
+            Checked = false,
             AutoSize = true,
             Margin = new Padding(0, 8, 14, 0)
         };
         var retryPaused = new CheckBox
         {
             Text = "Thử lại CAPTCHA / lỗi cần xử lý",
-            Checked = false,
+            Checked = true,
             AutoSize = true,
             Margin = new Padding(0, 8, 14, 0)
         };
 
         void RefreshResumeEstimate()
         {
-            var estimated = initialAccounts.Count(x =>
+            // Hai checkbox là hai lane độc lập:
+            // - resumeIncomplete chỉ đếm PROCESSING/non-final thật sự.
+            // - retryPaused chỉ đếm CAPTCHA/FAIL/lỗi cần xử lý.
+            // Profile đang RUNNING/RECOVERING/PAUSED trong Manager không thuộc
+            // "tạo dở", kể cả Excel còn sót PROCESSING.
+            var incompleteEstimated = initialAccounts.Count(x =>
                 ShouldResumeAutoProfileAccount(
                     x,
                     initialStates,
                     initialIdentityDone,
                     nextProfile.Text.Trim(),
-                    retryPaused.Checked,
+                    resumeIncomplete: true,
+                    retryPaused: false,
+                    out _));
+
+            var retryEstimated = initialAccounts.Count(x =>
+                ShouldResumeAutoProfileAccount(
+                    x,
+                    initialStates,
+                    initialIdentityDone,
+                    nextProfile.Text.Trim(),
+                    resumeIncomplete: false,
+                    retryPaused: true,
                     out _));
 
             resumeIncomplete.Text =
-                $"Tiếp tục profile tạo dở hợp lệ ({estimated})";
+                $"Tiếp tục profile tạo dở hợp lệ ({incompleteEstimated})";
+            retryPaused.Text =
+                $"Thử lại CAPTCHA / lỗi cần xử lý ({retryEstimated})";
         }
 
         nextProfile.TextChanged += (_, _) => RefreshResumeEstimate();
-        retryPaused.CheckedChanged += (_, _) => RefreshResumeEstimate();
         RefreshResumeEstimate();
 
         var autoRename = new CheckBox
@@ -227,7 +250,7 @@ public sealed partial class ManagerForm
         };
         var vmHint = new Label
         {
-            Text = "VM chậm: chạy tuần tự 1 profile. FAIL cũ có Tên/ảnh DONE sẽ tự phục hồi; CAPTCHA/cooldown/config chỉ thử lại khi bạn bật tùy chọn.",
+            Text = "Số profile mới = mục tiêu THÀNH CÔNG. BAN/lỗi/CAPTCHA không tính quota; tool tiếp tục account kế tiếp đến khi đủ mục tiêu hoặc hết kho. VM chậm vẫn chạy tuần tự 1 profile.",
             AutoSize = true,
             MaximumSize = new Size(780, 0),
             ForeColor = Color.DimGray,
@@ -236,7 +259,7 @@ public sealed partial class ManagerForm
 
         config.Controls.Add(FieldLabel("Profile bắt đầu"), 0, 0);
         config.Controls.Add(profileStartPanel, 1, 0);
-        config.Controls.Add(FieldLabel("Số profile mới"), 2, 0);
+        config.Controls.Add(FieldLabel("Mục tiêu profile mới"), 2, 0);
         config.Controls.Add(count, 3, 0);
         config.Controls.Add(resumeIncomplete, 0, 1);
         config.SetColumnSpan(resumeIncomplete, 2);
@@ -454,36 +477,66 @@ public sealed partial class ManagerForm
                 if (queue.Count == 0)
                     throw new InvalidOperationException("Không có profile tạo dở cần tiếp tục và không có tài khoản chưa gán phù hợp để tạo mới.");
 
+                // V13.8.6+: "Số profile mới" là MỤC TIÊU THÀNH CÔNG,
+                // không còn là số lần thử. BuildAutoProfileQueue nạp toàn bộ account
+                // mới đủ điều kiện của snapshot hiện tại; vòng lặp chỉ lấy dần đến khi
+                // đủ requestedNew profile thành công hoặc đã thử hết kho.
+                var resumeQueued = queue.Count(x => x.ResumeExisting);
+                var newCandidates = queue.Count - resumeQueued;
+
                 grid.Rows.Clear();
-                foreach (var item in queue)
-                {
-                    var index = grid.Rows.Add(
-                        item.ResumeExisting ? "Tiếp tục" : "Mới",
-                        item.ProfileName,
-                        $"Dòng {item.Account.SourceRow}: {item.Account.Username}",
-                        "WAITING",
-                        "Chờ tới lượt");
-                    grid.Rows[index].Tag = item;
-                }
 
                 running = true;
                 paused = false;
                 pause.Text = "Tạm dừng";
                 runCts = new CancellationTokenSource();
                 SetInputsEnabled(false);
-                status.Text = $"Bắt đầu hàng đợi {queue.Count} profile — xử lý tuần tự 1 profile/lần.";
+                status.Text = requestedNew > 0
+                    ? $"Mục tiêu: tạo đủ {requestedNew} profile mới thành công | Có {newCandidates} account phù hợp trong kho | Resume: {resumeQueued}."
+                    : $"Bắt đầu tiếp tục {resumeQueued} profile tạo dở — xử lý tuần tự 1 profile/lần.";
 
                 await _autoProfileQueueGate.WaitAsync(runCts.Token);
-                var success = 0;
                 var skippedByExcel = 0;
                 var pausedOrError = 0;
+                var newSuccess = 0;
+                var newAttempts = 0;
+                var newNotSuccessful = 0;
+                var resumeSuccess = 0;
                 try
                 {
                     for (var i = 0; i < queue.Count; i++)
                     {
                         var item = queue[i];
+
+                        // Resume được xử lý độc lập. Với lane profile mới, dừng ngay
+                        // khi đã đủ số profile THÀNH CÔNG mà người dùng yêu cầu.
+                        if (!item.ResumeExisting && newSuccess >= requestedNew)
+                            break;
+
                         await WaitAutoProfilePausePointAsync(() => paused, runCts.Token);
-                        status.Text = $"Đang xử lý {i + 1}/{queue.Count}: {item.ProfileName} — {item.Account.Username}";
+
+                        // Chỉ thêm row khi profile thực sự đến lượt, tránh hiển thị
+                        // hàng trăm account chưa cần dùng nếu mục tiêu chỉ là 1-2 profile.
+                        var rowIndex = grid.Rows.Add(
+                            item.ResumeExisting ? "Tiếp tục" : "Mới",
+                            item.ProfileName,
+                            $"Dòng {item.Account.SourceRow}: {item.Account.Username}",
+                            "WAITING",
+                            "Chờ tới lượt");
+                        grid.Rows[rowIndex].Tag = item;
+
+                        if (item.ResumeExisting)
+                        {
+                            status.Text = $"Đang tiếp tục {item.ProfileName} — {item.Account.Username}";
+                        }
+                        else
+                        {
+                            newAttempts++;
+                            status.Text =
+                                $"Đang tạo profile mới: thành công {newSuccess}/{requestedNew} | "
+                                + $"lần thử {newAttempts} | {item.ProfileName} — {item.Account.Username}";
+                        }
+
                         UpdateGridRow(item, "PREPARE", "Đang chuẩn bị...", Color.RoyalBlue);
 
                         AutoProfileProcessOutcome outcome;
@@ -503,19 +556,64 @@ public sealed partial class ManagerForm
                             throw;
                         }
 
-                        if (outcome.Success) success++;
-                        else if (outcome.Skipped) skippedByExcel++;
-                        else pausedOrError++;
+                        if (outcome.Success)
+                        {
+                            if (item.ResumeExisting)
+                                resumeSuccess++;
+                            else
+                                newSuccess++;
+                        }
+                        else
+                        {
+                            if (outcome.Skipped) skippedByExcel++;
+                            else pausedOrError++;
 
-                        if (i + 1 < queue.Count)
+                            // BAN / đình chỉ / user không tồn tại / CAPTCHA / login lỗi /
+                            // Worker lỗi / Excel race... đều KHÔNG được tính vào mục tiêu
+                            // profile mới thành công.
+                            if (!item.ResumeExisting)
+                                newNotSuccessful++;
+                        }
+
+                        var hasMoreRequiredWork =
+                            i + 1 < queue.Count
+                            && (queue[i + 1].ResumeExisting || newSuccess < requestedNew);
+
+                        if (hasMoreRequiredWork)
                         {
                             await WaitAutoProfilePausePointAsync(() => paused, runCts.Token);
-                            status.Text = $"Nghỉ {(int)AutoProfileBetweenProfilesDelay.TotalSeconds}s để VM ổn định trước profile tiếp theo...";
+                            status.Text = item.ResumeExisting
+                                ? $"Nghỉ {(int)AutoProfileBetweenProfilesDelay.TotalSeconds}s để VM ổn định trước profile tiếp theo..."
+                                : $"Thành công {newSuccess}/{requestedNew}. "
+                                  + $"Account vừa rồi {(outcome.Success ? "đã đạt" : "chưa đạt")} — "
+                                  + $"tiếp tục account kế tiếp sau {(int)AutoProfileBetweenProfilesDelay.TotalSeconds}s...";
                             await Task.Delay(AutoProfileBetweenProfilesDelay, runCts.Token);
                         }
                     }
 
-                    status.Text = $"Hoàn tất. DONE: {success} | BỎ QUA EXCEL: {skippedByExcel} | CHƯA XONG: {pausedOrError}. Lỗi tạm thời giữ PROCESSING; CAPTCHA/cooldown/config mới giữ FAIL.";
+                    if (requestedNew > 0)
+                    {
+                        if (newSuccess >= requestedNew)
+                        {
+                            status.Text =
+                                $"Hoàn tất đủ mục tiêu. PROFILE MỚI: {newSuccess}/{requestedNew} | "
+                                + $"ĐÃ THỬ: {newAttempts} | CHƯA THÀNH CÔNG: {newNotSuccessful} | "
+                                + $"RESUME DONE: {resumeSuccess} | BỎ QUA EXCEL: {skippedByExcel}.";
+                        }
+                        else
+                        {
+                            status.Text =
+                                $"Đã hết kho tài khoản phù hợp trước khi đủ mục tiêu. PROFILE MỚI: {newSuccess}/{requestedNew} | "
+                                + $"ĐÃ THỬ: {newAttempts} | CHƯA THÀNH CÔNG: {newNotSuccessful} | "
+                                + $"RESUME DONE: {resumeSuccess} | BỎ QUA EXCEL: {skippedByExcel}.";
+                        }
+                    }
+                    else
+                    {
+                        status.Text =
+                            $"Hoàn tất Resume. DONE: {resumeSuccess} | BỎ QUA EXCEL: {skippedByExcel} | "
+                            + $"CHƯA XONG: {pausedOrError}.";
+                    }
                 }
                 finally
                 {
@@ -573,7 +671,7 @@ public sealed partial class ManagerForm
         bool IsBan(TikTokAccountPoolItem account)
             => TikTokAccountPoolService.IsBanNoteValue(account.Note);
 
-        if (resumeIncomplete)
+        if (resumeIncomplete || retryPaused)
         {
             foreach (var account in accounts.Where(x => x.IsAssigned))
             {
@@ -582,6 +680,7 @@ public sealed partial class ManagerForm
                         states,
                         identityDoneUsers,
                         requestedStartName,
+                        resumeIncomplete,
                         retryPaused,
                         out var resumeReason))
                 {
@@ -635,12 +734,15 @@ public sealed partial class ManagerForm
                 $"[AUTO_PROFILE_EXCEL_SKIP] mode=new user={account.Username} row={account.SourceRow} reason=AUTOPRF_PROCESSING");
         }
 
+        // Nạp TOÀN BỘ candidate phù hợp của snapshot hiện tại.
+        // "Số profile mới" được hiểu là số profile phải THÀNH CÔNG, vì vậy
+        // BAN/lỗi/CAPTCHA/skip sẽ không làm hết quota. Vòng xử lý bên trên
+        // tự dừng ngay khi đủ requestedNew thành công.
         var candidates = eligible
             .Where(x =>
                 !IsBan(x)
                 && !IsDone(x)
                 && (!states.TryGetValue(x.Id, out var state) || !state.IsInProgress))
-            .Take(requestedNew)
             .ToList();
         if (candidates.Count == 0) return queue;
 
@@ -660,6 +762,7 @@ public sealed partial class ManagerForm
         IReadOnlyDictionary<string, TikTokAccountPoolService.TikTokAccountAutoState> states,
         IReadOnlySet<string> identityDoneUsers,
         string requestedStartName,
+        bool resumeIncomplete,
         bool retryPaused,
         out string reason)
     {
@@ -677,6 +780,15 @@ public sealed partial class ManagerForm
             return false;
         }
 
+        // Excel có thể còn +auto=PROCESSING từ một lượt cũ dù profile đã
+        // được Start và đang sử dụng bình thường. Không được đưa những profile
+        // đang hoạt động này vào danh sách "profile tạo dở" hoặc retry.
+        if (IsAutoProfileAlreadyInUse(account.AssignedProfile))
+        {
+            reason = "PROFILE_ALREADY_ACTIVE";
+            return false;
+        }
+
         if (states.TryGetValue(account.Id, out var state))
         {
             if (state.IsReady)
@@ -687,36 +799,43 @@ public sealed partial class ManagerForm
 
             if (state.IsPausedOrError)
             {
-                // Self-heal: FAIL cũ không còn là khóa vĩnh viễn. Nếu cột Tên/ảnh
-                // đã DONE thì profile đủ căn cứ để tiếp tục từ trạng thái thực tế.
-                // CAPTCHA/cooldown/config chưa có Tên/ảnh DONE vẫn chỉ retry khi
-                // người dùng chủ động bật checkbox.
-                if (IsAutoProfileFailAutoRecoverable(account, identityDoneUsers))
+                // FAIL/CAPTCHA/cooldown/config thuộc riêng checkbox "Thử lại".
+                // Khi người dùng tắt retry thì tuyệt đối không kéo nhóm này vào
+                // chỉ vì checkbox "Tiếp tục profile tạo dở" đang bật.
+                if (!retryPaused)
                 {
-                    reason = "AUTOPRF_FAIL_SELF_HEAL";
-                    return true;
+                    reason = "AUTOPRF_FAIL_NEEDS_MANUAL_RETRY";
+                    return false;
                 }
 
-                reason = retryPaused
-                    ? "RETRY_BLOCKED_FAIL_ALLOWED"
-                    : "AUTOPRF_FAIL_NEEDS_MANUAL_RETRY";
-                return retryPaused;
+                reason = IsAutoProfileFailAutoRecoverable(account, identityDoneUsers)
+                    ? "AUTOPRF_FAIL_SELF_HEAL"
+                    : "RETRY_BLOCKED_FAIL_ALLOWED";
+                return true;
             }
 
-            // PROCESSING là checkpoint rõ ràng do Auto Profile mới ghi.
-            // Đây mới là profile tạo dở thật sự, nên được resume kể cả số profile
-            // nhỏ hơn ô "Profile bắt đầu".
+            // PROCESSING/non-final thuộc riêng checkbox "Tiếp tục profile tạo dở".
             if (state.IsInProgress)
             {
-                reason = "AUTOPRF_PROCESSING";
-                return true;
+                reason = resumeIncomplete
+                    ? "AUTOPRF_PROCESSING"
+                    : "AUTOPRF_PROCESSING_RESUME_DISABLED";
+                return resumeIncomplete;
             }
 
             if (!state.IsEmpty)
             {
-                reason = "AUTOPRF_NONFINAL";
-                return true;
+                reason = resumeIncomplete
+                    ? "AUTOPRF_NONFINAL"
+                    : "AUTOPRF_NONFINAL_RESUME_DISABLED";
+                return resumeIncomplete;
             }
+        }
+
+        if (!resumeIncomplete)
+        {
+            reason = "RESUME_INCOMPLETE_DISABLED";
+            return false;
         }
 
         // Tương thích dữ liệu cũ: trước V13.7.5 patch, checkpoint kỹ thuật không
@@ -733,6 +852,35 @@ public sealed partial class ManagerForm
 
         reason = "LEGACY_NO_CHECKPOINT_AT_OR_AFTER_START";
         return true;
+    }
+
+    bool IsAutoProfileAlreadyInUse(string? profileName)
+    {
+        var normalized = (profileName ?? "").Trim();
+        if (normalized.Length == 0) return false;
+        if (!_contexts.TryGetValue(normalized, out var ctx)) return false;
+
+        try
+        {
+            var workerAlive = ctx.Worker is not null && !ctx.Worker.HasExited;
+            if (!workerAlive) return false;
+
+            var runtimeState = GetEffectiveRuntimeState(ctx);
+            if (runtimeState is RuntimeStateRunning or RuntimeStateRecovering or RuntimeStatePaused)
+                return true;
+
+            // Expected-running là fallback cho lúc snapshot vừa chậm/UNKNOWN nhưng
+            // Manager đã biết profile này thuộc tập đang chạy. Không dùng riêng
+            // WorkerAlive vì Worker của profile tạo dở cũng có thể đang mở ở bước login.
+            return _autoCloseExpectedRunningProfiles.Contains(normalized)
+                   && runtimeState != RuntimeStateStopped;
+        }
+        catch
+        {
+            // Không biến lỗi đọc trạng thái runtime thành lý do loại một profile
+            // tạo dở thật sự. Gate Excel/runtime phía sau vẫn kiểm tra lại.
+            return false;
+        }
     }
 
     static bool IsAutoProfileFailAutoRecoverable(
@@ -796,6 +944,23 @@ public sealed partial class ManagerForm
         try
         {
             await WaitAutoProfilePausePointAsync(isPaused, ct);
+
+            // Race guard: profile có thể đã được Start sau lúc dựng queue.
+            // Nếu hiện tại đang RUNNING/RECOVERING/PAUSED thì đây là profile
+            // đang sử dụng, không được coi là tạo dở rồi resume đè lên nó.
+            if (item.ResumeExisting && IsAutoProfileAlreadyInUse(item.ProfileName))
+            {
+                const string activeMessage = "Bỏ qua: profile đang hoạt động trong Manager; không coi là profile tạo dở.";
+                ui("ACTIVE_GUARD", activeMessage, Color.DarkGreen);
+                _log.Info($"[AUTO_PROFILE_ACTIVE_GUARD_SKIP] profile={item.ProfileName} account={item.Account.Username}");
+                return new AutoProfileProcessOutcome(
+                    false,
+                    false,
+                    "SKIPPED_ACTIVE",
+                    "ACTIVE_GUARD",
+                    activeMessage,
+                    Skipped: true);
+            }
 
             // RE-CHECK ngay trước hành động đầu tiên. Hàng đợi có thể đã được dựng
             // vài giây/phút trước và người dùng có thể sửa Excel trong thời gian đó.
@@ -1016,6 +1181,41 @@ public sealed partial class ManagerForm
             _log.Info($"[AUTO_PROFILE_READY] profile={item.ProfileName} account={item.Account.Username} elapsed={stopwatch.Elapsed}");
             return new AutoProfileProcessOutcome(true, false, "READY", "DONE", "Hoàn tất");
         }
+        catch (AutoProfileLoginBanException ex)
+        {
+            _autoIdentityHandledSession.Add(item.ProfileName);
+
+            var detail = "LOGIN_BAN: TikTok xác nhận tài khoản bị cấm/đình chỉ/không tồn tại trong lúc đăng nhập.";
+            var handled = false;
+
+            if (ctx is not null)
+            {
+                handled = await HandleDetectedLoginBanAsync(
+                    ctx,
+                    item.Account,
+                    source: "auto_profile_login",
+                    detail: detail,
+                    CancellationToken.None);
+            }
+            else
+            {
+                _log.Warn($"[AUTO_PROFILE_LOGIN_BAN_NO_CONTEXT] profile={item.ProfileName} account={item.Account.Username}");
+                await TryWriteAutoPauseCheckpointAsync(
+                    item.Account.Id,
+                    "FAIL",
+                    "WAIT_LOGIN",
+                    "TikTok xác nhận tài khoản bị BAN nhưng Manager không còn context để đóng runtime.",
+                    CancellationToken.None);
+            }
+
+            var note = handled
+                ? "TikTok xác nhận account bị BAN/đình chỉ/không tồn tại; đã note ban, ghi +auto=FAIL và đóng Chrome/Worker."
+                : "TikTok xác nhận account bị BAN/đình chỉ/không tồn tại; đã yêu cầu note ban + đóng Chrome/Worker, xem nhật ký nếu Excel/cleanup lỗi.";
+
+            ui("WAIT_LOGIN", "LOGIN_BANNED — " + note, Color.Firebrick);
+            _log.Warn($"[AUTO_PROFILE_LOGIN_BANNED] profile={item.ProfileName} account={item.Account.Username} handled={handled} message={ex.Message}");
+            return new AutoProfileProcessOutcome(false, false, "LOGIN_BANNED", "WAIT_LOGIN", note);
+        }
         catch (AutoProfilePauseException ex)
         {
             if (!ex.Step.Equals("RENAME", StringComparison.OrdinalIgnoreCase))
@@ -1139,6 +1339,8 @@ public sealed partial class ManagerForm
             ct.ThrowIfCancellationRequested();
             _log.Info($"[AUTO_PROFILE_LAUNCH] profile={item.ProfileName} attempt={attempt}/2");
             last = await SendCommandAsync(ctx, "launch_auto", TimeSpan.FromSeconds(105));
+            if (string.Equals(last, "account_banned", StringComparison.OrdinalIgnoreCase))
+                throw new AutoProfileLoginBanException("Worker phát hiện TikTok hiển thị thông báo tài khoản bị cấm/đình chỉ/không tồn tại.");
             if (string.Equals(last, "captcha_required", StringComparison.OrdinalIgnoreCase))
                 throw new AutoProfilePauseException("PAUSED_CAPTCHA_LOGIN", "WAIT_LOGIN", "Phát hiện CAPTCHA khi đăng nhập. Chrome được giữ nguyên để xử lý thủ công sau.");
             if (string.Equals(last, "totp_required", StringComparison.OrdinalIgnoreCase))

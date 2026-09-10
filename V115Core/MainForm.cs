@@ -1265,6 +1265,10 @@ public sealed partial class MainForm : Form
                     SetChromeStatus("Trạng thái Chrome: 🟠 Chưa có đăng nhập tự động", Color.DarkOrange, "TikTok: 🟠 Hãy đăng nhập/cấu hình tài khoản", Color.DarkOrange);
                     _log.Warn("[TIKTOK_STARTUP_LOGIN_REQUIRED] " + result.Message);
                     break;
+                case "ACCOUNT_BANNED":
+                    SetChromeStatus("Trạng thái Chrome: 🔴 Tài khoản bị BAN", Color.Firebrick, "TikTok: 🔴 Account bị cấm/đình chỉ/không tồn tại", Color.Firebrick);
+                    _log.Warn("[TIKTOK_STARTUP_ACCOUNT_BANNED] " + result.Message);
+                    break;
                 default:
                     SetChromeStatus("Trạng thái Chrome: 🟠 TikTok chưa sẵn sàng", Color.DarkOrange, $"TikTok: 🟠 {ShortText(result.Message, 90)}", Color.DarkOrange);
                     _log.Warn($"[TIKTOK_STARTUP_{result.State}] {result.Message}");

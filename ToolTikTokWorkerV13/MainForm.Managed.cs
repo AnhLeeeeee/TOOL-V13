@@ -246,6 +246,7 @@ public sealed partial class MainForm
             "CAPTCHA_REQUIRED" => "captcha_required",
             "TOTP_REQUIRED" => "totp_required",
             "LOGIN_REQUIRED" => "login_required",
+            "ACCOUNT_BANNED" => "account_banned",
             "LOGIN_FAILED" => "login_failed",
             "LOGIN_FORM_NOT_FOUND" => "login_form_not_found",
             "ERROR" => "startup_error",

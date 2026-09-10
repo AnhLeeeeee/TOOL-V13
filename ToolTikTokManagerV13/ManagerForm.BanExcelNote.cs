@@ -159,7 +159,8 @@ public sealed partial class ManagerForm
     async Task MarkAccountSnapshotAsBanInBackgroundAsync(
         string profileName,
         TikTokAccountPoolItem accountSnapshot,
-        string detail)
+        string detail,
+        bool queueAutoDelete = true)
     {
         const int maxAttempts = 5;
         Exception? lastError = null;
@@ -191,10 +192,15 @@ public sealed partial class ManagerForm
                                 $"Đã ghi ban và xác minh lại dòng {accountSnapshot.SourceRow} trong Excel.");
 
                         // CHỈ sau khi note=ban đã được đọc lại/xác minh thành công
-                        // mới được phép xóa profile BAN.
-                        QueueAutoDeleteRetiredProfileAfterExcelNote(
-                            profileName,
-                            "BAN");
+                        // mới được phép xóa profile BAN. Login-BAN có thể yêu cầu
+                        // hoãn queue delete tới SAU khi runtime đã đóng sạch để tránh
+                        // hai cleanup transaction chạy chồng nhau.
+                        if (queueAutoDelete)
+                        {
+                            QueueAutoDeleteRetiredProfileAfterExcelNote(
+                                profileName,
+                                "BAN");
+                        }
 
                         return;
                     }

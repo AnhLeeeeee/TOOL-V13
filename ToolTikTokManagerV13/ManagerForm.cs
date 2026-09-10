@@ -56,6 +56,7 @@ public sealed partial class ManagerForm : Form
     sealed record ProfileOpenSelection(bool IsMultiple, IReadOnlyList<ProfileContext> Contexts);
     sealed record BatchOpenResult(string ProfileName, bool Opened, bool Skipped, string? Error = null);
     sealed record ProfileCreateRequest(string Name, string Username, string Password, string TotpSecret, bool AutoLogin, string? AccountPoolId);
+    sealed record ManagerDefaultConfigMetadata(string DisplayName, string SourceType, string SourceValue, DateTime SavedAtUtc);
 
     sealed class NaturalProfileNameComparer : IComparer<string>
     {
@@ -631,6 +632,18 @@ public sealed partial class ManagerForm : Form
             FinishAutoDiagnosticOpenChrome(ctx, "manual_open_chrome", autoDiagTrace, "LOGIN_REQUIRED", $"workerReply={result}");
             return;
         }
+        if (string.Equals(result, "account_banned", StringComparison.OrdinalIgnoreCase))
+        {
+            SetStatus(ctx, "TikTok xác nhận tài khoản bị BAN — đang note ban và đóng profile...", Color.Firebrick);
+            FinishAutoDiagnosticOpenChrome(ctx, "manual_open_chrome", autoDiagTrace, "ACCOUNT_BANNED", $"workerReply={result}");
+            await HandleDetectedLoginBanAsync(
+                ctx,
+                accountSnapshot: null,
+                source: "manual_open_chrome",
+                detail: "LOGIN_BAN: TikTok xác nhận tài khoản bị cấm/đình chỉ/không tồn tại khi mở Chrome.",
+                CancellationToken.None);
+            return;
+        }
         if (!string.Equals(result, "opened", StringComparison.OrdinalIgnoreCase))
         {
             FinishAutoDiagnosticOpenChrome(ctx, "manual_open_chrome", autoDiagTrace, "OPEN_FAILED", $"workerReply={result}");
@@ -1199,6 +1212,53 @@ public sealed partial class ManagerForm : Form
     string ManagerDefaultConfigRoot => Path.Combine(_baseDir, "manager_default_config");
     string ManagerDefaultIniPath => Path.Combine(ManagerDefaultConfigRoot, "auto_chrome.ini");
     string ManagerDefaultContentPath => Path.Combine(ManagerDefaultConfigRoot, "auto_chrome_noidung.txt");
+    string ManagerDefaultMetadataPath => Path.Combine(ManagerDefaultConfigRoot, "default_config_metadata.json");
+
+    ManagerDefaultConfigMetadata? LoadManagerDefaultConfigMetadata()
+    {
+        try
+        {
+            if (!File.Exists(ManagerDefaultMetadataPath)) return null;
+            var json = File.ReadAllText(ManagerDefaultMetadataPath, Encoding.UTF8);
+            return JsonSerializer.Deserialize<ManagerDefaultConfigMetadata>(json);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"[DEFAULT_CONFIG_METADATA_READ] {ex.Message}");
+            return null;
+        }
+    }
+
+    void SaveManagerDefaultConfigMetadata(string displayName, string sourceType, string sourceValue)
+    {
+        try
+        {
+            Directory.CreateDirectory(ManagerDefaultConfigRoot);
+            var cleanName = string.IsNullOrWhiteSpace(displayName) ? "Cấu hình riêng" : displayName.Trim();
+            var metadata = new ManagerDefaultConfigMetadata(
+                cleanName,
+                string.IsNullOrWhiteSpace(sourceType) ? "unknown" : sourceType.Trim(),
+                sourceValue?.Trim() ?? "",
+                DateTime.UtcNow);
+            var json = JsonSerializer.Serialize(metadata, new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(ManagerDefaultMetadataPath, json, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        }
+        catch (Exception ex)
+        {
+            // Metadata chỉ dùng để hiển thị tên cấu hình; không làm hỏng thao tác nhập/lưu cấu hình nếu ghi metadata lỗi.
+            _log.Warn($"[DEFAULT_CONFIG_METADATA_WRITE] {ex.Message}");
+        }
+    }
+
+    string GetManagerDefaultConfigDisplayName()
+    {
+        var metadata = LoadManagerDefaultConfigMetadata();
+        if (!string.IsNullOrWhiteSpace(metadata?.DisplayName))
+            return metadata.DisplayName.Trim();
+
+        // Cấu hình được tạo từ các phiên bản cũ chưa có metadata.
+        return "Cấu hình riêng (chưa có tên)";
+    }
 
     void ApplyManagerDefaultConfigToNewProfile(string dataRoot)
     {
@@ -1380,13 +1440,14 @@ public sealed partial class ManagerForm : Form
             if (File.Exists(ManagerDefaultIniPath))
             {
                 var contentState = File.Exists(ManagerDefaultContentPath) ? "có nội dung dán" : "không có nội dung dán";
-                status.Text = $"Đang dùng cấu hình mặc định riêng ({contentState}). Profile tạo mới sẽ tự nhận cấu hình này.";
+                var configName = GetManagerDefaultConfigDisplayName();
+                status.Text = $"Cấu hình đang dùng: {configName}\nĐang dùng cấu hình mặc định riêng ({contentState}). Profile tạo mới sẽ tự nhận cấu hình này.";
                 status.ForeColor = Color.DarkGreen;
                 clear.Enabled = true;
             }
             else
             {
-                status.Text = "Chưa đặt cấu hình mặc định riêng. Profile mới sẽ dùng defaults gốc đi kèm Tool.";
+                status.Text = "Cấu hình đang dùng: Defaults gốc của Tool\nChưa đặt cấu hình mặc định riêng. Profile mới sẽ dùng defaults gốc đi kèm Tool.";
                 status.ForeColor = Color.DimGray;
                 clear.Enabled = false;
             }
@@ -1405,6 +1466,10 @@ public sealed partial class ManagerForm : Form
             try
             {
                 ImportManagerDefaultConfigZip(picker.FileName);
+                SaveManagerDefaultConfigMetadata(
+                    Path.GetFileNameWithoutExtension(picker.FileName),
+                    "zip",
+                    Path.GetFileName(picker.FileName));
                 RefreshStatus();
                 ModernDialog.ShowMessage(form,
                     $"Đã nhập cấu hình mặc định từ:\n{Path.GetFileName(picker.FileName)}\n\nCác profile tạo mới sẽ tự nhận cấu hình này.",
@@ -1434,6 +1499,10 @@ public sealed partial class ManagerForm : Form
                 File.Copy(sourceIni, ManagerDefaultIniPath, overwrite: true);
                 if (File.Exists(sourceContent)) File.Copy(sourceContent, ManagerDefaultContentPath, overwrite: true);
                 else if (File.Exists(ManagerDefaultContentPath)) File.Delete(ManagerDefaultContentPath);
+                SaveManagerDefaultConfigMetadata(
+                    $"Profile {profile.Name}",
+                    "profile",
+                    profile.Name);
                 _log.Info($"[DEFAULT_CONFIG_SET_FROM_PROFILE] profile={profile.Name} source={sourceRoot}");
                 RefreshStatus();
                 ModernDialog.ShowMessage(form, $"Đã lấy cấu hình của {profile.Name} làm mặc định. Các profile tạo từ bây giờ sẽ tự nhận cấu hình này.", "Cấu hình mặc định", MessageBoxIcon.Information);
@@ -1485,11 +1554,12 @@ public sealed partial class ManagerForm : Form
 
     void BackupManagerDefaultConfig()
     {
-        if (!File.Exists(ManagerDefaultIniPath) && !File.Exists(ManagerDefaultContentPath)) return;
+        if (!File.Exists(ManagerDefaultIniPath) && !File.Exists(ManagerDefaultContentPath) && !File.Exists(ManagerDefaultMetadataPath)) return;
         var backupRoot = Path.Combine(_baseDir, "default_config_backups", DateTime.Now.ToString("yyyyMMdd_HHmmss_fff"));
         Directory.CreateDirectory(backupRoot);
         if (File.Exists(ManagerDefaultIniPath)) File.Copy(ManagerDefaultIniPath, Path.Combine(backupRoot, "auto_chrome.ini"), true);
         if (File.Exists(ManagerDefaultContentPath)) File.Copy(ManagerDefaultContentPath, Path.Combine(backupRoot, "auto_chrome_noidung.txt"), true);
+        if (File.Exists(ManagerDefaultMetadataPath)) File.Copy(ManagerDefaultMetadataPath, Path.Combine(backupRoot, "default_config_metadata.json"), true);
         try
         {
             var root = new DirectoryInfo(Path.Combine(_baseDir, "default_config_backups"));

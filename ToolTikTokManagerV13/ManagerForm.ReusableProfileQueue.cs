@@ -93,9 +93,20 @@ public sealed partial class ManagerForm
                     busyProfiles.Add(ctx.Profile.Name);
             }
 
-            var accounts = await RunAccountPoolIoAsync(
-                () => _accountPoolService.Load(),
+            // Đọc chung account + hai trạng thái Excel một lần cho mỗi lượt quét.
+            // Soft-retired được tự quay lại queue khi Tên/ảnh=DONE.
+            // +auto không cần DONE nữa; chỉ +auto=FAIL mới tiếp tục chặn để tránh
+            // tự hồi sinh profile đã có lỗi cứng/đã được đánh dấu không nên retry.
+            var accountPoolSnapshot = await RunAccountPoolIoAsync(
+                () => (
+                    Accounts: _accountPoolService.Load(),
+                    AutoProfileResults: _accountPoolService.LoadAutoProfileResults(),
+                    IdentityResults: _accountPoolService.GetIdentityResults()),
                 ct);
+
+            var accounts = accountPoolSnapshot.Accounts;
+            var autoProfileResults = accountPoolSnapshot.AutoProfileResults;
+            var identityResults = accountPoolSnapshot.IdentityResults;
 
             var catalog = await Task.Run(
                 () => _profileService.Load(),
@@ -271,20 +282,30 @@ public sealed partial class ManagerForm
                     continue;
                 }
 
-                // Queue TỰ ĐỘNG không được lấy lại profile vừa bị AutoClose loại/retired.
-                // Nếu người dùng thật sự muốn dùng lại thì nút thêm THỦ CÔNG ở dưới vẫn
-                // có quyền override retired một cách có chủ đích.
                 supplyStateSnapshot.Profiles.TryGetValue(profileName, out var supplyState);
+
+                var persistedRetired =
+                    supplyState is not null
+                    && (supplyState.State ?? "").Trim().Equals(
+                        "retired",
+                        StringComparison.OrdinalIgnoreCase);
+
                 var retired =
                     _autoReplacementRetiredProfiles.Contains(profileName)
-                    || (supplyState is not null
-                        && (supplyState.State ?? "").Trim().Equals(
-                            "retired",
-                            StringComparison.OrdinalIgnoreCase));
+                    || persistedRetired;
 
-                if (retired)
+                // HARD RETIRED: BAN/LOGIN_BAN/TIME là điểm kết thúc vòng đời.
+                // Không tự hồi sinh dù Excel DONE/DONE; chỉ thao tác thủ công mới có thể
+                // can thiệp theo chủ đích. Các retired khác (FAULT/lỗi kỹ thuật/legacy)
+                // là SOFT RETIRED và có thể tự quay lại queue sau khi xác minh an toàn.
+                if (retired && IsHardReusableProfileRetired(supplyState))
                 {
-                    reasons[profileName] = "RETIRED · CHỈ DÙNG LẠI THỦ CÔNG";
+                    var hardSource =
+                        string.IsNullOrWhiteSpace(supplyState?.Source)
+                            ? "hard-retired"
+                            : supplyState!.Source.Trim();
+
+                    reasons[profileName] = $"RETIRED CỨNG · {hardSource}";
                     continue;
                 }
 
@@ -336,7 +357,76 @@ public sealed partial class ManagerForm
                     continue;
                 }
 
-                reasons[profileName] = "ĐỦ ĐIỀU KIỆN";
+                if (retired)
+                {
+                    autoProfileResults.TryGetValue(account.Id, out var autoResult);
+                    var autoProfileStatus = (autoResult ?? "").Trim();
+                    var autoProfileFailed =
+                        string.Equals(
+                            autoProfileStatus,
+                            "FAIL",
+                            StringComparison.OrdinalIgnoreCase);
+
+                    var identityDone =
+                        identityResults.TryGetValue(account.Username, out var identityResult)
+                        && string.Equals(
+                            (identityResult ?? "").Trim(),
+                            "DONE",
+                            StringComparison.OrdinalIgnoreCase);
+
+                    // Quy tắc reuse mới:
+                    // - Tên/ảnh=DONE là điều kiện hoàn tất cần thiết.
+                    // - +auto=DONE/PROCESSING/trống đều KHÔNG chặn reuse.
+                    // - +auto=FAIL vẫn chặn để không tự lấy lại profile đã bị đánh dấu lỗi cứng.
+                    if (!identityDone)
+                    {
+                        reasons[profileName] =
+                            $"SOFT RETIRED · TÊN/ẢNH CHƯA DONE (+auto={(autoProfileStatus.Length == 0 ? "TRỐNG" : autoProfileStatus)})";
+                        continue;
+                    }
+
+                    if (autoProfileFailed)
+                    {
+                        reasons[profileName] = "SOFT RETIRED · +auto=FAIL";
+                        continue;
+                    }
+
+                    // Profile đã từng đóng vì lỗi không kết thúc vòng đời, Tên/ảnh đã DONE
+                    // và không có note. Không yêu cầu +auto phải DONE nữa.
+                    // PROCESSING hoặc trống vẫn được đưa lại kho dùng lại.
+                    _autoReplacementRetiredProfiles.Remove(profileName);
+
+                    var previousSource =
+                        string.IsNullOrWhiteSpace(supplyState?.Source)
+                            ? "legacy_retired"
+                            : supplyState!.Source.Trim();
+
+                    MarkProfileSupplyState(
+                        profileName,
+                        "used",
+                        "auto_reuse_soft_retired_recovered:" + previousSource);
+
+                    var recoveredState = GetProfileSupplyState(profileName);
+                    if (recoveredState is not null
+                        && (recoveredState.State ?? "").Trim().Equals(
+                            "retired",
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Ghi state thất bại: giữ hàng rào, không cho candidate lọt qua
+                        // pre-open guard bằng một trạng thái chỉ hồi sinh trong RAM.
+                        _autoReplacementRetiredProfiles.Add(profileName);
+                        reasons[profileName] = "SOFT RETIRED · CHƯA LƯU ĐƯỢC TRẠNG THÁI KHÔI PHỤC";
+                        continue;
+                    }
+
+                    reasons[profileName] = "ĐỦ ĐIỀU KIỆN · KHÔI PHỤC SOFT RETIRED";
+                    _log.Info(
+                        $"[REUSE_QUEUE_SOFT_RETIRED_RECOVERED] profile={profileName} account={account.Username} oldSource={previousSource} total={TimeSpan.FromSeconds(totalSeconds):c}");
+                }
+                else
+                {
+                    reasons[profileName] = "ĐỦ ĐIỀU KIỆN";
+                }
 
                 eligible.Add(
                     new ReusableProfileQueueEntry
@@ -426,6 +516,58 @@ public sealed partial class ManagerForm
         {
             _reusableProfileRefreshGate.Release();
         }
+    }
+
+    static bool IsHardReusableProfileRetired(
+        ProfileSupplyStateEntry? supplyState)
+    {
+        if (supplyState is null
+            || !(supplyState.State ?? "").Trim().Equals(
+                "retired",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var source = (supplyState.Source ?? "").Trim();
+        if (source.Length == 0)
+        {
+            // State legacy không có lý do được xem là soft, nhưng chỉ được hồi sinh
+            // nếu Excel vẫn DONE/DONE + note trống + profile không bận + chưa hết giờ.
+            return false;
+        }
+
+        if (source.StartsWith(
+                "login_banned:",
+                StringComparison.OrdinalIgnoreCase)
+            || source.Contains(
+                "login_ban",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (source.StartsWith(
+                "auto_close:",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            var reason = source["auto_close:".Length..].Trim();
+
+            if (reason.Equals(
+                    "BAN",
+                    StringComparison.OrdinalIgnoreCase)
+                || reason.StartsWith(
+                    "BAN_",
+                    StringComparison.OrdinalIgnoreCase)
+                || reason.StartsWith(
+                    "TIME_",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     Dictionary<string, ReusableProfileQueueView>

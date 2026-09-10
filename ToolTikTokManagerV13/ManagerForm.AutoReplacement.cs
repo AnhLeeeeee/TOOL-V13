@@ -341,6 +341,13 @@ public sealed partial class ManagerForm
                     continue;
                 }
 
+                // Toàn bộ cleanup + mở profile bù dùng chung global transaction gate
+                // với AutoClose. Nhờ vậy BAN/TIME/FAULT không đóng Chrome/ghi Excel
+                // chồng lên lúc một suất bù đang dọn/mở profile mới.
+                using var replacementOperationLease = await EnterReplacementOperationAsync(
+                    request.ClosedProfileName,
+                    "AUTO_REPLACE:" + request.Reason);
+
                 // CLEANUP BARRIER: profile cũ phải sạch thật trước khi được phép bù.
                 // Không dùng delay cố định để đoán Chrome đã đóng.
                 var cleanup = await EnsureAutoReplacementSourceCleanupAsync(request);
@@ -742,13 +749,15 @@ public sealed partial class ManagerForm
 
         try
         {
-            const int maxCreateAttemptsPerSlot = 3;
+            // Một suất Tự bù cần đạt đúng 1 profile RUNNING khỏe. BAN/lỗi/skip
+            // không được làm mất quota như logic cũ giới hạn 3 lần thử.
+            // Giữ danh sách account đã thử trong chính suất này để account vừa lỗi
+            // nhưng được ReleaseAccount() không bị lấy lại ngay và gây vòng lặp.
+            var attemptedAccountIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var attempt = 0;
 
-            for (var attempt = 1; attempt <= maxCreateAttemptsPerSlot; attempt++)
+            while (!_closing)
             {
-                if (_closing)
-                    return false;
-
                 var startName = DetectNextAutoProfileName();
 
                 var queue = await RunAccountPoolIoAsync(
@@ -769,28 +778,41 @@ public sealed partial class ManagerForm
                     },
                     CancellationToken.None);
 
-                if (queue.Count == 0)
+                // BuildAutoProfileQueue hiện nạp toàn bộ candidate phù hợp. Chọn account
+                // đầu tiên chưa được thử trong suất Tự bù hiện tại. Điều này đặc biệt
+                // quan trọng khi CREATE_PROFILE lỗi trước khi profile tồn tại và account
+                // được trả về trạng thái chưa gán.
+                var item = queue.FirstOrDefault(x =>
+                    !x.ResumeExisting
+                    && !attemptedAccountIds.Contains(x.Account.Id));
+
+                if (item is null)
                 {
+                    var detail = queue.Count == 0
+                        ? "Không còn tài khoản chưa gán có mật khẩu để tạo profile bù."
+                        : $"Đã thử hết {attemptedAccountIds.Count} tài khoản phù hợp trong suất bù này; chưa có profile RUNNING khỏe.";
+
                     _log.Warn(
-                        $"[AUTO_REPLACE_CREATE_NONE] closed={request.ClosedProfileName} reason=no_unassigned_account_with_password");
+                        $"[AUTO_REPLACE_CREATE_EXHAUSTED] closed={request.ClosedProfileName} attempted={attemptedAccountIds.Count} queue={queue.Count} reason=no_remaining_candidate");
 
                     WriteAutoActivityLog(
                         action: "TỰ BÙ",
                         profile: request.ClosedProfileName,
                         reason: request.Reason,
-                        result: "CHỜ",
-                        detail: "Không còn tài khoản chưa gán có mật khẩu để tạo profile bù.");
+                        result: "HẾT KHO / CHỜ",
+                        detail: detail);
 
                     return false;
                 }
 
-                var item = queue[0];
+                attemptedAccountIds.Add(item.Account.Id);
+                attempt++;
                 _autoReplacementClaimedProfiles.Add(item.ProfileName);
 
                 try
                 {
                     _log.Info(
-                        $"[AUTO_REPLACE_CREATE_BEGIN] closed={request.ClosedProfileName} profile={item.ProfileName} account={item.Account.Username} attempt={attempt}/{maxCreateAttemptsPerSlot}");
+                        $"[AUTO_REPLACE_CREATE_BEGIN] closed={request.ClosedProfileName} profile={item.ProfileName} account={item.Account.Username} attempt={attempt} mode=until_success_or_exhausted");
 
                     WriteAutoActivityLog(
                         action: "MỞ PROFILE BÙ",
@@ -799,7 +821,7 @@ public sealed partial class ManagerForm
                         reason: request.Reason,
                         replacementProfile: item.ProfileName,
                         result: "BẮT ĐẦU",
-                        detail: $"Lần thử {attempt}/{maxCreateAttemptsPerSlot}");
+                        detail: $"Lần thử {attempt}; tiếp tục đến khi có 1 profile RUNNING khỏe hoặc hết kho.");
 
                     var outcome = await ProcessAutoProfileQueueItemAsync(
                         item,
@@ -875,8 +897,32 @@ public sealed partial class ManagerForm
 
                     if (outcome.Skipped)
                     {
-                        _log.Info(
-                            $"[AUTO_REPLACE_CREATE_SKIP_EXCEL] profile={item.ProfileName} account={item.Account.Username} status={outcome.Status} step={outcome.Step} note={outcome.Note}");
+                        // Skipped có 2 nghĩa:
+                        // 1) SKIPPED_EXCEL/ACTIVE_GUARD xảy ra trước khi mở runtime => chỉ bỏ qua.
+                        // 2) Paused=true là LOGIN/CAPTCHA/2FA/Worker/START... lỗi sau khi profile
+                        //    đã có thể mở Chrome + Worker. Với Tự thay phải đóng runtime này trước
+                        //    khi thử account tiếp theo, NHƯNG KHÔNG xóa/retire profile non-BAN.
+                        if (!outcome.Paused)
+                        {
+                            _log.Info(
+                                $"[AUTO_REPLACE_CREATE_SKIP_EXCEL] profile={item.ProfileName} account={item.Account.Username} status={outcome.Status} step={outcome.Step} note={outcome.Note}");
+
+                            WriteAutoActivityLog(
+                                action: "MỞ PROFILE BÙ",
+                                profile: request.ClosedProfileName,
+                                account: item.Account.Username,
+                                reason: request.Reason,
+                                replacementProfile: item.ProfileName,
+                                result: "BỎ QUA",
+                                detail: outcome.Note);
+
+                            // Excel vừa thay đổi sau lúc dựng queue (BAN/DONE/đổi mapping).
+                            // Không coi đây là lỗi tài khoản; thử lấy ứng viên mới ở vòng kế tiếp.
+                            continue;
+                        }
+
+                        _log.Warn(
+                            $"[AUTO_REPLACE_CREATE_NONBAN_FAIL] profile={item.ProfileName} account={item.Account.Username} status={outcome.Status} step={outcome.Step} action=close_runtime_keep_profile");
 
                         WriteAutoActivityLog(
                             action: "MỞ PROFILE BÙ",
@@ -884,11 +930,15 @@ public sealed partial class ManagerForm
                             account: item.Account.Username,
                             reason: request.Reason,
                             replacementProfile: item.ProfileName,
-                            result: "BỎ QUA",
-                            detail: outcome.Note);
+                            result: "LỖI - ĐÓNG KHÔNG XÓA",
+                            detail: $"status={outcome.Status}; step={outcome.Step}; đóng Chrome + Worker, giữ nguyên profile để có thể xử lý/resume sau.");
 
-                        // Excel vừa thay đổi sau lúc dựng queue (BAN/DONE/đổi mapping).
-                        // Không coi đây là lỗi tài khoản; thử lấy ứng viên mới ở vòng kế tiếp.
+                        await CleanupCreatedReplacementAttemptAsync(
+                            item.ProfileName,
+                            $"nonban_paused:{outcome.Status}:{outcome.Step}");
+
+                        // CỐ Ý KHÔNG gọi QueueAutoDeleteRetiredProfileAfterExcelNote ở đây.
+                        // Profile/account lỗi non-BAN được giữ lại; chỉ runtime bị đóng.
                         continue;
                     }
 
@@ -911,6 +961,16 @@ public sealed partial class ManagerForm
                     await CleanupCreatedReplacementAttemptAsync(
                         item.ProfileName,
                         $"outcome_fail:{outcome.Status}:{outcome.Step}");
+
+                    // LOGIN_BANNED đã được note=ban + retire trong Auto Profile.
+                    // Chỉ sau khi cleanup candidate hoàn tất mới cho Tự xóa BAN chạy,
+                    // tránh xóa catalog/folder song song với cleanup của Tự bù.
+                    if (outcome.Status.Equals("LOGIN_BANNED", StringComparison.OrdinalIgnoreCase))
+                    {
+                        QueueAutoDeleteRetiredProfileAfterExcelNote(
+                            item.ProfileName,
+                            "BAN");
+                    }
                 }
                 catch (Exception ex)
                 {

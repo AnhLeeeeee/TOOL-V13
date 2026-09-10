@@ -2350,8 +2350,15 @@ public sealed partial class ChromeController : IAsyncDisposable
         // profile runs the normal auto-login flow but stays on TikTok home; pressing
         // Bắt đầu runs the same authentication gate and then opens LIVE. Session-cookie
         // detection is done through CDP so HttpOnly cookies are included.
+        //
+        // LOGIN_BAN gate phải chạy TRƯỚC cookie/session. TikTok có thể vẫn giữ cookie
+        // trong lúc trang đăng nhập/2FA đã hiện rõ thông báo account bị cấm/đình chỉ.
         try
         {
+            var loginBan = await DetectLoginAccountBanAsync(ct);
+            if (!string.IsNullOrWhiteSpace(loginBan))
+                return BuildLoginAccountBannedResult(loginBan);
+
             if (await HasTikTokSessionCookieAsync(ct))
             {
                 return await FinalizeTikTokAuthenticatedAsync(
@@ -2375,9 +2382,17 @@ public sealed partial class ChromeController : IAsyncDisposable
         _log.Info("[TIKTOK_LOGIN_START] auto=true usernameConfigured=true totpConfigured=" + (!string.IsNullOrWhiteSpace(totpSecret)));
         await NavigateAndWaitAsync(loginUrl, 1000, 15000, ct);
 
+        var loginBanAfterNavigate = await DetectLoginAccountBanAsync(ct);
+        if (!string.IsNullOrWhiteSpace(loginBanAfterNavigate))
+            return BuildLoginAccountBannedResult(loginBanAfterNavigate);
+
         var formReady = await WaitForLoginFormAsync(TimeSpan.FromSeconds(15), ct);
         if (!formReady)
         {
+            var loginBanBeforeCaptcha = await DetectLoginAccountBanAsync(ct);
+            if (!string.IsNullOrWhiteSpace(loginBanBeforeCaptcha))
+                return BuildLoginAccountBannedResult(loginBanBeforeCaptcha);
+
             if (await DetectCaptchaAsync(ct))
             {
                 if (stopOnCaptcha)
@@ -2393,6 +2408,10 @@ public sealed partial class ChromeController : IAsyncDisposable
                 // CAPTCHA may have completed an already-started login, may reveal
                 // the normal login form, or may go directly to 2FA. Do not
                 // navigate away here: keep the current TikTok authentication state.
+                var loginBanAfterCaptcha = await DetectLoginAccountBanAsync(ct);
+                if (!string.IsNullOrWhiteSpace(loginBanAfterCaptcha))
+                    return BuildLoginAccountBannedResult(loginBanAfterCaptcha);
+
                 if (await HasTikTokSessionCookieAsync(ct))
                 {
                     return await FinalizeTikTokAuthenticatedAsync(
@@ -2446,6 +2465,10 @@ public sealed partial class ChromeController : IAsyncDisposable
         var completion = await WaitForTikTokLoginCompletionAsync(totpSecret, TimeSpan.FromSeconds(45), openLiveWhenReady, stopOnCaptcha, ct);
         if (completion is not null) return completion;
 
+        var loginBanAtTimeout = await DetectLoginAccountBanAsync(ct);
+        if (!string.IsNullOrWhiteSpace(loginBanAtTimeout))
+            return BuildLoginAccountBannedResult(loginBanAtTimeout);
+
         if (await HasTikTokSessionCookieAsync(ct))
         {
             return await FinalizeTikTokAuthenticatedAsync(
@@ -2471,6 +2494,13 @@ public sealed partial class ChromeController : IAsyncDisposable
         while (DateTime.UtcNow < loginDeadline)
         {
             ct.ThrowIfCancellationRequested();
+
+            // BAN/SUSPENDED có priority cao nhất trong login state-machine.
+            // Kiểm tra trước cookie, CAPTCHA và 2FA để account chết không bị
+            // hiểu nhầm thành LOGIN_OK/PROCESSING.
+            var loginBan = await DetectLoginAccountBanAsync(ct);
+            if (!string.IsNullOrWhiteSpace(loginBan))
+                return BuildLoginAccountBannedResult(loginBan);
 
             if (await HasTikTokSessionCookieAsync(ct))
             {
@@ -2767,6 +2797,12 @@ public sealed partial class ChromeController : IAsyncDisposable
         while (DateTime.UtcNow < deadline)
         {
             ct.ThrowIfCancellationRequested();
+
+            // Thoát wait sớm nếu TikTok đã hiện hard-ban/suspended. Caller sẽ
+            // đọc lại signal và trả ACCOUNT_BANNED thay vì đợi đủ 15 giây.
+            if (!string.IsNullOrWhiteSpace(await DetectLoginAccountBanAsync(ct)))
+                return false;
+
             var r = await EvalAsync("""
 (() => {
   const visible = e => { if(!e) return false; const r=e.getBoundingClientRect(); const s=getComputedStyle(e); return r.width>1&&r.height>1&&s.display!=='none'&&s.visibility!=='hidden'; };
@@ -2822,6 +2858,74 @@ public sealed partial class ChromeController : IAsyncDisposable
         if (!r.TryGetProperty("value", out var v) || v.ValueKind != JsonValueKind.True)
             throw new InvalidOperationException("Không tìm thấy nút Đăng nhập TikTok.");
         _log.Info("[TIKTOK_LOGIN_SUBMIT] clicked=true");
+    }
+
+    TikTokStartupResult BuildLoginAccountBannedResult(string signal)
+    {
+        var compact = (signal ?? "").Replace('\r', ' ').Replace('\n', ' ').Trim();
+        if (compact.Length > 180) compact = compact[..180];
+        _log.Warn($"[TIKTOK_LOGIN_ACCOUNT_BANNED] signal={compact}");
+        return new TikTokStartupResult(
+            "ACCOUNT_BANNED",
+            "TikTok xác nhận tài khoản đã bị cấm/đình chỉ/không tồn tại trong lúc đăng nhập.",
+            false,
+            false);
+    }
+
+    async Task<string> DetectLoginAccountBanAsync(CancellationToken ct)
+    {
+        try
+        {
+            var r = await EvalAsync("""
+(() => {
+  const norm = x => String(x || '')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase().replace(/đ/g, 'd').replace(/\s+/g, ' ').trim();
+  const text = norm(document.body?.innerText || document.body?.textContent || '');
+  if (!text) return '';
+
+  // Chỉ dùng hard markers có nghĩa trực tiếp "account đã bị cấm/đình chỉ".
+  // Không suy BAN từ login fail, sai password, CAPTCHA, 2FA hay timeout.
+  const markers = [
+    ['VI_BANNED', 'tai khoan cua ban da bi cam'],
+    ['VI_SUSPENDED', 'tai khoan cua ban da bi dinh chi'],
+    ['EN_BANNED', 'your account has been banned'],
+    ['EN_BANNED_WAS', 'your account was banned'],
+    ['EN_SUSPENDED', 'your account has been suspended'],
+    ['EN_SUSPENDED_WAS', 'your account was suspended'],
+
+    // Account/username khong con ton tai tren TikTok. Voi nghiep vu kho
+    // tai khoan cu, day duoc xu ly nhu hard BAN de loai vinh vien khoi reuse.
+    ['VI_USER_NOT_EXIST', 'nguoi dung khong ton tai'],
+    ['VI_USER_NOT_EXIST_THIS', 'nguoi dung nay khong ton tai'],
+    ['EN_USER_NOT_EXIST', 'user does not exist'],
+    ['EN_USER_NOT_EXIST_SHORT', "user doesn't exist"],
+    ['EN_ACCOUNT_NOT_EXIST', 'account does not exist'],
+    ['EN_ACCOUNT_NOT_EXIST_SHORT', "account doesn't exist"]
+  ];
+
+  const match = markers.find(x => text.includes(x[1]));
+  if (!match) return '';
+  const path = String(location.pathname || '');
+  return match[0] + '|path=' + path;
+})()
+""", ct: ct);
+
+            var signal = r.TryGetProperty("value", out var v) && v.ValueKind == JsonValueKind.String
+                ? (v.GetString() ?? "").Trim()
+                : "";
+
+            if (signal.Length > 0)
+                _log.Warn($"[TIKTOK_LOGIN_BAN_SIGNAL] {signal}");
+
+            return signal;
+        }
+        catch
+        {
+            // Detector là safety signal phụ: lỗi probe/CDP không được biến thành
+            // lỗi đăng nhập. Khi DOM đọc lại được, vòng poll kế tiếp sẽ kiểm tra tiếp.
+            return "";
+        }
     }
 
     public Task<bool> IsCaptchaVisibleAsync(CancellationToken ct = default)
