@@ -10,16 +10,14 @@ public sealed partial class ManagerForm
 {
     sealed class AutoCloseSettingsDocument
     {
-        public int Version { get; set; } = 1;
+        // V6: TIME mặc định 6 giờ. Bản cũ từng có default time=false / 3-5h,
+        // khiến UI và runtime có thể lệch sau khi copy/cập nhật dist.
+        public int Version { get; set; } = 6;
         public bool CloseOnBan { get; set; } = true;
-        public bool CloseOnRunTime { get; set; }
-        public int RunHours { get; set; } = 3;
+        public bool CloseOnRunTime { get; set; } = true;
+        public int RunHours { get; set; } = 6;
         public bool CloseOnNotRunning10Minutes { get; set; } = true;
         public bool OpenReplacementAfterAutoClose { get; set; } = true;
-
-        // Khi bật: các lần TIME_xH được cấp lượt cách nhau 30 phút.
-        // BAN luôn bỏ qua hàng chờ này.
-        public bool StaggerTimeReplacement30Minutes { get; set; } = true;
 
         // Chỉ xóa profile sau khi Excel đã ghi/xác minh:
         // BAN -> note=ban; hết vòng đời -> note=TIME_xH.
@@ -47,6 +45,7 @@ public sealed partial class ManagerForm
         new(StringComparer.OrdinalIgnoreCase);
     bool _autoCloseFeatureInitialized;
     bool _autoCloseRuntimeCheckBusy;
+    readonly HashSet<string> _autoCloseVerifiedCleanProfiles = new(StringComparer.OrdinalIgnoreCase);
     AutoCloseSettingsDocument _autoCloseSettings = new();
     Button? _autoCloseToolbarButton;
 
@@ -60,14 +59,14 @@ public sealed partial class ManagerForm
         _autoCloseSettings = LoadAutoCloseSettings();
         InjectAutoCloseToolbarButton();
         InitializeAutoReplacementFeature();
-        InitializeTimeReplacementScheduler();
         InitializeManualRuntimeIntentGuard();
 
-        // Dùng chung timer 1 giây hiện có của Manager, không tạo thread/timer mới.
+        // V13.8.6 style: dùng trực tiếp watchdog 1 giây. Đủ tổng giờ thì đóng ngay,
+        // không qua hàng đợi/scheduler TIME 30 phút.
         _refreshTimer.Tick += async (_, _) => await CheckAutoCloseRuntimeAsync();
 
         _log.Info(
-            $"[AUTO_CLOSE_INIT] ban={_autoCloseSettings.CloseOnBan} time={_autoCloseSettings.CloseOnRunTime} hours={_autoCloseSettings.RunHours} stuck10m={_autoCloseSettings.CloseOnNotRunning10Minutes} replace={_autoCloseSettings.OpenReplacementAfterAutoClose} staggerTime30m={_autoCloseSettings.StaggerTimeReplacement30Minutes} deleteRetired={_autoCloseSettings.DeleteProfileAfterBanOrLifetime}");
+            $"[AUTO_CLOSE_INIT] ban={_autoCloseSettings.CloseOnBan} time={_autoCloseSettings.CloseOnRunTime} hours={_autoCloseSettings.RunHours} stuck10m={_autoCloseSettings.CloseOnNotRunning10Minutes} replace={_autoCloseSettings.OpenReplacementAfterAutoClose} deleteRetired={_autoCloseSettings.DeleteProfileAfterBanOrLifetime} settingsPath={AutoCloseSettingsPath}");
     }
 
     AutoCloseSettingsDocument LoadAutoCloseSettings()
@@ -75,25 +74,81 @@ public sealed partial class ManagerForm
         try
         {
             if (!File.Exists(AutoCloseSettingsPath))
-                return NormalizeAutoCloseSettings(new AutoCloseSettingsDocument());
+            {
+                var defaults = NormalizeAutoCloseSettings(new AutoCloseSettingsDocument());
+                PersistAutoCloseSettingsMigration(defaults, oldVersion: 0, reason: "missing_file");
+                return defaults;
+            }
 
             var loaded = JsonSerializer.Deserialize<AutoCloseSettingsDocument>(
                 File.ReadAllText(AutoCloseSettingsPath));
 
-            return NormalizeAutoCloseSettings(loaded ?? new AutoCloseSettingsDocument());
+            if (loaded is null)
+                return NormalizeAutoCloseSettings(new AutoCloseSettingsDocument());
+
+            var oldVersion = loaded.Version;
+
+            // Migration V6: bản cũ có thể lưu time=false và RunHours=5 từ default
+            // lịch sử, trong khi người dùng đang dùng preset 6h. Chỉ migrate MỘT LẦN.
+            // Sau khi đã lên V6, người dùng vẫn có thể chủ động tắt TIME trong UI
+            // và giá trị false sẽ được tôn trọng ở các lần mở sau.
+            if (oldVersion < 6)
+            {
+                loaded.CloseOnRunTime = true;
+                loaded.RunHours = 6;
+            }
+
+            var normalized = NormalizeAutoCloseSettings(loaded);
+
+            if (oldVersion < 6)
+            {
+                PersistAutoCloseSettingsMigration(
+                    normalized,
+                    oldVersion,
+                    reason: "legacy_time_defaults_to_6h");
+            }
+
+            return normalized;
         }
         catch (Exception ex)
         {
-            _log.Warn($"[AUTO_CLOSE_SETTINGS_READ] error={ex.Message}");
+            _log.Warn($"[AUTO_CLOSE_SETTINGS_READ] path={AutoCloseSettingsPath} error={ex.Message}");
             return NormalizeAutoCloseSettings(new AutoCloseSettingsDocument());
         }
     }
 
     static AutoCloseSettingsDocument NormalizeAutoCloseSettings(AutoCloseSettingsDocument settings)
     {
-        settings.Version = 5;
+        settings.Version = 6;
         settings.RunHours = Math.Clamp(settings.RunHours, 3, 8);
         return settings;
+    }
+
+    void PersistAutoCloseSettingsMigration(
+        AutoCloseSettingsDocument settings,
+        int oldVersion,
+        string reason)
+    {
+        try
+        {
+            var json = JsonSerializer.Serialize(
+                settings,
+                new JsonSerializerOptions { WriteIndented = true });
+
+            var temp = AutoCloseSettingsPath + ".tmp";
+            File.WriteAllText(temp, json, new UTF8Encoding(false));
+            File.Move(temp, AutoCloseSettingsPath, overwrite: true);
+
+            _log.Info(
+                $"[AUTO_CLOSE_SETTINGS_MIGRATE_V6] oldVersion={oldVersion} time={settings.CloseOnRunTime} hours={settings.RunHours} reason={reason} path={AutoCloseSettingsPath}");
+        }
+        catch (Exception ex)
+        {
+            // Không chặn Manager khởi động chỉ vì không ghi được migration; runtime
+            // hiện tại vẫn dùng settings đã normalize.
+            _log.Warn(
+                $"[AUTO_CLOSE_SETTINGS_MIGRATE_V6_WARN] oldVersion={oldVersion} reason={reason} path={AutoCloseSettingsPath} error={ex.Message}");
+        }
     }
 
     void SaveAutoCloseSettings()
@@ -112,7 +167,7 @@ public sealed partial class ManagerForm
         NotifyAutoReplacementSettingsChanged();
 
         _log.Info(
-            $"[AUTO_CLOSE_SETTINGS_SAVE] ban={_autoCloseSettings.CloseOnBan} time={_autoCloseSettings.CloseOnRunTime} hours={_autoCloseSettings.RunHours} stuck10m={_autoCloseSettings.CloseOnNotRunning10Minutes} replace={_autoCloseSettings.OpenReplacementAfterAutoClose} staggerTime30m={_autoCloseSettings.StaggerTimeReplacement30Minutes} deleteRetired={_autoCloseSettings.DeleteProfileAfterBanOrLifetime}");
+            $"[AUTO_CLOSE_SETTINGS_SAVE] ban={_autoCloseSettings.CloseOnBan} time={_autoCloseSettings.CloseOnRunTime} hours={_autoCloseSettings.RunHours} stuck10m={_autoCloseSettings.CloseOnNotRunning10Minutes} replace={_autoCloseSettings.OpenReplacementAfterAutoClose} deleteRetired={_autoCloseSettings.DeleteProfileAfterBanOrLifetime}");
     }
 
     void InjectAutoCloseToolbarButton()
@@ -167,12 +222,7 @@ public sealed partial class ManagerForm
 
         var parts = new List<string>();
         if (_autoCloseSettings.CloseOnBan) parts.Add("BAN");
-        if (_autoCloseSettings.CloseOnRunTime)
-        {
-            parts.Add($"{_autoCloseSettings.RunHours}h");
-            if (_autoCloseSettings.StaggerTimeReplacement30Minutes)
-                parts.Add("TIME30p");
-        }
+        if (_autoCloseSettings.CloseOnRunTime) parts.Add($"{_autoCloseSettings.RunHours}h");
         if (_autoCloseSettings.CloseOnNotRunning10Minutes) parts.Add("Lỗi10p");
 
         if (parts.Count > 0 && _autoCloseSettings.OpenReplacementAfterAutoClose)
@@ -316,18 +366,10 @@ public sealed partial class ManagerForm
 
         var openReplacement = new CheckBox
         {
-            Text = "Sau khi Tự đóng: lấy tài khoản chưa gán và tự tạo profile mới",
+            Text = "Tự bù sau khi đóng: ưu tiên PRF có sẵn; không có thì tạo PRF mới",
             Checked = _autoCloseSettings.OpenReplacementAfterAutoClose,
             AutoSize = true,
             Location = new Point(18, 154)
-        };
-
-        var staggerTimeReplacement = new CheckBox
-        {
-            Text = "Giãn các lần thay TIME cách nhau 30 phút (BAN vẫn thay ngay)",
-            Checked = _autoCloseSettings.StaggerTimeReplacement30Minutes,
-            AutoSize = true,
-            Location = new Point(18, 194)
         };
 
         var deleteRetiredProfile = new CheckBox
@@ -335,22 +377,14 @@ public sealed partial class ManagerForm
             Text = "Tự xóa profile sau khi đã ghi Excel (BAN + hết vòng đời TIME_xH)",
             Checked = _autoCloseSettings.DeleteProfileAfterBanOrLifetime,
             AutoSize = true,
-            Location = new Point(18, 234)
+            Location = new Point(18, 194)
         };
-
-        void UpdateTimeReplacementToggleEnabled()
-        {
-            staggerTimeReplacement.Enabled = closeOnTime.Checked;
-        }
-
-        closeOnTime.CheckedChanged += (_, _) => UpdateTimeReplacementToggleEnabled();
-        UpdateTimeReplacementToggleEnabled();
 
         var configGroup = new GroupBox
         {
             Text = "Cấu hình Tự đóng & Tự bù",
             Location = new Point(0, 0),
-            Size = new Size(666, 285),
+            Size = new Size(666, 245),
             Padding = new Padding(12),
             ForeColor = Color.FromArgb(45, 67, 94),
             Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
@@ -361,13 +395,12 @@ public sealed partial class ManagerForm
         configGroup.Controls.Add(hours);
         configGroup.Controls.Add(closeOnStuck);
         configGroup.Controls.Add(openReplacement);
-        configGroup.Controls.Add(staggerTimeReplacement);
         configGroup.Controls.Add(deleteRetiredProfile);
 
         var logGroup = new GroupBox
         {
             Text = "Nhật ký tự động",
-            Location = new Point(0, 297),
+            Location = new Point(0, 257),
             Size = new Size(666, 68),
             Padding = new Padding(12),
             ForeColor = Color.FromArgb(45, 67, 94),
@@ -439,21 +472,16 @@ public sealed partial class ManagerForm
 
         save.Click += (_, _) =>
         {
-            var oldCloseOnTime = _autoCloseSettings.CloseOnRunTime;
-            var oldStaggerTime = _autoCloseSettings.StaggerTimeReplacement30Minutes;
-
             _autoCloseSettings.CloseOnBan = closeOnBan.Checked;
             _autoCloseSettings.CloseOnRunTime = closeOnTime.Checked;
             _autoCloseSettings.RunHours = Math.Clamp(hours.SelectedIndex + 3, 3, 8);
             _autoCloseSettings.CloseOnNotRunning10Minutes = closeOnStuck.Checked;
             _autoCloseSettings.OpenReplacementAfterAutoClose = openReplacement.Checked;
-            _autoCloseSettings.StaggerTimeReplacement30Minutes = staggerTimeReplacement.Checked;
             _autoCloseSettings.DeleteProfileAfterBanOrLifetime = deleteRetiredProfile.Checked;
 
             try
             {
                 SaveAutoCloseSettings();
-                NotifyTimeReplacementSchedulerSettingsChanged(oldCloseOnTime, oldStaggerTime);
                 form.DialogResult = DialogResult.OK;
                 form.Close();
             }
@@ -615,10 +643,6 @@ public sealed partial class ManagerForm
 
         var profileName = ctx.Profile.Name;
 
-        // BAN không đi qua hàng chờ TIME 30 phút. Nếu profile đang chờ TIME,
-        // hủy request đó ngay rồi vào luồng BAN ưu tiên.
-        CancelTimeReplacementForBan(profileName, detail);
-
         // BAN là lý do ưu tiên cao nhất: chốt ngay trước mọi watchdog khác.
         PromoteAutoCloseReason(
             profileName,
@@ -693,10 +717,6 @@ public sealed partial class ManagerForm
 
         try
         {
-            // TIME replacement được điều phối tập trung. Request đã tới hạn vẫn
-            // tiếp tục RUNNING cho đến khi được cấp slot 30 phút.
-            await ProcessTimeReplacementSchedulerAsync();
-
             var timeThreshold = TimeSpan.FromHours(_autoCloseSettings.RunHours);
             var stuckThreshold = TimeSpan.FromMinutes(AutoCloseNotRunningMinutes);
 
@@ -750,27 +770,14 @@ public sealed partial class ManagerForm
                         var total = ReadStatisticsRuntime(ctx).Total;
                         if (total >= timeThreshold)
                         {
-                            var timeReason = $"TIME_{_autoCloseSettings.RunHours}H";
-                            var timeDetail = $"Đạt tổng thời gian chạy {_autoCloseSettings.RunHours} giờ (tổng={total:c}).";
-
                             _log.Info(
-                                $"[AUTO_CLOSE_TIME_DUE] profile={profileName} total={total:c} threshold={timeThreshold:c} state={state} stagger30m={_autoCloseSettings.StaggerTimeReplacement30Minutes}");
+                                $"[AUTO_CLOSE_TIME_DUE] profile={profileName} total={total:c} threshold={timeThreshold:c} state={state}");
 
-                            if (_autoCloseSettings.StaggerTimeReplacement30Minutes)
-                            {
-                                if (!HasPendingTimeReplacement(profileName))
-                                    QueueTimeReplacement(ctx, timeReason, timeDetail);
-                            }
-                            else if (!HasPendingTimeReplacement(profileName))
-                            {
-                                // Chế độ thủ công TẮT giãn TIME: trở về hành vi cũ,
-                                // đủ giờ là vào luồng Tự đóng/Tự bù ngay. BAN vẫn ưu tiên như cũ.
-                                await AutoCloseProfileAsync(
-                                    ctx,
-                                    timeReason,
-                                    timeDetail,
-                                    source: "runtime_watchdog_time_direct");
-                            }
+                            await AutoCloseProfileAsync(
+                                ctx,
+                                $"TIME_{_autoCloseSettings.RunHours}H",
+                                $"Đạt tổng thời gian chạy {_autoCloseSettings.RunHours} giờ (tổng={total:c}).",
+                                source: "runtime_watchdog_time_healthy");
 
                             continue;
                         }
@@ -843,25 +850,14 @@ public sealed partial class ManagerForm
                     var total = ReadStatisticsRuntime(ctx).Total;
                     if (total >= timeThreshold)
                     {
-                        var timeReason = $"TIME_{_autoCloseSettings.RunHours}H";
-                        var timeDetail = $"Đạt tổng thời gian chạy {_autoCloseSettings.RunHours} giờ (tổng={total:c}) trong lúc runtime không khỏe.";
-
                         _log.Info(
-                            $"[AUTO_CLOSE_TIME_DUE] profile={profileName} total={total:c} threshold={timeThreshold:c} state={state} healthy=false stagger30m={_autoCloseSettings.StaggerTimeReplacement30Minutes}");
+                            $"[AUTO_CLOSE_TIME_DUE] profile={profileName} total={total:c} threshold={timeThreshold:c} state={state} healthy=false");
 
-                        if (_autoCloseSettings.StaggerTimeReplacement30Minutes)
-                        {
-                            if (!HasPendingTimeReplacement(profileName))
-                                QueueTimeReplacement(ctx, timeReason, timeDetail);
-                        }
-                        else if (!HasPendingTimeReplacement(profileName))
-                        {
-                            await AutoCloseProfileAsync(
-                                ctx,
-                                timeReason,
-                                timeDetail,
-                                source: "runtime_watchdog_time_direct_unhealthy");
-                        }
+                        await AutoCloseProfileAsync(
+                            ctx,
+                            $"TIME_{_autoCloseSettings.RunHours}H",
+                            $"Đạt tổng thời gian chạy {_autoCloseSettings.RunHours} giờ (tổng={total:c}) trong lúc runtime không khỏe.",
+                            source: "runtime_watchdog_time_unhealthy");
 
                         continue;
                     }
@@ -1000,6 +996,35 @@ public sealed partial class ManagerForm
 
         // Sau crash cứng Worker có thể biến mất trước khi Manager kịp lưu expected-set.
         // runtime_stats.json còn isRunning=true là dấu hiệu phiên trước chết khi đang RUNNING.
+        return RuntimeStatsFileSaysRunning(ctx);
+    }
+
+    bool IsAutoCloseTimeEligibleAfterManagerRestart(ProfileContext ctx, string state)
+    {
+        // Người dùng Pause chủ động thì không TIME-close trong lúc đang pause.
+        if (state == RuntimeStatePaused)
+            return false;
+
+        // State RUNNING/RECOVERING là đủ cho TIME. Không bắt buộc ctx.Worker phải
+        // được Manager hiện tại adopt, vì Worker có thể đã chạy từ phiên Manager trước.
+        if (state is RuntimeStateRunning or RuntimeStateRecovering)
+            return true;
+
+        try
+        {
+            if (ctx.Worker is not null && !ctx.Worker.HasExited)
+                return true;
+        }
+        catch
+        {
+            if (ctx.Worker is not null)
+                return true;
+        }
+
+        // Quan trọng cho trường hợp mở lại Manager: runtime_stats.json là nguồn
+        // đang được UI dùng để hiển thị Tổng thời gian và có cờ isRunning. Với TIME,
+        // cờ này được phép khôi phục eligibility dù Worker object chưa adopt được.
+        // Luật FAULT_10M bên dưới vẫn KHÔNG dùng tín hiệu này một mình.
         return RuntimeStatsFileSaysRunning(ctx);
     }
 
@@ -1197,6 +1222,8 @@ public sealed partial class ManagerForm
 
         if (command is "start" or "start_auto" or "resume")
         {
+            _autoCloseVerifiedCleanProfiles.Remove(profileName);
+
             // Một lần Start/Resume mới mở một vòng đời mới cho profile.
             ClearAutoCloseReasonDecision(
                 profileName,
@@ -1401,21 +1428,7 @@ public sealed partial class ManagerForm
         if (!_autoCloseInProgressProfiles.Add(ctx.Profile.Name))
             return;
 
-        // Một thời điểm chỉ cho một transaction đóng/xóa/bù bắt đầu. BAN không
-        // chờ slot 30 phút, nhưng nếu transaction khác đang chạy thì chỉ chờ đúng
-        // thời gian transaction đó kết thúc để tránh Worker/Excel/Chrome đè nhau.
-        using var replacementOperationLease = await EnterReplacementOperationAsync(
-            ctx.Profile.Name,
-            reason);
-
-        // Trong lúc chờ global gate, BAN có thể vừa được phát hiện. Nâng reason
-        // trước khi bắt đầu transaction để BAN luôn thắng TIME/FAULT.
-        var gateDecision = ResolveAutoCloseReasonDecision(
-            ctx.Profile.Name,
-            reason,
-            detail);
-        reason = gateDecision.Reason;
-        detail = gateDecision.Detail;
+        _autoCloseVerifiedCleanProfiles.Remove(ctx.Profile.Name);
 
         // Chốt số suất mục tiêu TRƯỚC khi profile lỗi bị gỡ khỏi expected-running.
         // Ví dụ đang chạy 6 profile thì Tự bù chỉ được duy trì tối đa 6 suất.
@@ -1527,16 +1540,38 @@ public sealed partial class ManagerForm
                     $"[AUTO_CLOSE_CHROME_NEEDS_FINAL_CLEANUP] profile={ctx.Profile.Name} workerCloseVerified=false");
             }
 
-            // Worker phải chết THẬT trước khi cleanup Chrome cuối cùng.
+            // Worker phải chết THẬT trước khi được phép giải phóng slot.
             WriteAutoDiagnosticEvent(
                 ctx, source, reason, "STEP", "step=SHUTDOWN_WORKER");
             await EnsureAutoCloseWorkerStoppedAsync(ctx);
 
-            // Một probe duy nhất. CIM timeout => CLEANUP_PENDING, chưa sinh suất bù.
-            // Nếu tìm thấy PID đúng ProfilePath thì kill trực tiếp PID đã xác minh.
-            WriteAutoDiagnosticEvent(
-                ctx, source, reason, "STEP", "step=FINAL_CHROME_CLEANUP");
-            await EnsureAutoCloseChromeStoppedAsync(ctx);
+            if (chromeClosedByWorker)
+            {
+                // Worker chỉ trả "closed"/"not_running" sau khi CloseManagedBrowserAsync
+                // xác minh CDP đã tắt và toàn bộ PID Chrome đã sở hữu/xác minh đều đã thoát.
+                // Không chạy CIM/PowerShell lần hai vì chính bước thừa này có thể timeout
+                // và làm profile mắc ở STOPPED dù Chrome thực tế đã đóng sạch.
+                _autoCloseVerifiedCleanProfiles.Add(ctx.Profile.Name);
+
+                _log.Info(
+                    $"[AUTO_CLOSE_CHROME_CLEAN_CONFIRMED] profile={ctx.Profile.Name} source=worker_close_verified");
+            }
+            else
+            {
+                // Worker không xác minh được việc đóng Chrome => fail-closed.
+                // Bắt buộc dùng probe theo đúng ProfilePath. Nếu probe timeout/UNKNOWN
+                // thì EnsureAutoCloseChromeStoppedAsync ném CLEANUP_PENDING và TUYỆT ĐỐI
+                // chưa gỡ tab / chưa tạo suất bù.
+                WriteAutoDiagnosticEvent(
+                    ctx, source, reason, "STEP", "step=FINAL_CHROME_CLEANUP_FALLBACK");
+
+                await EnsureAutoCloseChromeStoppedAsync(ctx);
+
+                _autoCloseVerifiedCleanProfiles.Add(ctx.Profile.Name);
+
+                _log.Info(
+                    $"[AUTO_CLOSE_CHROME_CLEAN_CONFIRMED] profile={ctx.Profile.Name} source=manager_profile_path_probe");
+            }
 
             WriteAutoDiagnosticEvent(
                 ctx, source, reason, "STEP", "step=REMOVE_TAB");

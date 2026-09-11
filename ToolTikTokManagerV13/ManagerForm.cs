@@ -143,6 +143,7 @@ public sealed partial class ManagerForm : Form
         MinimumSize = new Size(980, 620);
         StartPosition = FormStartPosition.CenterScreen;
         BuildLayout();
+        InitializeProfileLifecycleDiagnostics();
         InitializeMonitorRelayoutHooks();
         ReloadCatalog();
         EnsureAddTab();

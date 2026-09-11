@@ -123,7 +123,7 @@ public sealed partial class MainForm : Form
             Location = new Point(-32000, -32000);
         }
         BackColor = SystemColors.Control;
-        _log = new Logger(_baseDir); _settingsService = new SettingsService(_baseDir); _profileService = new TikTokProfileService(_baseDir);
+        _log = new Logger(_baseDir); InitializePersistentWorkerDiagnostics(); _settingsService = new SettingsService(_baseDir); _profileService = new TikTokProfileService(_baseDir);
         var settingsSw = System.Diagnostics.Stopwatch.StartNew();
         _settings = _settingsService.Load();
         settingsSw.Stop();

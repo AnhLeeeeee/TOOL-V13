@@ -1,6 +1,7 @@
 ﻿using System.Text;
 using System.Text.Json;
 using ToolTikTokV12.Models;
+using ToolTikTokV12.Services;
 
 namespace ToolTikTokManagerV13;
 
@@ -13,6 +14,14 @@ public sealed partial class ManagerForm
         public string Username { get; set; } = "";
         public double TotalRunSeconds { get; set; }
         public bool IsManual { get; set; }
+
+        // Profile được tạo để bù nhưng TikTok chưa phản ánh tên mới ngay.
+        // Vẫn dùng CHÍNH queue Chờ dùng lại; cờ này chỉ tách lane để không bị
+        // lấy lại ngay ở lượt bù bình thường. Recovery sweep sẽ kiểm tra sau.
+        public bool NameSyncPending { get; set; }
+        public DateTime? NameSyncQueuedUtc { get; set; }
+        public int NameSyncCheckCount { get; set; }
+
         public DateTime AddedUtc { get; set; } = DateTime.UtcNow;
         public DateTime LastCheckedUtc { get; set; } = DateTime.UtcNow;
     }
@@ -26,7 +35,7 @@ public sealed partial class ManagerForm
 
     sealed class ReusableProfileQueueDocument
     {
-        public int Version { get; set; } = 2;
+        public int Version { get; set; } = 3;
         public List<ReusableProfileQueueEntry> Pending { get; set; } = new();
         public List<string> ExcludedProfiles { get; set; } = new();
         public Dictionary<string, ReusableProfileFailureEntry> FailedProfiles { get; set; } =
@@ -214,12 +223,19 @@ public sealed partial class ManagerForm
                 if (profileName.Length == 0)
                     continue;
 
-                // Xác định entry thủ công từ queue cũ trước khi đánh giá điều kiện.
-                var isManual =
+                // Xác định trạng thái đã có trong queue cũ trước khi đánh giá điều kiện.
+                var hasOldEntry =
                     previousByProfile.TryGetValue(
                         profileName,
-                        out var oldEntry)
-                    && oldEntry.IsManual;
+                        out var oldEntry);
+
+                var isManual =
+                    hasOldEntry
+                    && oldEntry!.IsManual;
+
+                var nameSyncPending =
+                    hasOldEntry
+                    && oldEntry!.NameSyncPending;
 
                 if (!IsReusableProfileActuallyCreated(profile))
                 {
@@ -246,6 +262,55 @@ public sealed partial class ManagerForm
                     Math.Max(
                         0,
                         totalSeconds);
+
+                // Lane đặc biệt nhưng vẫn nằm trong CHÍNH queue Chờ dùng lại:
+                // profile vừa tạo đã Save tên nhưng TikTok có thể cập nhật chậm.
+                // Giữ entry qua mọi lượt refresh, nhưng TryUseReusableProfileQueueAsync
+                // sẽ bỏ qua lane này cho tới khi recovery sweep chủ động kiểm tra.
+                if (nameSyncPending)
+                {
+                    var pendingNote = (account.Note ?? "").Trim();
+                    if (pendingNote.Equals("ban", StringComparison.OrdinalIgnoreCase))
+                    {
+                        reasons[profileName] = "GHI CHÚ: ban";
+                        continue;
+                    }
+
+                    if (excludedProfiles.Contains(profileName))
+                    {
+                        reasons[profileName] = "ĐÃ BỎ CHỜ";
+                        continue;
+                    }
+
+                    if (totalSeconds >= automaticMaxTotalSeconds)
+                    {
+                        reasons[profileName] = $"TỔNG >= {automaticMaxHours}H";
+                        continue;
+                    }
+
+                    failedProfiles.Remove(profileName);
+                    reasons[profileName] =
+                        busyProfiles.Contains(profileName)
+                            ? "CHỜ ĐỒNG BỘ TÊN · PROFILE ĐANG MỞ"
+                            : $"CHỜ ĐỒNG BỘ TÊN · ĐÃ KIỂM TRA {Math.Max(0, oldEntry!.NameSyncCheckCount)} LẦN";
+
+                    eligible.Add(
+                        new ReusableProfileQueueEntry
+                        {
+                            ProfileName = profileName,
+                            AccountId = account.Id,
+                            Username = account.Username,
+                            TotalRunSeconds = totalSeconds,
+                            IsManual = false,
+                            NameSyncPending = true,
+                            NameSyncQueuedUtc = oldEntry!.NameSyncQueuedUtc ?? oldEntry.AddedUtc,
+                            NameSyncCheckCount = Math.Max(0, oldEntry.NameSyncCheckCount),
+                            AddedUtc = oldEntry.AddedUtc,
+                            LastCheckedUtc = oldEntry.LastCheckedUtc
+                        });
+
+                    continue;
+                }
 
                 if (isManual)
                 {
@@ -467,7 +532,7 @@ public sealed partial class ManagerForm
             var updated =
                 new ReusableProfileQueueDocument
                 {
-                    Version = 2,
+                    Version = 3,
                     Pending = eligible,
                     ExcludedProfiles =
                         excludedProfiles
@@ -645,14 +710,23 @@ public sealed partial class ManagerForm
 
         var automatic =
             items
-                .Where(x => !x.IsManual)
+                .Where(x => !x.IsManual && !x.NameSyncPending)
                 .OrderByDescending(x => x.TotalRunSeconds)
+                .ThenBy(
+                    x => x.ProfileName,
+                    NaturalProfileNameOrder);
+
+        var nameSyncPending =
+            items
+                .Where(x => !x.IsManual && x.NameSyncPending)
+                .OrderBy(x => x.AddedUtc)
                 .ThenBy(
                     x => x.ProfileName,
                     NaturalProfileNameOrder);
 
         return manual
             .Concat(automatic)
+            .Concat(nameSyncPending)
             .ToList();
     }
 
@@ -791,7 +865,7 @@ public sealed partial class ManagerForm
                 OrderReusableProfileEntries(
                     document.Pending);
 
-            document.Version = 2;
+            document.Version = 3;
 
             _reusableProfileQueueCache = document;
             _reusableProfileQueueLoaded = true;
@@ -845,7 +919,7 @@ public sealed partial class ManagerForm
                 document.ExcludedProfiles.Add(profileName);
             }
 
-            document.Version = 2;
+            document.Version = 3;
 
             _reusableProfileQueueCache = document;
             _reusableProfileQueueLoaded = true;
@@ -891,6 +965,420 @@ public sealed partial class ManagerForm
                || tabOpen;
     }
 
+    int GetNameSyncPendingReusableProfileCount()
+    {
+        lock (_reusableProfileQueueLock)
+        {
+            return EnsureReusableProfileQueueLoadedUnsafe()
+                .Pending
+                .Count(x => x.NameSyncPending);
+        }
+    }
+
+    void QueueReusableProfileNameSyncPending(
+        AutoProfileQueueItem item,
+        string detail)
+    {
+        var profileName = (item.ProfileName ?? "").Trim();
+        if (profileName.Length == 0)
+            return;
+
+        double totalSeconds = 0;
+        try
+        {
+            var profile = _profileService.Load().Profiles.FirstOrDefault(x =>
+                x.Name.Equals(profileName, StringComparison.OrdinalIgnoreCase));
+            if (profile is not null)
+                totalSeconds = ReadReusableProfileTotalSeconds(profile);
+        }
+        catch { }
+
+        var nowUtc = DateTime.UtcNow;
+
+        lock (_reusableProfileQueueLock)
+        {
+            var document = CloneReusableProfileQueueDocument(
+                EnsureReusableProfileQueueLoadedUnsafe());
+
+            var existing = document.Pending.FirstOrDefault(x =>
+                x.ProfileName.Equals(profileName, StringComparison.OrdinalIgnoreCase));
+
+            document.Pending.RemoveAll(x =>
+                x.ProfileName.Equals(profileName, StringComparison.OrdinalIgnoreCase));
+
+            // Đây là lỗi đồng bộ tên tạm thời, không phải lỗi profile cứng.
+            document.FailedProfiles.Remove(profileName);
+            document.ExcludedProfiles.RemoveAll(x =>
+                x.Equals(profileName, StringComparison.OrdinalIgnoreCase));
+
+            document.Pending.Add(
+                new ReusableProfileQueueEntry
+                {
+                    ProfileName = profileName,
+                    AccountId = item.Account.Id,
+                    Username = item.Account.Username,
+                    TotalRunSeconds = Math.Max(0, totalSeconds),
+                    IsManual = false,
+                    NameSyncPending = true,
+                    NameSyncQueuedUtc = existing?.NameSyncQueuedUtc ?? nowUtc,
+                    NameSyncCheckCount = existing?.NameSyncCheckCount ?? 0,
+                    AddedUtc = existing?.AddedUtc ?? nowUtc,
+                    LastCheckedUtc = existing?.LastCheckedUtc ?? nowUtc
+                });
+
+            document.Pending = OrderReusableProfileEntries(document.Pending);
+            document.Version = 3;
+            _reusableProfileQueueCache = document;
+            _reusableProfileQueueLoaded = true;
+            _reusableProfileReasonCache[profileName] = "CHỜ ĐỒNG BỘ TÊN";
+            SaveReusableProfileQueueUnsafe(document);
+        }
+
+        _log.Warn(
+            $"[REUSE_QUEUE_NAME_SYNC_ADD] profile={profileName} account={item.Account.Username} detail={detail}");
+
+        WriteAutoActivityLog(
+            action: "CHỜ DÙNG LẠI",
+            profile: profileName,
+            account: item.Account.Username,
+            result: "CHỜ ĐỒNG BỘ TÊN",
+            detail: "TikTok chưa phản ánh tên mới. Đã đóng runtime và giữ profile trong Chờ dùng lại để recovery sweep kiểm tra sau.");
+    }
+
+    void TouchReusableProfileNameSyncPending(
+        string profileName,
+        string reason)
+    {
+        profileName = (profileName ?? "").Trim();
+        if (profileName.Length == 0)
+            return;
+
+        lock (_reusableProfileQueueLock)
+        {
+            var document = CloneReusableProfileQueueDocument(
+                EnsureReusableProfileQueueLoadedUnsafe());
+
+            var entry = document.Pending.FirstOrDefault(x =>
+                x.ProfileName.Equals(profileName, StringComparison.OrdinalIgnoreCase)
+                && x.NameSyncPending);
+
+            if (entry is null)
+                return;
+
+            entry.NameSyncCheckCount = Math.Max(0, entry.NameSyncCheckCount) + 1;
+            entry.LastCheckedUtc = DateTime.UtcNow;
+
+            // Đưa xuống cuối lane NAME_SYNC_PENDING cho đúng nghĩa thử một lượt.
+            entry.AddedUtc = DateTime.UtcNow;
+
+            document.Pending = OrderReusableProfileEntries(document.Pending);
+            document.Version = 3;
+            _reusableProfileQueueCache = document;
+            _reusableProfileQueueLoaded = true;
+            _reusableProfileReasonCache[profileName] =
+                $"CHỜ ĐỒNG BỘ TÊN · ĐÃ KIỂM TRA {entry.NameSyncCheckCount} LẦN";
+            SaveReusableProfileQueueUnsafe(document);
+        }
+
+        _log.Info(
+            $"[REUSE_QUEUE_NAME_SYNC_ROTATE] profile={profileName} reason={reason}");
+    }
+
+    async Task<bool> TryRecoverNameSyncPendingReusableProfilesOnceAsync(
+        AutoReplacementRequest request)
+    {
+        await RefreshReusableProfileQueueAsync("name_sync_recovery_sweep");
+
+        if (_closing)
+            return false;
+
+        List<ReusableProfileQueueEntry> candidates;
+        lock (_reusableProfileQueueLock)
+        {
+            candidates = EnsureReusableProfileQueueLoadedUnsafe()
+                .Pending
+                .Where(x => x.NameSyncPending)
+                .OrderBy(x => x.AddedUtc)
+                .ThenBy(x => x.ProfileName, NaturalProfileNameOrder)
+                .Select(CloneReusableProfileQueueEntry)
+                .ToList();
+        }
+
+        if (candidates.Count == 0)
+            return false;
+
+        _log.Info(
+            $"[NAME_SYNC_RECOVERY_SWEEP_BEGIN] closed={request.ClosedProfileName} pending={candidates.Count}");
+
+        foreach (var candidate in candidates)
+        {
+            if (_closing)
+                return false;
+
+            var profileName = (candidate.ProfileName ?? "").Trim();
+            if (profileName.Length == 0
+                || profileName.Equals(request.ClosedProfileName, StringComparison.OrdinalIgnoreCase)
+                || _autoReplacementClaimedProfiles.Contains(profileName))
+            {
+                continue;
+            }
+
+            TikTokAccountPoolItem? account = null;
+            try
+            {
+                account = await RunAccountPoolIoAsync(
+                    () =>
+                    {
+                        if (!string.IsNullOrWhiteSpace(_accountPoolService.CurrentSourcePath))
+                            _accountPoolService.ReloadCurrentExcel();
+
+                        var accounts = _accountPoolService.Load();
+                        return accounts.FirstOrDefault(x =>
+                            x.Id.Equals(candidate.AccountId, StringComparison.OrdinalIgnoreCase)
+                            || (x.Username.Equals(candidate.Username, StringComparison.OrdinalIgnoreCase)
+                                && (x.AssignedProfile ?? "").Equals(profileName, StringComparison.OrdinalIgnoreCase)));
+                    },
+                    CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _log.Warn(
+                    $"[NAME_SYNC_RECOVERY_ACCOUNT_READ_WARN] profile={profileName} error={ex.Message}");
+            }
+
+            if (account is null)
+            {
+                RemoveReusableProfileQueueEntry(profileName, "name_sync_account_missing");
+                continue;
+            }
+
+            if ((account.Note ?? "").Trim().Equals("ban", StringComparison.OrdinalIgnoreCase)
+                || !string.Equals((account.AssignedProfile ?? "").Trim(), profileName, StringComparison.OrdinalIgnoreCase))
+            {
+                RemoveReusableProfileQueueEntry(profileName, "name_sync_account_invalid_or_remapped");
+                continue;
+            }
+
+            try
+            {
+                var catalog = _profileService.Load();
+                RefreshContextsFromCatalog(catalog);
+            }
+            catch { }
+
+            if (!_contexts.TryGetValue(profileName, out var ctx))
+            {
+                RemoveReusableProfileQueueEntry(profileName, "name_sync_context_missing");
+                continue;
+            }
+
+            if (IsReusableProfileBusy(profileName))
+            {
+                TouchReusableProfileNameSyncPending(profileName, "profile_busy");
+                continue;
+            }
+
+            _autoReplacementClaimedProfiles.Add(profileName);
+
+            try
+            {
+                _log.Info(
+                    $"[NAME_SYNC_RECOVERY_OPEN] closed={request.ClosedProfileName} profile={profileName} account={account.Username}");
+
+                WriteAutoActivityLog(
+                    action: "KIỂM TRA TÊN CHỜ",
+                    profile: request.ClosedProfileName,
+                    account: account.Username,
+                    reason: request.Reason,
+                    replacementProfile: profileName,
+                    result: "BẮT ĐẦU",
+                    detail: "Mở lại profile trong Chờ dùng lại để chỉ kiểm tra tên đã đồng bộ hay chưa.");
+
+                var opened = await OpenProfileAsync(
+                    ctx,
+                    $"Kiểm tra lại tên profile chờ dùng lại {profileName}...");
+
+                if (!opened && (ctx.Worker is null || ctx.Worker.HasExited))
+                {
+                    await CleanupCreatedReplacementAttemptAsync(
+                        profileName,
+                        "name_sync_recovery_open_failed");
+                    TouchReusableProfileNameSyncPending(profileName, "open_worker_failed");
+                    continue;
+                }
+
+                try { await RefreshStatusAsync(ctx); } catch { }
+
+                if (!string.Equals(ctx.LastSnapshot?.Chrome, "CONNECTED", StringComparison.OrdinalIgnoreCase))
+                {
+                    await OpenChromeForProfileAsync(ctx);
+                    try { await RefreshStatusAsync(ctx); } catch { }
+                }
+
+                if (!string.Equals(ctx.LastSnapshot?.Chrome, "CONNECTED", StringComparison.OrdinalIgnoreCase))
+                {
+                    await CleanupCreatedReplacementAttemptAsync(
+                        profileName,
+                        "name_sync_recovery_chrome_not_connected");
+                    TouchReusableProfileNameSyncPending(profileName, "chrome_not_connected");
+                    continue;
+                }
+
+                var identityState = LoadIdentityToolState();
+                var names = SplitIdentityNames(identityState.NamesText);
+                if (names.Count == 0)
+                {
+                    await CleanupCreatedReplacementAttemptAsync(
+                        profileName,
+                        "name_sync_recovery_names_empty");
+                    TouchReusableProfileNameSyncPending(profileName, "identity_names_empty");
+                    continue;
+                }
+
+                // Chỉ PROBE tên. Không gọi ProcessNameGuardOnceAsync vì hàm đó sẽ
+                // đổi tên lại khi chưa match; recovery sweep theo yêu cầu chỉ kiểm tra.
+                var probe = await ProbeNameGuardFastAsync(
+                    ctx,
+                    account.Username,
+                    names);
+
+                if (!probe.Ok)
+                {
+                    _log.Warn(
+                        $"[NAME_SYNC_RECOVERY_PROBE_WAIT] profile={profileName} source={probe.Source} message={probe.Message}");
+
+                    await CleanupCreatedReplacementAttemptAsync(
+                        profileName,
+                        "name_sync_recovery_probe_transient");
+                    TouchReusableProfileNameSyncPending(profileName, "probe_transient");
+                    continue;
+                }
+
+                if (!probe.Matched)
+                {
+                    _log.Info(
+                        $"[NAME_SYNC_RECOVERY_NOT_YET] profile={profileName} currentName={probe.CurrentName}");
+
+                    await CleanupCreatedReplacementAttemptAsync(
+                        profileName,
+                        "name_sync_not_updated_yet");
+                    TouchReusableProfileNameSyncPending(profileName, "name_not_updated_yet");
+                    continue;
+                }
+
+                var identityDone = await MarkIdentityDoneVerifiedAsync(
+                    account.Username,
+                    profileName,
+                    CancellationToken.None);
+
+                if (!identityDone.Ok)
+                {
+                    _log.Warn(
+                        $"[NAME_SYNC_RECOVERY_EXCEL_WAIT] profile={profileName} error={identityDone.Error}");
+
+                    await CleanupCreatedReplacementAttemptAsync(
+                        profileName,
+                        "name_sync_identity_done_write_failed");
+                    TouchReusableProfileNameSyncPending(profileName, "identity_done_write_failed");
+                    continue;
+                }
+
+                MarkNameGuardVerifiedForCurrentChromeSession(ctx, account.Username);
+
+                var startReply = await StartWithNameGuardAsync(
+                    ctx,
+                    "start_auto",
+                    TimeSpan.FromSeconds(100),
+                    suppressStatus: true);
+
+                if (!string.Equals(startReply, "started", StringComparison.OrdinalIgnoreCase))
+                {
+                    await CleanupCreatedReplacementAttemptAsync(
+                        profileName,
+                        "name_sync_recovery_start:" + startReply);
+                    TouchReusableProfileNameSyncPending(profileName, "start:" + startReply);
+                    continue;
+                }
+
+                var healthy = await WaitForReplacementHealthyRunningAsync(
+                    ctx,
+                    request,
+                    "name_sync_recovery");
+
+                if (!healthy)
+                {
+                    await CleanupCreatedReplacementAttemptAsync(
+                        profileName,
+                        "name_sync_recovery_not_healthy");
+                    TouchReusableProfileNameSyncPending(profileName, "started_but_not_healthy");
+                    continue;
+                }
+
+                try
+                {
+                    await RunAccountPoolIoAsync(
+                        () => _accountPoolService.SetAutoProfileResult(account.Id, "DONE"),
+                        CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    _log.Warn(
+                        $"[NAME_SYNC_RECOVERY_DONE_WRITE_WARN] profile={profileName} account={account.Username} error={ex.Message}");
+                }
+
+                RemoveReusableProfileQueueEntry(profileName, "name_sync_recovered_success");
+                MarkProfileSupplyState(
+                    profileName,
+                    "used",
+                    "name_sync_recovered_running_confirmed");
+
+                _log.Info(
+                    $"[NAME_SYNC_RECOVERY_OK] closed={request.ClosedProfileName} replacement={profileName} account={account.Username} currentName={probe.CurrentName}");
+
+                WriteAutoActivityLog(
+                    action: "KIỂM TRA TÊN CHỜ",
+                    profile: request.ClosedProfileName,
+                    account: account.Username,
+                    reason: request.Reason,
+                    replacementProfile: profileName,
+                    result: "THÀNH CÔNG",
+                    detail: $"Tên đã cập nhật thành '{probe.CurrentName}'. Đã xác minh DONE và profile RUNNING khỏe.");
+
+                return true;
+            }
+            catch (AutoReplacementCleanupBarrierException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _log.Warn(
+                    $"[NAME_SYNC_RECOVERY_ERROR] profile={profileName} error={ex.Message}");
+
+                try
+                {
+                    await CleanupCreatedReplacementAttemptAsync(
+                        profileName,
+                        "name_sync_recovery_exception:" + ex.GetType().Name);
+                    TouchReusableProfileNameSyncPending(profileName, "exception:" + ex.GetType().Name);
+                }
+                catch (AutoReplacementCleanupBarrierException)
+                {
+                    throw;
+                }
+            }
+            finally
+            {
+                _autoReplacementClaimedProfiles.Remove(profileName);
+            }
+        }
+
+        _log.Info(
+            $"[NAME_SYNC_RECOVERY_SWEEP_END] closed={request.ClosedProfileName} result=NO_MATCH pending={GetNameSyncPendingReusableProfileCount()}");
+
+        return false;
+    }
+
     async Task<bool> TryUseReusableProfileQueueAsync(
         AutoReplacementRequest request)
     {
@@ -911,6 +1399,9 @@ public sealed partial class ManagerForm
                 OrderReusableProfileEntries(
                     EnsureReusableProfileQueueLoadedUnsafe()
                         .Pending)
+                    // NAME_SYNC_PENDING chỉ được recovery sweep lấy lại.
+                    // Lượt bù bình thường phải bỏ qua để tránh mở lại ngay sau khi vừa đóng.
+                    .Where(x => !x.NameSyncPending)
                     .Select(CloneReusableProfileQueueEntry)
                     .ToList();
         }
@@ -1417,7 +1908,7 @@ public sealed partial class ManagerForm
         NewReusableProfileQueueDocument()
         => new()
         {
-            Version = 2,
+            Version = 3,
             Pending = new List<ReusableProfileQueueEntry>(),
             ExcludedProfiles = new List<string>(),
             FailedProfiles =
@@ -1435,6 +1926,9 @@ public sealed partial class ManagerForm
             Username = source.Username ?? "",
             TotalRunSeconds = source.TotalRunSeconds,
             IsManual = source.IsManual,
+            NameSyncPending = source.NameSyncPending,
+            NameSyncQueuedUtc = source.NameSyncQueuedUtc,
+            NameSyncCheckCount = source.NameSyncCheckCount,
             AddedUtc = source.AddedUtc,
             LastCheckedUtc = source.LastCheckedUtc
         };
@@ -1444,7 +1938,7 @@ public sealed partial class ManagerForm
             ReusableProfileQueueDocument source)
         => new()
         {
-            Version = Math.Max(2, source.Version),
+            Version = Math.Max(3, source.Version),
             Pending =
                 source.Pending
                     .Select(

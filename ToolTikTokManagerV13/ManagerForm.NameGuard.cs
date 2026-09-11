@@ -262,7 +262,9 @@ public sealed partial class ManagerForm
             workerTimeout: TimeSpan.FromSeconds(75),
             nameGuardFastMode: true);
 
-        // Fast mode: Save/Confirm thành công là DONE; KHÔNG reload/verify lại tên.
+        // Save/Confirm chỉ xác nhận TikTok đã nhận thao tác, KHÔNG phải bằng chứng
+        // tên đã phản ánh trên trang Hồ sơ. Vì TikTok có thể đồng bộ nickname chậm,
+        // tuyệt đối không ghi DONE chỉ dựa vào reply.Ok.
         var completed = reply.Ok && !reply.NameCooldown && !reply.Skipped;
         if (!completed)
         {
@@ -275,8 +277,44 @@ public sealed partial class ManagerForm
             return new NameGuardResult(false, reason);
         }
 
-        // TikTok đã Save/Confirm thành công: cập nhật state local trước. Excel DONE lỗi
-        // không được làm mất kết quả avatar vừa đổi hoặc biến lượt này thành FAIL.
+        // 4) Sau Save/Confirm, quay lại Hồ sơ và đọc tên thực tế. Probe hiện có chỉ
+        // đọc [data-e2e=user-title], không dùng giá trị trong form Edit profile.
+        // Thử tối đa 2 lần ngắn; nếu TikTok chưa kịp đồng bộ thì đưa profile sang
+        // lane NAME_SYNC_PENDING để recovery sweep hiện có kiểm tra lại sau.
+        NameGuardProbeReply? verifiedProbe = null;
+        for (var verifyAttempt = 1; verifyAttempt <= 2; verifyAttempt++)
+        {
+            if (verifyAttempt > 1)
+                await Task.Delay(1200);
+
+            verifiedProbe = await ProbeNameGuardFastAsync(ctx, username, names);
+            _log.Info(
+                $"[NAME_GUARD_AFTER_SAVE_VERIFY] profile={ctx.Profile.Name} account={username} " +
+                $"attempt={verifyAttempt}/2 ok={verifiedProbe.Ok} matched={verifiedProbe.Matched} " +
+                $"currentName={verifiedProbe.CurrentName} source={verifiedProbe.Source}");
+
+            if (verifiedProbe.Ok && verifiedProbe.Matched)
+                break;
+        }
+
+        if (verifiedProbe is null || !verifiedProbe.Ok || !verifiedProbe.Matched)
+        {
+            var seenName = verifiedProbe?.CurrentName ?? "";
+            var detail = verifiedProbe is null || !verifiedProbe.Ok
+                ? $"TikTok đã Save/Confirm nhưng chưa đọc/xác minh được tên mới trên Hồ sơ. " +
+                  $"source={verifiedProbe?.Source ?? "-"}; message={verifiedProbe?.Message ?? "-"}"
+                : $"TikTok đã Save/Confirm nhưng tên trên Hồ sơ vẫn chưa cập nhật. " +
+                  $"currentName='{seenName}', target='{targetName}'.";
+
+            await QueueNameGuardNameSyncPendingAndCloseAsync(ctx, username, detail);
+            return new NameGuardResult(
+                false,
+                "Tên đã Save nhưng TikTok chưa đồng bộ trên Hồ sơ; đã đưa profile vào Chờ dùng lại.",
+                ChangedName: reply.NameChanged,
+                Transient: true);
+        }
+
+        // Chỉ tới đây mới có bằng chứng tên thực tế trên Hồ sơ đã đúng.
         if (reply.AvatarChanged && !string.IsNullOrWhiteSpace(avatarPath))
         {
             state.LastAvatarByProfile[ctx.Profile.Name] = avatarPath;
@@ -291,13 +329,15 @@ public sealed partial class ManagerForm
             return RegisterNameGuardPersistenceWarning(
                 ctx,
                 username,
-                "Đổi Tên/ảnh đã Save/Confirm thành công",
+                "Tên trên Hồ sơ đã được xác minh đúng sau Save/Confirm",
                 excelDone.Error,
                 changedName: reply.NameChanged);
         }
 
-        _log.Info($"[NAME_GUARD_UPDATE_DONE_NO_RECHECK] profile={ctx.Profile.Name} account={username} target={targetName} nameChanged={reply.NameChanged} avatarChanged={reply.AvatarChanged}");
-        return new NameGuardResult(true, "Đổi Tên/ảnh thành công.", ChangedName: reply.NameChanged);
+        _log.Info(
+            $"[NAME_GUARD_UPDATE_DONE_VERIFIED] profile={ctx.Profile.Name} account={username} " +
+            $"target={targetName} currentName={verifiedProbe.CurrentName} nameChanged={reply.NameChanged} avatarChanged={reply.AvatarChanged}");
+        return new NameGuardResult(true, "Đổi Tên/ảnh thành công và đã xác minh tên trên Hồ sơ.", ChangedName: reply.NameChanged);
     }
 
     async Task<(string Username, string AssignedProfile)> ResolveNameGuardAccountAsync(ProfileContext ctx)
@@ -500,6 +540,89 @@ public sealed partial class ManagerForm
 
         var bio = state.UpdateBio ? (state.BioText ?? "").Trim() : "";
         return (avatarPath, bio);
+    }
+
+    async Task QueueNameGuardNameSyncPendingAndCloseAsync(
+        ProfileContext ctx,
+        string username,
+        string detail)
+    {
+        _nameGuardVerifiedSessionAccount.Remove(ctx.Profile.Name);
+
+        // Tên chưa được xác minh nên tuyệt đối không để Excel ở DONE. PROCESSING
+        // phản ánh đúng trạng thái: TikTok đã nhận Save nhưng còn chờ đồng bộ.
+        await TrySetNameGuardExcelStatusAsync(username, "PROCESSING", ctx.Profile.Name);
+
+        try
+        {
+            var account = await RunAccountPoolIoAsync(
+                () => _accountPoolService.Load().FirstOrDefault(x =>
+                    x.Username.Equals(username, StringComparison.OrdinalIgnoreCase)),
+                CancellationToken.None);
+
+            if (account is not null)
+            {
+                QueueReusableProfileNameSyncPending(
+                    new AutoProfileQueueItem(account, ctx.Profile.Name, ResumeExisting: true),
+                    detail);
+            }
+            else
+            {
+                _log.Warn(
+                    $"[NAME_GUARD_NAME_SYNC_QUEUE_ACCOUNT_MISSING] profile={ctx.Profile.Name} account={username}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Warn(
+                $"[NAME_GUARD_NAME_SYNC_QUEUE_WARN] profile={ctx.Profile.Name} account={username} error={ex.Message}");
+        }
+
+        // Khóa AutoOnReady chen vào đúng lúc đang cleanup. Recovery sweep của
+        // NAME_SYNC_PENDING sẽ chủ động mở lại profile khi tới lượt.
+        _autoIdentityHandledSession.Add(ctx.Profile.Name);
+        _autoIdentityNextProbeUtc.Remove(ctx.Profile.Name);
+
+        _log.Warn(
+            $"[NAME_GUARD_NAME_SYNC_PENDING_CLOSE] profile={ctx.Profile.Name} account={username} detail={detail}");
+        WriteAutoDiagnosticEvent(
+            ctx,
+            "name_guard",
+            "NAME_SYNC_PENDING",
+            "CLOSE_REQUEST",
+            $"account={username}; detail={detail}");
+
+        try
+        {
+            await CloseChromeForProfileAsync(ctx);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn(
+                $"[NAME_GUARD_NAME_SYNC_CHROME_CLOSE_WARN] profile={ctx.Profile.Name} error={ex.Message}");
+        }
+
+        try
+        {
+            await EnsureAutoCloseWorkerStoppedAsync(ctx);
+
+            if (ctx.Tab is not null && !ctx.Tab.IsDisposed && ctx.Tab.Parent == _tabs)
+                RemoveTab(ctx);
+
+            _log.Info(
+                $"[NAME_GUARD_NAME_SYNC_PENDING_CLOSED] profile={ctx.Profile.Name} account={username}");
+            WriteAutoDiagnosticEvent(
+                ctx,
+                "name_guard",
+                "NAME_SYNC_PENDING",
+                "CLOSED",
+                $"account={username}; detail={detail}");
+        }
+        catch (Exception ex)
+        {
+            _log.Error(
+                $"[NAME_GUARD_NAME_SYNC_CLOSE_ERROR] profile={ctx.Profile.Name} error={ex}");
+        }
     }
 
     async Task FailNameGuardAndCloseAsync(ProfileContext ctx, string username, string reason)

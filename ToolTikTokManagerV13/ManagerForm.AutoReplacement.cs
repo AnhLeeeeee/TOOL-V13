@@ -63,6 +63,12 @@ public sealed partial class ManagerForm
     static readonly TimeSpan AutoReplacementFailedProfileCooldown = TimeSpan.FromMinutes(5);
     static readonly TimeSpan AutoReplacementQueueWaitSlice = TimeSpan.FromSeconds(5);
 
+    // Nếu TikTok Save tên nhưng giao diện cập nhật chậm, vẫn tiếp tục tạo PRF mới.
+    // Chỉ sau 30 phút thiếu suất, hoặc sau mỗi 5 lần thử mới khi đã có PRF chờ tên,
+    // mới vét lane NAME_SYNC_PENDING một lượt rồi quay lại logic tạo mới hiện tại.
+    static readonly TimeSpan AutoReplacementNameSyncRecoveryAfter = TimeSpan.FromMinutes(30);
+    const int AutoReplacementNameSyncRecoveryAfterNewAttempts = 5;
+
     readonly List<AutoReplacementRequest> _autoReplacementQueue = new();
     readonly HashSet<string> _autoReplacementRetiredProfiles = new(StringComparer.OrdinalIgnoreCase);
     readonly HashSet<string> _autoReplacementClaimedProfiles = new(StringComparer.OrdinalIgnoreCase);
@@ -341,9 +347,9 @@ public sealed partial class ManagerForm
                     continue;
                 }
 
-                // Toàn bộ cleanup + mở profile bù dùng chung global transaction gate
-                // với AutoClose. Nhờ vậy BAN/TIME/FAULT không đóng Chrome/ghi Excel
-                // chồng lên lúc một suất bù đang dọn/mở profile mới.
+                // Queue Tự bù có gate RIÊNG để các suất bù không đè nhau.
+                // Gate này KHÔNG chặn AutoClose; TIME/BAN/FAULT vẫn được đóng đúng lượt
+                // ngay cả khi một suất bù đang tạo PRF mới hoặc chờ cleanup.
                 using var replacementOperationLease = await EnterReplacementOperationAsync(
                     request.ClosedProfileName,
                     "AUTO_REPLACE:" + request.Reason);
@@ -421,6 +427,10 @@ public sealed partial class ManagerForm
 
                     if (!filled)
                     {
+                        // Logic bù cũ được giữ nguyên: nếu không có PRF có sẵn đủ
+                        // điều kiện thì chuyển ngay sang tạo PRF mới từ account chưa gán.
+                        // Việc kho bù có/không có tuyệt đối không ảnh hưởng quyết định
+                        // Tự đóng của profile nguồn.
                         _log.Info(
                             $"[AUTO_REPLACE_REUSE_EMPTY_FALLBACK_NEW] id={request.Id} closed={request.ClosedProfileName}");
 
@@ -737,6 +747,20 @@ public sealed partial class ManagerForm
     }
 
 
+    static bool IsNameSyncPendingOutcome(AutoProfileProcessOutcome outcome)
+    {
+        if (!outcome.Step.Equals("RENAME", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        // CAPTCHA/config là lỗi cần xử lý riêng, không phải trường hợp TikTok
+        // Save xong nhưng tên cập nhật chậm. Các PAUSED_RENAME còn lại đều đáng
+        // giữ lại để một sweep sau chỉ PROBE tên thực tế.
+        if (!outcome.Status.StartsWith("PAUSED_RENAME", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        return !outcome.Status.Equals("PAUSED_RENAME_CONFIG", StringComparison.OrdinalIgnoreCase);
+    }
+
     async Task<bool> TryCreateReplacementAsync(AutoReplacementRequest request)
     {
         // Tự bù chỉ dùng tài khoản CHƯA GÁN và luôn tạo profile MỚI.
@@ -755,9 +779,34 @@ public sealed partial class ManagerForm
             // nhưng được ReleaseAccount() không bị lấy lại ngay và gây vòng lặp.
             var attemptedAccountIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var attempt = 0;
+            var newAttemptsSinceNameSyncSweep = 0;
+            var deadlineSweepCompleted = false;
 
             while (!_closing)
             {
+                var nameSyncPending = GetNameSyncPendingReusableProfileCount();
+                var replacementAge = DateTime.UtcNow - request.QueuedUtc;
+                var dueByAge = replacementAge >= AutoReplacementNameSyncRecoveryAfter
+                    && !deadlineSweepCompleted;
+                var dueByAttempts = newAttemptsSinceNameSyncSweep >= AutoReplacementNameSyncRecoveryAfterNewAttempts;
+
+                if (nameSyncPending > 0 && (dueByAge || dueByAttempts))
+                {
+                    _log.Info(
+                        $"[NAME_SYNC_RECOVERY_TRIGGER] closed={request.ClosedProfileName} pending={nameSyncPending} age={replacementAge:c} newAttemptsSinceSweep={newAttemptsSinceNameSyncSweep} trigger={(dueByAge ? "30m" : "5_attempts")}");
+
+                    var recovered = await TryRecoverNameSyncPendingReusableProfilesOnceAsync(request);
+                    newAttemptsSinceNameSyncSweep = 0;
+                    if (dueByAge)
+                        deadlineSweepCompleted = true;
+
+                    if (recovered)
+                        return true;
+
+                    // Vét xong một lượt vẫn chưa có tên cập nhật: quay về đúng logic cũ,
+                    // tiếp tục tạo PRF mới. Không lặp recovery liên tục.
+                }
+
                 var startName = DetectNextAutoProfileName();
 
                 var queue = await RunAccountPoolIoAsync(
@@ -807,6 +856,7 @@ public sealed partial class ManagerForm
 
                 attemptedAccountIds.Add(item.Account.Id);
                 attempt++;
+                newAttemptsSinceNameSyncSweep++;
                 _autoReplacementClaimedProfiles.Add(item.ProfileName);
 
                 try
@@ -937,6 +987,16 @@ public sealed partial class ManagerForm
                             item.ProfileName,
                             $"nonban_paused:{outcome.Status}:{outcome.Step}");
 
+                        // TikTok đôi lúc đã nhận Save tên nhưng trang Hồ sơ chưa phản ánh ngay.
+                        // Giữ PRF trong CHÍNH "Chờ dùng lại" với lane NAME_SYNC_PENDING;
+                        // lượt bù bình thường vẫn tiếp tục account mới, recovery chỉ vét sau.
+                        if (IsNameSyncPendingOutcome(outcome))
+                        {
+                            QueueReusableProfileNameSyncPending(
+                                item,
+                                $"status={outcome.Status}; step={outcome.Step}; note={outcome.Note}");
+                        }
+
                         // CỐ Ý KHÔNG gọi QueueAutoDeleteRetiredProfileAfterExcelNote ở đây.
                         // Profile/account lỗi non-BAN được giữ lại; chỉ runtime bị đóng.
                         continue;
@@ -961,6 +1021,13 @@ public sealed partial class ManagerForm
                     await CleanupCreatedReplacementAttemptAsync(
                         item.ProfileName,
                         $"outcome_fail:{outcome.Status}:{outcome.Step}");
+
+                    if (IsNameSyncPendingOutcome(outcome))
+                    {
+                        QueueReusableProfileNameSyncPending(
+                            item,
+                            $"status={outcome.Status}; step={outcome.Step}; note={outcome.Note}");
+                    }
 
                     // LOGIN_BANNED đã được note=ban + retire trong Auto Profile.
                     // Chỉ sau khi cleanup candidate hoàn tất mới cho Tự xóa BAN chạy,

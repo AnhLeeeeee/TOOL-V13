@@ -223,13 +223,31 @@ public sealed partial class ManagerForm
                 }
             }
 
-            try
+            if (_autoCloseVerifiedCleanProfiles.Contains(profileName))
             {
-                await EnsureAutoCloseChromeStoppedAsync(ctx);
+                // AutoClose đã có bằng chứng đóng sạch trong CHÍNH phiên Manager này.
+                // Worker/tab/opening ở trên cũng đã được dọn xong, vì vậy không cần
+                // chạy CIM/PowerShell lần nữa chỉ để xác minh lại cùng một việc.
+                _log.Info(
+                    $"[AUTO_REPLACE_CLEAN_BARRIER_FASTPASS] profile={profileName} source=verified_clean_session");
             }
-            catch (Exception ex)
+            else
             {
-                return new AutoReplacementCleanupResult(false, ex.Message);
+                try
+                {
+                    // Không có bằng chứng sạch => vẫn bắt buộc probe theo ProfilePath.
+                    // Nếu probe UNKNOWN/timeout/còn PID, trả false để queue bù CHỜ,
+                    // tuyệt đối không mở Chrome/profile mới chồng lên profile cũ.
+                    await EnsureAutoCloseChromeStoppedAsync(ctx);
+                    _autoCloseVerifiedCleanProfiles.Add(profileName);
+
+                    _log.Info(
+                        $"[AUTO_REPLACE_CLEAN_BARRIER_CONFIRMED] profile={profileName} source=profile_path_probe");
+                }
+                catch (Exception ex)
+                {
+                    return new AutoReplacementCleanupResult(false, ex.Message);
+                }
             }
 
             // Xác minh lại Worker và tab sau cleanup.

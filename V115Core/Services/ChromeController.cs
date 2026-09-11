@@ -48,6 +48,12 @@ public sealed partial class ChromeController : IAsyncDisposable
     CdpClient? _cdp;
     int _port;
     const string TikTokUrl = "https://www.tiktok.com/";
+
+    // LOGIN_BAN safety gate: chỉ được arm sau khi chính account hiện tại đã
+    // được Tool điền + bấm Đăng nhập. Các probe trước submit luôn trả rỗng để
+    // không thể gán nhầm trạng thái/session cũ của Chrome cho account mới.
+    bool _loginBanDetectionArmed;
+
     string _managedProfileDir = "";
     int _managedWindowPort;
     readonly HashSet<int> _managedPids = [];
@@ -2346,6 +2352,10 @@ public sealed partial class ChromeController : IAsyncDisposable
     {
         const string loginUrl = "https://www.tiktok.com/login/phone-or-email/email";
 
+        // Mỗi lượt Prepare bắt đầu ở trạng thái CHƯA xác nhận account hiện tại.
+        // Chỉ arm LOGIN_BAN sau ClickTikTokLoginSubmitAsync bên dưới.
+        _loginBanDetectionArmed = false;
+
         // Authentication and LIVE navigation are deliberately separable. Opening a
         // profile runs the normal auto-login flow but stays on TikTok home; pressing
         // Bắt đầu runs the same authentication gate and then opens LIVE. Session-cookie
@@ -2436,6 +2446,8 @@ public sealed partial class ChromeController : IAsyncDisposable
 
             if (!formReady)
             {
+                await CaptureLoginPageDiagnosticAsync("login_form_not_found", ct);
+
                 if (await HasTikTokSessionCookieAsync(ct))
                 {
                     return await FinalizeTikTokAuthenticatedAsync(
@@ -2462,8 +2474,15 @@ public sealed partial class ChromeController : IAsyncDisposable
         await FillTikTokLoginFormAsync(username, password, ct);
         await ClickTikTokLoginSubmitAsync(ct);
 
+        // Từ thời điểm này mới được phép kết luận BAN cho account đang gán.
+        // Trước mốc này mọi marker BAN có thể thuộc trang/session cũ.
+        _loginBanDetectionArmed = true;
+        _log.Info("[TIKTOK_LOGIN_BAN_GATE] armed=true reason=current-account-submitted");
+
         var completion = await WaitForTikTokLoginCompletionAsync(totpSecret, TimeSpan.FromSeconds(45), openLiveWhenReady, stopOnCaptcha, ct);
         if (completion is not null) return completion;
+
+        await CaptureLoginPageDiagnosticAsync("after_submit_timeout", ct);
 
         var loginBanAtTimeout = await DetectLoginAccountBanAsync(ct);
         if (!string.IsNullOrWhiteSpace(loginBanAtTimeout))
@@ -2561,6 +2580,8 @@ public sealed partial class ChromeController : IAsyncDisposable
         string homeMessage,
         CancellationToken ct)
     {
+        _loginBanDetectionArmed = false;
+
         if (openLiveWhenReady)
         {
             await OpenTikTokLiveReadyAsync(ct);
@@ -2862,6 +2883,8 @@ public sealed partial class ChromeController : IAsyncDisposable
 
     TikTokStartupResult BuildLoginAccountBannedResult(string signal)
     {
+        _loginBanDetectionArmed = false;
+
         var compact = (signal ?? "").Replace('\r', ' ').Replace('\n', ' ').Trim();
         if (compact.Length > 180) compact = compact[..180];
         _log.Warn($"[TIKTOK_LOGIN_ACCOUNT_BANNED] signal={compact}");
@@ -2874,18 +2897,85 @@ public sealed partial class ChromeController : IAsyncDisposable
 
     async Task<string> DetectLoginAccountBanAsync(CancellationToken ct)
     {
+        // Tuyệt đối không dùng marker BAN trước khi chính account hiện tại đã
+        // được Tool submit. Đây là hàng rào chống gán nhầm trạng thái/session cũ.
+        if (!_loginBanDetectionArmed)
+            return "";
+
         try
         {
-            var r = await EvalAsync("""
+            var first = await ProbeVisibleLoginAccountBanOnceAsync(ct);
+            if (string.IsNullOrWhiteSpace(first))
+                return "";
+
+            _log.Warn($"[TIKTOK_LOGIN_BAN_VISIBLE_FIRST] {first}");
+
+            // TikTok SPA có thể render/chớp text cũ trong thời gian rất ngắn.
+            // Chỉ chốt BAN khi cùng marker vẫn HIỂN THỊ sau lần đọc thứ hai.
+            await Task.Delay(900, ct);
+
+            if (!_loginBanDetectionArmed)
+                return "";
+
+            var second = await ProbeVisibleLoginAccountBanOnceAsync(ct);
+            if (string.IsNullOrWhiteSpace(second))
+            {
+                _log.Warn($"[TIKTOK_LOGIN_BAN_REJECTED] reason=disappeared first={first}");
+                return "";
+            }
+
+            static string MarkerOf(string signal)
+            {
+                var i = signal.IndexOf('|');
+                return (i >= 0 ? signal[..i] : signal).Trim();
+            }
+
+            var firstMarker = MarkerOf(first);
+            var secondMarker = MarkerOf(second);
+            if (!firstMarker.Equals(secondMarker, StringComparison.OrdinalIgnoreCase))
+            {
+                _log.Warn($"[TIKTOK_LOGIN_BAN_REJECTED] reason=marker_changed first={first} second={second}");
+                return "";
+            }
+
+            _log.Warn($"[TIKTOK_LOGIN_BAN_SIGNAL] {second}");
+            _log.Warn($"[TIKTOK_LOGIN_BAN_CONFIRMED] marker={secondMarker} confirm=2 visible=true afterSubmit=true");
+            await CaptureLoginPageDiagnosticAsync("ban_signal:" + second, ct);
+            return second;
+        }
+        catch
+        {
+            // Detector là safety signal phụ: lỗi probe/CDP không được biến thành
+            // lỗi đăng nhập. Khi DOM đọc lại được, vòng poll kế tiếp sẽ kiểm tra tiếp.
+            return "";
+        }
+    }
+
+    async Task<string> ProbeVisibleLoginAccountBanOnceAsync(CancellationToken ct)
+    {
+        var r = await EvalAsync("""
 (() => {
   const norm = x => String(x || '')
     .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
     .toLowerCase().replace(/đ/g, 'd').replace(/\s+/g, ' ').trim();
-  const text = norm(document.body?.innerText || document.body?.textContent || '');
-  if (!text) return '';
 
-  // Chỉ dùng hard markers có nghĩa trực tiếp "account đã bị cấm/đình chỉ".
-  // Không suy BAN từ login fail, sai password, CAPTCHA, 2FA hay timeout.
+  const actuallyVisible = el => {
+    if (!el || el.nodeType !== 1) return false;
+
+    const r = el.getBoundingClientRect();
+    if (r.width <= 2 || r.height <= 2) return false;
+    if (r.bottom <= 0 || r.right <= 0 || r.top >= window.innerHeight || r.left >= window.innerWidth) return false;
+
+    // Kiểm tra cả ancestor. Opacity của parent không "inherit" vào computed opacity
+    // của child nên chỉ kiểm tra chính element là chưa đủ.
+    for (let n = el; n && n.nodeType === 1; n = n.parentElement) {
+      const s = getComputedStyle(n);
+      if (s.display === 'none' || s.visibility === 'hidden' || s.visibility === 'collapse') return false;
+      if (Number(s.opacity || 1) <= 0.02) return false;
+    }
+    return true;
+  };
+
   const markers = [
     ['VI_BANNED', 'tai khoan cua ban da bi cam'],
     ['VI_SUSPENDED', 'tai khoan cua ban da bi dinh chi'],
@@ -2894,8 +2984,7 @@ public sealed partial class ChromeController : IAsyncDisposable
     ['EN_SUSPENDED', 'your account has been suspended'],
     ['EN_SUSPENDED_WAS', 'your account was suspended'],
 
-    // Account/username khong con ton tai tren TikTok. Voi nghiep vu kho
-    // tai khoan cu, day duoc xu ly nhu hard BAN de loai vinh vien khoi reuse.
+    // Theo nghiệp vụ hiện tại: account/user không tồn tại cũng loại như BAN.
     ['VI_USER_NOT_EXIST', 'nguoi dung khong ton tai'],
     ['VI_USER_NOT_EXIST_THIS', 'nguoi dung nay khong ton tai'],
     ['EN_USER_NOT_EXIST', 'user does not exist'],
@@ -2904,28 +2993,49 @@ public sealed partial class ChromeController : IAsyncDisposable
     ['EN_ACCOUNT_NOT_EXIST_SHORT', "account doesn't exist"]
   ];
 
-  const match = markers.find(x => text.includes(x[1]));
-  if (!match) return '';
+  // Không còn quét document.body text để quyết định BAN.
+  // Chỉ xét các khối text nhỏ, đang thực sự nhìn thấy trong viewport.
+  const selector = '[role="alert"],[role="dialog"],[aria-live],div,span,p,section,article,h1,h2,h3,li';
+  const hits = [];
+
+  for (const el of document.querySelectorAll(selector)) {
+    if (!actuallyVisible(el)) continue;
+
+    // innerText phản ánh phần text render; không fallback textContent vì textContent
+    // có thể chứa node ẩn/template mà người dùng không nhìn thấy.
+    const raw = String(el.innerText || '').replace(/\s+/g, ' ').trim();
+    if (!raw || raw.length > 500) continue;
+
+    const text = norm(raw);
+    if (!text) continue;
+
+    const marker = markers.find(x => text.includes(x[1]));
+    if (!marker) continue;
+
+    const box = el.getBoundingClientRect();
+    hits.push({
+      marker: marker[0],
+      text: raw.slice(0, 180),
+      tag: String(el.tagName || '').toUpperCase(),
+      len: raw.length,
+      area: Math.max(0, box.width * box.height)
+    });
+  }
+
+  if (!hits.length) return '';
+
+  // Ưu tiên node nhỏ/leaf-like để tránh container lớn chứa nhiều text con.
+  hits.sort((a, b) => (a.len - b.len) || (a.area - b.area));
+  const hit = hits[0];
   const path = String(location.pathname || '');
-  return match[0] + '|path=' + path;
+  const safeText = String(hit.text || '').replace(/[|\r\n]/g, ' ');
+  return hit.marker + '|path=' + path + '|tag=' + hit.tag + '|text=' + safeText;
 })()
 """, ct: ct);
 
-            var signal = r.TryGetProperty("value", out var v) && v.ValueKind == JsonValueKind.String
-                ? (v.GetString() ?? "").Trim()
-                : "";
-
-            if (signal.Length > 0)
-                _log.Warn($"[TIKTOK_LOGIN_BAN_SIGNAL] {signal}");
-
-            return signal;
-        }
-        catch
-        {
-            // Detector là safety signal phụ: lỗi probe/CDP không được biến thành
-            // lỗi đăng nhập. Khi DOM đọc lại được, vòng poll kế tiếp sẽ kiểm tra tiếp.
-            return "";
-        }
+        return r.TryGetProperty("value", out var v) && v.ValueKind == JsonValueKind.String
+            ? (v.GetString() ?? "").Trim()
+            : "";
     }
 
     public Task<bool> IsCaptchaVisibleAsync(CancellationToken ct = default)
