@@ -29,6 +29,9 @@ public sealed partial class ManagerForm
         public int AttemptCount { get; set; }
         public DateTime NextAttemptUtc { get; set; } = DateTime.UtcNow;
         public string LastError { get; set; } = "";
+        // Request sinh từ thiếu suất sau Start All không có profile nguồn cần cleanup.
+        // Request AutoClose bình thường luôn giữ true.
+        public bool RequiresSourceCleanup { get; set; } = true;
     }
 
     sealed class AutoReplacementQueueDocument
@@ -75,9 +78,68 @@ public sealed partial class ManagerForm
     readonly Dictionary<string, DateTime> _autoReplacementFailedProfileRetryUtc = new(StringComparer.OrdinalIgnoreCase);
     readonly object _autoReplacementQueueLock = new();
     readonly object _profileSupplyStateLock = new();
+    readonly object _autoReplacementExecutionLock = new();
+    CancellationTokenSource _autoReplacementExecutionCts = new();
+    int _autoReplacementExecutionGeneration;
     bool _autoReplacementFeatureInitialized;
     bool _autoReplacementQueueRunning;
     bool _autoReplacementSessionArmed;
+
+    (int Generation, CancellationToken Token) CaptureAutoReplacementExecution()
+    {
+        lock (_autoReplacementExecutionLock)
+        {
+            return (
+                _autoReplacementExecutionGeneration,
+                _autoReplacementExecutionCts.Token);
+        }
+    }
+
+    bool IsAutoReplacementExecutionAllowed(int generation)
+    {
+        if (_closing
+            || IsDisposed
+            || Disposing
+            || !_autoReplacementSessionArmed
+            || !_autoCloseSettings.OpenReplacementAfterAutoClose)
+        {
+            return false;
+        }
+
+        lock (_autoReplacementExecutionLock)
+        {
+            return generation == _autoReplacementExecutionGeneration
+                   && !_autoReplacementExecutionCts.IsCancellationRequested;
+        }
+    }
+
+    int InvalidateAutoReplacementExecution(string source)
+    {
+        CancellationTokenSource previous;
+        int generation;
+
+        lock (_autoReplacementExecutionLock)
+        {
+            previous = _autoReplacementExecutionCts;
+            _autoReplacementExecutionCts = new CancellationTokenSource();
+            generation = ++_autoReplacementExecutionGeneration;
+        }
+
+        try
+        {
+            previous.Cancel();
+        }
+        catch (Exception ex)
+        {
+            _log.Warn(
+                $"[AUTO_REPLACE_HARD_STOP_CANCEL_WARN] source={source} generation={generation} error={ex.Message}");
+        }
+
+        _log.Warn(
+            $"[AUTO_REPLACE_HARD_STOP_INVALIDATE] source={source} generation={generation}");
+
+        return generation;
+    }
 
     string ProfileSupplyStatePath => Path.Combine(_baseDir, "manager_profile_supply.json");
     string AutoReplacementQueuePath => Path.Combine(_baseDir, "manager_auto_replacement_queue.json");
@@ -142,6 +204,10 @@ public sealed partial class ManagerForm
         }
 
         UpdateAutoCloseToolbarButtonText();
+
+        // Reconcile nhẹ mỗi ~15 giây để phiên Tự bù giữ đúng số suất mục tiêu.
+        // Hàm bên trong có throttle + busy guard nên Tick 1 giây không tạo tải đáng kể.
+        _refreshTimer.Tick += async (_, _) => await MaybeReconcileAutoReplacementCapacityAsync();
 
         // Queue "dùng lại" là queue riêng, KHÔNG bị xóa cùng suất bù cũ.
         // Quét sau khi form hiển thị để không làm chậm thời điểm tạo Handle/UI.
@@ -347,6 +413,16 @@ public sealed partial class ManagerForm
                     continue;
                 }
 
+                var execution =
+                    CaptureAutoReplacementExecution();
+
+                if (!IsAutoReplacementExecutionAllowed(execution.Generation))
+                {
+                    _log.Warn(
+                        $"[AUTO_REPLACE_HARD_STOP_BEFORE_REQUEST] id={request.Id} generation={execution.Generation}");
+                    return;
+                }
+
                 // Queue Tự bù có gate RIÊNG để các suất bù không đè nhau.
                 // Gate này KHÔNG chặn AutoClose; TIME/BAN/FAULT vẫn được đóng đúng lượt
                 // ngay cả khi một suất bù đang tạo PRF mới hoặc chờ cleanup.
@@ -354,33 +430,49 @@ public sealed partial class ManagerForm
                     request.ClosedProfileName,
                     "AUTO_REPLACE:" + request.Reason);
 
-                // CLEANUP BARRIER: profile cũ phải sạch thật trước khi được phép bù.
-                // Không dùng delay cố định để đoán Chrome đã đóng.
-                var cleanup = await EnsureAutoReplacementSourceCleanupAsync(request);
-
-                if (!cleanup.Succeeded)
+                if (!IsAutoReplacementExecutionAllowed(execution.Generation))
                 {
                     _log.Warn(
-                        $"[AUTO_REPLACE_CLEANUP_BLOCKED] id={request.Id} closed={request.ClosedProfileName} detail={cleanup.Detail}");
-
-                    WriteAutoActivityLog(
-                        action: "TỰ BÙ",
-                        profile: request.ClosedProfileName,
-                        reason: request.Reason,
-                        result: "CHỜ DỌN PROFILE CŨ",
-                        detail: cleanup.Detail);
-
-                    ScheduleAutoReplacementRetry(
-                        request.Id,
-                        "Cleanup chưa hoàn tất: " + cleanup.Detail);
-
-                    continue;
+                        $"[AUTO_REPLACE_HARD_STOP_AFTER_OPERATION_GATE] id={request.Id} generation={execution.Generation}");
+                    return;
                 }
 
-                if (_closing
-                    || !_autoReplacementSessionArmed
-                    || !_autoCloseSettings.OpenReplacementAfterAutoClose)
+                // CLEANUP BARRIER: request do AutoClose sinh ra phải chờ profile cũ sạch thật.
+                // Request CAPACITY_RECONCILE chỉ đại diện cho một slot bị thiếu sau Start All,
+                // không có profile nguồn nên bỏ qua source-cleanup và đi thẳng tới slot gate.
+                if (request.RequiresSourceCleanup)
                 {
+                    var cleanup = await EnsureAutoReplacementSourceCleanupAsync(request);
+
+                    if (!cleanup.Succeeded)
+                    {
+                        _log.Warn(
+                            $"[AUTO_REPLACE_CLEANUP_BLOCKED] id={request.Id} closed={request.ClosedProfileName} detail={cleanup.Detail}");
+
+                        WriteAutoActivityLog(
+                            action: "TỰ BÙ",
+                            profile: request.ClosedProfileName,
+                            reason: request.Reason,
+                            result: "CHỜ DỌN PROFILE CŨ",
+                            detail: cleanup.Detail);
+
+                        ScheduleAutoReplacementRetry(
+                            request.Id,
+                            "Cleanup chưa hoàn tất: " + cleanup.Detail);
+
+                        continue;
+                    }
+                }
+                else
+                {
+                    _log.Info(
+                        $"[AUTO_REPLACE_CAPACITY_CLEANUP_BYPASS] id={request.Id} slot={request.ClosedProfileName} reason={request.Reason}");
+                }
+
+                if (!IsAutoReplacementExecutionAllowed(execution.Generation))
+                {
+                    _log.Warn(
+                        $"[AUTO_REPLACE_HARD_STOP_AFTER_SOURCE_CLEANUP] id={request.Id} generation={execution.Generation}");
                     return;
                 }
 
@@ -389,6 +481,13 @@ public sealed partial class ManagerForm
                 // CountAutoReplacementOccupiedSlots() có thể tưởng đã đủ suất và xóa
                 // request Tự bù. Xác minh các marker nghi stale 2 lượt trước khi đếm.
                 await PruneStaleAutoReplacementExpectedRunningAsync(request);
+
+                if (!IsAutoReplacementExecutionAllowed(execution.Generation))
+                {
+                    _log.Warn(
+                        $"[AUTO_REPLACE_HARD_STOP_AFTER_SLOT_HEAL] id={request.Id} generation={execution.Generation}");
+                    return;
+                }
 
                 var slotGate = EvaluateAutoReplacementFixedSlotGate(request);
 
@@ -429,10 +528,20 @@ public sealed partial class ManagerForm
                     _log.Info(
                         $"[AUTO_REPLACE_REUSE_FIRST] id={request.Id} closed={request.ClosedProfileName} reusePending={GetReusableProfileQueueCount()}");
 
-                    filled = await TryOpenNextExistingReplacementAsync(request);
+                    filled = await TryOpenNextExistingReplacementAsync(
+                        request,
+                        execution.Generation,
+                        execution.Token);
 
                     if (!filled)
                     {
+                        if (!IsAutoReplacementExecutionAllowed(execution.Generation))
+                        {
+                            _log.Warn(
+                                $"[AUTO_REPLACE_HARD_STOP_BEFORE_FALLBACK_NEW] id={request.Id} generation={execution.Generation}");
+                            return;
+                        }
+
                         // Logic bù cũ được giữ nguyên: nếu không có PRF có sẵn đủ
                         // điều kiện thì chuyển ngay sang tạo PRF mới từ account chưa gán.
                         // Việc kho bù có/không có tuyệt đối không ảnh hưởng quyết định
@@ -440,7 +549,10 @@ public sealed partial class ManagerForm
                         _log.Info(
                             $"[AUTO_REPLACE_REUSE_EMPTY_FALLBACK_NEW] id={request.Id} closed={request.ClosedProfileName}");
 
-                        filled = await TryCreateReplacementAsync(request);
+                        filled = await TryCreateReplacementAsync(
+                            request,
+                            execution.Generation,
+                            execution.Token);
                     }
 
                     if (!filled)
@@ -448,6 +560,14 @@ public sealed partial class ManagerForm
                         lastError =
                             "Không dùng lại được profile chờ và chưa tạo được profile mới từ tài khoản chưa gán; giữ suất bù để thử lại.";
                     }
+                }
+                catch (OperationCanceledException)
+                    when (execution.Token.IsCancellationRequested
+                          || !IsAutoReplacementExecutionAllowed(execution.Generation))
+                {
+                    _log.Warn(
+                        $"[AUTO_REPLACE_HARD_STOP_CANCELLED] id={request.Id} closed={request.ClosedProfileName} generation={execution.Generation}");
+                    return;
                 }
                 catch (AutoReplacementCleanupBarrierException ex)
                 {
@@ -479,8 +599,12 @@ public sealed partial class ManagerForm
                         detail: ex.Message);
                 }
 
-                if (_closing)
+                if (!IsAutoReplacementExecutionAllowed(execution.Generation))
+                {
+                    _log.Warn(
+                        $"[AUTO_REPLACE_HARD_STOP_AFTER_ATTEMPT] id={request.Id} generation={execution.Generation} filled={filled}");
                     return;
+                }
 
                 if (filled)
                 {
@@ -516,12 +640,22 @@ public sealed partial class ManagerForm
     }
 
     async Task<bool> TryOpenNextExistingReplacementAsync(
-        AutoReplacementRequest request)
+        AutoReplacementRequest request,
+        int executionGeneration,
+        CancellationToken executionToken)
     {
+        if (!IsAutoReplacementExecutionAllowed(executionGeneration))
+            return false;
+
+        executionToken.ThrowIfCancellationRequested();
+
         // Không dùng scan MỚI/TEST cũ nữa vì scan đó gọi
         // ChromeProfileNameSyncService.IsProfileInUse() cho từng profile.
         // Queue dùng lại đã được lọc trước bằng file nhỏ runtime_stats.json.
-        return await TryUseReusableProfileQueueAsync(request);
+        return await TryUseReusableProfileQueueAsync(
+            request,
+            executionGeneration,
+            executionToken);
     }
 
     async Task CloseFailedReplacementRuntimeAsync(ProfileContext ctx)
@@ -767,18 +901,29 @@ public sealed partial class ManagerForm
         return !outcome.Status.Equals("PAUSED_RENAME_CONFIG", StringComparison.OrdinalIgnoreCase);
     }
 
-    async Task<bool> TryCreateReplacementAsync(AutoReplacementRequest request)
+    async Task<bool> TryCreateReplacementAsync(
+        AutoReplacementRequest request,
+        int executionGeneration,
+        CancellationToken executionToken)
     {
+        if (!IsAutoReplacementExecutionAllowed(executionGeneration))
+            return false;
+
+        executionToken.ThrowIfCancellationRequested();
         // Tự bù chỉ dùng tài khoản CHƯA GÁN và luôn tạo profile MỚI.
         // BuildAutoProfileQueue(requestedNew: 1, resumeIncomplete: false) sẽ lấy
         // tài khoản chưa gán + có mật khẩu theo thứ tự Excel, sau đó ASSIGN ngay
         // để các suất bù khác không thể lấy trùng tài khoản.
         // Dùng cùng gate với cửa sổ "+ Auto Profile" để không có hai luồng
         // đồng thời tranh account / tên profile / Chrome trên VM.
-        await _autoProfileQueueGate.WaitAsync();
+        await _autoProfileQueueGate.WaitAsync(executionToken);
 
         try
         {
+            if (!IsAutoReplacementExecutionAllowed(executionGeneration))
+                return false;
+
+            executionToken.ThrowIfCancellationRequested();
             // Một suất Tự bù cần đạt đúng 1 profile RUNNING khỏe. BAN/lỗi/skip
             // không được làm mất quota như logic cũ giới hạn 3 lần thử.
             // Giữ danh sách account đã thử trong chính suất này để account vừa lỗi
@@ -788,8 +933,10 @@ public sealed partial class ManagerForm
             var newAttemptsSinceNameSyncSweep = 0;
             var deadlineSweepCompleted = false;
 
-            while (!_closing)
+            while (!_closing
+                   && IsAutoReplacementExecutionAllowed(executionGeneration))
             {
+                executionToken.ThrowIfCancellationRequested();
                 var nameSyncPending = GetNameSyncPendingReusableProfileCount();
                 var replacementAge = DateTime.UtcNow - request.QueuedUtc;
                 var dueByAge = replacementAge >= AutoReplacementNameSyncRecoveryAfter
@@ -801,7 +948,10 @@ public sealed partial class ManagerForm
                     _log.Info(
                         $"[NAME_SYNC_RECOVERY_TRIGGER] closed={request.ClosedProfileName} pending={nameSyncPending} age={replacementAge:c} newAttemptsSinceSweep={newAttemptsSinceNameSyncSweep} trigger={(dueByAge ? "30m" : "5_attempts")}");
 
-                    var recovered = await TryRecoverNameSyncPendingReusableProfilesOnceAsync(request);
+                    var recovered = await TryRecoverNameSyncPendingReusableProfilesOnceAsync(
+                        request,
+                        executionGeneration,
+                        executionToken);
                     newAttemptsSinceNameSyncSweep = 0;
                     if (dueByAge)
                         deadlineSweepCompleted = true;
@@ -831,7 +981,7 @@ public sealed partial class ManagerForm
                             resumeIncomplete: false,
                             retryPaused: false);
                     },
-                    CancellationToken.None);
+                    executionToken);
 
                 // BuildAutoProfileQueue hiện nạp toàn bộ candidate phù hợp. Chọn account
                 // đầu tiên chưa được thử trong suất Tự bù hiện tại. Điều này đặc biệt
@@ -860,6 +1010,15 @@ public sealed partial class ManagerForm
                     return false;
                 }
 
+                if (!IsAutoReplacementExecutionAllowed(executionGeneration))
+                {
+                    _log.Warn(
+                        $"[AUTO_REPLACE_HARD_STOP_BEFORE_NEW_CANDIDATE] closed={request.ClosedProfileName} profile={item.ProfileName} generation={executionGeneration}");
+                    return false;
+                }
+
+                executionToken.ThrowIfCancellationRequested();
+
                 attemptedAccountIds.Add(item.Account.Id);
                 attempt++;
                 newAttemptsSinceNameSyncSweep++;
@@ -884,7 +1043,7 @@ public sealed partial class ManagerForm
                         autoRename: true,
                         autoStart: true,
                         isPaused: static () => false,
-                        ct: CancellationToken.None,
+                        ct: executionToken,
                         ui: (step, result, _) =>
                         {
                             _log.Info(
@@ -1044,6 +1203,30 @@ public sealed partial class ManagerForm
                             item.ProfileName,
                             "BAN");
                     }
+                }
+                catch (OperationCanceledException)
+                    when (executionToken.IsCancellationRequested
+                          || !IsAutoReplacementExecutionAllowed(executionGeneration))
+                {
+                    _log.Warn(
+                        $"[AUTO_REPLACE_CREATE_HARD_STOP] closed={request.ClosedProfileName} profile={item.ProfileName} generation={executionGeneration}");
+
+                    // Nếu lệnh Dừng đến đúng lúc Worker/Chrome của candidate đang mở,
+                    // dọn runtime candidate hiện tại nhưng tuyệt đối không chuyển sang
+                    // account/profile kế tiếp.
+                    try
+                    {
+                        await CleanupCreatedReplacementAttemptAsync(
+                            item.ProfileName,
+                            "manual_hard_stop");
+                    }
+                    catch (Exception cleanupEx)
+                    {
+                        _log.Warn(
+                            $"[AUTO_REPLACE_CREATE_HARD_STOP_CLEANUP_WARN] profile={item.ProfileName} error={cleanupEx.Message}");
+                    }
+
+                    return false;
                 }
                 catch (Exception ex)
                 {

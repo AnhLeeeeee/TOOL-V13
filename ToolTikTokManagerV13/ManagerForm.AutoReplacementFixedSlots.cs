@@ -18,6 +18,194 @@ public sealed partial class ManagerForm
     readonly object _autoReplacementFixedSlotLock = new();
     int _autoReplacementTargetSlots;
 
+    // Capacity reconcile chỉ hoạt động trong phiên hiện tại. Không persist target qua restart.
+    bool _autoReplacementCapacityReconcileRunning;
+    bool _autoReplacementStartAllInProgress;
+    DateTime _autoReplacementNextCapacityReconcileUtc = DateTime.MinValue;
+    static readonly TimeSpan AutoReplacementCapacityReconcileInterval = TimeSpan.FromSeconds(15);
+
+    void CaptureAutoReplacementTargetForStartAll(int requestedSlots)
+    {
+        if (!_autoCloseSettings.OpenReplacementAfterAutoClose || requestedSlots <= 0)
+            return;
+
+        lock (_autoReplacementFixedSlotLock)
+        {
+            var old = _autoReplacementTargetSlots;
+            // Start All là intent mới rõ ràng: target phải BẰNG đúng số tab đang mở,
+            // không giữ target lớn hơn từ một lượt Start All cũ trong cùng phiên.
+            _autoReplacementTargetSlots = requestedSlots;
+
+            _log.Info(
+                $"[AUTO_REPLACE_TARGET_START_ALL] old={old} requested={requestedSlots} target={_autoReplacementTargetSlots}");
+        }
+
+        // Chạy tất cả là intent rõ ràng của user muốn duy trì đúng số tab đang mở.
+        ArmAutoReplacementSession($"start_all_target:{requestedSlots}");
+    }
+
+    async Task MaybeReconcileAutoReplacementCapacityAsync(
+        string source = "periodic",
+        bool force = false)
+    {
+        if (_closing
+            || IsDisposed
+            || Disposing
+            || !_autoReplacementFeatureInitialized
+            || !_autoCloseSettings.OpenReplacementAfterAutoClose
+            || !_autoReplacementSessionArmed
+            || _autoReplacementStartAllInProgress)
+        {
+            return;
+        }
+
+        int target;
+        lock (_autoReplacementFixedSlotLock)
+            target = _autoReplacementTargetSlots;
+
+        if (target <= 0)
+            return;
+
+        var nowUtc = DateTime.UtcNow;
+        if (!force && nowUtc < _autoReplacementNextCapacityReconcileUtc)
+            return;
+
+        if (_autoReplacementCapacityReconcileRunning)
+            return;
+
+        _autoReplacementCapacityReconcileRunning = true;
+        _autoReplacementNextCapacityReconcileUtc = nowUtc.Add(AutoReplacementCapacityReconcileInterval);
+
+        try
+        {
+            // Dùng request probe tạm để tái sử dụng logic dọn ExpectedRunning stale 2-pass.
+            var probeRequest = new AutoReplacementRequest
+            {
+                Id = "capacity-probe-" + Guid.NewGuid().ToString("N"),
+                ClosedProfileName = "CAPACITY_PROBE",
+                Reason = "CAPACITY_RECONCILE_PROBE",
+                RequiresSourceCleanup = false
+            };
+
+            await PruneStaleAutoReplacementExpectedRunningAsync(probeRequest);
+
+            var occupiedPass1 = CountAutoReplacementOccupiedSlots();
+            var pendingPass1 = GetAutoReplacementPendingCount();
+            var initialDeficit = target - occupiedPass1 - pendingPass1;
+
+            if (initialDeficit <= 0)
+            {
+                _log.Info(
+                    $"[AUTO_REPLACE_CAPACITY_OK] source={source} target={target} occupied={occupiedPass1} pending={pendingPass1} deficit=0");
+                return;
+            }
+
+            // Chậm mà chắc: thiếu suất phải tồn tại 2 lần liên tiếp cách nhau 1-2 giây.
+            // Nếu profile chỉ đang chuyển trạng thái chậm, lượt 2 sẽ thấy nó trở lại và không bù thừa.
+            var delayMs = Random.Shared.Next(1000, 2001);
+            _log.Warn(
+                $"[AUTO_REPLACE_CAPACITY_GAP_CHECK] source={source} pass=1/2 target={target} occupied={occupiedPass1} pending={pendingPass1} deficit={initialDeficit} delayMs={delayMs}");
+            await Task.Delay(delayMs);
+
+            if (_closing
+                || !_autoReplacementSessionArmed
+                || !_autoCloseSettings.OpenReplacementAfterAutoClose
+                || _autoReplacementStartAllInProgress)
+            {
+                return;
+            }
+
+            var occupiedPass2 = CountAutoReplacementOccupiedSlots();
+            var pendingPass2 = GetAutoReplacementPendingCount();
+
+            // Lấy occupied lớn hơn của 2 pass để fail-safe chống mở thừa.
+            var stableOccupied = Math.Max(occupiedPass1, occupiedPass2);
+            var deficit = target - stableOccupied - pendingPass2;
+
+            _log.Warn(
+                $"[AUTO_REPLACE_CAPACITY_GAP_CHECK] source={source} pass=2/2 target={target} occupied1={occupiedPass1} occupied2={occupiedPass2} stableOccupied={stableOccupied} pending={pendingPass2} deficit={Math.Max(0, deficit)}");
+
+            if (deficit <= 0)
+                return;
+
+            QueueAutoReplacementCapacityDeficit(
+                deficit,
+                source,
+                target,
+                stableOccupied,
+                pendingPass2);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn(
+                $"[AUTO_REPLACE_CAPACITY_RECONCILE_WARN] source={source} error={ex.Message}");
+        }
+        finally
+        {
+            _autoReplacementCapacityReconcileRunning = false;
+        }
+    }
+
+    void QueueAutoReplacementCapacityDeficit(
+        int requestedCount,
+        string source,
+        int target,
+        int occupied,
+        int pendingBefore)
+    {
+        if (requestedCount <= 0
+            || _closing
+            || !_autoReplacementSessionArmed
+            || !_autoCloseSettings.OpenReplacementAfterAutoClose)
+        {
+            return;
+        }
+
+        var queued = new List<AutoReplacementRequest>();
+
+        lock (_autoReplacementQueueLock)
+        {
+            // Recheck pending ngay trong lock để 2 reconcile không thể tạo dư request.
+            var currentPending = _autoReplacementQueue.Count;
+            var allowed = Math.Max(0, target - occupied - currentPending);
+            var count = Math.Min(requestedCount, allowed);
+
+            for (var i = 0; i < count; i++)
+            {
+                var request = new AutoReplacementRequest
+                {
+                    Id = Guid.NewGuid().ToString("N"),
+                    ClosedProfileName = "CAPACITY_GAP_" + Guid.NewGuid().ToString("N")[..8],
+                    Reason = "CAPACITY_RECONCILE",
+                    QueuedUtc = DateTime.UtcNow,
+                    NextAttemptUtc = DateTime.UtcNow,
+                    RequiresSourceCleanup = false
+                };
+
+                _autoReplacementQueue.Add(request);
+                queued.Add(request);
+            }
+
+            if (queued.Count > 0)
+                SaveAutoReplacementQueueUnsafe();
+        }
+
+        if (queued.Count == 0)
+            return;
+
+        _log.Warn(
+            $"[AUTO_REPLACE_CAPACITY_DEFICIT_QUEUED] source={source} target={target} occupied={occupied} pendingBefore={pendingBefore} added={queued.Count} pendingNow={GetAutoReplacementPendingCount()}");
+
+        WriteAutoActivityLog(
+            action: "TỰ BÙ",
+            reason: "CAPACITY_RECONCILE",
+            result: $"THIẾU {queued.Count} SUẤT",
+            detail: $"source={source}; target={target}; occupied={occupied}; pendingBefore={pendingBefore}; queued={queued.Count}");
+
+        // Session đã armed; gọi lại để queue runner thức dậy ngay nếu đang idle.
+        ArmAutoReplacementSession("capacity_reconcile:" + source);
+    }
+
     void CaptureAutoReplacementTargetBeforeAutoClose(
         ProfileContext ctx,
         string reason)

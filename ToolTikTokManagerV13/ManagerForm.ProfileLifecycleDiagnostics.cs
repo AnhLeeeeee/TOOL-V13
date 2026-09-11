@@ -10,6 +10,9 @@ public sealed partial class ManagerForm
     readonly object _profileLifecycleDiagnosticLock = new();
     bool _profileLifecycleDiagnosticInitialized;
     Button? _profileLifecycleDiagnosticButton;
+    string _managerShutdownIntent = "";
+    string _managerShutdownIntentDetail = "";
+    int _managerShutdownClosingEventCount;
 
     string ProfileLifecycleDiagnosticDirectory
         => Path.Combine(_baseDir, "logs", "diagnostic");
@@ -31,6 +34,9 @@ public sealed partial class ManagerForm
                 $"=== SESSION START {DateTime.Now:yyyy-MM-dd HH:mm:ss} | app={AppVersionInfo.Display} | pid={Environment.ProcessId} ===");
         }
         catch { }
+
+        FormClosing += CaptureManagerFormClosingDiagnostic;
+        FormClosed += CaptureManagerFormClosedDiagnostic;
 
         _log.LineWritten += CaptureManagerProfileLifecycleLine;
         InjectProfileLifecycleDiagnosticButton();
@@ -68,7 +74,9 @@ public sealed partial class ManagerForm
             "[WORKER_",
             "[NAME_GUARD_",
             "[CHROME_",
-            "[RUNTIME_"
+            "[RUNTIME_",
+            "[MANAGER_",
+            "[VERSION_"
         ];
 
         return important.Any(token =>
@@ -77,22 +85,7 @@ public sealed partial class ManagerForm
 
     void AppendManagerProfileLifecycleDiagnostic(string line)
     {
-        try
-        {
-            lock (_profileLifecycleDiagnosticLock)
-            {
-                Directory.CreateDirectory(ProfileLifecycleDiagnosticDirectory);
-                RotateDiagnosticFileIfNeeded(ManagerProfileLifecycleDiagnosticPath, 4 * 1024 * 1024);
-                File.AppendAllText(
-                    ManagerProfileLifecycleDiagnosticPath,
-                    line + Environment.NewLine,
-                    new UTF8Encoding(false));
-            }
-        }
-        catch
-        {
-            // Nhật ký chẩn đoán không bao giờ được làm gián đoạn tool.
-        }
+        ManagerProcessDiagnostics.Append(line);
     }
 
     static void RotateDiagnosticFileIfNeeded(string path, long maxBytes)
@@ -107,6 +100,64 @@ public sealed partial class ManagerForm
         }
         catch { }
     }
+
+    void MarkManagerShutdownIntent(string reason, string? detail = null)
+    {
+        reason = string.IsNullOrWhiteSpace(reason) ? "UNKNOWN" : reason.Trim();
+        detail ??= "";
+
+        if (string.IsNullOrWhiteSpace(_managerShutdownIntent))
+        {
+            _managerShutdownIntent = reason;
+            _managerShutdownIntentDetail = detail;
+        }
+
+        AppendManagerProfileLifecycleDiagnostic(
+            $"[MANAGER_SHUTDOWN_INTENT] time={DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} pid={Environment.ProcessId} " +
+            $"reason={reason} detail={ManagerProcessDiagnostics.OneLine(detail, 2000)} " +
+            $"callerStack={ManagerProcessDiagnostics.OneLine(Environment.StackTrace, 5000)}");
+    }
+
+    void CaptureManagerFormClosingDiagnostic(object? sender, FormClosingEventArgs e)
+    {
+        var eventNo = Interlocked.Increment(ref _managerShutdownClosingEventCount);
+        var intent = string.IsNullOrWhiteSpace(_managerShutdownIntent)
+            ? ResolveManagerShutdownReason(e.CloseReason)
+            : _managerShutdownIntent;
+        var detail = string.IsNullOrWhiteSpace(_managerShutdownIntentDetail)
+            ? $"closeReason={e.CloseReason}"
+            : _managerShutdownIntentDetail;
+
+        AppendManagerProfileLifecycleDiagnostic(
+            $"[MANAGER_FORM_CLOSING] time={DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} pid={Environment.ProcessId} " +
+            $"event={eventNo} phase={(_closing ? "FINAL_OR_REENTRY" : "INITIAL")} reason={intent} " +
+            $"closeReason={e.CloseReason} cancelBeforeHandler={e.Cancel} detail={ManagerProcessDiagnostics.OneLine(detail, 2000)} " +
+            $"callerStack={ManagerProcessDiagnostics.OneLine(Environment.StackTrace, 5000)}");
+    }
+
+    void CaptureManagerFormClosedDiagnostic(object? sender, FormClosedEventArgs e)
+    {
+        var intent = string.IsNullOrWhiteSpace(_managerShutdownIntent)
+            ? ResolveManagerShutdownReason(e.CloseReason)
+            : _managerShutdownIntent;
+
+        AppendManagerProfileLifecycleDiagnostic(
+            $"[MANAGER_FORM_CLOSED] time={DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} pid={Environment.ProcessId} " +
+            $"reason={intent} closeReason={e.CloseReason}");
+    }
+
+    static string ResolveManagerShutdownReason(CloseReason closeReason)
+        => closeReason switch
+        {
+            CloseReason.WindowsShutDown => "WINDOWS_SHUTDOWN",
+            CloseReason.TaskManagerClosing => "TASK_MANAGER_CLOSE",
+            CloseReason.ApplicationExitCall => "APPLICATION_EXIT_CALL",
+            CloseReason.FormOwnerClosing => "OWNER_FORM_CLOSING",
+            CloseReason.MdiFormClosing => "MDI_FORM_CLOSING",
+            CloseReason.None => "CLOSE_REASON_NONE",
+            CloseReason.UserClosing => "USER_CLOSE_OR_UNMARKED_CODE_CLOSE",
+            _ => "UNKNOWN_" + closeReason
+        };
 
     void InjectProfileLifecycleDiagnosticButton()
     {

@@ -1375,6 +1375,9 @@ public sealed partial class ManagerForm
             });
             setupLaunched = true;
             _log.Info($"[VERSION_SETUP_LAUNCHED] from={ManagerDisplayVersion} to={manifest.Version} downgrade={isDowngrade} path={destination}");
+            MarkManagerShutdownIntent(
+                "VERSION_INSTALL_RESTART",
+                $"from={ManagerDisplayVersion}; to={manifest.Version}; downgrade={isDowngrade}; setup={destination}");
             BeginInvoke(new Action(Close));
         }
         catch (Exception ex)

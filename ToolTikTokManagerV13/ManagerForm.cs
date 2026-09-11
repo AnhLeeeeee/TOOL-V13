@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.IO.Compression;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
@@ -151,7 +151,6 @@ public sealed partial class ManagerForm : Form
         _refreshTimer.Tick += async (_, _) => await RefreshOpenProfilesAsync();
         InitializeIdentityAutoFlow();
         InitializeMessageReplyAutoFlow();
-        Shown += (_, _) => RegisterChromeMonitorHotkey();
         FormClosing += OnClosing;
     }
 
@@ -202,12 +201,8 @@ public sealed partial class ManagerForm : Form
         toolbarRow1.Controls.Add(Button("Cấu hình mặc định", (_, _) => ShowDefaultConfigDialog(), UiButtonKind.Neutral));
         toolbarRow1.Controls.Add(Button("Tên & ảnh TikTok", (_, _) => ShowTikTokIdentityDialog(), UiButtonKind.Neutral));
         toolbarRow1.Controls.Add(Button("Tin nhắn TikTok", (_, _) => ShowTikTokMessageReplyDialog(), UiButtonKind.Neutral));
-        toolbarRow1.Controls.Add(Button("Profile có sẵn", async (_, _) => { try { await AddExistingProfileAsync(); } catch (Exception ex) { ShowError(ex); } }));
 
         var toolbarRow2 = ToolbarRow();
-        toolbarRow2.Controls.Add(Button("Đổi tên", async (_, _) => { try { await RenameSelectedProfileAsync(); } catch (Exception ex) { ShowError(ex); } }));
-        toolbarRow2.Controls.Add(Button("Đồng bộ tên Chrome", (_, _) => ShowChromeNameSyncDialog()));
-        toolbarRow2.Controls.Add(Button("Giám sát Chrome", (_, _) => ShowChromeMonitor(), UiButtonKind.Primary));
         toolbarRow2.Controls.Add(Button("Xóa profile", (_, _) => ShowDeleteProfilesDialog(), UiButtonKind.Danger));
         toolbarRow2.Controls.Add(Button("Chạy tất cả", async (_, _) => await StartAllAsync(), UiButtonKind.Primary));
         toolbarRow2.Controls.Add(Button("Dừng tất cả", async (_, _) => await StopAllAsync(), UiButtonKind.Danger));
@@ -248,8 +243,7 @@ public sealed partial class ManagerForm : Form
             {
                 "Mở profile" => (Color.FromArgb(232, 242, 255), Color.FromArgb(35, 91, 152)),
                 "+ Profile" or "+ Auto Profile" => (Color.FromArgb(238, 246, 255), Color.FromArgb(35, 91, 152)),
-                "Profile có sẵn" or "Đổi tên" or "Đồng bộ tên Chrome" or "Kho tài khoản" or "Cấu hình mặc định" or "Tên & ảnh TikTok" or "Tin nhắn TikTok" => (Color.FromArgb(242, 246, 251), Color.FromArgb(55, 76, 103)),
-                "Giám sát Chrome" => (Color.FromArgb(234, 244, 255), Color.FromArgb(31, 91, 158)),
+                "Kho tài khoản" or "Cấu hình mặc định" or "Tên & ảnh TikTok" or "Tin nhắn TikTok" => (Color.FromArgb(242, 246, 251), Color.FromArgb(55, 76, 103)),
                 "Xóa profile" or "Dừng tất cả" => (Color.FromArgb(255, 239, 239), Color.FromArgb(171, 62, 62)),
                 "Chạy tất cả" => (Color.FromArgb(234, 248, 238), Color.FromArgb(36, 119, 66)),
                 _ => (UiTheme.Card, Color.FromArgb(42, 57, 76))
@@ -913,6 +907,11 @@ public sealed partial class ManagerForm : Form
             {
                 if (ctx.Opening) continue;
                 if (ctx.Worker is null) continue;
+
+                // Worker ghi marker ngay khi user bấm X. Đọc marker trước khi process
+                // thoát để Target giảm sớm, tránh reconcile hiểu nhầm là thiếu suất.
+                TryConsumeWorkerManualCloseIntent(ctx, source: "refresh_before_exit");
+
                 if (IsWorkerProcessExited(ctx))
                 {
                     ConfirmRuntimeState(ctx, RuntimeStateStopped, "worker_process_exited");
@@ -1063,23 +1062,50 @@ public sealed partial class ManagerForm : Form
             .OrderBy(ctx => ctx.Profile.Name, NaturalProfileNameOrder)
             .ToList();
 
-        foreach (var ctx in openContexts)
+        // Target phải được chốt TRƯỚC khi chạy từng profile. Nếu profile đầu tiên lỗi
+        // Name Guard/login và bị đóng, tool vẫn nhớ user đã yêu cầu đủ N suất.
+        CaptureAutoReplacementTargetForStartAll(openContexts.Count);
+        _autoReplacementStartAllInProgress = true;
+
+        try
         {
-            try
+            foreach (var ctx in openContexts)
             {
-                // Tab đã mở nhưng Worker có thể vừa thoát; OpenProfileAsync sẽ bảo đảm
-                // Worker của đúng profile sẵn sàng rồi mới gửi lệnh start.
-                await OpenProfileAsync(ctx);
-                await StartWithNameGuardAsync(ctx, "start", TimeSpan.FromSeconds(30));
+                try
+                {
+                    // Tab đã mở nhưng Worker có thể vừa thoát; OpenProfileAsync sẽ bảo đảm
+                    // Worker của đúng profile sẵn sàng rồi mới gửi lệnh start.
+                    await OpenProfileAsync(ctx);
+                    await StartWithNameGuardAsync(ctx, "start", TimeSpan.FromSeconds(30));
+                }
+                catch (Exception ex)
+                {
+                    SetStatus(ctx, "Không chạy được: " + ex.Message, Color.Firebrick);
+                    _log.Error($"[{ctx.Profile.Name}] START_ALL_OPEN_ONLY: {ex}");
+                }
             }
-            catch (Exception ex)
-            {
-                SetStatus(ctx, "Không chạy được: " + ex.Message, Color.Firebrick);
-                _log.Error($"[{ctx.Profile.Name}] START_ALL_OPEN_ONLY: {ex}");
-            }
+        }
+        finally
+        {
+            _autoReplacementStartAllInProgress = false;
         }
 
         _log.Info($"[START_ALL_OPEN_ONLY] requested={openContexts.Count}");
+
+        // Cho các Worker/Chrome cuối cùng thêm vài giây settle rồi reconcile 2-pass.
+        // Ví dụ target=10 nhưng 2 profile bị Name Guard đóng -> tự tạo đúng 2 suất bù.
+        if (openContexts.Count > 0
+            && _autoCloseSettings.OpenReplacementAfterAutoClose
+            && _autoReplacementSessionArmed)
+        {
+            var settleMs = Random.Shared.Next(5000, 8001);
+            _log.Info(
+                $"[AUTO_REPLACE_START_ALL_SETTLE] requested={openContexts.Count} delayMs={settleMs}");
+            await Task.Delay(settleMs);
+            await MaybeReconcileAutoReplacementCapacityAsync(
+                "start_all_complete",
+                force: true);
+        }
     }
 
     async Task StopAllAsync()
@@ -2404,11 +2430,13 @@ public sealed partial class ManagerForm : Form
         add.Click += (_, _) =>
         {
             var sourceRow = items.Count == 0 ? 2 : Math.Max(2, items.Max(x => x.SourceRow) + 1);
-            var created = ShowAccountPoolItemEditor(form, null, sourceRow);
+            var created = ShowAccountPoolItemEditor(form, null, sourceRow, out var createdIdentityStatus);
             if (created is null) return;
             try
             {
                 _accountPoolService.Upsert(created);
+                if (!string.IsNullOrWhiteSpace(createdIdentityStatus))
+                    _accountPoolService.MarkIdentityResult(created.Username, createdIdentityStatus);
                 RefreshGrid();
             }
             catch (Exception ex)
@@ -2421,11 +2449,13 @@ public sealed partial class ManagerForm : Form
         {
             var current = SelectedItem();
             if (current is null) return;
-            var updated = ShowAccountPoolItemEditor(form, current, current.SourceRow);
+            var updated = ShowAccountPoolItemEditor(form, current, current.SourceRow, out var updatedIdentityStatus);
             if (updated is null) return;
             try
             {
                 _accountPoolService.Upsert(updated);
+                if (!string.IsNullOrWhiteSpace(updatedIdentityStatus))
+                    _accountPoolService.MarkIdentityResult(updated.Username, updatedIdentityStatus);
                 RefreshGrid();
             }
             catch (Exception ex)
@@ -2577,14 +2607,14 @@ public sealed partial class ManagerForm : Form
         form.ShowDialog(this);
     }
 
-    TikTokAccountPoolItem? ShowAccountPoolItemEditor(IWin32Window owner, TikTokAccountPoolItem? current, int sourceRow)
+    TikTokAccountPoolItem? ShowAccountPoolItemEditor(IWin32Window owner, TikTokAccountPoolItem? current, int sourceRow, out string? identityStatusToSave)
     {
         using var form = new Form
         {
             Text = current is null ? "Thêm tài khoản TikTok" : "Sửa tài khoản TikTok",
             Width = 560,
-            Height = 520,
-            MinimumSize = new Size(520, 450),
+            Height = 590,
+            MinimumSize = new Size(520, 500),
             StartPosition = FormStartPosition.CenterParent,
             FormBorderStyle = FormBorderStyle.Sizable,
             MinimizeBox = false,
@@ -2611,6 +2641,34 @@ public sealed partial class ManagerForm : Form
         var user = Box(current?.Username ?? "");
         var pass = Box(current?.Password ?? "", true);
         var totp = Box(current?.TotpSecret ?? "", true);
+
+        var identityResults = _accountPoolService.GetIdentityResults();
+        var originalIdentityStatus =
+            current is not null
+            && identityResults.TryGetValue(current.Username, out var existingIdentityStatus)
+                ? (existingIdentityStatus ?? "").Trim().ToUpperInvariant()
+                : "";
+
+        var identityStatus = new ComboBox
+        {
+            Dock = DockStyle.Top,
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Font = new Font("Segoe UI", 11F),
+            MinimumSize = new Size(0, 36)
+        };
+        identityStatus.Items.AddRange(new object[] { "—", "DONE", "PROCESSING", "FAIL" });
+        identityStatus.SelectedItem = originalIdentityStatus.Length > 0
+            ? originalIdentityStatus
+            : "—";
+
+        var identityHint = new Label
+        {
+            Text = "Chọn DONE để bỏ qua kiểm tra/đổi tên ở những lần chạy sau.",
+            AutoSize = true,
+            ForeColor = Color.DimGray,
+            Margin = new Padding(0, 3, 0, 3)
+        };
+
         var noteBox = new TextBox
         {
             Text = current?.Note ?? "",
@@ -2629,6 +2687,7 @@ public sealed partial class ManagerForm : Form
         root.Controls.Add(LabelFor("Tài khoản / Email / Số điện thoại"), 0, row++); root.Controls.Add(user, 0, row++);
         root.Controls.Add(LabelFor("Mật khẩu"), 0, row++); root.Controls.Add(pass, 0, row++);
         root.Controls.Add(LabelFor("Secret 2FA/TOTP"), 0, row++); root.Controls.Add(totp, 0, row++);
+        root.Controls.Add(LabelFor("Tên/ảnh (Excel)"), 0, row++); root.Controls.Add(identityStatus, 0, row++); root.Controls.Add(identityHint, 0, row++);
         root.Controls.Add(LabelFor("Ghi chú"), 0, row++); root.Controls.Add(noteBox, 0, row++);
         root.Controls.Add(show, 0, row++);
 
@@ -2642,6 +2701,7 @@ public sealed partial class ManagerForm : Form
         form.AcceptButton = save; form.CancelButton = cancel;
 
         TikTokAccountPoolItem? result = null;
+        string? pendingIdentityStatus = null;
         save.Click += (_, _) =>
         {
             try
@@ -2656,6 +2716,18 @@ public sealed partial class ManagerForm : Form
                     noteBox.Text.Trim(),
                     current?.AssignedProfile ?? "",
                     sourceRow);
+
+                var selectedIdentityStatus =
+                    (identityStatus.SelectedItem?.ToString() ?? "").Trim().ToUpperInvariant();
+                if (selectedIdentityStatus == "—")
+                    selectedIdentityStatus = "";
+
+                pendingIdentityStatus =
+                    selectedIdentityStatus.Length > 0
+                    && !selectedIdentityStatus.Equals(originalIdentityStatus, StringComparison.OrdinalIgnoreCase)
+                        ? selectedIdentityStatus
+                        : null;
+
                 form.DialogResult = DialogResult.OK;
                 form.Close();
             }
@@ -2665,7 +2737,9 @@ public sealed partial class ManagerForm : Form
             }
         };
         form.Shown += (_, _) => { ModernDialog.FitToWorkingArea(form); user.Focus(); };
-        return form.ShowDialog(owner) == DialogResult.OK ? result : null;
+        var dialogResult = form.ShowDialog(owner);
+        identityStatusToSave = dialogResult == DialogResult.OK ? pendingIdentityStatus : null;
+        return dialogResult == DialogResult.OK ? result : null;
     }
 
     TikTokAccountPoolItem? ShowAccountPoolPicker(IWin32Window owner, string? currentProfile = null, bool includeAssigned = false)

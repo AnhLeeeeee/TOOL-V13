@@ -107,10 +107,12 @@ public sealed partial class ManagerForm
     {
         var clearedPending = 0;
 
-        // Chặn queue đang chạy trước, sau đó mới xóa backlog.
-        // Profile bù nào đã đi sâu vào một lần CREATE_PROFILE thì để lượt đó
-        // kết thúc an toàn; tuyệt đối không khởi chạy lượt tiếp theo.
+        // HARD STOP: vô hiệu hóa session trước, sau đó hủy luôn execution token
+        // của lượt Tự bù đang chạy. Nhờ generation/token riêng, một request cũ
+        // không thể tiếp tục sang PRF/account kế tiếp sau khi người dùng bấm Dừng.
         _autoReplacementSessionArmed = false;
+        var stopGeneration =
+            InvalidateAutoReplacementExecution("manual_ui_stop");
 
         lock (_autoReplacementQueueLock)
         {
@@ -147,14 +149,15 @@ public sealed partial class ManagerForm
         UpdateAutoReplacementManualControlButton();
 
         _log.Warn(
-            $"[AUTO_REPLACE_MANUAL_STOP] clearedPending={clearedPending} armed=false");
+            $"[AUTO_REPLACE_MANUAL_STOP] clearedPending={clearedPending} armed=false generation={stopGeneration} hardStop=true");
 
         WriteAutoActivityLog(
             action: "TỰ BÙ",
             result: "ĐÃ DỪNG THỦ CÔNG",
             detail:
-                $"Người dùng bấm Dừng Tự bù; đã xóa {clearedPending} suất bù đang chờ. "
-                + "Các profile đang chạy giữ nguyên.");
+                $"Người dùng bấm Dừng Tự bù; đã xóa {clearedPending} suất bù đang chờ "
+                + $"và hủy execution generation cũ (generation={stopGeneration}). "
+                + "Không được chuyển sang PRF/account bù kế tiếp; các profile đã chạy trước đó giữ nguyên.");
     }
 
     void StartAutoReplacementFromUi()

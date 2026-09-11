@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 
 namespace ToolTikTokManagerV13;
 
@@ -169,6 +169,13 @@ public sealed partial class ManagerForm
 
             var exitCode = "?";
             try { exitCode = process.ExitCode.ToString(); } catch { }
+
+            // Fallback: nếu refresh chưa kịp đọc marker USER_X_CLOSE trước khi Worker
+            // thoát, consume tại Exited callback bằng đúng PID của process này.
+            TryConsumeWorkerManualCloseIntent(
+                ctx,
+                expectedWorkerPid: process.Id,
+                source: "worker_process_exited");
 
             // Exit code 0 là đường thoát sạch (shutdown/đóng Worker bình thường).
             // Đây là thao tác kết thúc chủ động, không được giữ expected-running

@@ -1085,12 +1085,21 @@ public sealed partial class ManagerForm
     }
 
     async Task<bool> TryRecoverNameSyncPendingReusableProfilesOnceAsync(
-        AutoReplacementRequest request)
+        AutoReplacementRequest request,
+        int executionGeneration,
+        CancellationToken executionToken)
     {
+        if (!IsAutoReplacementExecutionAllowed(executionGeneration))
+            return false;
+
+        executionToken.ThrowIfCancellationRequested();
+
         await RefreshReusableProfileQueueAsync("name_sync_recovery_sweep");
 
-        if (_closing)
+        if (!IsAutoReplacementExecutionAllowed(executionGeneration))
             return false;
+
+        executionToken.ThrowIfCancellationRequested();
 
         List<ReusableProfileQueueEntry> candidates;
         lock (_reusableProfileQueueLock)
@@ -1112,8 +1121,10 @@ public sealed partial class ManagerForm
 
         foreach (var candidate in candidates)
         {
-            if (_closing)
+            if (!IsAutoReplacementExecutionAllowed(executionGeneration))
                 return false;
+
+            executionToken.ThrowIfCancellationRequested();
 
             var profileName = (candidate.ProfileName ?? "").Trim();
             if (profileName.Length == 0
@@ -1138,7 +1149,15 @@ public sealed partial class ManagerForm
                             || (x.Username.Equals(candidate.Username, StringComparison.OrdinalIgnoreCase)
                                 && (x.AssignedProfile ?? "").Equals(profileName, StringComparison.OrdinalIgnoreCase)));
                     },
-                    CancellationToken.None);
+                    executionToken);
+            }
+            catch (OperationCanceledException)
+                when (executionToken.IsCancellationRequested
+                      || !IsAutoReplacementExecutionAllowed(executionGeneration))
+            {
+                _log.Warn(
+                    $"[NAME_SYNC_RECOVERY_HARD_STOP_ACCOUNT_READ] profile={profileName} generation={executionGeneration}");
+                throw;
             }
             catch (Exception ex)
             {
@@ -1194,9 +1213,37 @@ public sealed partial class ManagerForm
                     result: "BẮT ĐẦU",
                     detail: "Mở lại profile trong Chờ dùng lại để chỉ kiểm tra tên đã đồng bộ hay chưa.");
 
+                if (!IsAutoReplacementExecutionAllowed(executionGeneration))
+                {
+                    _log.Warn(
+                        $"[NAME_SYNC_RECOVERY_HARD_STOP_BEFORE_OPEN] profile={profileName} generation={executionGeneration}");
+                    return false;
+                }
+
+                executionToken.ThrowIfCancellationRequested();
+
                 var opened = await OpenProfileAsync(
                     ctx,
                     $"Kiểm tra lại tên profile chờ dùng lại {profileName}...");
+
+                if (!IsAutoReplacementExecutionAllowed(executionGeneration))
+                {
+                    try
+                    {
+                        await CleanupCreatedReplacementAttemptAsync(
+                            profileName,
+                            "name_sync_recovery_hard_stop_after_open");
+                    }
+                    catch (Exception cleanupEx)
+                    {
+                        _log.Warn(
+                            $"[NAME_SYNC_RECOVERY_HARD_STOP_CLEANUP_WARN] profile={profileName} error={cleanupEx.Message}");
+                    }
+
+                    return false;
+                }
+
+                executionToken.ThrowIfCancellationRequested();
 
                 if (!opened && (ctx.Worker is null || ctx.Worker.HasExited))
                 {
@@ -1269,7 +1316,7 @@ public sealed partial class ManagerForm
                 var identityDone = await MarkIdentityDoneVerifiedAsync(
                     account.Username,
                     profileName,
-                    CancellationToken.None);
+                    executionToken);
 
                 if (!identityDone.Ok)
                 {
@@ -1285,11 +1332,49 @@ public sealed partial class ManagerForm
 
                 MarkNameGuardVerifiedForCurrentChromeSession(ctx, account.Username);
 
+                if (!IsAutoReplacementExecutionAllowed(executionGeneration))
+                {
+                    try
+                    {
+                        await CleanupCreatedReplacementAttemptAsync(
+                            profileName,
+                            "name_sync_recovery_hard_stop_before_start");
+                    }
+                    catch (Exception cleanupEx)
+                    {
+                        _log.Warn(
+                            $"[NAME_SYNC_RECOVERY_HARD_STOP_CLEANUP_WARN] profile={profileName} error={cleanupEx.Message}");
+                    }
+
+                    return false;
+                }
+
+                executionToken.ThrowIfCancellationRequested();
+
                 var startReply = await StartWithNameGuardAsync(
                     ctx,
                     "start_auto",
                     TimeSpan.FromSeconds(100),
                     suppressStatus: true);
+
+                if (!IsAutoReplacementExecutionAllowed(executionGeneration))
+                {
+                    try
+                    {
+                        await CleanupCreatedReplacementAttemptAsync(
+                            profileName,
+                            "name_sync_recovery_hard_stop_after_start");
+                    }
+                    catch (Exception cleanupEx)
+                    {
+                        _log.Warn(
+                            $"[NAME_SYNC_RECOVERY_HARD_STOP_CLEANUP_WARN] profile={profileName} error={cleanupEx.Message}");
+                    }
+
+                    return false;
+                }
+
+                executionToken.ThrowIfCancellationRequested();
 
                 if (!string.Equals(startReply, "started", StringComparison.OrdinalIgnoreCase))
                 {
@@ -1346,6 +1431,27 @@ public sealed partial class ManagerForm
 
                 return true;
             }
+            catch (OperationCanceledException)
+                when (executionToken.IsCancellationRequested
+                      || !IsAutoReplacementExecutionAllowed(executionGeneration))
+            {
+                _log.Warn(
+                    $"[NAME_SYNC_RECOVERY_HARD_STOP] profile={profileName} generation={executionGeneration}");
+
+                try
+                {
+                    await CleanupCreatedReplacementAttemptAsync(
+                        profileName,
+                        "name_sync_recovery_hard_stop");
+                }
+                catch (Exception cleanupEx)
+                {
+                    _log.Warn(
+                        $"[NAME_SYNC_RECOVERY_HARD_STOP_CLEANUP_WARN] profile={profileName} error={cleanupEx.Message}");
+                }
+
+                return false;
+            }
             catch (AutoReplacementCleanupBarrierException)
             {
                 throw;
@@ -1380,13 +1486,22 @@ public sealed partial class ManagerForm
     }
 
     async Task<bool> TryUseReusableProfileQueueAsync(
-        AutoReplacementRequest request)
+        AutoReplacementRequest request,
+        int executionGeneration,
+        CancellationToken executionToken)
     {
+        if (!IsAutoReplacementExecutionAllowed(executionGeneration))
+            return false;
+
+        executionToken.ThrowIfCancellationRequested();
+
         await RefreshReusableProfileQueueAsync(
             "before_replacement");
 
-        if (_closing)
+        if (!IsAutoReplacementExecutionAllowed(executionGeneration))
             return false;
+
+        executionToken.ThrowIfCancellationRequested();
 
         var catalog = _profileService.Load();
         RefreshContextsFromCatalog(catalog);
@@ -1408,8 +1523,10 @@ public sealed partial class ManagerForm
 
         foreach (var candidate in candidates)
         {
-            if (_closing)
+            if (!IsAutoReplacementExecutionAllowed(executionGeneration))
                 return false;
+
+            executionToken.ThrowIfCancellationRequested();
 
             var profileName =
                 (candidate.ProfileName ?? "").Trim();
@@ -1510,12 +1627,41 @@ public sealed partial class ManagerForm
                             ? $"Dùng lại profile THỦ CÔNG. Tổng chạy={TimeSpan.FromSeconds(candidate.TotalRunSeconds):c}."
                             : $"Dùng lại profile tự quét. Tổng chạy={TimeSpan.FromSeconds(candidate.TotalRunSeconds):c}.");
 
+                if (!IsAutoReplacementExecutionAllowed(executionGeneration))
+                {
+                    _log.Warn(
+                        $"[REUSE_QUEUE_HARD_STOP_BEFORE_OPEN] profile={profileName} generation={executionGeneration}");
+                    return false;
+                }
+
+                executionToken.ThrowIfCancellationRequested();
+
                 // KHÔNG quét IsProfileInUse() theo từng profile.
                 // Chỉ mở đúng candidate đang đứng đầu queue.
                 var opened =
                     await OpenProfileAsync(
                         ctx,
                         $"Tự bù cho {request.ClosedProfileName}: dùng lại profile {profileName}...");
+
+                if (!IsAutoReplacementExecutionAllowed(executionGeneration))
+                {
+                    _log.Warn(
+                        $"[REUSE_QUEUE_HARD_STOP_AFTER_OPEN] profile={profileName} generation={executionGeneration}");
+
+                    try
+                    {
+                        await CloseFailedReplacementRuntimeAsync(ctx);
+                    }
+                    catch (Exception cleanupEx)
+                    {
+                        _log.Warn(
+                            $"[REUSE_QUEUE_HARD_STOP_CLEANUP_WARN] profile={profileName} error={cleanupEx.Message}");
+                    }
+
+                    return false;
+                }
+
+                executionToken.ThrowIfCancellationRequested();
 
                 if (!opened
                     && (ctx.Worker is null
@@ -1532,12 +1678,49 @@ public sealed partial class ManagerForm
                     continue;
                 }
 
+                if (!IsAutoReplacementExecutionAllowed(executionGeneration))
+                {
+                    try
+                    {
+                        await CloseFailedReplacementRuntimeAsync(ctx);
+                    }
+                    catch (Exception cleanupEx)
+                    {
+                        _log.Warn(
+                            $"[REUSE_QUEUE_HARD_STOP_CLEANUP_WARN] profile={profileName} error={cleanupEx.Message}");
+                    }
+
+                    return false;
+                }
+
+                executionToken.ThrowIfCancellationRequested();
+
                 var reply =
                     await StartWithNameGuardAsync(
                         ctx,
                         "start_auto",
                         TimeSpan.FromSeconds(100),
                         suppressStatus: true);
+
+                if (!IsAutoReplacementExecutionAllowed(executionGeneration))
+                {
+                    _log.Warn(
+                        $"[REUSE_QUEUE_HARD_STOP_AFTER_START] profile={profileName} generation={executionGeneration}");
+
+                    try
+                    {
+                        await CloseFailedReplacementRuntimeAsync(ctx);
+                    }
+                    catch (Exception cleanupEx)
+                    {
+                        _log.Warn(
+                            $"[REUSE_QUEUE_HARD_STOP_CLEANUP_WARN] profile={profileName} error={cleanupEx.Message}");
+                    }
+
+                    return false;
+                }
+
+                executionToken.ThrowIfCancellationRequested();
 
                 if (!string.Equals(
                         reply,
@@ -1608,6 +1791,25 @@ public sealed partial class ManagerForm
                         $"Đã dùng lại profile {profileName}; RUNNING khỏe {AutoReplacementHealthyStableSeconds}s.");
 
                 return true;
+            }
+            catch (OperationCanceledException)
+                when (executionToken.IsCancellationRequested
+                      || !IsAutoReplacementExecutionAllowed(executionGeneration))
+            {
+                _log.Warn(
+                    $"[REUSE_QUEUE_HARD_STOP] profile={profileName} generation={executionGeneration}");
+
+                try
+                {
+                    await CloseFailedReplacementRuntimeAsync(ctx);
+                }
+                catch (Exception cleanupEx)
+                {
+                    _log.Warn(
+                        $"[REUSE_QUEUE_HARD_STOP_CLEANUP_WARN] profile={profileName} error={cleanupEx.Message}");
+                }
+
+                return false;
             }
             catch (Exception ex)
             {

@@ -1,4 +1,4 @@
-﻿using System.Text;
+using System.Text;
 using System.Text.Json;
 
 namespace ToolTikTokV11;
@@ -232,6 +232,7 @@ public sealed partial class MainForm
                     return "shown";
                 case "shutdown":
                     StopManagedMessageReply();
+                    _managedShutdownRequested = true;
                     BeginInvoke(new Action(Close));
                     return "bye";
                 default:
