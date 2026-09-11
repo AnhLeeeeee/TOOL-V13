@@ -73,6 +73,7 @@ public sealed partial class ManagerForm
             !x.IsAssigned
             && !string.IsNullOrWhiteSpace(x.Password)
             && !TikTokAccountPoolService.IsBanNoteValue(x.Note)
+            && !TikTokAccountPoolService.IsLifetimeCompletedNoteValue(x.Note)
             && (!initialStates.TryGetValue(x.Id, out var state)
                 || (!state.IsReady && !state.IsInProgress)));
         var initialResume = initialAccounts.Count(x =>
@@ -671,6 +672,9 @@ public sealed partial class ManagerForm
         bool IsBan(TikTokAccountPoolItem account)
             => TikTokAccountPoolService.IsBanNoteValue(account.Note);
 
+        bool IsLifetimeCompleted(TikTokAccountPoolItem account)
+            => TikTokAccountPoolService.IsLifetimeCompletedNoteValue(account.Note);
+
         if (resumeIncomplete || retryPaused)
         {
             foreach (var account in accounts.Where(x => x.IsAssigned))
@@ -707,6 +711,7 @@ public sealed partial class ManagerForm
 
         // Với profile MỚI, Excel là gate bắt buộc:
         // - Ghi chú=ban => tuyệt đối không gán.
+        // - Ghi chú=TIME_xH => account đã chạy đủ vòng đời, tuyệt đối không tạo lại.
         // - Auto Profile/AutoPrf=DONE => không tạo lại dù Profile đã gán đang trống.
         var eligible = accounts
             .Where(x => !x.IsAssigned && !string.IsNullOrWhiteSpace(x.Password))
@@ -719,7 +724,13 @@ public sealed partial class ManagerForm
                 $"[AUTO_PROFILE_EXCEL_SKIP] mode=new user={account.Username} row={account.SourceRow} reason=NOTE_BAN note={account.Note}");
         }
 
-        foreach (var account in eligible.Where(x => !IsBan(x) && IsDone(x)))
+        foreach (var account in eligible.Where(x => !IsBan(x) && IsLifetimeCompleted(x)))
+        {
+            _log.Info(
+                $"[AUTO_PROFILE_EXCEL_SKIP] mode=new user={account.Username} row={account.SourceRow} reason=NOTE_TIME_COMPLETED note={account.Note}");
+        }
+
+        foreach (var account in eligible.Where(x => !IsBan(x) && !IsLifetimeCompleted(x) && IsDone(x)))
         {
             _log.Info(
                 $"[AUTO_PROFILE_EXCEL_SKIP] mode=new user={account.Username} row={account.SourceRow} reason=AUTOPRF_DONE");
@@ -727,6 +738,7 @@ public sealed partial class ManagerForm
 
         foreach (var account in eligible.Where(x =>
                      !IsBan(x)
+                     && !IsLifetimeCompleted(x)
                      && states.TryGetValue(x.Id, out var state)
                      && state.IsInProgress))
         {
@@ -741,6 +753,7 @@ public sealed partial class ManagerForm
         var candidates = eligible
             .Where(x =>
                 !IsBan(x)
+                && !IsLifetimeCompleted(x)
                 && !IsDone(x)
                 && (!states.TryGetValue(x.Id, out var state) || !state.IsInProgress))
             .ToList();
@@ -777,6 +790,12 @@ public sealed partial class ManagerForm
         if (TikTokAccountPoolService.IsBanNoteValue(account.Note))
         {
             reason = "NOTE_BAN";
+            return false;
+        }
+
+        if (TikTokAccountPoolService.IsLifetimeCompletedNoteValue(account.Note))
+        {
+            reason = "NOTE_TIME_COMPLETED";
             return false;
         }
 
@@ -980,6 +999,11 @@ public sealed partial class ManagerForm
                 gateDecision = "SKIP";
                 gateReason = "NOTE_BAN";
             }
+            else if (freshExcel.IsLifetimeCompleted)
+            {
+                gateDecision = "SKIP";
+                gateReason = "NOTE_TIME_COMPLETED";
+            }
             else if (freshExcel.IsAutoProfileDone)
             {
                 gateDecision = "SKIP";
@@ -1019,6 +1043,7 @@ public sealed partial class ManagerForm
                 var message = gateReason switch
                 {
                     "NOTE_BAN" => "Bỏ qua: Excel đang ghi chú BAN; không gán tài khoản vào profile.",
+                    "NOTE_TIME_COMPLETED" => $"Bỏ qua: account đã chạy đủ vòng đời ({freshExcel.Note}); không tạo lại profile.",
                     "AUTOPRF_DONE" => "Bỏ qua: cột Auto Profile/AutoPrf đã DONE; không tạo lại profile.",
                     "AUTOPRF_PROCESSING" => "Bỏ qua: cột Auto Profile/AutoPrf đang PROCESSING; account đang thuộc một luồng Auto Profile khác.",
                     "ALREADY_ASSIGNED" => $"Bỏ qua: Excel đã gán tài khoản cho profile {freshExcel.AssignedProfile}.",

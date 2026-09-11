@@ -1545,33 +1545,22 @@ public sealed partial class ManagerForm
                 ctx, source, reason, "STEP", "step=SHUTDOWN_WORKER");
             await EnsureAutoCloseWorkerStoppedAsync(ctx);
 
-            if (chromeClosedByWorker)
-            {
-                // Worker chỉ trả "closed"/"not_running" sau khi CloseManagedBrowserAsync
-                // xác minh CDP đã tắt và toàn bộ PID Chrome đã sở hữu/xác minh đều đã thoát.
-                // Không chạy CIM/PowerShell lần hai vì chính bước thừa này có thể timeout
-                // và làm profile mắc ở STOPPED dù Chrome thực tế đã đóng sạch.
-                _autoCloseVerifiedCleanProfiles.Add(ctx.Profile.Name);
+            // Dù Worker trả "closed"/"not_running" cũng KHÔNG được coi CDP tắt là
+            // bằng chứng cuối cùng. Chrome có thể mất CDP trước nhưng process theo
+            // ProfilePath vẫn còn sống. Luôn chạy strict ProfilePath 2-pass sau khi
+            // Worker đã chết; chỉ khi pass 2/2 sạch mới được gỡ tab và tạo suất bù.
+            WriteAutoDiagnosticEvent(
+                ctx, source, reason, "STEP",
+                chromeClosedByWorker
+                    ? "step=FINAL_CHROME_STRICT_VERIFY_AFTER_WORKER_CLOSE"
+                    : "step=FINAL_CHROME_STRICT_CLEANUP_FALLBACK");
 
-                _log.Info(
-                    $"[AUTO_CLOSE_CHROME_CLEAN_CONFIRMED] profile={ctx.Profile.Name} source=worker_close_verified");
-            }
-            else
-            {
-                // Worker không xác minh được việc đóng Chrome => fail-closed.
-                // Bắt buộc dùng probe theo đúng ProfilePath. Nếu probe timeout/UNKNOWN
-                // thì EnsureAutoCloseChromeStoppedAsync ném CLEANUP_PENDING và TUYỆT ĐỐI
-                // chưa gỡ tab / chưa tạo suất bù.
-                WriteAutoDiagnosticEvent(
-                    ctx, source, reason, "STEP", "step=FINAL_CHROME_CLEANUP_FALLBACK");
+            await EnsureAutoCloseChromeStoppedAsync(ctx);
 
-                await EnsureAutoCloseChromeStoppedAsync(ctx);
+            _autoCloseVerifiedCleanProfiles.Add(ctx.Profile.Name);
 
-                _autoCloseVerifiedCleanProfiles.Add(ctx.Profile.Name);
-
-                _log.Info(
-                    $"[AUTO_CLOSE_CHROME_CLEAN_CONFIRMED] profile={ctx.Profile.Name} source=manager_profile_path_probe");
-            }
+            _log.Info(
+                $"[AUTO_CLOSE_CHROME_CLEAN_CONFIRMED] profile={ctx.Profile.Name} source=profile_path_strict_2pass workerCloseVerified={chromeClosedByWorker}");
 
             WriteAutoDiagnosticEvent(
                 ctx, source, reason, "STEP", "step=REMOVE_TAB");

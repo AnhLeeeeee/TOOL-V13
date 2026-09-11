@@ -92,9 +92,9 @@ public sealed partial class ChromeController
         }
 
         // 3) TikTok là SPA: URL/DOM có thể xuất hiện trước khi dữ liệu hồ sơ mới đồng bộ.
-        // Chờ ngẫu nhiên 1-2 giây trước mỗi lần đọc Name Guard để tránh đọc snapshot cũ
+        // Chờ ngẫu nhiên 2-4 giây trước mỗi lần đọc Name Guard để tránh đọc snapshot cũ
         // ngay sau khi vừa vào/load lại trang Hồ sơ. Ưu tiên chậm nhưng chắc.
-        var profileSettleDelayMs = Random.Shared.Next(1000, 2001);
+        var profileSettleDelayMs = Random.Shared.Next(2000, 4001);
         _log.Info($"[NAME_GUARD_PROFILE_SETTLE_WAIT] delayMs={profileSettleDelayMs} href={profileHref}");
         await Task.Delay(profileSettleDelayMs, ct);
 

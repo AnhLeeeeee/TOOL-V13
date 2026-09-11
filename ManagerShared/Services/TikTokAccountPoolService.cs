@@ -44,6 +44,9 @@ public sealed record TikTokAccountExcelSnapshot(
     public bool IsBanBlocked
         => TikTokAccountPoolService.IsBanNoteValue(Note);
 
+    public bool IsLifetimeCompleted
+        => TikTokAccountPoolService.IsLifetimeCompletedNoteValue(Note);
+
     public bool IsAutoProfileDone
         => (AutoProfileResult ?? "").Trim().Equals(
             "DONE",
@@ -128,6 +131,22 @@ public sealed class TikTokAccountPoolService
             || normalized.StartsWith("BAN_", StringComparison.OrdinalIgnoreCase)
             || normalized.StartsWith("BANNED ", StringComparison.OrdinalIgnoreCase)
             || normalized.StartsWith("BI BAN ", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static bool IsLifetimeCompletedNoteValue(string? value)
+    {
+        var normalized = NormalizeGateText(value);
+
+        if (normalized.Length == 0)
+            return false;
+
+        // TIME_xH là trạng thái terminal: account đã chạy đủ vòng đời.
+        // Chấp nhận cả các biến thể cũ như TIME 6H / TIME-8H nhưng không
+        // coi TIMEOUT hay lỗi kỹ thuật khác là hoàn tất vòng đời.
+        return Regex.IsMatch(
+            normalized,
+            @"^TIME[_\s-]*\d+(?:[.,]\d+)?\s*H\b",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
     }
 
     public TikTokAccountExcelSnapshot ReadFreshExcelSnapshot(string accountId)

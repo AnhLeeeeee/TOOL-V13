@@ -140,15 +140,13 @@ public sealed partial class ManagerForm
     async Task EnsureAutoCloseChromeStoppedAsync(
         ProfileContext ctx)
     {
-        // Fast verification path that does not depend on WMI/CIM. On some VMs the
-        // ProfilePath probe can intermittently timeout even after Chrome is already
-        // gone. That false UNKNOWN used to keep AutoClose/AutoReplacement stuck in
-        // CLEANUP_PENDING forever.
+        // CHẬM MÀ CHẮC: Worker/window/CDP chỉ là tín hiệu nhanh để log, KHÔNG còn
+        // được dùng để kết luận Chrome đã đóng. Chrome có thể mất CDP/cửa sổ trước
+        // nhưng process theo đúng --user-data-dir/ProfilePath vẫn còn sống.
         //
-        // We only accept this fast path when ALL three runtime signals say the
-        // profile is gone: Worker exited, cached Chrome window is invalid, and the
-        // profile's dedicated CDP port is no longer listening. If any signal still
-        // looks alive we fall back to the strict ProfilePath process probe below.
+        // Mọi đường AutoClose / Tự bù / NameGuard cleanup phải xác minh ProfilePath
+        // HAI lượt liên tiếp. Lượt 1 sẽ force-kill đúng PID nếu còn; lượt 2 sau
+        // 1-2 giây xác nhận không có process hồi sinh/chậm thoát trước khi nhường slot.
         var workerAlive = false;
         try
         {
@@ -162,16 +160,29 @@ public sealed partial class ManagerForm
         var cachedWindowAlive = HasAutoCloseCachedLiveChromeWindow(ctx);
         var cdpListening = await IsAutoCloseCdpPortListeningAsync(ctx.Profile.CdpPort);
 
-        if (!workerAlive && !cachedWindowAlive && !cdpListening)
+        _log.Info(
+            $"[AUTO_CLOSE_CHROME_STRICT_BEGIN] profile={ctx.Profile.Name} workerAlive={workerAlive} windowAlive={cachedWindowAlive} cdpListening={cdpListening} port={ctx.Profile.CdpPort} path={ctx.Profile.ProfilePath}");
+
+        for (var pass = 1; pass <= 2; pass++)
         {
+            await EnsureAutoCloseChromeStoppedByPathAsync(
+                ctx.Profile.Name,
+                ctx.Profile.ProfilePath);
+
             _log.Info(
-                $"[AUTO_CLOSE_CHROME_VERIFIED_CLOSED] profile={ctx.Profile.Name} processCount=0 method=worker_exit+window_closed+cdp_closed port={ctx.Profile.CdpPort}");
-            return;
+                $"[AUTO_CLOSE_CHROME_STRICT_PASS] profile={ctx.Profile.Name} pass={pass}/2 state=profile_path_closed");
+
+            if (pass == 1)
+            {
+                var delayMs = Random.Shared.Next(1000, 2001);
+                _log.Info(
+                    $"[AUTO_CLOSE_CHROME_STRICT_WAIT] profile={ctx.Profile.Name} delayMs={delayMs} nextPass=2/2");
+                await Task.Delay(delayMs);
+            }
         }
 
-        await EnsureAutoCloseChromeStoppedByPathAsync(
-            ctx.Profile.Name,
-            ctx.Profile.ProfilePath);
+        _log.Info(
+            $"[AUTO_CLOSE_CHROME_STRICT_CONFIRMED] profile={ctx.Profile.Name} passes=2/2 processCount=0");
     }
 
     static async Task<bool> IsAutoCloseCdpPortListeningAsync(int port)

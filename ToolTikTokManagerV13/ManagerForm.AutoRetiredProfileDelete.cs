@@ -476,11 +476,10 @@ public sealed partial class ManagerForm
             context.CommandGate.Release();
         }
 
-        // MỘT probe CIM duy nhất, bản thân helper chạy ProbeProfileProcesses trong
-        // Task.Run. UNKNOWN => AutoCloseCleanupPendingException => outer loop retry 20s.
-        await EnsureAutoCloseChromeStoppedByPathAsync(
-            plan.Profile.Name,
-            plan.ChromeProfilePath);
+        // Trước khi xóa profile hết hạn/BAN phải xác minh Chrome theo đúng
+        // ProfilePath HAI lượt liên tiếp. Không chấp nhận chỉ Worker/CDP đã tắt,
+        // vì process Chrome mồ côi sẽ khóa thư mục và làm profile không xóa được.
+        await EnsureAutoCloseChromeStoppedAsync(context);
     }
 
     async Task DeleteChromeProfileDirectoryForAutoRetiredAsync(

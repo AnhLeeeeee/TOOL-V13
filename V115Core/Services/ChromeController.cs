@@ -1646,7 +1646,7 @@ public sealed partial class ChromeController : IAsyncDisposable
         // thì đặt lại một lần nữa trước khi bấm Lưu.
         async Task DelayAfterDisplayNameAsync(string phase)
         {
-            var delayMs = Random.Shared.Next(1000, 2001);
+            var delayMs = Random.Shared.Next(2000, 4001);
             _log.Info($"[TIKTOK_IDENTITY_NAME_DELAY] phase={phase} delayMs={delayMs}");
             await Task.Delay(delayMs, ct);
         }

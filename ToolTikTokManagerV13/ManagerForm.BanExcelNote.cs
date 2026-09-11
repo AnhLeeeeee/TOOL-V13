@@ -544,6 +544,28 @@ public sealed partial class ManagerForm
                 $"Đã ghi nhưng đọc lại chưa thấy note={reason} (user={account.Username}, row={account.SourceRow}, actual={verifiedNote}).");
         }
 
+        // TIME_xH là kết thúc vòng đời hợp lệ, không phải lỗi Auto Profile.
+        // Chốt +auto=DONE để các lượt + Auto Profile sau này không bao giờ
+        // hiểu profile đã xóa vì đủ giờ thành PROCESSING/FAIL cần tạo lại.
+        if (TikTokAccountPoolService.IsLifetimeCompletedNoteValue(reason)
+            && TikTokAccountPoolService.IsLifetimeCompletedNoteValue(verifiedNote))
+        {
+            _accountPoolService.SetAutoProfileResult(account.Id, "DONE");
+
+            var terminalSnapshot =
+                _accountPoolService.ReadFreshExcelSnapshot(account.Id);
+
+            if (!terminalSnapshot.IsAutoProfileDone)
+            {
+                throw new InvalidOperationException(
+                    $"Đã ghi {reason} nhưng chưa xác minh được Auto Profile=DONE "
+                    + $"(user={account.Username}, row={account.SourceRow}, actual={terminalSnapshot.AutoProfileResult}).");
+            }
+
+            _log.Info(
+                $"[LIFETIME_AUTOPRF_DONE_OK] profile={profileName} user={account.Username} row={account.SourceRow} note={verifiedNote}");
+        }
+
         _log.Info(
             $"[LIFETIME_EXCEL_NOTE_OK] profile={profileName} user={account.Username} row={account.SourceRow} note={verifiedNote} requested={reason} detail={detail}");
 
