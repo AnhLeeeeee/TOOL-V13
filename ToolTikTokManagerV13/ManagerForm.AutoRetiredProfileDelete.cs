@@ -110,13 +110,24 @@ public sealed partial class ManagerForm
                         profileName,
                         out var cleanupRetryUtc))
                 {
-                    retryAttempt++;
-                    await WaitAutoRetiredDeleteRetryAsync(
-                        profileName,
-                        requestedReason,
-                        retryAttempt,
-                        $"auto_close_cleanup_pending_until={cleanupRetryUtc:O}");
-                    continue;
+                    // The old code waited forever as long as the dictionary key
+                    // existed, even after cleanupRetryUtc had already passed. If the
+                    // watchdog no longer considered this profile a runtime candidate,
+                    // nobody removed the stale key and DELETE_PENDING looped forever.
+                    if (DateTime.UtcNow < cleanupRetryUtc)
+                    {
+                        retryAttempt++;
+                        await WaitAutoRetiredDeleteRetryAsync(
+                            profileName,
+                            requestedReason,
+                            retryAttempt,
+                            $"auto_close_cleanup_pending_until={cleanupRetryUtc:O}");
+                        continue;
+                    }
+
+                    _autoCloseCleanupRetryUtc.Remove(profileName);
+                    _log.Info(
+                        $"[AUTO_RETIRED_DELETE_CLEANUP_RETRY_DUE] profile={profileName} retryAt={cleanupRetryUtc:O} action=continue_cleanup");
                 }
 
                 // Xác minh LẠI Excel ngay trước mỗi lượt xóa.

@@ -1644,6 +1644,13 @@ public sealed partial class ChromeController : IAsyncDisposable
         // (đây là thời điểm DOM ổn định nhất), sau đó mới xử lý avatar.
         // Sau khi popup ảnh đóng sẽ kiểm tra lại Tên; nếu TikTok re-render làm mất giá trị
         // thì đặt lại một lần nữa trước khi bấm Lưu.
+        async Task DelayAfterDisplayNameAsync(string phase)
+        {
+            var delayMs = Random.Shared.Next(1000, 2001);
+            _log.Info($"[TIKTOK_IDENTITY_NAME_DELAY] phase={phase} delayMs={delayMs}");
+            await Task.Delay(delayMs, ct);
+        }
+
         async Task<bool> SetDisplayNameAsync()
         {
             if (displayName.Length == 0) return true;
@@ -1729,7 +1736,7 @@ public sealed partial class ChromeController : IAsyncDisposable
                 throw new InvalidOperationException("Không tìm thấy hoặc không sửa được ô Tên trong form Sửa hồ sơ. Tool không thay TikTok ID.");
             nameChanged = true;
             _log.Info($"[TIKTOK_IDENTITY_NAME_SET] phase=before-avatar length={displayName.Length}");
-            await Task.Delay(350, ct);
+            await DelayAfterDisplayNameAsync("before-avatar");
         }
 
         // Luồng: Sửa hồ sơ -> Sửa tên (nếu có) -> Thay ảnh -> Đăng ký ảnh ->
@@ -1900,7 +1907,7 @@ public sealed partial class ChromeController : IAsyncDisposable
                 if (!await SetDisplayNameAsync())
                     throw new InvalidOperationException("Ảnh đã cập nhật nhưng TikTok làm mới form và không thể đặt lại ô Tên. Tool không thay TikTok ID.");
                 _log.Info($"[TIKTOK_IDENTITY_NAME_SET] phase=after-avatar-reapply length={displayName.Length}");
-                await Task.Delay(350, ct);
+                await DelayAfterDisplayNameAsync("after-avatar-reapply");
             }
             else
             {

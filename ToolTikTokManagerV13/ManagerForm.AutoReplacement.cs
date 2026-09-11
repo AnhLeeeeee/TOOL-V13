@@ -384,6 +384,12 @@ public sealed partial class ManagerForm
                     return;
                 }
 
+                // SLOT-GATE HEALING: ExpectedRunning là intent marker, không phải bằng chứng
+                // runtime vật lý. Nếu marker cũ bị sót sau khi Chrome/Worker đã đóng,
+                // CountAutoReplacementOccupiedSlots() có thể tưởng đã đủ suất và xóa
+                // request Tự bù. Xác minh các marker nghi stale 2 lượt trước khi đếm.
+                await PruneStaleAutoReplacementExpectedRunningAsync(request);
+
                 var slotGate = EvaluateAutoReplacementFixedSlotGate(request);
 
                 if (slotGate.AlreadySatisfied)

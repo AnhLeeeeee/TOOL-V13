@@ -140,9 +140,56 @@ public sealed partial class ManagerForm
     async Task EnsureAutoCloseChromeStoppedAsync(
         ProfileContext ctx)
     {
+        // Fast verification path that does not depend on WMI/CIM. On some VMs the
+        // ProfilePath probe can intermittently timeout even after Chrome is already
+        // gone. That false UNKNOWN used to keep AutoClose/AutoReplacement stuck in
+        // CLEANUP_PENDING forever.
+        //
+        // We only accept this fast path when ALL three runtime signals say the
+        // profile is gone: Worker exited, cached Chrome window is invalid, and the
+        // profile's dedicated CDP port is no longer listening. If any signal still
+        // looks alive we fall back to the strict ProfilePath process probe below.
+        var workerAlive = false;
+        try
+        {
+            workerAlive = ctx.Worker is not null && !ctx.Worker.HasExited;
+        }
+        catch
+        {
+            workerAlive = ctx.Worker is not null;
+        }
+
+        var cachedWindowAlive = HasAutoCloseCachedLiveChromeWindow(ctx);
+        var cdpListening = await IsAutoCloseCdpPortListeningAsync(ctx.Profile.CdpPort);
+
+        if (!workerAlive && !cachedWindowAlive && !cdpListening)
+        {
+            _log.Info(
+                $"[AUTO_CLOSE_CHROME_VERIFIED_CLOSED] profile={ctx.Profile.Name} processCount=0 method=worker_exit+window_closed+cdp_closed port={ctx.Profile.CdpPort}");
+            return;
+        }
+
         await EnsureAutoCloseChromeStoppedByPathAsync(
             ctx.Profile.Name,
             ctx.Profile.ProfilePath);
+    }
+
+    static async Task<bool> IsAutoCloseCdpPortListeningAsync(int port)
+    {
+        if (port <= 0 || port > 65535)
+            return false;
+
+        try
+        {
+            using var client = new System.Net.Sockets.TcpClient();
+            using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(400));
+            await client.ConnectAsync("127.0.0.1", port, cts.Token);
+            return client.Connected;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     async Task EnsureAutoCloseChromeStoppedByPathAsync(

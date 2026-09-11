@@ -91,7 +91,14 @@ public sealed partial class ChromeController
             return new TikTokFastNameProbeResult(false, "", false, username, "href", "Không vào được trang Hồ sơ: " + ex.Message);
         }
 
-        // 3) Poll tên ngay trên trang Hồ sơ. Không F5. Có tên là trả kết quả ngay.
+        // 3) TikTok là SPA: URL/DOM có thể xuất hiện trước khi dữ liệu hồ sơ mới đồng bộ.
+        // Chờ ngẫu nhiên 1-2 giây trước mỗi lần đọc Name Guard để tránh đọc snapshot cũ
+        // ngay sau khi vừa vào/load lại trang Hồ sơ. Ưu tiên chậm nhưng chắc.
+        var profileSettleDelayMs = Random.Shared.Next(1000, 2001);
+        _log.Info($"[NAME_GUARD_PROFILE_SETTLE_WAIT] delayMs={profileSettleDelayMs} href={profileHref}");
+        await Task.Delay(profileSettleDelayMs, ct);
+
+        // 4) Poll tên trên trang Hồ sơ sau khoảng settle ở trên. Không F5.
         string currentName = "";
         string currentHandle = username;
         var nameDeadline = DateTime.UtcNow.AddSeconds(3.5);

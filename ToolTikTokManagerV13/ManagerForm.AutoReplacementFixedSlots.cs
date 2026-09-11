@@ -156,6 +156,175 @@ public sealed partial class ManagerForm
         return names.Count;
     }
 
+    sealed record AutoReplacementExpectedRuntimeProbe(
+        bool Present,
+        bool WorkerAlive,
+        bool WindowAlive,
+        bool CdpListening,
+        bool Opening,
+        string Source);
+
+    async Task<AutoReplacementExpectedRuntimeProbe> ProbeAutoReplacementExpectedRuntimeAsync(
+        string profileName)
+    {
+        profileName = (profileName ?? "").Trim();
+
+        if (profileName.Length == 0)
+        {
+            return new AutoReplacementExpectedRuntimeProbe(
+                false, false, false, false, false, "empty_name");
+        }
+
+        // Profile bù đã claim slot phải tiếp tục được tính ngay cả khi Chrome chưa kịp mở.
+        // Đây là reservation thật, không phải marker ExpectedRunning cũ.
+        if (_autoReplacementClaimedProfiles.Contains(profileName))
+        {
+            return new AutoReplacementExpectedRuntimeProbe(
+                true, false, false, false, true, "replacement_claimed");
+        }
+
+        if (_contexts.TryGetValue(profileName, out var ctx))
+        {
+            var workerAlive = false;
+            try
+            {
+                workerAlive = ctx.Worker is not null && !ctx.Worker.HasExited;
+            }
+            catch
+            {
+                // Không đọc được Worker thì fail-closed: giữ slot, không prune nhầm.
+                workerAlive = ctx.Worker is not null;
+            }
+
+            var windowAlive = HasAutoCloseCachedLiveChromeWindow(ctx);
+            var cdpListening = await IsAutoCloseCdpPortListeningAsync(ctx.Profile.CdpPort);
+            var opening = ctx.Opening;
+
+            return new AutoReplacementExpectedRuntimeProbe(
+                workerAlive || windowAlive || cdpListening || opening,
+                workerAlive,
+                windowAlive,
+                cdpListening,
+                opening,
+                "context");
+        }
+
+        // Context đã mất: không còn Worker/window/opening để quan sát. Dùng CDP riêng
+        // của profile trong catalog làm tín hiệu runtime. Nếu profile cũng đã biến mất
+        // khỏi catalog thì ExpectedRunning chắc chắn là marker cũ.
+        try
+        {
+            var catalog = _profileService.Load();
+            var profile = catalog.Profiles.FirstOrDefault(x =>
+                x.Name.Equals(profileName, StringComparison.OrdinalIgnoreCase));
+
+            if (profile is null)
+            {
+                return new AutoReplacementExpectedRuntimeProbe(
+                    false, false, false, false, false, "missing_context_and_catalog");
+            }
+
+            var cdpListening = await IsAutoCloseCdpPortListeningAsync(profile.CdpPort);
+            return new AutoReplacementExpectedRuntimeProbe(
+                cdpListening,
+                false,
+                false,
+                cdpListening,
+                false,
+                "catalog_cdp");
+        }
+        catch (Exception ex)
+        {
+            // Không xác minh được => giữ marker để tránh mở thừa profile.
+            _log.Warn(
+                $"[AUTO_REPLACE_EXPECTED_PROBE_WARN] profile={profileName} error={ex.Message} action=KEEP_EXPECTED");
+
+            return new AutoReplacementExpectedRuntimeProbe(
+                true, false, false, false, false, "probe_error_keep_expected");
+        }
+    }
+
+    async Task<int> PruneStaleAutoReplacementExpectedRunningAsync(
+        AutoReplacementRequest request)
+    {
+        // Snapshot trước khi await để không enumerate trực tiếp HashSet qua nhiều nhịp async.
+        var expectedNames = _autoCloseExpectedRunningProfiles
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        if (expectedNames.Length == 0)
+            return 0;
+
+        var staleCandidates = new List<string>();
+
+        // PASS 1: chỉ đánh dấu ứng viên stale, chưa xóa ngay.
+        foreach (var profileName in expectedNames)
+        {
+            if (!_autoCloseExpectedRunningProfiles.Contains(profileName))
+                continue;
+
+            var probe = await ProbeAutoReplacementExpectedRuntimeAsync(profileName);
+
+            _log.Info(
+                $"[AUTO_REPLACE_EXPECTED_SLOT_PROBE] request={request.Id} profile={profileName} pass=1/2 present={probe.Present} workerAlive={probe.WorkerAlive} windowAlive={probe.WindowAlive} cdpListening={probe.CdpListening} opening={probe.Opening} source={probe.Source}");
+
+            if (!probe.Present)
+                staleCandidates.Add(profileName);
+        }
+
+        if (staleCandidates.Count == 0)
+            return 0;
+
+        // Chậm mà chắc: đợi 1-2 giây rồi xác minh lại tất cả ứng viên stale.
+        // Chỉ cần MỘT lần wait chung, không cộng dồn 1-2 giây cho từng profile.
+        var delayMs = Random.Shared.Next(1000, 2001);
+        _log.Info(
+            $"[AUTO_REPLACE_EXPECTED_SLOT_WAIT] request={request.Id} candidates={staleCandidates.Count} delayMs={delayMs} nextPass=2/2");
+        await Task.Delay(delayMs);
+
+        var removed = 0;
+
+        // PASS 2: chỉ prune khi runtime vẫn sạch lần thứ hai.
+        foreach (var profileName in staleCandidates)
+        {
+            if (!_autoCloseExpectedRunningProfiles.Contains(profileName))
+                continue;
+
+            var probe = await ProbeAutoReplacementExpectedRuntimeAsync(profileName);
+
+            _log.Info(
+                $"[AUTO_REPLACE_EXPECTED_SLOT_PROBE] request={request.Id} profile={profileName} pass=2/2 present={probe.Present} workerAlive={probe.WorkerAlive} windowAlive={probe.WindowAlive} cdpListening={probe.CdpListening} opening={probe.Opening} source={probe.Source}");
+
+            if (probe.Present)
+            {
+                _log.Info(
+                    $"[AUTO_REPLACE_EXPECTED_SLOT_KEEP] request={request.Id} profile={profileName} reason=runtime_reappeared");
+                continue;
+            }
+
+            var hadExpected = _autoCloseExpectedRunningProfiles.Contains(profileName);
+            ClearAutoCloseExpectedRunning(
+                profileName,
+                "auto_replace_slot_gate_stale_runtime_2pass");
+
+            if (hadExpected && !_autoCloseExpectedRunningProfiles.Contains(profileName))
+            {
+                removed++;
+                _log.Warn(
+                    $"[AUTO_REPLACE_EXPECTED_SLOT_PRUNED] request={request.Id} profile={profileName} reason=worker_window_cdp_opening_closed_2pass");
+            }
+        }
+
+        if (removed > 0)
+        {
+            _log.Warn(
+                $"[AUTO_REPLACE_EXPECTED_SLOT_PRUNE_SUMMARY] request={request.Id} removed={removed} before={expectedNames.Length} remaining={_autoCloseExpectedRunningProfiles.Count}");
+        }
+
+        return removed;
+    }
+
     AutoReplacementSlotGateResult EvaluateAutoReplacementFixedSlotGate(
         AutoReplacementRequest request)
     {
@@ -189,6 +358,102 @@ public sealed partial class ManagerForm
             target,
             occupied,
             $"Có 1 slot trống: occupied={occupied}, target={target}.");
+    }
+
+    async Task<AutoReplacementCleanupResult> VerifyAutoReplacementRuntimeClosedTwiceAsync(
+        ProfileContext ctx)
+    {
+        var profileName = (ctx.Profile.Name ?? "").Trim();
+
+        // Tự bù ưu tiên chậm mà chắc: chỉ giải phóng slot khi các tín hiệu runtime
+        // đều sạch HAI lần liên tiếp. Lượt thứ hai diễn ra sau 1-2 giây để tránh
+        // trường hợp Chrome/Worker vừa tắt nhưng còn process/cửa sổ/CDP hồi sinh muộn.
+        for (var pass = 1; pass <= 2; pass++)
+        {
+            var workerAlive = false;
+            try
+            {
+                workerAlive = ctx.Worker is not null && !ctx.Worker.HasExited;
+            }
+            catch
+            {
+                // Không xác minh được Worker => fail-closed, chưa cho phép Tự bù.
+                workerAlive = ctx.Worker is not null;
+            }
+
+            var cachedWindowAlive = HasAutoCloseCachedLiveChromeWindow(ctx);
+            var cdpListening = await IsAutoCloseCdpPortListeningAsync(ctx.Profile.CdpPort);
+            var opening = ctx.Opening;
+
+            _log.Info(
+                $"[AUTO_REPLACE_STABLE_CLOSE_CHECK] profile={profileName} pass={pass}/2 workerAlive={workerAlive} windowAlive={cachedWindowAlive} cdpListening={cdpListening} opening={opening} port={ctx.Profile.CdpPort}");
+
+            if (workerAlive || cachedWindowAlive || cdpListening || opening)
+            {
+                return new AutoReplacementCleanupResult(
+                    false,
+                    $"Chưa đóng ổn định ở lượt {pass}/2: "
+                    + $"worker={workerAlive}, window={cachedWindowAlive}, "
+                    + $"cdp={cdpListening}, opening={opening}. Tự bù sẽ thử lại sau.");
+            }
+
+            if (pass == 1)
+            {
+                var delayMs = Random.Shared.Next(1000, 2001);
+                _log.Info(
+                    $"[AUTO_REPLACE_STABLE_CLOSE_WAIT] profile={profileName} delayMs={delayMs} nextPass=2/2");
+                await Task.Delay(delayMs);
+            }
+        }
+
+        _log.Info(
+            $"[AUTO_REPLACE_STABLE_CLOSE_CONFIRMED] profile={profileName} passes=2/2 window=closed cdp=closed worker=closed");
+
+        return new AutoReplacementCleanupResult(
+            true,
+            "STABLE_CLOSED: xác minh sạch 2/2 lượt, cách nhau 1-2 giây.");
+    }
+
+    async Task<AutoReplacementCleanupResult> VerifyAutoReplacementProfilePathClosedTwiceAsync(
+        string profileName,
+        string profilePath)
+    {
+        profileName = (profileName ?? "").Trim();
+        profilePath = (profilePath ?? "").Trim();
+
+        // Khi context đã mất nhưng profile vẫn còn catalog, không còn Worker/window/CDP
+        // để quan sát ổn định. Vì vậy dùng chính probe theo ProfilePath hai lượt liên tiếp.
+        for (var pass = 1; pass <= 2; pass++)
+        {
+            try
+            {
+                await EnsureAutoCloseChromeStoppedByPathAsync(profileName, profilePath);
+            }
+            catch (Exception ex)
+            {
+                return new AutoReplacementCleanupResult(
+                    false,
+                    $"ProfilePath chưa sạch ở lượt {pass}/2: {ex.Message}");
+            }
+
+            _log.Info(
+                $"[AUTO_REPLACE_STABLE_PATH_CHECK] profile={profileName} pass={pass}/2 state=closed");
+
+            if (pass == 1)
+            {
+                var delayMs = Random.Shared.Next(1000, 2001);
+                _log.Info(
+                    $"[AUTO_REPLACE_STABLE_PATH_WAIT] profile={profileName} delayMs={delayMs} nextPass=2/2");
+                await Task.Delay(delayMs);
+            }
+        }
+
+        _log.Info(
+            $"[AUTO_REPLACE_STABLE_PATH_CONFIRMED] profile={profileName} passes=2/2");
+
+        return new AutoReplacementCleanupResult(
+            true,
+            "STABLE_CLOSED: ProfilePath sạch 2/2 lượt, cách nhau 1-2 giây.");
     }
 
     async Task<AutoReplacementCleanupResult> EnsureAutoReplacementSourceCleanupAsync(
@@ -268,9 +533,17 @@ public sealed partial class ManagerForm
                 return new AutoReplacementCleanupResult(false, "Tab Manager profile cũ vẫn còn mở.");
             }
 
+            // Safety gate RIÊNG cho Tự bù: dù AutoClose đã đánh dấu clean trong session,
+            // vẫn bắt buộc quan sát runtime sạch 2 lần liên tiếp cách nhau 1-2 giây.
+            // Điều này tránh mở profile bù ngay đúng lúc Chrome cũ đang shutdown chậm
+            // hoặc một process/window/CDP xuất hiện lại muộn.
+            var stableClose = await VerifyAutoReplacementRuntimeClosedTwiceAsync(ctx);
+            if (!stableClose.Succeeded)
+                return stableClose;
+
             return new AutoReplacementCleanupResult(
                 true,
-                "CLEANUP_DONE: Chrome=0 process, Worker=closed, tab=removed.");
+                "CLEANUP_DONE: Chrome/Worker ổn định sạch 2/2 lượt, tab=removed.");
         }
 
         // Context đã bị xóa (ví dụ BAN/TIME bật auto-delete): nếu catalog cũng không còn
@@ -286,20 +559,17 @@ public sealed partial class ManagerForm
                 "CLEANUP_DONE: profile đã được xóa khỏi catalog.");
         }
 
-        // Context mất nhưng profile vẫn còn catalog: vẫn phải verify process bằng ProfilePath.
-        try
-        {
-            await EnsureAutoCloseChromeStoppedByPathAsync(
-                profileName,
-                profile.ProfilePath);
-        }
-        catch (Exception ex)
-        {
-            return new AutoReplacementCleanupResult(false, ex.Message);
-        }
+        // Context mất nhưng profile vẫn còn catalog: xác minh ProfilePath HAI lượt
+        // cách nhau 1-2 giây trước khi cho phép mở profile bù.
+        var stablePathClose = await VerifyAutoReplacementProfilePathClosedTwiceAsync(
+            profileName,
+            profile.ProfilePath);
+
+        if (!stablePathClose.Succeeded)
+            return stablePathClose;
 
         return new AutoReplacementCleanupResult(
             true,
-            "CLEANUP_DONE: context không còn, Chrome đã xác minh 0 process.");
+            "CLEANUP_DONE: context không còn, ProfilePath sạch ổn định 2/2 lượt.");
     }
 }
