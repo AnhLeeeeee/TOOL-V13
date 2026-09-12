@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.IO.Compression;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
@@ -206,7 +206,8 @@ public sealed partial class ManagerForm : Form
         toolbarRow2.Controls.Add(Button("Xóa profile", (_, _) => ShowDeleteProfilesDialog(), UiButtonKind.Danger));
         toolbarRow2.Controls.Add(Button("Chạy tất cả", async (_, _) => await StartAllAsync(), UiButtonKind.Primary));
         toolbarRow2.Controls.Add(Button("Dừng tất cả", async (_, _) => await StopAllAsync(), UiButtonKind.Danger));
-        toolbarRow2.Controls.Add(_availability);
+        // Không hiển thị "Profile chưa mở" trên toolbar; thông tin này không cần thiết
+        // trong vận hành hằng ngày và làm hàng nút bị dài trên VM màn hình nhỏ.
 
         toolbarHost.Controls.Add(toolbarRow1, 0, 0);
         toolbarHost.Controls.Add(toolbarRow2, 0, 1);
@@ -2228,7 +2229,7 @@ public sealed partial class ManagerForm : Form
             sourceInfo.Text = string.IsNullOrWhiteSpace(currentFile)
                 ? "Chưa chọn Excel  •  Bấm Mở Excel để chọn nguồn tài khoản."
                 : $"{Path.GetFileName(currentFile)}  •  {items.Count} tài khoản  •  Chờ dùng lại: {reuseQueue.Count}  •  "
-                  + $"Tự quét: Tổng < {Math.Clamp(_autoCloseSettings.RunHours, 3, 8)}h";
+                  + $"Tự quét: Tổng < {Math.Clamp(_autoCloseSettings.RunHours, 3, 24)}h";
             sourceInfo.Tag = currentFile;
 
             CaptureSourceWriteTime();
@@ -2328,7 +2329,7 @@ public sealed partial class ManagerForm : Form
                     Math.Clamp(
                         _autoCloseSettings.RunHours,
                         3,
-                        8);
+                        24);
 
                 ModernDialog.ShowMessage(
                     form,

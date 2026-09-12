@@ -190,7 +190,7 @@ public sealed partial class ManagerForm
                 Math.Clamp(
                     _autoCloseSettings.RunHours,
                     3,
-                    8);
+                    24);
 
             var automaticMaxTotalSeconds =
                 TimeSpan.FromHours(
@@ -1727,10 +1727,36 @@ public sealed partial class ManagerForm
                         "started",
                         StringComparison.OrdinalIgnoreCase))
                 {
-                    await MarkReusableProfileFailedAsync(
-                        request,
-                        candidate,
-                        "start:" + reply);
+                    if (IsNameGuardTransientStartReply(reply))
+                    {
+                        // Name Guard đã retry cùng profile 3 lượt nhưng vẫn chỉ gặp lỗi
+                        // kỹ thuật tạm thời. Không ghi +auto=FAIL vào Excel vì account/profile
+                        // chưa có bằng chứng lỗi cứng; chỉ cooldown rồi chuyển candidate khác.
+                        MarkReplacementProfileFailed(
+                            profileName,
+                            "reuse_queue:name_guard_transient");
+
+                        _log.Warn(
+                            $"[REUSE_QUEUE_NAME_GUARD_TRANSIENT] profile={profileName} account={candidate.Username} action=COOLDOWN_NO_EXCEL_FAIL");
+
+                        WriteAutoActivityLog(
+                            action: "MỞ PROFILE BÙ",
+                            profile: request.ClosedProfileName,
+                            account: candidate.Username,
+                            reason: request.Reason,
+                            replacementProfile: profileName,
+                            result: "TẠM HOÃN",
+                            detail:
+                                $"Name Guard chưa ổn định sau {NameGuardTransientStartMaxAttempts} lượt; " +
+                                $"không ghi +auto=FAIL, cooldown {AutoReplacementFailedProfileCooldown.TotalMinutes:0} phút rồi đánh giá lại.");
+                    }
+                    else
+                    {
+                        await MarkReusableProfileFailedAsync(
+                            request,
+                            candidate,
+                            "start:" + reply);
+                    }
 
                     await CloseFailedReplacementRuntimeAsync(ctx);
                     continue;

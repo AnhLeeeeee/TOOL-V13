@@ -1,4 +1,5 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
+using System.IO.Compression;
 using System.Text;
 using ToolTikTokV12.Controls;
 using ToolTikTokV12.Utils;
@@ -10,12 +11,16 @@ public sealed partial class ManagerForm
     readonly object _profileLifecycleDiagnosticLock = new();
     bool _profileLifecycleDiagnosticInitialized;
     Button? _profileLifecycleDiagnosticButton;
+    ContextMenuStrip? _profileLifecycleDiagnosticMenu;
     string _managerShutdownIntent = "";
     string _managerShutdownIntentDetail = "";
     int _managerShutdownClosingEventCount;
 
+    string ToolLogDirectory
+        => Path.Combine(_baseDir, "logs");
+
     string ProfileLifecycleDiagnosticDirectory
-        => Path.Combine(_baseDir, "logs", "diagnostic");
+        => Path.Combine(ToolLogDirectory, "diagnostic");
 
     string ManagerProfileLifecycleDiagnosticPath
         => Path.Combine(ProfileLifecycleDiagnosticDirectory, "manager-profile-lifecycle.log");
@@ -161,11 +166,11 @@ public sealed partial class ManagerForm
 
     void InjectProfileLifecycleDiagnosticButton()
     {
-        if (_profileLifecycleDiagnosticButton is not null
-            && !_profileLifecycleDiagnosticButton.IsDisposed)
-        {
+        var buttonReady = _profileLifecycleDiagnosticButton is not null
+            && !_profileLifecycleDiagnosticButton.IsDisposed;
+
+        if (buttonReady)
             return;
-        }
 
         try
         {
@@ -178,14 +183,35 @@ public sealed partial class ManagerForm
             if (toolbar is null)
                 return;
 
+            _profileLifecycleDiagnosticMenu?.Dispose();
+            _profileLifecycleDiagnosticMenu = new ContextMenuStrip();
+            _profileLifecycleDiagnosticMenu.Items.Add(
+                "Mở thư mục Log",
+                null,
+                (_, _) => OpenToolLogDirectory());
+            _profileLifecycleDiagnosticMenu.Items.Add(
+                "Xuất log chẩn đoán...",
+                null,
+                async (_, _) => await ExportDiagnosticLogsAsync());
+
             _profileLifecycleDiagnosticButton = Button(
-                "Nhật ký lỗi",
-                (_, _) => OpenProfileLifecycleDiagnosticDirectory(),
+                "Log ▼",
+                (_, _) => ShowProfileLifecycleDiagnosticMenu(),
                 UiButtonKind.Neutral);
 
             toolbar.Controls.Add(_profileLifecycleDiagnosticButton);
         }
         catch { }
+    }
+
+    void ShowProfileLifecycleDiagnosticMenu()
+    {
+        var button = _profileLifecycleDiagnosticButton;
+        var menu = _profileLifecycleDiagnosticMenu;
+        if (button is null || button.IsDisposed || menu is null || menu.IsDisposed)
+            return;
+
+        menu.Show(button, new Point(0, button.Height));
     }
 
     static IEnumerable<Control> EnumerateProfileLifecycleControls(Control root)
@@ -198,15 +224,15 @@ public sealed partial class ManagerForm
         }
     }
 
-    void OpenProfileLifecycleDiagnosticDirectory()
+    void OpenToolLogDirectory()
     {
         try
         {
-            Directory.CreateDirectory(ProfileLifecycleDiagnosticDirectory);
+            Directory.CreateDirectory(ToolLogDirectory);
             Process.Start(new ProcessStartInfo
             {
                 FileName = "explorer.exe",
-                Arguments = $"\"{ProfileLifecycleDiagnosticDirectory}\"",
+                Arguments = $"\"{ToolLogDirectory}\"",
                 UseShellExecute = true
             });
         }
@@ -214,9 +240,164 @@ public sealed partial class ManagerForm
         {
             ModernDialog.ShowMessage(
                 this,
-                "Không mở được thư mục nhật ký.\r\n\r\n" + ex.Message,
-                "Nhật ký lỗi",
+                "Không mở được thư mục Log.\r\n\r\n" + ex.Message,
+                "Mở thư mục Log",
                 MessageBoxIcon.Warning);
         }
+    }
+
+    async Task ExportDiagnosticLogsAsync()
+    {
+        var logButton = _profileLifecycleDiagnosticButton;
+        if (logButton is not null)
+            logButton.Enabled = false;
+
+        try
+        {
+            Directory.CreateDirectory(ToolLogDirectory);
+
+            var desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+            if (string.IsNullOrWhiteSpace(desktop) || !Directory.Exists(desktop))
+                desktop = _baseDir;
+
+            using var saveDialog = new SaveFileDialog
+            {
+                Title = "Chọn vị trí lưu log chẩn đoán",
+                Filter = "ZIP (*.zip)|*.zip",
+                DefaultExt = "zip",
+                AddExtension = true,
+                OverwritePrompt = true,
+                CheckPathExists = true,
+                InitialDirectory = desktop,
+                FileName = $"ToolTikTok_Diagnostic_{DateTime.Now:yyyyMMdd_HHmmss}.zip"
+            };
+
+            if (saveDialog.ShowDialog(this) != DialogResult.OK
+                || string.IsNullOrWhiteSpace(saveDialog.FileName))
+            {
+                return;
+            }
+
+            var archivePath = Path.GetFullPath(saveDialog.FileName);
+            var result = await Task.Run(() => CreateDiagnosticLogArchive(archivePath));
+
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = "explorer.exe",
+                    Arguments = $"/select,\"{archivePath}\"",
+                    UseShellExecute = true
+                });
+            }
+            catch { }
+
+            var skippedNote = result.Skipped.Count == 0
+                ? ""
+                : $"\r\nBỏ qua {result.Skipped.Count} file đang khóa/không đọc được; danh sách đã được ghi trong ZIP.";
+
+            ModernDialog.ShowMessage(
+                this,
+                $"Đã xuất gói chẩn đoán gồm {result.Included} file Log.\r\n\r\n" +
+                $"{archivePath}{skippedNote}\r\n\r\n" +
+                "Khi cần kiểm tra lỗi, chỉ cần gửi file ZIP này.",
+                "Xuất log chẩn đoán",
+                MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            ModernDialog.ShowMessage(
+                this,
+                "Không xuất được log chẩn đoán.\r\n\r\n" + ex.Message,
+                "Xuất log chẩn đoán",
+                MessageBoxIcon.Warning);
+        }
+        finally
+        {
+            if (logButton is not null && !logButton.IsDisposed)
+                logButton.Enabled = true;
+        }
+    }
+
+    (int Included, List<string> Skipped) CreateDiagnosticLogArchive(string archivePath)
+    {
+        var skipped = new List<string>();
+        var included = 0;
+
+        using var archiveStream = new FileStream(
+            archivePath,
+            FileMode.Create,
+            FileAccess.Write,
+            FileShare.None);
+        using var archive = new ZipArchive(archiveStream, ZipArchiveMode.Create, leaveOpen: false);
+
+        IEnumerable<string> files;
+        try
+        {
+            files = Directory
+                .EnumerateFiles(ToolLogDirectory, "*", SearchOption.AllDirectories)
+                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+        }
+        catch (Exception ex)
+        {
+            skipped.Add($"Không liệt kê được thư mục Log: {ex.Message}");
+            files = Array.Empty<string>();
+        }
+
+        foreach (var file in files)
+        {
+            if (string.Equals(
+                    Path.GetFullPath(file),
+                    Path.GetFullPath(archivePath),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var relative = Path.GetRelativePath(ToolLogDirectory, file);
+
+            try
+            {
+                using var input = new FileStream(
+                    file,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete);
+
+                var entryName = "logs/" + relative.Replace('\\', '/');
+                var entry = archive.CreateEntry(entryName, CompressionLevel.Fastest);
+                using var output = entry.Open();
+                input.CopyTo(output);
+                included++;
+            }
+            catch (Exception ex)
+            {
+                skipped.Add($"{relative}: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        var infoEntry = archive.CreateEntry("diagnostic-info.txt", CompressionLevel.Fastest);
+        using (var writer = new StreamWriter(infoEntry.Open(), new UTF8Encoding(false)))
+        {
+            writer.WriteLine($"Tool TikTok diagnostic export");
+            writer.WriteLine($"Version: {AppVersionInfo.Display}");
+            writer.WriteLine($"Exported local time: {DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}");
+            writer.WriteLine($"Manager PID: {Environment.ProcessId}");
+            writer.WriteLine($"Base directory: {_baseDir}");
+            writer.WriteLine($"Log directory: {ToolLogDirectory}");
+            writer.WriteLine($"Included files: {included}");
+            writer.WriteLine($"Skipped files: {skipped.Count}");
+
+            if (skipped.Count > 0)
+            {
+                writer.WriteLine();
+                writer.WriteLine("Skipped details:");
+                foreach (var item in skipped)
+                    writer.WriteLine("- " + item);
+            }
+        }
+
+        return (included, skipped);
     }
 }

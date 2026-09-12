@@ -6,11 +6,24 @@ public sealed partial class ManagerForm
 {
     sealed class AutoCloseCleanupPendingException : InvalidOperationException
     {
-        public AutoCloseCleanupPendingException(string message)
-            : base(message) { }
+        public bool ProbeUnavailable { get; }
 
-        public AutoCloseCleanupPendingException(string message, Exception inner)
-            : base(message, inner) { }
+        public AutoCloseCleanupPendingException(
+            string message,
+            bool probeUnavailable = false)
+            : base(message)
+        {
+            ProbeUnavailable = probeUnavailable;
+        }
+
+        public AutoCloseCleanupPendingException(
+            string message,
+            Exception inner,
+            bool probeUnavailable = false)
+            : base(message, inner)
+        {
+            ProbeUnavailable = probeUnavailable;
+        }
     }
 
     sealed record AutoCloseProgressWatchState(
@@ -163,26 +176,43 @@ public sealed partial class ManagerForm
         _log.Info(
             $"[AUTO_CLOSE_CHROME_STRICT_BEGIN] profile={ctx.Profile.Name} workerAlive={workerAlive} windowAlive={cachedWindowAlive} cdpListening={cdpListening} port={ctx.Profile.CdpPort} path={ctx.Profile.ProfilePath}");
 
-        for (var pass = 1; pass <= 2; pass++)
+        try
         {
-            await EnsureAutoCloseChromeStoppedByPathAsync(
-                ctx.Profile.Name,
-                ctx.Profile.ProfilePath);
+            for (var pass = 1; pass <= 2; pass++)
+            {
+                await EnsureAutoCloseChromeStoppedByPathAsync(
+                    ctx.Profile.Name,
+                    ctx.Profile.ProfilePath);
+
+                _log.Info(
+                    $"[AUTO_CLOSE_CHROME_STRICT_PASS] profile={ctx.Profile.Name} pass={pass}/2 state=profile_path_closed");
+
+                if (pass == 1)
+                {
+                    var delayMs = Random.Shared.Next(1000, 2001);
+                    _log.Info(
+                        $"[AUTO_CLOSE_CHROME_STRICT_WAIT] profile={ctx.Profile.Name} delayMs={delayMs} nextPass=2/2");
+                    await Task.Delay(delayMs);
+                }
+            }
 
             _log.Info(
-                $"[AUTO_CLOSE_CHROME_STRICT_PASS] profile={ctx.Profile.Name} pass={pass}/2 state=profile_path_closed");
-
-            if (pass == 1)
-            {
-                var delayMs = Random.Shared.Next(1000, 2001);
-                _log.Info(
-                    $"[AUTO_CLOSE_CHROME_STRICT_WAIT] profile={ctx.Profile.Name} delayMs={delayMs} nextPass=2/2");
-                await Task.Delay(delayMs);
-            }
+                $"[AUTO_CLOSE_CHROME_STRICT_CONFIRMED] profile={ctx.Profile.Name} passes=2/2 processCount=0");
         }
+        catch (AutoCloseCleanupPendingException ex) when (ex.ProbeUnavailable)
+        {
+            // CIM/PowerShell UNKNOWN không đồng nghĩa Chrome còn sống. Khi chính probe
+            // hệ thống bị timeout, dùng các tín hiệu runtime độc lập (Worker, cửa sổ,
+            // CDP, PID top-level đã biết) hai lượt liên tiếp. Chỉ fallback nếu TẤT CẢ
+            // đều sạch; nếu còn bất kỳ tín hiệu sống nào vẫn fail-closed như cũ.
+            var fallbackClosed = await TryConfirmAutoCloseChromeStoppedWithoutCimAsync(ctx, ex.Message);
+            if (!fallbackClosed)
+                throw;
 
-        _log.Info(
-            $"[AUTO_CLOSE_CHROME_STRICT_CONFIRMED] profile={ctx.Profile.Name} passes=2/2 processCount=0");
+            _log.Warn(
+                $"[AUTO_CLOSE_CHROME_CLEANUP_FALLBACK_CONFIRMED] profile={ctx.Profile.Name} " +
+                $"reason=process_probe_unavailable action=ALLOW_CLEANUP_CONTINUE");
+        }
     }
 
     static async Task<bool> IsAutoCloseCdpPortListeningAsync(int port)
@@ -228,7 +258,8 @@ public sealed partial class ManagerForm
 
             throw new AutoCloseCleanupPendingException(
                 $"Chưa xác minh được Chrome profile {profileName} đã đóng (probe={error}). "
-                + "Chuyển CLEANUP_PENDING để thử lại sau; chưa tạo suất bù.");
+                + "Chuyển CLEANUP_PENDING để thử lại sau; chưa tạo suất bù.",
+                probeUnavailable: true);
         }
 
         if (probe.ProcessIds.Count == 0)
@@ -317,6 +348,87 @@ public sealed partial class ManagerForm
 
         _log.Info(
             $"[AUTO_CLOSE_CHROME_VERIFIED_CLOSED] profile={profileName} processCount=0 method=known_pid_kill_final");
+    }
+
+    async Task<bool> TryConfirmAutoCloseChromeStoppedWithoutCimAsync(
+        ProfileContext ctx,
+        string probeError)
+    {
+        static bool IsPidAlive(int pid)
+        {
+            if (pid <= 0) return false;
+            try
+            {
+                using var process = System.Diagnostics.Process.GetProcessById(pid);
+                return !process.HasExited;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        var knownChromePid = 0;
+        var hwndValue = ctx.LastSnapshot?.ChromeWindowHandle ?? 0;
+        if (hwndValue > 0)
+        {
+            try
+            {
+                GetWindowThreadProcessId(new IntPtr(hwndValue), out var pid);
+                if (pid > 0)
+                    knownChromePid = (int)pid;
+            }
+            catch { }
+        }
+
+        // Nếu PID top-level cũ còn sống, force-kill đúng cây process đó trước khi
+        // xác minh. Không quét/kill Chrome profile khác.
+        if (knownChromePid > 0 && IsPidAlive(knownChromePid))
+        {
+            try
+            {
+                using var chrome = System.Diagnostics.Process.GetProcessById(knownChromePid);
+                chrome.Kill(entireProcessTree: true);
+                _log.Warn(
+                    $"[AUTO_CLOSE_FALLBACK_KILL_KNOWN_PID] profile={ctx.Profile.Name} pid={knownChromePid} probeError={probeError}");
+            }
+            catch (Exception ex)
+            {
+                _log.Warn(
+                    $"[AUTO_CLOSE_FALLBACK_KILL_WARN] profile={ctx.Profile.Name} pid={knownChromePid} error={ex.Message}");
+            }
+        }
+
+        for (var pass = 1; pass <= 2; pass++)
+        {
+            var workerAlive = false;
+            try
+            {
+                workerAlive = ctx.Worker is not null && !ctx.Worker.HasExited;
+            }
+            catch
+            {
+                workerAlive = ctx.Worker is not null;
+            }
+
+            var windowAlive = HasAutoCloseCachedLiveChromeWindow(ctx);
+            var cdpListening = await IsAutoCloseCdpPortListeningAsync(ctx.Profile.CdpPort);
+            var pidAlive = IsPidAlive(knownChromePid);
+            var opening = ctx.Opening;
+
+            _log.Warn(
+                $"[AUTO_CLOSE_FALLBACK_CLOSE_CHECK] profile={ctx.Profile.Name} pass={pass}/2 " +
+                $"workerAlive={workerAlive} windowAlive={windowAlive} cdpListening={cdpListening} " +
+                $"knownPid={knownChromePid} pidAlive={pidAlive} opening={opening} probeError={probeError}");
+
+            if (workerAlive || windowAlive || cdpListening || pidAlive || opening)
+                return false;
+
+            if (pass == 1)
+                await Task.Delay(Random.Shared.Next(900, 1401));
+        }
+
+        return true;
     }
 
     bool IsAutoCloseRuntimeStillPresent(

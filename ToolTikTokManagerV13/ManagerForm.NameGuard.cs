@@ -23,6 +23,8 @@ public sealed partial class ManagerForm
         bool Transient = false);
 
     static readonly TimeSpan NameGuardTransientRetryDelay = TimeSpan.FromSeconds(15);
+    static readonly TimeSpan NameGuardManagerProbeTimeout = TimeSpan.FromSeconds(45);
+    const int NameGuardTransientStartMaxAttempts = 3;
 
     // Phân biệt "đã xử lý trong phiên" với "đã xác minh tên đúng".
     // _autoIdentityHandledSession còn được dùng để khóa loop sau FAIL, nên tuyệt đối
@@ -74,19 +76,67 @@ public sealed partial class ManagerForm
         TimeSpan timeout,
         bool suppressStatus = false)
     {
-        var guard = await EnsureNameGuardBeforeStartAsync(ctx);
-        if (!guard.Allowed)
+        // Lỗi kỹ thuật tạm thời của Name Guard (DOM/CDP/IPC chậm) không được biến
+        // ngay thành một profile bù hỏng. Giữ nguyên Chrome/Worker và thử lại cùng
+        // profile tối đa 3 lượt, cách nhau 15 giây. Chỉ lỗi cứng mới BLOCK ngay.
+        for (var attempt = 1; attempt <= NameGuardTransientStartMaxAttempts; attempt++)
         {
+            var guard = await EnsureNameGuardBeforeStartAsync(ctx);
+            if (guard.Allowed)
+            {
+                var reply = await SendCommandAsync(ctx, command, timeout);
+                _log.Info(
+                    $"[NAME_GUARD_START_ALLOWED] profile={ctx.Profile.Name} command={command} " +
+                    $"attempt={attempt}/{NameGuardTransientStartMaxAttempts} changed={guard.ChangedName} reply={reply}");
+                return reply;
+            }
+
+            if (!guard.Transient)
+            {
+                if (!suppressStatus)
+                    SetStatus(ctx, "Không Start: " + guard.Message, Color.Firebrick);
+
+                _log.Warn(
+                    $"[NAME_GUARD_START_BLOCKED] profile={ctx.Profile.Name} command={command} " +
+                    $"attempt={attempt}/{NameGuardTransientStartMaxAttempts} transient=false reason={guard.Message}");
+                return "name_guard_blocked";
+            }
+
+            if (attempt >= NameGuardTransientStartMaxAttempts)
+            {
+                if (!suppressStatus)
+                    SetStatus(ctx, "Name Guard tạm thời chưa sẵn sàng; sẽ thử lại ở lượt sau.", Color.DarkOrange);
+
+                _log.Warn(
+                    $"[NAME_GUARD_START_TRANSIENT_EXHAUSTED] profile={ctx.Profile.Name} command={command} " +
+                    $"attempt={attempt}/{NameGuardTransientStartMaxAttempts} reason={guard.Message}");
+                return "name_guard_transient";
+            }
+
             if (!suppressStatus)
-                SetStatus(ctx, "Không Start: " + guard.Message, Color.Firebrick);
-            _log.Warn($"[NAME_GUARD_START_BLOCKED] profile={ctx.Profile.Name} command={command} reason={guard.Message}");
-            return "name_guard_blocked";
+            {
+                SetStatus(
+                    ctx,
+                    $"Name Guard đang chờ ổn định ({attempt}/{NameGuardTransientStartMaxAttempts}); thử lại sau {NameGuardTransientRetryDelay.TotalSeconds:0}s...",
+                    Color.DarkOrange);
+            }
+
+            _log.Warn(
+                $"[NAME_GUARD_START_TRANSIENT_RETRY] profile={ctx.Profile.Name} command={command} " +
+                $"attempt={attempt}/{NameGuardTransientStartMaxAttempts} retryIn={NameGuardTransientRetryDelay.TotalSeconds:0}s " +
+                $"workerAlive={IsNameGuardWorkerAlive(ctx)} reason={guard.Message}");
+
+            await Task.Delay(NameGuardTransientRetryDelay);
         }
 
-        var reply = await SendCommandAsync(ctx, command, timeout);
-        _log.Info($"[NAME_GUARD_START_ALLOWED] profile={ctx.Profile.Name} command={command} changed={guard.ChangedName} reply={reply}");
-        return reply;
+        return "name_guard_transient";
     }
+
+    static bool IsNameGuardTransientStartReply(string? reply)
+        => string.Equals(
+            (reply ?? "").Trim(),
+            "name_guard_transient",
+            StringComparison.OrdinalIgnoreCase);
 
     async Task<NameGuardResult> EnsureNameGuardBeforeStartAsync(ProfileContext ctx)
     {
@@ -137,7 +187,12 @@ public sealed partial class ManagerForm
         // chỉ chạy từng PRF một, không có hai Chrome bị điều khiển song song.
         var slot = await AcquireManualIdentitySlotAsync(ctx.Profile.Name, TimeSpan.FromSeconds(45));
         if (!slot)
-            return new NameGuardResult(false, "Tên của profile đang được luồng Tên/ảnh khác xử lý.");
+        {
+            return new NameGuardResult(
+                false,
+                "Tên của profile đang được luồng Tên/ảnh khác xử lý.",
+                Transient: true);
+        }
 
         await _autoIdentityQueueGate.WaitAsync();
         try
@@ -221,6 +276,66 @@ public sealed partial class ManagerForm
                 string.IsNullOrWhiteSpace(probe.Source)
                     ? "profile_name_probe_failed"
                     : "profile_name_probe_failed:" + probe.Source);
+        }
+
+        // Nếu lần đầu đọc ra tên SAI, chưa được phép sửa/đóng ngay. Worker đã yêu cầu
+        // mismatch ổn định trong cùng một probe; Manager vẫn xác nhận thêm một probe độc lập
+        // sau khoảng nghỉ để loại trừ snapshot cũ của TikTok SPA.
+        if (!probe.Matched)
+        {
+            var firstMismatchName = (probe.CurrentName ?? "").Trim();
+            await Task.Delay(1800);
+
+            var confirmProbe = await ProbeNameGuardFastAsync(ctx, username, names);
+            _log.Info(
+                $"[NAME_GUARD_MISMATCH_SECOND_CONFIRM] profile={ctx.Profile.Name} account={username} " +
+                $"first='{firstMismatchName}' second='{confirmProbe.CurrentName}' " +
+                $"ok={confirmProbe.Ok} matched={confirmProbe.Matched} source={confirmProbe.Source}");
+
+            if (!confirmProbe.Ok)
+            {
+                var confirmReason = string.IsNullOrWhiteSpace(confirmProbe.Message)
+                    ? "Lần xác nhận thứ hai chưa đọc ổn định được tên trên Hồ sơ."
+                    : confirmProbe.Message;
+
+                return RegisterNameGuardTransientFailure(
+                    ctx,
+                    username,
+                    confirmReason,
+                    "mismatch_second_probe_unstable");
+            }
+
+            // Lần hai đã thấy tên đúng => lần đầu là snapshot cũ. Cho chạy và ghi DONE
+            // qua nhánh matched phía dưới, tuyệt đối không sửa tên/ảnh.
+            if (confirmProbe.Matched)
+            {
+                _log.Info(
+                    $"[NAME_GUARD_FALSE_MISMATCH_RECOVERED] profile={ctx.Profile.Name} account={username} " +
+                    $"first='{firstMismatchName}' current='{confirmProbe.CurrentName}'");
+                probe = confirmProbe;
+            }
+            else
+            {
+                var secondMismatchName = (confirmProbe.CurrentName ?? "").Trim();
+
+                // Hai probe đều báo sai nhưng lại thấy hai giá trị khác nhau => DOM đang
+                // chuyển trạng thái, không đủ bằng chứng để sửa/đóng. Giữ Chrome mở và retry.
+                if (!firstMismatchName.Equals(secondMismatchName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return RegisterNameGuardTransientFailure(
+                        ctx,
+                        username,
+                        $"Tên trên Hồ sơ chưa ổn định: lần 1='{firstMismatchName}', lần 2='{secondMismatchName}'.",
+                        "mismatch_values_changed_between_probes");
+                }
+
+                // Chỉ khi hai probe độc lập cùng xác nhận đúng một tên sai mới cho đi tiếp
+                // sang luồng cập nhật Tên/ảnh.
+                probe = confirmProbe;
+                _log.Info(
+                    $"[NAME_GUARD_MISMATCH_CONFIRMED_TWICE] profile={ctx.Profile.Name} account={username} " +
+                    $"currentName='{probe.CurrentName}'");
+            }
         }
 
         // 2) Tên trùng BẤT KỲ tên mẫu => bằng chứng thực tế đã đủ để cho chạy.
@@ -384,7 +499,7 @@ public sealed partial class ManagerForm
             var raw = await SendCommandAsync(
                 ctx,
                 "identity_name_probe|" + payload,
-                TimeSpan.FromSeconds(10));
+                NameGuardManagerProbeTimeout);
 
             if (string.IsNullOrWhiteSpace(raw))
             {

@@ -120,7 +120,7 @@ public sealed partial class ManagerForm
     static AutoCloseSettingsDocument NormalizeAutoCloseSettings(AutoCloseSettingsDocument settings)
     {
         settings.Version = 6;
-        settings.RunHours = Math.Clamp(settings.RunHours, 3, 8);
+        settings.RunHours = Math.Clamp(settings.RunHours, 3, 24);
         return settings;
     }
 
@@ -349,10 +349,20 @@ public sealed partial class ManagerForm
             Location = new Point(420, 70)
         };
 
-        foreach (var value in new[] { 3, 4, 5, 6, 7, 8 })
+        var runHourOptions = new[] { 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 20, 24 };
+        foreach (var value in runHourOptions)
             hours.Items.Add($"{value} giờ");
 
-        hours.SelectedIndex = Math.Clamp(_autoCloseSettings.RunHours - 3, 0, 5);
+        var selectedRunHours = Math.Clamp(_autoCloseSettings.RunHours, 3, 24);
+        var selectedHourIndex = Array.IndexOf(runHourOptions, selectedRunHours);
+        if (selectedHourIndex < 0)
+        {
+            selectedHourIndex = Array.FindIndex(runHourOptions, value => value >= selectedRunHours);
+            if (selectedHourIndex < 0)
+                selectedHourIndex = runHourOptions.Length - 1;
+        }
+
+        hours.SelectedIndex = selectedHourIndex;
         hours.Enabled = closeOnTime.Checked;
         closeOnTime.CheckedChanged += (_, _) => hours.Enabled = closeOnTime.Checked;
 
@@ -474,7 +484,7 @@ public sealed partial class ManagerForm
         {
             _autoCloseSettings.CloseOnBan = closeOnBan.Checked;
             _autoCloseSettings.CloseOnRunTime = closeOnTime.Checked;
-            _autoCloseSettings.RunHours = Math.Clamp(hours.SelectedIndex + 3, 3, 8);
+            _autoCloseSettings.RunHours = runHourOptions[Math.Clamp(hours.SelectedIndex, 0, runHourOptions.Length - 1)];
             _autoCloseSettings.CloseOnNotRunning10Minutes = closeOnStuck.Checked;
             _autoCloseSettings.OpenReplacementAfterAutoClose = openReplacement.Checked;
             _autoCloseSettings.DeleteProfileAfterBanOrLifetime = deleteRetiredProfile.Checked;

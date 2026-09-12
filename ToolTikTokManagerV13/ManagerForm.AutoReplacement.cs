@@ -65,6 +65,8 @@ public sealed partial class ManagerForm
     const int AutoReplacementHealthyStableSeconds = 30;
     static readonly TimeSpan AutoReplacementFailedProfileCooldown = TimeSpan.FromMinutes(5);
     static readonly TimeSpan AutoReplacementQueueWaitSlice = TimeSpan.FromSeconds(5);
+    const int AutoReplacementCleanupBarrierRetrySeconds = 15;
+    const int AutoReplacementCleanupBarrierMaxAttempts = 4;
 
     // Nếu TikTok Save tên nhưng giao diện cập nhật chậm, vẫn tiếp tục tạo PRF mới.
     // Chỉ sau 30 phút thiếu suất, hoặc sau mỗi 5 lần thử mới khi đã có PRF chờ tên,
@@ -808,12 +810,20 @@ public sealed partial class ManagerForm
         if (profileName.Length == 0)
             return;
 
-        const int retrySeconds = 20;
-
-        while (!_closing && !IsDisposed && !Disposing)
+        // Không profile bù lỗi nào được phép khóa GLOBAL queue vô hạn. Thử cleanup
+        // tối đa 4 lượt (~60s chưa tính thời gian probe). Nếu vẫn UNKNOWN, cô lập
+        // profile lỗi bằng cooldown và trả quyền điều khiển cho queue để các suất bù
+        // khác còn được xử lý.
+        for (var attempt = 1;
+             attempt <= AutoReplacementCleanupBarrierMaxAttempts
+             && !_closing
+             && !IsDisposed
+             && !Disposing;
+             attempt++)
         {
             _log.Warn(
-                $"[AUTO_REPLACE_CLEANUP_BARRIER_WAIT] blockedProfile={profileName} request={request.Id} retryIn={retrySeconds}s");
+                $"[AUTO_REPLACE_CLEANUP_BARRIER_WAIT] blockedProfile={profileName} request={request.Id} " +
+                $"attempt={attempt}/{AutoReplacementCleanupBarrierMaxAttempts} retryIn={AutoReplacementCleanupBarrierRetrySeconds}s");
 
             WriteAutoActivityLog(
                 action: "TỰ BÙ",
@@ -821,9 +831,11 @@ public sealed partial class ManagerForm
                 reason: request.Reason,
                 replacementProfile: profileName,
                 result: "CHỜ DỌN PROFILE BÙ LỖI",
-                detail: $"Profile bù {profileName} chưa đóng sạch; chưa mở profile bù khác. Thử lại sau {retrySeconds}s.");
+                detail:
+                    $"Profile bù {profileName} chưa đóng sạch; thử dọn lại " +
+                    $"{attempt}/{AutoReplacementCleanupBarrierMaxAttempts} sau {AutoReplacementCleanupBarrierRetrySeconds}s.");
 
-            await Task.Delay(TimeSpan.FromSeconds(retrySeconds));
+            await Task.Delay(TimeSpan.FromSeconds(AutoReplacementCleanupBarrierRetrySeconds));
 
             try
             {
@@ -831,7 +843,7 @@ public sealed partial class ManagerForm
                 {
                     await CloseFailedReplacementRuntimeAsync(ctx);
                     _log.Info(
-                        $"[AUTO_REPLACE_CLEANUP_BARRIER_CLEARED] profile={profileName} source=context");
+                        $"[AUTO_REPLACE_CLEANUP_BARRIER_CLEARED] profile={profileName} source=context attempt={attempt}");
                     return;
                 }
 
@@ -842,7 +854,7 @@ public sealed partial class ManagerForm
                 {
                     await CloseFailedReplacementRuntimeAsync(refreshedCtx);
                     _log.Info(
-                        $"[AUTO_REPLACE_CLEANUP_BARRIER_CLEARED] profile={profileName} source=refreshed_context");
+                        $"[AUTO_REPLACE_CLEANUP_BARRIER_CLEARED] profile={profileName} source=refreshed_context attempt={attempt}");
                     return;
                 }
 
@@ -852,7 +864,7 @@ public sealed partial class ManagerForm
                 if (profile is null)
                 {
                     _log.Info(
-                        $"[AUTO_REPLACE_CLEANUP_BARRIER_CLEARED] profile={profileName} source=profile_missing");
+                        $"[AUTO_REPLACE_CLEANUP_BARRIER_CLEARED] profile={profileName} source=profile_missing attempt={attempt}");
                     return;
                 }
 
@@ -862,7 +874,7 @@ public sealed partial class ManagerForm
                     profile.ProfilePath);
 
                 _log.Info(
-                    $"[AUTO_REPLACE_CLEANUP_BARRIER_CLEARED] profile={profileName} source=profile_path");
+                    $"[AUTO_REPLACE_CLEANUP_BARRIER_CLEARED] profile={profileName} source=profile_path attempt={attempt}");
                 return;
             }
             catch (AutoReplacementCleanupBarrierException ex)
@@ -884,7 +896,33 @@ public sealed partial class ManagerForm
                     ex);
             }
         }
+
+        if (_closing || IsDisposed || Disposing)
+            return;
+
+        // Safety valve: lỗi cleanup của MỘT profile không được làm chết cả hệ thống
+        // Tự bù. Profile đó vào cooldown; request hiện tại đã được ScheduleRetry ở
+        // caller nên queue sẽ quay lại sau, trong khi các request khác được tiếp tục.
+        MarkReplacementProfileFailed(profileName, "cleanup_barrier_exhausted");
+
+        var finalDetail =
+            $"Profile bù {profileName} vẫn chưa xác minh cleanup sau " +
+            $"{AutoReplacementCleanupBarrierMaxAttempts} lượt. Đã cô lập profile này vào cooldown; " +
+            "không khóa hàng Tự bù vô hạn. Các suất bù khác tiếp tục được xử lý.";
+
+        _log.Error(
+            $"[AUTO_REPLACE_CLEANUP_BARRIER_RELEASED] blockedProfile={profileName} request={request.Id} " +
+            $"attempts={AutoReplacementCleanupBarrierMaxAttempts} action=QUARANTINE_AND_CONTINUE error={barrier.Message}");
+
+        WriteAutoActivityLog(
+            action: "TỰ BÙ",
+            profile: request.ClosedProfileName,
+            reason: request.Reason,
+            replacementProfile: profileName,
+            result: "CÔ LẬP PROFILE BÙ LỖI",
+            detail: finalDetail);
     }
+
 
 
     static bool IsNameSyncPendingOutcome(AutoProfileProcessOutcome outcome)

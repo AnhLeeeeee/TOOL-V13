@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using ToolTikTokV11.Services;
 
 namespace ToolTikTokV11;
 
@@ -135,9 +136,33 @@ public sealed partial class MainForm
                             new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
                             ?? throw new InvalidOperationException("Payload Name Guard không hợp lệ.");
 
-                        var result = await _chrome.ProbeCurrentAccountDisplayNameAsync(
-                            request.Username,
-                            request.AllowedDisplayNames);
+                        // Worker phải tự kết thúc probe TRƯỚC timeout IPC phía Manager.
+                        // Probe DOM/CDP hiện có thể tốn hơn 20 giây trên VM chậm; cho
+                        // ngân sách 30 giây và trả lỗi tạm thời có cấu trúc thay vì để
+                        // Manager cắt pipe giữa lúc Worker vẫn còn chạy lệnh cũ.
+                        using var probeCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                        TikTokFastNameProbeResult result;
+                        try
+                        {
+                            result = await _chrome.ProbeCurrentAccountDisplayNameAsync(
+                                request.Username,
+                                request.AllowedDisplayNames,
+                                probeCts.Token);
+                        }
+                        catch (OperationCanceledException) when (probeCts.IsCancellationRequested)
+                        {
+                            _log.Warn("[NAME_GUARD_PROBE_TIMEOUT] budget=30s action=RETURN_TRANSIENT");
+                            return JsonSerializer.Serialize(new
+                            {
+                                ok = false,
+                                currentName = "",
+                                matched = false,
+                                currentHandle = "",
+                                source = "worker_probe_timeout",
+                                message = "Name Guard chưa hoàn tất trong 30 giây; giữ Chrome mở và thử lại."
+                            });
+                        }
+
                         return JsonSerializer.Serialize(new
                         {
                             ok = result.Ok,
