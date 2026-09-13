@@ -749,6 +749,15 @@ public sealed partial class ManagerForm
                 if (_autoCloseInProgressProfiles.Contains(profileName))
                     continue;
 
+                // Candidate đang thuộc một suất Tự bù (STABILIZING/CLEANUP) được chính
+                // luồng Tự bù quản lý grace 10 phút. Watchdog global không được tạo
+                // thêm FAULT_10M/suất bù thứ hai cho cùng profile.
+                if (_autoReplacementClaimedProfiles.Contains(profileName)
+                    || _autoReplacementCleanupProfiles.Contains(profileName))
+                {
+                    continue;
+                }
+
                 // Cleanup bị UNKNOWN (thường powershell_cim_timeout) không được giữ
                 // cả watchdog 40-45 giây hoặc retry mỗi giây. Giữ riêng profile này
                 // ở CLEANUP_PENDING 20s; các profile khác vẫn được xét bình thường.

@@ -333,7 +333,8 @@ public sealed partial class ManagerForm : Form
             e.Graphics.FillRectangle(backgroundBrush, e.Bounds);
         using (var border = new Pen(active ? ActiveProfileColor : UiTheme.Border))
             e.Graphics.DrawRectangle(border, e.Bounds.X, e.Bounds.Y, e.Bounds.Width - 1, e.Bounds.Height - 1);
-        var textRect = new Rectangle(e.Bounds.X + 8, e.Bounds.Y + 4, e.Bounds.Width - (closeable ? 24 : 10), e.Bounds.Height - 8);
+        // Chừa thêm chỗ cho nút X lớn hơn để dễ bấm trên VM/RDP.
+        var textRect = new Rectangle(e.Bounds.X + 8, e.Bounds.Y + 4, e.Bounds.Width - (closeable ? 34 : 10), e.Bounds.Height - 8);
         var profileName = page.Tag is ProfileContext context ? context.Profile.Name : page.Text;
         var text = active ? "● " + profileName : profileName;
         using var tabFont = new Font(Font, active ? FontStyle.Bold : FontStyle.Regular);
@@ -341,7 +342,11 @@ public sealed partial class ManagerForm : Form
         if (closeable)
         {
             var close = GetCloseRect(e.Bounds);
-            TextRenderer.DrawText(e.Graphics, "×", tabFont, close, active ? Color.White : Color.DimGray, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+            using var closeFont = new Font(
+                Font.FontFamily,
+                Math.Max(11f, Font.Size + 1.5f),
+                FontStyle.Bold);
+            TextRenderer.DrawText(e.Graphics, "×", closeFont, close, active ? Color.White : Color.DimGray, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
         }
     }
 
@@ -414,7 +419,17 @@ public sealed partial class ManagerForm : Form
             return;
         }
     }
-    static Rectangle GetCloseRect(Rectangle tab) => new(tab.Right - 18, tab.Top + 6, 12, Math.Max(12, tab.Height - 12));
+    static Rectangle GetCloseRect(Rectangle tab)
+    {
+        // Hit target cũ chỉ rộng 12 px nên khá khó bấm khi Remote/VM.
+        // Giữ nút nằm gọn bên phải tab nhưng tăng vùng bấm lên khoảng 22 px.
+        var size = Math.Min(22, Math.Max(18, tab.Height - 4));
+        return new Rectangle(
+            tab.Right - size - 4,
+            tab.Top + Math.Max(1, (tab.Height - size) / 2),
+            size,
+            size);
+    }
 
     void EnsureTab(ProfileContext ctx)
     {
@@ -1123,6 +1138,25 @@ public sealed partial class ManagerForm : Form
         if (worker is not null && !worker.HasExited)
         {
             if (MessageBox.Show($"Đóng worker V13 của '{ctx.Profile.Name}'?\nChrome/profile đăng nhập không bị xóa.", "Đóng profile", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+        }
+
+        // Nút X trên tab là ý định ĐÓNG THỦ CÔNG của người dùng.
+        // Trước đây nhánh này chỉ shutdown Worker + gỡ tab, nhưng không giảm target
+        // Tự bù. Sau khi tab biến mất, capacity reconcile thấy thiếu 1 slot và có thể
+        // tự mở profile bù trở lại.
+        //
+        // Chỉ giảm target khi profile này thực sự đang chiếm một slot và không nằm
+        // trong AutoClose/cleanup tự động; nhờ vậy X thủ công không sinh suất bù,
+        // còn BAN/TIME/FAULT thật vẫn giữ nguyên cơ chế bù hiện tại.
+        if (!_autoCloseInProgressProfiles.Contains(ctx.Profile.Name)
+            && !_autoReplacementClaimedProfiles.Contains(ctx.Profile.Name)
+            && IsAutoReplacementSlotCurrentlyCounted(ctx.Profile.Name))
+        {
+            RegisterManagerManualCloseIntent(ctx, "MANAGER_TAB_X_CLOSE");
+        }
+
+        if (worker is not null && !worker.HasExited)
+        {
             try { await SendPipeAsync(ctx.Profile.Name, "shutdown", TimeSpan.FromSeconds(5)); } catch { }
             try { if (!await WaitForProcessExitAsync(worker, TimeSpan.FromSeconds(7))) worker.Kill(true); } catch { }
         }

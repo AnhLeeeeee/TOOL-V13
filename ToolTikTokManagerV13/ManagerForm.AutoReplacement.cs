@@ -29,6 +29,12 @@ public sealed partial class ManagerForm
         public int AttemptCount { get; set; }
         public DateTime NextAttemptUtc { get; set; } = DateTime.UtcNow;
         public string LastError { get; set; } = "";
+
+        // Mỗi profile bù chỉ được mở/thử tối đa 1 lần trong cùng một suất bù.
+        // Danh sách này sống xuyên suốt các RETRY của chính request để profile
+        // vừa kiểm tra tên/chạy lỗi không bị mở lại liên tục khi TikTok chưa kịp đồng bộ.
+        public List<string> AttemptedProfiles { get; set; } = new();
+
         // Request sinh từ thiếu suất sau Start All không có profile nguồn cần cleanup.
         // Request AutoClose bình thường luôn giữ true.
         public bool RequiresSourceCleanup { get; set; } = true;
@@ -36,7 +42,7 @@ public sealed partial class ManagerForm
 
     sealed class AutoReplacementQueueDocument
     {
-        public int Version { get; set; } = 1;
+        public int Version { get; set; } = 2;
         public List<AutoReplacementRequest> Pending { get; set; } = new();
     }
 
@@ -46,6 +52,12 @@ public sealed partial class ManagerForm
         string SupplyState,
         TimeSpan TotalRuntime,
         int Priority);
+
+    sealed record AutoReplacementStabilizationResult(
+        bool Healthy,
+        bool NameSyncPending,
+        bool HardFailed,
+        string Detail);
 
     sealed class ProfileSupplyStateDocument
     {
@@ -61,22 +73,25 @@ public sealed partial class ManagerForm
     }
 
     const double AutoReplacementTreoThresholdMinutes = 30.0;
-    const int AutoReplacementHealthyConfirmTimeoutSeconds = 60;
+    const int AutoReplacementHealthyConfirmTimeoutSeconds = AutoCloseNotRunningMinutes * 60;
     const int AutoReplacementHealthyStableSeconds = 30;
+    static readonly TimeSpan AutoReplacementStabilizationRecoveryInterval = TimeSpan.FromSeconds(30);
     static readonly TimeSpan AutoReplacementFailedProfileCooldown = TimeSpan.FromMinutes(5);
     static readonly TimeSpan AutoReplacementQueueWaitSlice = TimeSpan.FromSeconds(5);
     const int AutoReplacementCleanupBarrierRetrySeconds = 15;
     const int AutoReplacementCleanupBarrierMaxAttempts = 4;
 
-    // Nếu TikTok Save tên nhưng giao diện cập nhật chậm, vẫn tiếp tục tạo PRF mới.
-    // Chỉ sau 30 phút thiếu suất, hoặc sau mỗi 5 lần thử mới khi đã có PRF chờ tên,
-    // mới vét lane NAME_SYNC_PENDING một lượt rồi quay lại logic tạo mới hiện tại.
-    static readonly TimeSpan AutoReplacementNameSyncRecoveryAfter = TimeSpan.FromMinutes(30);
-    const int AutoReplacementNameSyncRecoveryAfterNewAttempts = 5;
+    // Profile NAME_SYNC_PENDING đã tồn tại phải được ưu tiên TRƯỚC khi tiêu account mới,
+    // nhưng không mở lại ngay sau khi vừa đóng. Mỗi profile cần nghỉ tối thiểu 60 giây
+    // kể từ lần queue/probe gần nhất; đồng thời AttemptedProfiles chặn thử lại trong cùng suất.
+    static readonly TimeSpan AutoReplacementNameSyncMinRetryAge = TimeSpan.FromSeconds(60);
 
     readonly List<AutoReplacementRequest> _autoReplacementQueue = new();
     readonly HashSet<string> _autoReplacementRetiredProfiles = new(StringComparer.OrdinalIgnoreCase);
     readonly HashSet<string> _autoReplacementClaimedProfiles = new(StringComparer.OrdinalIgnoreCase);
+    // Profile đang CLEANUP vẫn chiếm slot cho tới khi xác minh đóng sạch hoặc hết
+    // safety-valve. Capacity reconcile không được mở bù chồng lên runtime đang dọn.
+    readonly HashSet<string> _autoReplacementCleanupProfiles = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, DateTime> _autoReplacementFailedProfileRetryUtc = new(StringComparer.OrdinalIgnoreCase);
     readonly object _autoReplacementQueueLock = new();
     readonly object _profileSupplyStateLock = new();
@@ -540,16 +555,35 @@ public sealed partial class ManagerForm
                         if (!IsAutoReplacementExecutionAllowed(execution.Generation))
                         {
                             _log.Warn(
+                                $"[AUTO_REPLACE_HARD_STOP_BEFORE_NAME_SYNC_REUSE] id={request.Id} generation={execution.Generation}");
+                            return;
+                        }
+
+                        // V13.9.9: profile đã tồn tại luôn được ưu tiên trước account mới.
+                        // Sau lane dùng lại bình thường, vét NAME_SYNC_PENDING đủ tuổi đúng
+                        // 1 lần/profile/suất. Profile vừa tạo/kiểm tra chưa đủ 60s sẽ bỏ qua.
+                        _log.Info(
+                            $"[AUTO_REPLACE_NAME_SYNC_BEFORE_NEW] id={request.Id} closed={request.ClosedProfileName} pending={GetNameSyncPendingReusableProfileCount()} attemptedProfiles={GetAutoReplacementAttemptedProfileCount(request)}");
+
+                        filled = await TryRecoverNameSyncPendingReusableProfilesOnceAsync(
+                            request,
+                            execution.Generation,
+                            execution.Token);
+                    }
+
+                    if (!filled)
+                    {
+                        if (!IsAutoReplacementExecutionAllowed(execution.Generation))
+                        {
+                            _log.Warn(
                                 $"[AUTO_REPLACE_HARD_STOP_BEFORE_FALLBACK_NEW] id={request.Id} generation={execution.Generation}");
                             return;
                         }
 
-                        // Logic bù cũ được giữ nguyên: nếu không có PRF có sẵn đủ
-                        // điều kiện thì chuyển ngay sang tạo PRF mới từ account chưa gán.
-                        // Việc kho bù có/không có tuyệt đối không ảnh hưởng quyết định
-                        // Tự đóng của profile nguồn.
+                        // Chỉ sau khi đã vét profile có sẵn (thường + NAME_SYNC_PENDING)
+                        // mới tiêu account chưa gán để tạo profile mới.
                         _log.Info(
-                            $"[AUTO_REPLACE_REUSE_EMPTY_FALLBACK_NEW] id={request.Id} closed={request.ClosedProfileName}");
+                            $"[AUTO_REPLACE_REUSE_EXHAUSTED_FALLBACK_NEW] id={request.Id} closed={request.ClosedProfileName} attemptedProfiles={GetAutoReplacementAttemptedProfileCount(request)}");
 
                         filled = await TryCreateReplacementAsync(
                             request,
@@ -662,6 +696,10 @@ public sealed partial class ManagerForm
 
     async Task CloseFailedReplacementRuntimeAsync(ProfileContext ctx)
     {
+        var cleanupProfileName = (ctx.Profile.Name ?? "").Trim();
+        if (cleanupProfileName.Length > 0)
+            _autoReplacementCleanupProfiles.Add(cleanupProfileName);
+
         WriteAutoDiagnosticEvent(
             ctx,
             "auto_replacement",
@@ -712,6 +750,13 @@ public sealed partial class ManagerForm
             _log.Info(
                 $"[AUTO_REPLACE_FAILED_CLEANUP_DONE] profile={ctx.Profile.Name} chrome=0 worker=closed tab=removed");
 
+            ClearAutoCloseExpectedRunning(
+                ctx.Profile.Name,
+                "auto_replacement_failed_cleanup_done");
+
+            if (cleanupProfileName.Length > 0)
+                _autoReplacementCleanupProfiles.Remove(cleanupProfileName);
+
             WriteAutoDiagnosticEvent(
                 ctx,
                 "auto_replacement",
@@ -748,6 +793,8 @@ public sealed partial class ManagerForm
         if (profileName.Length == 0)
             return;
 
+        _autoReplacementCleanupProfiles.Add(profileName);
+
         if (!_contexts.TryGetValue(profileName, out var ctx))
         {
             try
@@ -777,12 +824,19 @@ public sealed partial class ManagerForm
                     x.Name.Equals(profileName, StringComparison.OrdinalIgnoreCase));
 
                 if (profile is null)
+                {
+                    _autoReplacementCleanupProfiles.Remove(profileName);
                     return;
+                }
 
                 _log.Warn($"[AUTO_REPLACE_FAILED_CLEANUP_BEGIN] profile={profileName} source={source}:path_only");
                 await EnsureAutoCloseChromeStoppedByPathAsync(
                     profileName,
                     profile.ProfilePath);
+                ClearAutoCloseExpectedRunning(
+                    profileName,
+                    "auto_replacement_path_cleanup_done");
+                _autoReplacementCleanupProfiles.Remove(profileName);
                 return;
             }
             catch (AutoReplacementCleanupBarrierException)
@@ -863,6 +917,7 @@ public sealed partial class ManagerForm
 
                 if (profile is null)
                 {
+                    _autoReplacementCleanupProfiles.Remove(profileName);
                     _log.Info(
                         $"[AUTO_REPLACE_CLEANUP_BARRIER_CLEARED] profile={profileName} source=profile_missing attempt={attempt}");
                     return;
@@ -873,6 +928,10 @@ public sealed partial class ManagerForm
                     profileName,
                     profile.ProfilePath);
 
+                ClearAutoCloseExpectedRunning(
+                    profileName,
+                    "auto_replacement_barrier_path_cleanup_done");
+                _autoReplacementCleanupProfiles.Remove(profileName);
                 _log.Info(
                     $"[AUTO_REPLACE_CLEANUP_BARRIER_CLEARED] profile={profileName} source=profile_path attempt={attempt}");
                 return;
@@ -903,6 +962,9 @@ public sealed partial class ManagerForm
         // Safety valve: lỗi cleanup của MỘT profile không được làm chết cả hệ thống
         // Tự bù. Profile đó vào cooldown; request hiện tại đã được ScheduleRetry ở
         // caller nên queue sẽ quay lại sau, trong khi các request khác được tiếp tục.
+        // Chỉ tại đây mới giải phóng reservation CLEANUP sau khi đã thử đủ barrier.
+        _autoReplacementCleanupProfiles.Remove(profileName);
+        ClearAutoCloseExpectedRunning(profileName, "cleanup_barrier_exhausted_quarantine");
         MarkReplacementProfileFailed(profileName, "cleanup_barrier_exhausted");
 
         var finalDetail =
@@ -939,6 +1001,22 @@ public sealed partial class ManagerForm
         return !outcome.Status.Equals("PAUSED_RENAME_CONFIG", StringComparison.OrdinalIgnoreCase);
     }
 
+    static bool IsAutoReplacementRuntimeStabilizationEligible(AutoProfileProcessOutcome outcome)
+    {
+        if (!outcome.Paused)
+            return false;
+
+        // Chỉ grace 10 phút cho lỗi START/Worker/runtime. CAPTCHA, LOGIN, cấu hình
+        // hoặc RENAME cần luồng xử lý riêng và không được giữ slot giả 10 phút.
+        if (!outcome.Step.Equals("START_TOOL", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (outcome.Status.Contains("CAPTCHA", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        return true;
+    }
+
     async Task<bool> TryCreateReplacementAsync(
         AutoReplacementRequest request,
         int executionGeneration,
@@ -968,39 +1046,15 @@ public sealed partial class ManagerForm
             // nhưng được ReleaseAccount() không bị lấy lại ngay và gây vòng lặp.
             var attemptedAccountIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var attempt = 0;
-            var newAttemptsSinceNameSyncSweep = 0;
-            var deadlineSweepCompleted = false;
 
             while (!_closing
                    && IsAutoReplacementExecutionAllowed(executionGeneration))
             {
                 executionToken.ThrowIfCancellationRequested();
-                var nameSyncPending = GetNameSyncPendingReusableProfileCount();
-                var replacementAge = DateTime.UtcNow - request.QueuedUtc;
-                var dueByAge = replacementAge >= AutoReplacementNameSyncRecoveryAfter
-                    && !deadlineSweepCompleted;
-                var dueByAttempts = newAttemptsSinceNameSyncSweep >= AutoReplacementNameSyncRecoveryAfterNewAttempts;
 
-                if (nameSyncPending > 0 && (dueByAge || dueByAttempts))
-                {
-                    _log.Info(
-                        $"[NAME_SYNC_RECOVERY_TRIGGER] closed={request.ClosedProfileName} pending={nameSyncPending} age={replacementAge:c} newAttemptsSinceSweep={newAttemptsSinceNameSyncSweep} trigger={(dueByAge ? "30m" : "5_attempts")}");
-
-                    var recovered = await TryRecoverNameSyncPendingReusableProfilesOnceAsync(
-                        request,
-                        executionGeneration,
-                        executionToken);
-                    newAttemptsSinceNameSyncSweep = 0;
-                    if (dueByAge)
-                        deadlineSweepCompleted = true;
-
-                    if (recovered)
-                        return true;
-
-                    // Vét xong một lượt vẫn chưa có tên cập nhật: quay về đúng logic cũ,
-                    // tiếp tục tạo PRF mới. Không lặp recovery liên tục.
-                }
-
+                // NAME_SYNC_PENDING đã được vét ở tầng ngoài TRƯỚC khi vào hàm này.
+                // Không recovery xen kẽ lúc đang tạo mới để tránh vừa tạo xong lại mở
+                // chính profile đó kiểm tra tên trong cùng một suất bù.
                 var startName = DetectNextAutoProfileName();
 
                 var queue = await RunAccountPoolIoAsync(
@@ -1059,7 +1113,14 @@ public sealed partial class ManagerForm
 
                 attemptedAccountIds.Add(item.Account.Id);
                 attempt++;
-                newAttemptsSinceNameSyncSweep++;
+
+                // Đánh dấu TRƯỚC khi mở/tạo runtime. Nếu profile này rơi vào
+                // NAME_SYNC_PENDING thì các RETRY của cùng suất không được mở lại.
+                MarkAutoReplacementProfileAttempted(
+                    request,
+                    item.ProfileName,
+                    "create_new");
+
                 _autoReplacementClaimedProfiles.Add(item.ProfileName);
 
                 try
@@ -1105,7 +1166,9 @@ public sealed partial class ManagerForm
                             && await WaitForReplacementHealthyRunningAsync(
                                 createdCtx,
                                 request,
-                                "created");
+                                "created",
+                                executionGeneration,
+                                executionToken);
 
                         if (!healthy)
                         {
@@ -1203,6 +1266,79 @@ public sealed partial class ManagerForm
                         // CỐ Ý KHÔNG gọi QueueAutoDeleteRetiredProfileAfterExcelNote ở đây.
                         // Profile/account lỗi non-BAN được giữ lại; chỉ runtime bị đóng.
                         continue;
+                    }
+
+                    if (IsAutoReplacementRuntimeStabilizationEligible(outcome))
+                    {
+                        if (!_contexts.TryGetValue(item.ProfileName, out var stabilizeCtx))
+                        {
+                            try
+                            {
+                                var catalog = _profileService.Load();
+                                RefreshContextsFromCatalog(catalog);
+                                _contexts.TryGetValue(item.ProfileName, out stabilizeCtx);
+                            }
+                            catch { }
+                        }
+
+                        if (stabilizeCtx is not null)
+                        {
+                            _log.Warn(
+                                $"[AUTO_REPLACE_CREATE_START_GRACE] profile={item.ProfileName} status={outcome.Status} " +
+                                $"step={outcome.Step} action=STABILIZE_10M");
+
+                            var stabilization = await StabilizeReplacementRuntimeAsync(
+                                stabilizeCtx,
+                                request,
+                                "created_start_recovery",
+                                executionGeneration,
+                                executionToken);
+
+                            if (stabilization.NameSyncPending)
+                            {
+                                await CleanupCreatedReplacementAttemptAsync(
+                                    item.ProfileName,
+                                    "created_start_recovery_name_sync_pending");
+                                QueueReusableProfileNameSyncPending(
+                                    item,
+                                    "created_start_recovery:name_sync_pending");
+                                continue;
+                            }
+
+                            if (stabilization.Healthy)
+                            {
+                                try
+                                {
+                                    await RunAccountPoolIoAsync(
+                                        () => _accountPoolService.SetAutoProfileResult(item.Account.Id, "DONE"),
+                                        CancellationToken.None);
+                                }
+                                catch (Exception ex)
+                                {
+                                    _log.Warn(
+                                        $"[AUTO_REPLACE_CREATE_RECOVERY_DONE_WRITE_WARN] profile={item.ProfileName} error={ex.Message}");
+                                }
+
+                                MarkProfileSupplyState(
+                                    item.ProfileName,
+                                    "used",
+                                    "auto_replacement_created_recovered_10m");
+
+                                WriteAutoActivityLog(
+                                    action: "MỞ PROFILE BÙ",
+                                    profile: request.ClosedProfileName,
+                                    account: item.Account.Username,
+                                    reason: request.Reason,
+                                    replacementProfile: item.ProfileName,
+                                    result: "THÀNH CÔNG",
+                                    detail: "Profile gặp lỗi START ban đầu nhưng đã tự phục hồi trong cửa sổ ổn định 10 phút.");
+
+                                return true;
+                            }
+
+                            _log.Warn(
+                                $"[AUTO_REPLACE_CREATE_START_GRACE_EXPIRED] profile={item.ProfileName} hard={stabilization.HardFailed} detail={stabilization.Detail}");
+                        }
                     }
 
                     _log.Warn(
@@ -1314,22 +1450,38 @@ public sealed partial class ManagerForm
         }
     }
 
-    async Task<bool> WaitForReplacementHealthyRunningAsync(
+    async Task<AutoReplacementStabilizationResult> StabilizeReplacementRuntimeAsync(
         ProfileContext ctx,
         AutoReplacementRequest request,
-        string source)
+        string source,
+        int executionGeneration,
+        CancellationToken executionToken)
     {
         var deadlineUtc = DateTime.UtcNow.AddSeconds(AutoReplacementHealthyConfirmTimeoutSeconds);
+        var nextRecoveryUtc = DateTime.MinValue;
         DateTime? healthySinceUtc = null;
         string lastFault = "";
+        var recoveryAttempt = 0;
+
+        // Candidate đang được đánh giá vẫn chiếm đúng 1 suất. 10 phút ở đây cùng
+        // triết lý với FAULT_10M: profile mới/VM chậm có thời gian ổn định trước khi
+        // bị kết luận lỗi và thay profile khác.
+        MarkAutoCloseExpectedRunning(
+            ctx.Profile.Name,
+            "auto_replace_stabilizing:" + source);
 
         _log.Info(
-            $"[AUTO_REPLACE_CONFIRM_BEGIN] id={request.Id} profile={ctx.Profile.Name} source={source} stable={AutoReplacementHealthyStableSeconds}s timeout={AutoReplacementHealthyConfirmTimeoutSeconds}s");
+            $"[AUTO_REPLACE_STABILIZE_BEGIN] id={request.Id} profile={ctx.Profile.Name} source={source} " +
+            $"stable={AutoReplacementHealthyStableSeconds}s grace={AutoReplacementHealthyConfirmTimeoutSeconds}s");
 
         while (!_closing && DateTime.UtcNow < deadlineUtc)
         {
-            var pollOk = false;
+            if (!IsAutoReplacementExecutionAllowed(executionGeneration))
+                throw new OperationCanceledException(executionToken);
 
+            executionToken.ThrowIfCancellationRequested();
+
+            var pollOk = false;
             try
             {
                 await RefreshStatusAsync(ctx);
@@ -1347,30 +1499,250 @@ public sealed partial class ManagerForm
             if (healthy)
             {
                 healthySinceUtc ??= nowUtc;
-
                 var stableFor = nowUtc - healthySinceUtc.Value;
                 if (stableFor >= TimeSpan.FromSeconds(AutoReplacementHealthyStableSeconds))
                 {
                     _log.Info(
-                        $"[AUTO_REPLACE_CONFIRM_OK] id={request.Id} profile={ctx.Profile.Name} source={source} stable={stableFor:c}");
-                    return true;
+                        $"[AUTO_REPLACE_STABILIZE_OK] id={request.Id} profile={ctx.Profile.Name} source={source} " +
+                        $"stable={stableFor:c} recoveryAttempts={recoveryAttempt}");
+                    return new AutoReplacementStabilizationResult(
+                        true, false, false,
+                        $"RUNNING khỏe {stableFor:c}.");
                 }
             }
             else
             {
                 healthySinceUtc = null;
-
                 var described = DescribeAutoCloseRuntimeFault(ctx, state, nowUtc);
                 if (!string.IsNullOrWhiteSpace(described))
                     lastFault = described;
             }
 
-            await Task.Delay(TimeSpan.FromSeconds(2));
+            // Trong grace 10 phút chỉ cứu CHÍNH profile này; không tạo profile mới.
+            // Không spam START khi runtime đang RUNNING/RECOVERING, chỉ recovery khi
+            // Worker/Chrome/RunState chưa sẵn sàng và tối đa mỗi 30 giây.
+            if (!healthy && nowUtc >= nextRecoveryUtc)
+            {
+                nextRecoveryUtc = nowUtc.Add(AutoReplacementStabilizationRecoveryInterval);
+                recoveryAttempt++;
+
+                var workerAlive = IsNameGuardWorkerAlive(ctx);
+                var chromeConnected = string.Equals(
+                    ctx.LastSnapshot?.Chrome,
+                    "CONNECTED",
+                    StringComparison.OrdinalIgnoreCase);
+
+                _log.Warn(
+                    $"[AUTO_REPLACE_STABILIZE_RECOVERY] id={request.Id} profile={ctx.Profile.Name} " +
+                    $"source={source} attempt={recoveryAttempt} state={state} workerAlive={workerAlive} " +
+                    $"chromeConnected={chromeConnected} fault={lastFault}");
+
+                if (!workerAlive)
+                {
+                    try
+                    {
+                        await OpenProfileAsync(
+                            ctx,
+                            $"Đang chờ profile {ctx.Profile.Name} ổn định (tối đa 10 phút)...");
+                    }
+                    catch (Exception ex)
+                    {
+                        lastFault = "reopen_worker:" + ex.Message;
+                        _log.Warn(
+                            $"[AUTO_REPLACE_STABILIZE_REOPEN_WARN] profile={ctx.Profile.Name} error={ex.Message}");
+                    }
+                }
+
+                try { await RefreshStatusAsync(ctx); } catch { }
+                state = GetEffectiveRuntimeState(ctx);
+                workerAlive = IsNameGuardWorkerAlive(ctx);
+                chromeConnected = string.Equals(
+                    ctx.LastSnapshot?.Chrome,
+                    "CONNECTED",
+                    StringComparison.OrdinalIgnoreCase);
+
+                if (workerAlive && !chromeConnected)
+                {
+                    try
+                    {
+                        await OpenChromeForProfileAsync(ctx);
+                        try { await RefreshStatusAsync(ctx); } catch { }
+                    }
+                    catch (Exception ex)
+                    {
+                        lastFault = "reopen_chrome:" + ex.Message;
+                        _log.Warn(
+                            $"[AUTO_REPLACE_STABILIZE_CHROME_WARN] profile={ctx.Profile.Name} error={ex.Message}");
+                    }
+
+                    state = GetEffectiveRuntimeState(ctx);
+                    chromeConnected = string.Equals(
+                        ctx.LastSnapshot?.Chrome,
+                        "CONNECTED",
+                        StringComparison.OrdinalIgnoreCase);
+                }
+
+                if (workerAlive
+                    && state is not (RuntimeStateRunning or RuntimeStateRecovering))
+                {
+                    try
+                    {
+                        var reply = await StartWithNameGuardAsync(
+                            ctx,
+                            "start_auto",
+                            TimeSpan.FromSeconds(100),
+                            suppressStatus: true);
+
+                        if (IsNameGuardNameSyncPendingStartReply(reply))
+                        {
+                            ClearAutoCloseExpectedRunning(
+                                ctx.Profile.Name,
+                                "auto_replace_name_sync_pending");
+
+                            _log.Warn(
+                                $"[AUTO_REPLACE_STABILIZE_DEFER_NAME_SYNC] id={request.Id} profile={ctx.Profile.Name} source={source}");
+
+                            return new AutoReplacementStabilizationResult(
+                                false, true, false,
+                                "Tên đã Save nhưng TikTok chưa đồng bộ; defer profile sang lượt bù khác.");
+                        }
+
+                        if (string.Equals(reply, "name_guard_blocked", StringComparison.OrdinalIgnoreCase))
+                        {
+                            ClearAutoCloseExpectedRunning(
+                                ctx.Profile.Name,
+                                "auto_replace_name_guard_hard_block");
+
+                            return new AutoReplacementStabilizationResult(
+                                false, false, true,
+                                "Name Guard block cứng; không tiếp tục grace runtime.");
+                        }
+
+                        _log.Info(
+                            $"[AUTO_REPLACE_STABILIZE_START_REPLY] id={request.Id} profile={ctx.Profile.Name} source={source} reply={reply}");
+                    }
+                    catch (Exception ex)
+                    {
+                        lastFault = "recovery_start:" + ex.Message;
+                        _log.Warn(
+                            $"[AUTO_REPLACE_STABILIZE_START_WARN] profile={ctx.Profile.Name} error={ex.Message}");
+                    }
+                }
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(2), executionToken);
         }
 
         _log.Warn(
-            $"[AUTO_REPLACE_CONFIRM_TIMEOUT] id={request.Id} profile={ctx.Profile.Name} source={source} fault={lastFault}");
+            $"[AUTO_REPLACE_STABILIZE_TIMEOUT] id={request.Id} profile={ctx.Profile.Name} source={source} " +
+            $"grace={AutoReplacementHealthyConfirmTimeoutSeconds}s fault={lastFault}");
 
+        return new AutoReplacementStabilizationResult(
+            false, false, false,
+            $"Không RUNNING khỏe sau {AutoReplacementHealthyConfirmTimeoutSeconds / 60} phút. fault={lastFault}");
+    }
+
+    async Task<bool> WaitForReplacementHealthyRunningAsync(
+        ProfileContext ctx,
+        AutoReplacementRequest request,
+        string source,
+        int executionGeneration,
+        CancellationToken executionToken)
+    {
+        var result = await StabilizeReplacementRuntimeAsync(
+            ctx, request, source, executionGeneration, executionToken);
+        return result.Healthy;
+    }
+
+    async Task<bool> WaitForReplacementProbeReadyAsync(
+        ProfileContext ctx,
+        AutoReplacementRequest request,
+        string source,
+        int executionGeneration,
+        CancellationToken executionToken)
+    {
+        var deadlineUtc = DateTime.UtcNow.AddSeconds(AutoReplacementHealthyConfirmTimeoutSeconds);
+        var nextRecoveryUtc = DateTime.MinValue;
+        var recoveryAttempt = 0;
+        string lastFault = "";
+
+        _log.Info(
+            $"[AUTO_REPLACE_PROBE_GRACE_BEGIN] id={request.Id} profile={ctx.Profile.Name} source={source} " +
+            $"grace={AutoReplacementHealthyConfirmTimeoutSeconds}s");
+
+        while (!_closing && DateTime.UtcNow < deadlineUtc)
+        {
+            if (!IsAutoReplacementExecutionAllowed(executionGeneration))
+                throw new OperationCanceledException(executionToken);
+
+            executionToken.ThrowIfCancellationRequested();
+
+            try { await RefreshStatusAsync(ctx); } catch (Exception ex) { lastFault = ex.Message; }
+
+            var workerAlive = IsNameGuardWorkerAlive(ctx);
+            var chromeConnected = string.Equals(
+                ctx.LastSnapshot?.Chrome,
+                "CONNECTED",
+                StringComparison.OrdinalIgnoreCase);
+
+            if (workerAlive && chromeConnected)
+            {
+                _log.Info(
+                    $"[AUTO_REPLACE_PROBE_GRACE_READY] id={request.Id} profile={ctx.Profile.Name} source={source} attempts={recoveryAttempt}");
+                return true;
+            }
+
+            var nowUtc = DateTime.UtcNow;
+            if (nowUtc >= nextRecoveryUtc)
+            {
+                nextRecoveryUtc = nowUtc.Add(AutoReplacementStabilizationRecoveryInterval);
+                recoveryAttempt++;
+
+                _log.Warn(
+                    $"[AUTO_REPLACE_PROBE_GRACE_RECOVERY] id={request.Id} profile={ctx.Profile.Name} source={source} " +
+                    $"attempt={recoveryAttempt} workerAlive={workerAlive} chromeConnected={chromeConnected} fault={lastFault}");
+
+                if (!workerAlive)
+                {
+                    try
+                    {
+                        await OpenProfileAsync(
+                            ctx,
+                            $"Đang chờ Worker profile {ctx.Profile.Name} ổn định...");
+                    }
+                    catch (Exception ex)
+                    {
+                        lastFault = "open_worker:" + ex.Message;
+                    }
+                }
+
+                try { await RefreshStatusAsync(ctx); } catch { }
+                workerAlive = IsNameGuardWorkerAlive(ctx);
+                chromeConnected = string.Equals(
+                    ctx.LastSnapshot?.Chrome,
+                    "CONNECTED",
+                    StringComparison.OrdinalIgnoreCase);
+
+                if (workerAlive && !chromeConnected)
+                {
+                    try
+                    {
+                        await OpenChromeForProfileAsync(ctx);
+                        try { await RefreshStatusAsync(ctx); } catch { }
+                    }
+                    catch (Exception ex)
+                    {
+                        lastFault = "open_chrome:" + ex.Message;
+                    }
+                }
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(2), executionToken);
+        }
+
+        _log.Warn(
+            $"[AUTO_REPLACE_PROBE_GRACE_TIMEOUT] id={request.Id} profile={ctx.Profile.Name} source={source} " +
+            $"grace={AutoReplacementHealthyConfirmTimeoutSeconds}s fault={lastFault}");
         return false;
     }
 
@@ -1401,6 +1773,84 @@ public sealed partial class ManagerForm
 
         _log.Warn(
             $"[AUTO_REPLACE_PROFILE_COOLDOWN] profile={profileName} retry={retryUtc:O} reason={reason}");
+    }
+
+    bool HasAutoReplacementProfileBeenAttempted(
+        AutoReplacementRequest request,
+        string profileName)
+    {
+        profileName = (profileName ?? "").Trim();
+        if (profileName.Length == 0)
+            return false;
+
+        lock (_autoReplacementQueueLock)
+        {
+            var live = _autoReplacementQueue.FirstOrDefault(x =>
+                x.Id.Equals(request.Id, StringComparison.OrdinalIgnoreCase));
+
+            var attempted = live?.AttemptedProfiles ?? request.AttemptedProfiles;
+            attempted ??= new List<string>();
+
+            return attempted.Any(x =>
+                string.Equals(
+                    (x ?? "").Trim(),
+                    profileName,
+                    StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
+    int GetAutoReplacementAttemptedProfileCount(AutoReplacementRequest request)
+    {
+        lock (_autoReplacementQueueLock)
+        {
+            var live = _autoReplacementQueue.FirstOrDefault(x =>
+                x.Id.Equals(request.Id, StringComparison.OrdinalIgnoreCase));
+
+            return (live?.AttemptedProfiles ?? request.AttemptedProfiles ?? new List<string>())
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Count();
+        }
+    }
+
+    void MarkAutoReplacementProfileAttempted(
+        AutoReplacementRequest request,
+        string profileName,
+        string source)
+    {
+        profileName = (profileName ?? "").Trim();
+        if (profileName.Length == 0)
+            return;
+
+        var added = false;
+
+        lock (_autoReplacementQueueLock)
+        {
+            var live = _autoReplacementQueue.FirstOrDefault(x =>
+                x.Id.Equals(request.Id, StringComparison.OrdinalIgnoreCase));
+
+            var target = live ?? request;
+            target.AttemptedProfiles ??= new List<string>();
+
+            if (!target.AttemptedProfiles.Any(x =>
+                    string.Equals(
+                        (x ?? "").Trim(),
+                        profileName,
+                        StringComparison.OrdinalIgnoreCase)))
+            {
+                target.AttemptedProfiles.Add(profileName);
+                added = true;
+
+                if (live is not null)
+                    SaveAutoReplacementQueueUnsafe();
+            }
+        }
+
+        if (added)
+        {
+            _log.Info(
+                $"[AUTO_REPLACE_PROFILE_ATTEMPT_ONCE] id={request.Id} closed={request.ClosedProfileName} profile={profileName} source={source} attemptedCount={GetAutoReplacementAttemptedProfileCount(request)}");
+        }
     }
 
     int GetAutoReplacementPendingCount()
@@ -1468,6 +1918,8 @@ public sealed partial class ManagerForm
 
             loaded ??= new AutoReplacementQueueDocument();
             loaded.Pending ??= new List<AutoReplacementRequest>();
+            foreach (var request in loaded.Pending)
+                request.AttemptedProfiles ??= new List<string>();
             return loaded;
         }
         catch (Exception ex)
@@ -1481,7 +1933,7 @@ public sealed partial class ManagerForm
     {
         var document = new AutoReplacementQueueDocument
         {
-            Version = 1,
+            Version = 2,
             Pending = _autoReplacementQueue
                 .OrderBy(x => x.QueuedUtc)
                 .ToList()

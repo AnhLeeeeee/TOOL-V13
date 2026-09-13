@@ -20,7 +20,8 @@ public sealed partial class ManagerForm
         bool Allowed,
         string Message,
         bool ChangedName = false,
-        bool Transient = false);
+        bool Transient = false,
+        bool Deferred = false);
 
     static readonly TimeSpan NameGuardTransientRetryDelay = TimeSpan.FromSeconds(15);
     static readonly TimeSpan NameGuardManagerProbeTimeout = TimeSpan.FromSeconds(45);
@@ -91,6 +92,20 @@ public sealed partial class ManagerForm
                 return reply;
             }
 
+            // NAME_SYNC_PENDING là trạng thái chủ động DEFER: Name Guard đã đóng
+            // sạch runtime để chờ TikTok đồng bộ tên. Tuyệt đối không retry nội bộ
+            // rồi mở lại chính profile này trong cùng một suất bù.
+            if (guard.Deferred)
+            {
+                if (!suppressStatus)
+                    SetStatus(ctx, "Tên đang chờ TikTok đồng bộ; chuyển sang profile khác.", Color.DarkOrange);
+
+                _log.Warn(
+                    $"[NAME_GUARD_START_DEFERRED] profile={ctx.Profile.Name} command={command} " +
+                    $"attempt={attempt}/{NameGuardTransientStartMaxAttempts} reason={guard.Message}");
+                return "name_sync_pending";
+            }
+
             if (!guard.Transient)
             {
                 if (!suppressStatus)
@@ -136,6 +151,12 @@ public sealed partial class ManagerForm
         => string.Equals(
             (reply ?? "").Trim(),
             "name_guard_transient",
+            StringComparison.OrdinalIgnoreCase);
+
+    static bool IsNameGuardNameSyncPendingStartReply(string? reply)
+        => string.Equals(
+            (reply ?? "").Trim(),
+            "name_sync_pending",
             StringComparison.OrdinalIgnoreCase);
 
     async Task<NameGuardResult> EnsureNameGuardBeforeStartAsync(ProfileContext ctx)
@@ -426,7 +447,8 @@ public sealed partial class ManagerForm
                 false,
                 "Tên đã Save nhưng TikTok chưa đồng bộ trên Hồ sơ; đã đưa profile vào Chờ dùng lại.",
                 ChangedName: reply.NameChanged,
-                Transient: true);
+                Transient: true,
+                Deferred: true);
         }
 
         // Chỉ tới đây mới có bằng chứng tên thực tế trên Hồ sơ đã đúng.

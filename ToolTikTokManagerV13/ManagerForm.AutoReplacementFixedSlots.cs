@@ -294,7 +294,8 @@ public sealed partial class ManagerForm
             return false;
 
         if (_autoCloseExpectedRunningProfiles.Contains(profileName)
-            || _autoReplacementClaimedProfiles.Contains(profileName))
+            || _autoReplacementClaimedProfiles.Contains(profileName)
+            || _autoReplacementCleanupProfiles.Contains(profileName))
         {
             return true;
         }
@@ -316,6 +317,9 @@ public sealed partial class ManagerForm
         foreach (var name in _autoReplacementClaimedProfiles)
             names.Add(name);
 
+        foreach (var name in _autoReplacementCleanupProfiles)
+            names.Add(name);
+
         foreach (var ctx in _contexts.Values)
         {
             var state = GetEffectiveRuntimeState(ctx);
@@ -324,6 +328,12 @@ public sealed partial class ManagerForm
                 names.Add(ctx.Profile.Name);
                 continue;
             }
+
+            // Profile đã bị quarantine/cooldown sau khi cleanup barrier thử đủ lượt
+            // không được giữ target "ảo" chỉ vì còn tab/window cache. Đây là safety-valve
+            // để target phản ánh số slot có thể phục vụ, sau khi đã cố đóng sạch 60-90s.
+            if (IsReplacementProfileCoolingDown(ctx.Profile.Name))
+                continue;
 
             // Safety net: profile bù lỗi có thể đang STOPPED/DISCONNECTED nhưng
             // Worker/tab/Opening vẫn còn. Nếu không tính các runtime vật lý này,

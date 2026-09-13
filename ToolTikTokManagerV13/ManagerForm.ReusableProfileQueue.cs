@@ -16,8 +16,8 @@ public sealed partial class ManagerForm
         public bool IsManual { get; set; }
 
         // Profile được tạo để bù nhưng TikTok chưa phản ánh tên mới ngay.
-        // Vẫn dùng CHÍNH queue Chờ dùng lại; cờ này chỉ tách lane để không bị
-        // lấy lại ngay ở lượt bù bình thường. Recovery sweep sẽ kiểm tra sau.
+        // Vẫn dùng CHÍNH queue Chờ dùng lại; lane này được vét SAU profile chờ
+        // bình thường nhưng TRƯỚC khi tạo profile mới, với min-age + one-attempt/request.
         public bool NameSyncPending { get; set; }
         public DateTime? NameSyncQueuedUtc { get; set; }
         public int NameSyncCheckCount { get; set; }
@@ -1134,6 +1134,23 @@ public sealed partial class ManagerForm
                 continue;
             }
 
+            // 1 profile chỉ được thử 1 lần trong CÙNG một suất bù, kể cả request
+            // đã RETRY sau 2/3/5 phút. Không mở đi mở lại khi tên TikTok chưa kịp sync.
+            if (HasAutoReplacementProfileBeenAttempted(request, profileName))
+            {
+                _log.Info(
+                    $"[NAME_SYNC_RECOVERY_SKIP_ALREADY_ATTEMPTED] id={request.Id} profile={profileName}");
+                continue;
+            }
+
+            var sinceLastCheck = DateTime.UtcNow - candidate.LastCheckedUtc;
+            if (sinceLastCheck < AutoReplacementNameSyncMinRetryAge)
+            {
+                _log.Info(
+                    $"[NAME_SYNC_RECOVERY_SKIP_TOO_FRESH] id={request.Id} profile={profileName} age={sinceLastCheck:c} min={AutoReplacementNameSyncMinRetryAge:c}");
+                continue;
+            }
+
             TikTokAccountPoolItem? account = null;
             try
             {
@@ -1197,6 +1214,13 @@ public sealed partial class ManagerForm
                 continue;
             }
 
+            // Đánh dấu trước khi mở Chrome. Dù probe fail/cleanup/retry request,
+            // profile này không được mở lần 2 trong cùng suất bù.
+            MarkAutoReplacementProfileAttempted(
+                request,
+                profileName,
+                "name_sync_pending");
+
             _autoReplacementClaimedProfiles.Add(profileName);
 
             try
@@ -1222,7 +1246,7 @@ public sealed partial class ManagerForm
 
                 executionToken.ThrowIfCancellationRequested();
 
-                var opened = await OpenProfileAsync(
+                _ = await OpenProfileAsync(
                     ctx,
                     $"Kiểm tra lại tên profile chờ dùng lại {profileName}...");
 
@@ -1245,29 +1269,41 @@ public sealed partial class ManagerForm
 
                 executionToken.ThrowIfCancellationRequested();
 
-                if (!opened && (ctx.Worker is null || ctx.Worker.HasExited))
+                // Worker/Chrome trên VM có thể cần nhiều thời gian để ổn định. Không kết
+                // luận lỗi ngay sau pipe timeout 10s; giữ đúng slot này tối đa 10 phút và
+                // chỉ recovery CHÍNH profile đang thử.
+                var probeReady = await WaitForReplacementProbeReadyAsync(
+                    ctx,
+                    request,
+                    "name_sync_recovery",
+                    executionGeneration,
+                    executionToken);
+
+                if (!IsAutoReplacementExecutionAllowed(executionGeneration))
+                {
+                    try
+                    {
+                        await CleanupCreatedReplacementAttemptAsync(
+                            profileName,
+                            "name_sync_recovery_hard_stop_after_probe_grace");
+                    }
+                    catch (Exception cleanupEx)
+                    {
+                        _log.Warn(
+                            $"[NAME_SYNC_RECOVERY_HARD_STOP_CLEANUP_WARN] profile={profileName} error={cleanupEx.Message}");
+                    }
+
+                    return false;
+                }
+
+                executionToken.ThrowIfCancellationRequested();
+
+                if (!probeReady)
                 {
                     await CleanupCreatedReplacementAttemptAsync(
                         profileName,
-                        "name_sync_recovery_open_failed");
-                    TouchReusableProfileNameSyncPending(profileName, "open_worker_failed");
-                    continue;
-                }
-
-                try { await RefreshStatusAsync(ctx); } catch { }
-
-                if (!string.Equals(ctx.LastSnapshot?.Chrome, "CONNECTED", StringComparison.OrdinalIgnoreCase))
-                {
-                    await OpenChromeForProfileAsync(ctx);
-                    try { await RefreshStatusAsync(ctx); } catch { }
-                }
-
-                if (!string.Equals(ctx.LastSnapshot?.Chrome, "CONNECTED", StringComparison.OrdinalIgnoreCase))
-                {
-                    await CleanupCreatedReplacementAttemptAsync(
-                        profileName,
-                        "name_sync_recovery_chrome_not_connected");
-                    TouchReusableProfileNameSyncPending(profileName, "chrome_not_connected");
+                        "name_sync_recovery_probe_ready_10m_timeout");
+                    TouchReusableProfileNameSyncPending(profileName, "probe_ready_10m_timeout");
                     continue;
                 }
 
@@ -1351,11 +1387,12 @@ public sealed partial class ManagerForm
 
                 executionToken.ThrowIfCancellationRequested();
 
-                var startReply = await StartWithNameGuardAsync(
+                var stabilization = await StabilizeReplacementRuntimeAsync(
                     ctx,
-                    "start_auto",
-                    TimeSpan.FromSeconds(100),
-                    suppressStatus: true);
+                    request,
+                    "name_sync_recovery",
+                    executionGeneration,
+                    executionToken);
 
                 if (!IsAutoReplacementExecutionAllowed(executionGeneration))
                 {
@@ -1363,7 +1400,7 @@ public sealed partial class ManagerForm
                     {
                         await CleanupCreatedReplacementAttemptAsync(
                             profileName,
-                            "name_sync_recovery_hard_stop_after_start");
+                            "name_sync_recovery_hard_stop_after_stabilize");
                     }
                     catch (Exception cleanupEx)
                     {
@@ -1376,26 +1413,25 @@ public sealed partial class ManagerForm
 
                 executionToken.ThrowIfCancellationRequested();
 
-                if (!string.Equals(startReply, "started", StringComparison.OrdinalIgnoreCase))
+                if (stabilization.NameSyncPending)
                 {
                     await CleanupCreatedReplacementAttemptAsync(
                         profileName,
-                        "name_sync_recovery_start:" + startReply);
-                    TouchReusableProfileNameSyncPending(profileName, "start:" + startReply);
+                        "name_sync_recovery_deferred_again");
+                    TouchReusableProfileNameSyncPending(profileName, "deferred_again");
                     continue;
                 }
 
-                var healthy = await WaitForReplacementHealthyRunningAsync(
-                    ctx,
-                    request,
-                    "name_sync_recovery");
-
-                if (!healthy)
+                if (!stabilization.Healthy)
                 {
                     await CleanupCreatedReplacementAttemptAsync(
                         profileName,
-                        "name_sync_recovery_not_healthy");
-                    TouchReusableProfileNameSyncPending(profileName, "started_but_not_healthy");
+                        stabilization.HardFailed
+                            ? "name_sync_recovery_hard_failed"
+                            : "name_sync_recovery_10m_timeout");
+                    TouchReusableProfileNameSyncPending(
+                        profileName,
+                        stabilization.HardFailed ? "hard_failed" : "stabilize_10m_timeout");
                     continue;
                 }
 
@@ -1514,8 +1550,8 @@ public sealed partial class ManagerForm
                 OrderReusableProfileEntries(
                     EnsureReusableProfileQueueLoadedUnsafe()
                         .Pending)
-                    // NAME_SYNC_PENDING chỉ được recovery sweep lấy lại.
-                    // Lượt bù bình thường phải bỏ qua để tránh mở lại ngay sau khi vừa đóng.
+                    // NAME_SYNC_PENDING dùng lane riêng: không trộn vào reuse thường.
+                    // Tầng ngoài sẽ vét lane này trước khi tiêu account mới.
                     .Where(x => !x.NameSyncPending)
                     .Select(CloneReusableProfileQueueEntry)
                     .ToList();
@@ -1541,6 +1577,13 @@ public sealed partial class ManagerForm
 
             if (_autoReplacementClaimedProfiles.Contains(profileName))
                 continue;
+
+            if (HasAutoReplacementProfileBeenAttempted(request, profileName))
+            {
+                _log.Info(
+                    $"[REUSE_QUEUE_SKIP_ALREADY_ATTEMPTED] id={request.Id} closed={request.ClosedProfileName} profile={profileName}");
+                continue;
+            }
 
             // Re-check ngay trước khi mở vì candidates là snapshot. Không cho profile
             // auto vừa bị retired/cooldown lọt qua do state thay đổi sau refresh.
@@ -1608,6 +1651,13 @@ public sealed partial class ManagerForm
                 continue;
             }
 
+            // Một candidate đã bắt đầu được thử thì khóa theo request ngay lập tức.
+            // Các RETRY của cùng suất không được mở lại candidate này.
+            MarkAutoReplacementProfileAttempted(
+                request,
+                profileName,
+                candidate.IsManual ? "reuse_manual" : "reuse_auto");
+
             _autoReplacementClaimedProfiles.Add(profileName);
 
             try
@@ -1638,10 +1688,9 @@ public sealed partial class ManagerForm
 
                 // KHÔNG quét IsProfileInUse() theo từng profile.
                 // Chỉ mở đúng candidate đang đứng đầu queue.
-                var opened =
-                    await OpenProfileAsync(
-                        ctx,
-                        $"Tự bù cho {request.ClosedProfileName}: dùng lại profile {profileName}...");
+                _ = await OpenProfileAsync(
+                    ctx,
+                    $"Tự bù cho {request.ClosedProfileName}: dùng lại profile {profileName}...");
 
                 if (!IsAutoReplacementExecutionAllowed(executionGeneration))
                 {
@@ -1663,49 +1712,19 @@ public sealed partial class ManagerForm
 
                 executionToken.ThrowIfCancellationRequested();
 
-                if (!opened
-                    && (ctx.Worker is null
-                        || ctx.Worker.HasExited))
-                {
-                    await MarkReusableProfileFailedAsync(
-                        request,
-                        candidate,
-                        "open_worker");
-
-                    // Dù Worker không mở được vẫn phải dọn tab/Chrome mồ côi nếu có.
-                    // Cleanup fail sẽ ném barrier và tuyệt đối không sang candidate khác.
-                    await CloseFailedReplacementRuntimeAsync(ctx);
-                    continue;
-                }
-
-                if (!IsAutoReplacementExecutionAllowed(executionGeneration))
-                {
-                    try
-                    {
-                        await CloseFailedReplacementRuntimeAsync(ctx);
-                    }
-                    catch (Exception cleanupEx)
-                    {
-                        _log.Warn(
-                            $"[REUSE_QUEUE_HARD_STOP_CLEANUP_WARN] profile={profileName} error={cleanupEx.Message}");
-                    }
-
-                    return false;
-                }
-
-                executionToken.ThrowIfCancellationRequested();
-
-                var reply =
-                    await StartWithNameGuardAsync(
-                        ctx,
-                        "start_auto",
-                        TimeSpan.FromSeconds(100),
-                        suppressStatus: true);
+                // Profile mới mở/VM chậm có tối đa 10 phút để ổn định. Trong grace
+                // chỉ recovery CHÍNH profile này; slot vẫn bị claim nên không mở bù chồng.
+                var stabilization = await StabilizeReplacementRuntimeAsync(
+                    ctx,
+                    request,
+                    "reuse_queue",
+                    executionGeneration,
+                    executionToken);
 
                 if (!IsAutoReplacementExecutionAllowed(executionGeneration))
                 {
                     _log.Warn(
-                        $"[REUSE_QUEUE_HARD_STOP_AFTER_START] profile={profileName} generation={executionGeneration}");
+                        $"[REUSE_QUEUE_HARD_STOP_AFTER_STABILIZE] profile={profileName} generation={executionGeneration}");
 
                     try
                     {
@@ -1722,59 +1741,32 @@ public sealed partial class ManagerForm
 
                 executionToken.ThrowIfCancellationRequested();
 
-                if (!string.Equals(
-                        reply,
-                        "started",
-                        StringComparison.OrdinalIgnoreCase))
+                if (stabilization.NameSyncPending)
                 {
-                    if (IsNameGuardTransientStartReply(reply))
-                    {
-                        // Name Guard đã retry cùng profile 3 lượt nhưng vẫn chỉ gặp lỗi
-                        // kỹ thuật tạm thời. Không ghi +auto=FAIL vào Excel vì account/profile
-                        // chưa có bằng chứng lỗi cứng; chỉ cooldown rồi chuyển candidate khác.
-                        MarkReplacementProfileFailed(
-                            profileName,
-                            "reuse_queue:name_guard_transient");
+                    // Name Guard đã chủ động đóng vì TikTok chưa sync tên. Đây là DEFER,
+                    // không phải FAIL. Xác minh đóng sạch rồi chuyển candidate khác.
+                    await CleanupCreatedReplacementAttemptAsync(
+                        profileName,
+                        "reuse_queue_name_sync_pending");
+                    TouchReusableProfileNameSyncPending(
+                        profileName,
+                        "deferred_same_slot_one_attempt");
 
-                        _log.Warn(
-                            $"[REUSE_QUEUE_NAME_GUARD_TRANSIENT] profile={profileName} account={candidate.Username} action=COOLDOWN_NO_EXCEL_FAIL");
-
-                        WriteAutoActivityLog(
-                            action: "MỞ PROFILE BÙ",
-                            profile: request.ClosedProfileName,
-                            account: candidate.Username,
-                            reason: request.Reason,
-                            replacementProfile: profileName,
-                            result: "TẠM HOÃN",
-                            detail:
-                                $"Name Guard chưa ổn định sau {NameGuardTransientStartMaxAttempts} lượt; " +
-                                $"không ghi +auto=FAIL, cooldown {AutoReplacementFailedProfileCooldown.TotalMinutes:0} phút rồi đánh giá lại.");
-                    }
-                    else
-                    {
-                        await MarkReusableProfileFailedAsync(
-                            request,
-                            candidate,
-                            "start:" + reply);
-                    }
-
-                    await CloseFailedReplacementRuntimeAsync(ctx);
+                    _log.Info(
+                        $"[REUSE_QUEUE_NAME_SYNC_DEFERRED] profile={profileName} id={request.Id} action=NEXT_CANDIDATE");
                     continue;
                 }
 
-                var healthy =
-                    await WaitForReplacementHealthyRunningAsync(
-                        ctx,
-                        request,
-                        "reuse_queue");
-
-                if (!healthy)
+                if (!stabilization.Healthy)
                 {
                     await MarkReusableProfileFailedAsync(
                         request,
                         candidate,
-                        "started_but_not_healthy");
+                        stabilization.HardFailed
+                            ? "stabilize_hard_failed:" + stabilization.Detail
+                            : "stabilize_10m_timeout:" + stabilization.Detail);
 
+                    // Đóng + xác minh sạch trước khi giải phóng claim và thử profile khác.
                     await CloseFailedReplacementRuntimeAsync(ctx);
                     continue;
                 }
