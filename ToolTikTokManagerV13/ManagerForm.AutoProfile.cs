@@ -15,7 +15,17 @@ public sealed partial class ManagerForm
         string Status,
         string Step,
         string Note,
-        bool Skipped = false);
+        bool Skipped = false,
+        bool RenameSucceeded = false,
+        bool IdentityVerified = false,
+        bool IdentityExcelDone = false);
+
+    sealed record AutoProfileIdentityApplyOutcome(
+        bool RenameSucceeded,
+        bool Verified,
+        bool ExcelDone,
+        string VerificationError = "",
+        string ExcelError = "");
 
     sealed class AutoProfilePauseException : Exception
     {
@@ -535,13 +545,14 @@ public sealed partial class ManagerForm
             var verifyYes = new RadioButton
             {
                 Text = "Có",
-                Checked = true,
+                Checked = false,
                 AutoSize = true,
                 Margin = new Padding(0, 4, 30, 0)
             };
             var verifyNo = new RadioButton
             {
                 Text = "Không",
+                Checked = true,
                 AutoSize = true,
                 Margin = new Padding(0, 4, 0, 0)
             };
@@ -734,7 +745,14 @@ public sealed partial class ManagerForm
                     detailLabel.Text = status.Text;
 
                     await _autoProfileQueueGate.WaitAsync(runCts.Token);
-                    var preparedSuccess = 0;
+                    // targetSuccess:
+                    // - Bật kiểm tra tên: chỉ tăng khi tên đã probe khớp (DONE nội bộ).
+                    // - Tắt kiểm tra tên: tăng ngay khi thao tác đổi tên thành công.
+                    // waitingAdded có thể lớn hơn targetSuccess vì PRF đã đổi tên thành công
+                    // nhưng TikTok chưa kịp hiển thị tên vẫn được đưa vào CHỜ.
+                    var targetSuccess = 0;
+                    var waitingAdded = 0;
+                    var pendingName = 0;
                     var attempts = 0;
                     var failed = 0;
 
@@ -742,7 +760,7 @@ public sealed partial class ManagerForm
                     {
                         foreach (var item in queue)
                         {
-                            if (preparedSuccess >= requestedNew || preCreateStopRequested)
+                            if (targetSuccess >= requestedNew || preCreateStopRequested)
                                 break;
 
                             await WaitAutoProfilePausePointAsync(() => paused, runCts.Token);
@@ -756,11 +774,13 @@ public sealed partial class ManagerForm
                                 "Chờ tới lượt");
                             grid.Rows[rowIndex].Tag = item;
 
-                            progressLabel.Text = $"Tiến độ: {preparedSuccess} / {requestedNew}";
+                            progressLabel.Text = verifyName
+                                ? $"Tiến độ DONE: {targetSuccess} / {requestedNew}"
+                                : $"Tiến độ PRF: {targetSuccess} / {requestedNew}";
                             currentLabel.Text = $"Đang xử lý: PRF {item.ProfileName}";
                             detailLabel.Text = $"Đang tạo PRF {item.ProfileName} — {item.Account.Username}";
                             status.Text =
-                                $"Tạo trước PRF chờ: {preparedSuccess}/{requestedNew} | "
+                                $"Tạo trước PRF chờ: {targetSuccess}/{requestedNew} | "
                                 + $"đang xử lý {item.ProfileName} — {item.Account.Username}";
                             UpdateGridRow(item, "PREPARE", "Đang tạo PRF tuần tự...", Color.RoyalBlue);
 
@@ -784,14 +804,18 @@ public sealed partial class ManagerForm
                                         }
                                     },
                                     verifyIdentityAfterRename: verifyName,
-                                    writeIdentityDoneToExcel: writeIdentityDone);
+                                    writeIdentityDoneToExcel: writeIdentityDone,
+                                    tolerateIdentityValidationFailure: true);
 
                                 UpdateGridRow(item, "CLOSING", "Đang đóng Chrome/Worker an toàn...", Color.RoyalBlue);
                                 currentLabel.Text = $"Đang xử lý: PRF {item.ProfileName} — CLOSING";
                                 detailLabel.Text = "Đang đóng Chrome/Worker an toàn...";
                                 await ClosePreparedProfileRuntimeAsync(item.ProfileName, item.Account.Username);
 
-                                if (outcome.Success)
+                                // Quy tắc Tạo trước:
+                                // Chỉ cần thao tác đổi tên đã thành công thì luôn đưa vào CHỜ,
+                                // kể cả probe tên chưa khớp vì TikTok có thể cập nhật chậm.
+                                if (outcome.RenameSucceeded)
                                 {
                                     if (!TryAddReusableProfileManual(
                                             item.Account.Id,
@@ -808,25 +832,62 @@ public sealed partial class ManagerForm
                                     }
                                     else
                                     {
-                                        preparedSuccess++;
-                                        progressLabel.Text = $"Tiến độ: {preparedSuccess} / {requestedNew}";
+                                        waitingAdded++;
+                                        var qualifiesForTarget = verifyName
+                                            ? outcome.IdentityVerified
+                                            : true;
+
+                                        if (qualifiesForTarget)
+                                            targetSuccess++;
+                                        else if (verifyName)
+                                            pendingName++;
+
+                                        progressLabel.Text = verifyName
+                                            ? $"Tiến độ DONE: {targetSuccess} / {requestedNew}"
+                                            : $"Tiến độ PRF: {targetSuccess} / {requestedNew}";
                                         waitingLabel.Text = $"PRF chờ hiện có: {GetReusableProfileQueueCount()}";
+
+                                        var queueState = verifyName && !outcome.IdentityVerified
+                                            ? "CHỜ - CHƯA XÁC NHẬN TÊN"
+                                            : "CHỜ - DONE";
+                                        var queueColor = verifyName && !outcome.IdentityVerified
+                                            ? Color.DarkOrange
+                                            : Color.DarkGreen;
+
+                                        var excelSuffix = verifyName && outcome.IdentityVerified && writeIdentityDone && !outcome.IdentityExcelDone
+                                            ? " | Excel chưa ghi DONE"
+                                            : "";
+
                                         UpdateGridRow(
                                             item,
-                                            "CHỜ",
-                                            $"Đã đóng sạch và thêm vào PRF chờ ({preparedSuccess}/{requestedNew}).",
-                                            Color.DarkGreen);
-                                        detailLabel.Text = $"PRF {item.ProfileName} đã vào CHỜ. Hoàn thành {preparedSuccess}/{requestedNew}.";
+                                            queueState,
+                                            verifyName
+                                                ? (outcome.IdentityVerified
+                                                    ? $"Đã vào CHỜ; DONE {targetSuccess}/{requestedNew}{excelSuffix}."
+                                                    : $"Đã vào CHỜ nhưng chưa tính quota DONE ({targetSuccess}/{requestedNew}); tên có thể cập nhật ở lần mở sau.")
+                                                : $"Đã vào CHỜ ({targetSuccess}/{requestedNew}); không kiểm tra lại tên.",
+                                            queueColor);
+
+                                        detailLabel.Text = verifyName
+                                            ? (outcome.IdentityVerified
+                                                ? $"PRF {item.ProfileName} đã vào CHỜ và được tính DONE. {targetSuccess}/{requestedNew}."
+                                                : $"PRF {item.ProfileName} đã đổi tên và vào CHỜ, nhưng chưa DONE nên không tính quota. Đang có {targetSuccess}/{requestedNew} DONE.")
+                                            : $"PRF {item.ProfileName} đã đổi tên và vào CHỜ. Hoàn thành {targetSuccess}/{requestedNew}.";
+
                                         WriteAutoActivityLog(
                                             action: "TẠO TRƯỚC PRF",
                                             profile: item.ProfileName,
                                             account: item.Account.Username,
-                                            result: "CHỜ",
+                                            result: queueState,
                                             detail: verifyName
-                                                ? (writeIdentityDone
-                                                    ? "Đổi tên + kiểm tra tên OK + ghi DONE Excel; đã đóng runtime và đưa vào PRF chờ."
-                                                    : "Đổi tên + kiểm tra tên OK; không ghi DONE Excel; đã đóng runtime và đưa vào PRF chờ.")
-                                                : "Đổi tên không kiểm tra lại; đã đóng runtime và đưa vào PRF chờ.");
+                                                ? (outcome.IdentityVerified
+                                                    ? (writeIdentityDone
+                                                        ? (outcome.IdentityExcelDone
+                                                            ? "Đổi tên thành công + kiểm tra tên DONE + ghi DONE Excel; đã đóng runtime và đưa vào PRF chờ."
+                                                            : "Đổi tên thành công + kiểm tra tên DONE; ghi DONE Excel chưa thành công; vẫn đưa vào PRF chờ và vẫn tính quota DONE.")
+                                                        : "Đổi tên thành công + kiểm tra tên DONE; không ghi Excel; đã đóng runtime và đưa vào PRF chờ.")
+                                                    : "Đổi tên thành công nhưng tên chưa kịp hiện đúng; vẫn đóng runtime và đưa vào PRF chờ, không tính quota DONE.")
+                                                : "Đổi tên thành công; không kiểm tra lại tên, không ghi DONE; đã đóng runtime và đưa vào PRF chờ.");
                                     }
                                 }
                                 else
@@ -835,9 +896,10 @@ public sealed partial class ManagerForm
                                     UpdateGridRow(
                                         item,
                                         outcome.Step,
-                                        $"Không đưa vào chờ: {outcome.Note}",
+                                        $"Không đưa vào chờ vì thao tác đổi tên chưa thành công: {outcome.Note}",
                                         outcome.Paused ? Color.DarkOrange : Color.Firebrick);
-                                    detailLabel.Text = $"PRF {item.ProfileName} không vào CHỜ: {outcome.Note}";
+                                    detailLabel.Text =
+                                        $"PRF {item.ProfileName} không vào CHỜ vì chưa đổi tên thành công: {outcome.Note}";
                                 }
                             }
                             catch (OperationCanceledException)
@@ -865,38 +927,43 @@ public sealed partial class ManagerForm
                             if (preCreateStopRequested)
                                 break;
 
-                            if (preparedSuccess < requestedNew)
+                            if (targetSuccess < requestedNew)
                             {
                                 currentLabel.Text = "Đang xử lý: chờ PRF tiếp theo...";
-                                detailLabel.Text =
-                                    $"Đã có {preparedSuccess}/{requestedNew} PRF chờ. "
-                                    + $"Nghỉ {(int)AutoProfileBetweenProfilesDelay.TotalSeconds}s trước PRF tiếp theo...";
+                                detailLabel.Text = verifyName
+                                    ? $"Đã có {targetSuccess}/{requestedNew} DONE; tổng PRF đã đưa vào CHỜ: {waitingAdded} "
+                                      + $"({pendingName} chưa xác nhận tên). Nghỉ {(int)AutoProfileBetweenProfilesDelay.TotalSeconds}s trước PRF tiếp theo..."
+                                    : $"Đã có {targetSuccess}/{requestedNew} PRF đổi tên thành công và vào CHỜ. "
+                                      + $"Nghỉ {(int)AutoProfileBetweenProfilesDelay.TotalSeconds}s trước PRF tiếp theo...";
                                 status.Text = detailLabel.Text;
                                 await Task.Delay(AutoProfileBetweenProfilesDelay, runCts.Token);
                             }
                         }
 
                         waitingLabel.Text = $"PRF chờ hiện có: {GetReusableProfileQueueCount()}";
-                        progressLabel.Text = $"Tiến độ: {preparedSuccess} / {requestedNew}";
+                        progressLabel.Text = verifyName
+                            ? $"Tiến độ DONE: {targetSuccess} / {requestedNew}"
+                            : $"Tiến độ PRF: {targetSuccess} / {requestedNew}";
                         currentLabel.Text = "Đang xử lý: —";
+
+                        var modeSummary = verifyName
+                            ? $"DONE: {targetSuccess}/{requestedNew} | vào CHỜ: {waitingAdded} | chưa DONE: {pendingName}"
+                            : $"PRF hợp lệ: {targetSuccess}/{requestedNew} | vào CHỜ: {waitingAdded}";
 
                         if (preCreateStopRequested)
                         {
                             detailLabel.Text =
-                                $"Đã dừng an toàn. PRF chờ đã tạo: {preparedSuccess}/{requestedNew} | "
-                                + $"đã thử: {attempts} | lỗi/chưa đạt: {failed}.";
+                                $"Đã dừng an toàn. {modeSummary} | đã thử: {attempts} | lỗi đổi tên/queue: {failed}.";
                         }
-                        else if (preparedSuccess >= requestedNew)
+                        else if (targetSuccess >= requestedNew)
                         {
                             detailLabel.Text =
-                                $"Hoàn tất tạo trước. PRF CHỜ: {preparedSuccess}/{requestedNew} | "
-                                + $"đã thử: {attempts} | lỗi/chưa đạt: {failed}.";
+                                $"Hoàn tất tạo trước. {modeSummary} | đã thử: {attempts} | lỗi đổi tên/queue: {failed}.";
                         }
                         else
                         {
                             detailLabel.Text =
-                                $"Đã hết tài khoản phù hợp trước khi đủ mục tiêu. PRF CHỜ: {preparedSuccess}/{requestedNew} | "
-                                + $"đã thử: {attempts} | lỗi/chưa đạt: {failed}.";
+                                $"Đã hết tài khoản phù hợp trước khi đủ mục tiêu. {modeSummary} | đã thử: {attempts} | lỗi đổi tên/queue: {failed}.";
                         }
 
                         status.Text = detailLabel.Text;
@@ -1466,11 +1533,15 @@ public sealed partial class ManagerForm
         CancellationToken ct,
         Action<string, string, Color> ui,
         bool verifyIdentityAfterRename = false,
-        bool writeIdentityDoneToExcel = true)
+        bool writeIdentityDoneToExcel = true,
+        bool tolerateIdentityValidationFailure = false)
     {
         var stopwatch = Stopwatch.StartNew();
         var step = "RESERVE";
         var reservedNow = false;
+        var renameSucceeded = false;
+        var identityVerified = false;
+        var identityExcelDone = false;
         ProfileContext? ctx = null;
         _autoIdentityInFlight.Add(item.ProfileName);
         try
@@ -1673,6 +1744,9 @@ public sealed partial class ManagerForm
 
                 if (identityDone)
                 {
+                    renameSucceeded = true;
+                    identityVerified = true;
+                    identityExcelDone = true;
                     ui("RENAMED", "Tên/ảnh trong Excel đã DONE — bỏ qua đổi lại.", Color.DarkGreen);
                     _log.Info($"[AUTO_PROFILE_IDENTITY_ALREADY_DONE] profile={item.ProfileName} account={item.Account.Username}");
                 }
@@ -1683,29 +1757,56 @@ public sealed partial class ManagerForm
                     ui(step, "Đang đổi tên / áp dụng Tên & ảnh TikTok...", Color.RoyalBlue);
                     await SetAutoCheckpointWithRetryAsync(item.Account.Id, "RENAMING", step,
                         AutoProfileNote("Bắt đầu luồng Tên & ảnh TikTok."), ct);
-                    await ApplyAutoProfileIdentityAsync(
+
+                    var identityResult = await ApplyAutoProfileIdentityAsync(
                         ctx,
                         item,
                         ct,
                         verifyNameAfterUpdate: verifyIdentityAfterRename,
-                        writeExcelDone: writeIdentityDoneToExcel);
-                    await SetAutoCheckpointWithRetryAsync(item.Account.Id, "RENAMED", step,
-                        AutoProfileNote(
-                            writeIdentityDoneToExcel
-                                ? "Tên/ảnh đã xử lý và Excel đã xác minh DONE."
-                                : (verifyIdentityAfterRename
-                                    ? "Tên/ảnh đã xử lý và tên thực tế đã kiểm tra đúng; không ghi DONE Excel."
-                                    : "Tên/ảnh đã xử lý; bỏ qua kiểm tra tên và không ghi DONE Excel.")),
+                        writeExcelDone: writeIdentityDoneToExcel,
+                        toleratePostRenameValidationFailure: tolerateIdentityValidationFailure);
+
+                    renameSucceeded = identityResult.RenameSucceeded;
+                    identityVerified = identityResult.Verified;
+                    identityExcelDone = identityResult.ExcelDone;
+
+                    var checkpointNote = !renameSucceeded
+                        ? "Tên/ảnh chưa đổi thành công."
+                        : (!verifyIdentityAfterRename
+                            ? "Tên/ảnh đã xử lý; bỏ qua kiểm tra tên và không ghi DONE Excel."
+                            : (identityVerified
+                                ? (writeIdentityDoneToExcel
+                                    ? (identityExcelDone
+                                        ? "Tên/ảnh đã kiểm tra đúng và Excel đã xác minh DONE."
+                                        : "Tên/ảnh đã kiểm tra đúng; Excel chưa ghi/xác minh DONE nhưng profile vẫn được giữ để đưa vào CHỜ.")
+                                    : "Tên/ảnh đã kiểm tra đúng; không ghi DONE Excel.")
+                                : "Đổi tên đã thành công nhưng tên thực tế chưa kịp khớp; profile vẫn được giữ để đưa vào CHỜ."));
+
+                    await SetAutoCheckpointWithRetryAsync(
+                        item.Account.Id,
+                        identityVerified || !verifyIdentityAfterRename ? "RENAMED" : "RENAMED_PENDING_VERIFY",
+                        step,
+                        AutoProfileNote(checkpointNote),
                         ct);
-                    identityDone = true;
+
+                    identityDone = writeIdentityDoneToExcel
+                        ? identityExcelDone
+                        : (verifyIdentityAfterRename ? identityVerified : renameSucceeded);
+
+                    var resultText = !verifyIdentityAfterRename
+                        ? "Đổi tên/ảnh hoàn tất (không kiểm tra tên)."
+                        : (identityVerified
+                            ? (writeIdentityDoneToExcel
+                                ? (identityExcelDone
+                                    ? "Đổi tên/ảnh hoàn tất + kiểm tra tên OK + DONE Excel."
+                                    : "Đổi tên/ảnh hoàn tất + kiểm tra tên OK; Excel chưa ghi DONE.")
+                                : "Đổi tên/ảnh hoàn tất + kiểm tra tên OK (không ghi DONE Excel).")
+                            : "Đổi tên thành công; tên chưa kịp hiện đúng — vẫn giữ PRF để đưa vào CHỜ.");
+
                     ui(
-                        "RENAMED",
-                        writeIdentityDoneToExcel
-                            ? "Đổi tên/ảnh hoàn tất + DONE Excel."
-                            : (verifyIdentityAfterRename
-                                ? "Đổi tên/ảnh hoàn tất + kiểm tra tên OK (không ghi DONE Excel)."
-                                : "Đổi tên/ảnh hoàn tất (không kiểm tra tên)."),
-                        Color.DarkGreen);
+                        identityVerified || !verifyIdentityAfterRename ? "RENAMED" : "RENAME_PENDING_VERIFY",
+                        resultText,
+                        identityVerified || !verifyIdentityAfterRename ? Color.DarkGreen : Color.DarkOrange);
                 }
             }
 
@@ -1736,14 +1837,35 @@ public sealed partial class ManagerForm
             // Với chế độ tạo trước không kiểm tra tên + không ghi DONE, không khóa
             // scheduler Tên/ảnh bằng một "đã xử lý" giả. Profile sẽ được đóng ngay
             // và lần mở sau vẫn có quyền kiểm tra tên nếu cấu hình yêu cầu.
-            if (!autoRename || verifyIdentityAfterRename || writeIdentityDoneToExcel)
+            if (!autoRename
+                || identityExcelDone
+                || (verifyIdentityAfterRename && identityVerified && !writeIdentityDoneToExcel))
             {
                 _autoIdentityHandledSession.Add(item.ProfileName);
                 _autoIdentityHandledSession.Add("account:" + item.Account.Username.Trim().ToLowerInvariant());
             }
-            ui("DONE", autoStart ? "READY — tool đang chạy." : "READY — chưa tự Bắt đầu theo cấu hình.", Color.DarkGreen);
-            _log.Info($"[AUTO_PROFILE_READY] profile={item.ProfileName} account={item.Account.Username} elapsed={stopwatch.Elapsed}");
-            return new AutoProfileProcessOutcome(true, false, "READY", "DONE", "Hoàn tất");
+
+            var readyStep = verifyIdentityAfterRename && renameSucceeded && !identityVerified
+                ? "READY_PENDING_NAME"
+                : "DONE";
+            var readyText = verifyIdentityAfterRename && renameSucceeded && !identityVerified
+                ? "READY — đổi tên thành công, tên chưa kịp xác nhận; sẽ đóng và đưa vào CHỜ."
+                : (autoStart ? "READY — tool đang chạy." : "READY — chưa tự Bắt đầu theo cấu hình.");
+
+            ui(readyStep, readyText, readyStep == "DONE" ? Color.DarkGreen : Color.DarkOrange);
+            _log.Info(
+                $"[AUTO_PROFILE_READY] profile={item.ProfileName} account={item.Account.Username} "
+                + $"renameSucceeded={renameSucceeded} verified={identityVerified} excelDone={identityExcelDone} "
+                + $"elapsed={stopwatch.Elapsed}");
+            return new AutoProfileProcessOutcome(
+                true,
+                false,
+                "READY",
+                readyStep,
+                readyText,
+                RenameSucceeded: renameSucceeded,
+                IdentityVerified: identityVerified,
+                IdentityExcelDone: identityExcelDone);
         }
         catch (AutoProfileLoginBanException ex)
         {
@@ -1778,7 +1900,11 @@ public sealed partial class ManagerForm
 
             ui("WAIT_LOGIN", "LOGIN_BANNED — " + note, Color.Firebrick);
             _log.Warn($"[AUTO_PROFILE_LOGIN_BANNED] profile={item.ProfileName} account={item.Account.Username} handled={handled} message={ex.Message}");
-            return new AutoProfileProcessOutcome(false, false, "LOGIN_BANNED", "WAIT_LOGIN", note);
+            return new AutoProfileProcessOutcome(
+                false, false, "LOGIN_BANNED", "WAIT_LOGIN", note,
+                RenameSucceeded: renameSucceeded,
+                IdentityVerified: identityVerified,
+                IdentityExcelDone: identityExcelDone);
         }
         catch (AutoProfilePauseException ex)
         {
@@ -1790,7 +1916,11 @@ public sealed partial class ManagerForm
             await TryWriteAutoPauseCheckpointAsync(item.Account.Id, ex.Status, ex.Step, ex.Message, ct);
             ui(ex.Step, ex.Status + " — " + ex.Message, Color.DarkOrange);
             _log.Warn($"[AUTO_PROFILE_PAUSED] profile={item.ProfileName} account={item.Account.Username} status={ex.Status} step={ex.Step} message={ex.Message}");
-            return new AutoProfileProcessOutcome(false, true, ex.Status, ex.Step, ex.Message);
+            return new AutoProfileProcessOutcome(
+                false, true, ex.Status, ex.Step, ex.Message,
+                RenameSucceeded: renameSucceeded,
+                IdentityVerified: identityVerified,
+                IdentityExcelDone: identityExcelDone);
         }
         catch (OperationCanceledException)
         {
@@ -1827,7 +1957,11 @@ public sealed partial class ManagerForm
             await TryWriteAutoPauseCheckpointAsync(item.Account.Id, status, step, note, CancellationToken.None);
             ui(step, status + " — " + note, captcha ? Color.DarkOrange : Color.Firebrick);
             _log.Warn($"[AUTO_PROFILE_ERROR] profile={item.ProfileName} account={item.Account.Username} step={step} {ex}");
-            return new AutoProfileProcessOutcome(false, true, status, step, note);
+            return new AutoProfileProcessOutcome(
+                false, true, status, step, note,
+                RenameSucceeded: renameSucceeded,
+                IdentityVerified: identityVerified,
+                IdentityExcelDone: identityExcelDone);
         }
         finally
         {
@@ -1947,12 +2081,13 @@ public sealed partial class ManagerForm
         return false;
     }
 
-    async Task ApplyAutoProfileIdentityAsync(
+    async Task<AutoProfileIdentityApplyOutcome> ApplyAutoProfileIdentityAsync(
         ProfileContext ctx,
         AutoProfileQueueItem item,
         CancellationToken ct,
         bool verifyNameAfterUpdate = false,
-        bool writeExcelDone = true)
+        bool writeExcelDone = true,
+        bool toleratePostRenameValidationFailure = false)
     {
         if (writeExcelDone
             && await RunAccountPoolIoAsync(
@@ -1960,7 +2095,10 @@ public sealed partial class ManagerForm
                 ct))
         {
             _log.Info($"[AUTO_PROFILE_RENAME_SKIP_DONE] profile={item.ProfileName} account={item.Account.Username}");
-            return;
+            return new AutoProfileIdentityApplyOutcome(
+                RenameSucceeded: true,
+                Verified: true,
+                ExcelDone: true);
         }
 
         var state = LoadIdentityToolState();
@@ -2008,6 +2146,12 @@ public sealed partial class ManagerForm
         if (reply.Skipped && !reply.AlreadyConfigured)
             throw new AutoProfilePauseException("PAUSED_RENAME", "RENAME", string.IsNullOrWhiteSpace(reply.Message) ? "TikTok bỏ qua thao tác đổi tên." : reply.Message);
 
+        // Từ đây thao tác đổi tên đã được TikTok/Worker xác nhận thành công.
+        // Với "Tạo trước PRF chờ", kể cả tên chưa kịp hiện đúng khi probe,
+        // profile vẫn phải được đóng và đưa vào CHỜ. Probe chỉ quyết định
+        // profile có được tính vào quota DONE hay không.
+        var verifiedOk = false;
+        var verificationError = "";
         if (verifyNameAfterUpdate)
         {
             var verified = await VerifyPreparedProfileNameAsync(
@@ -2016,22 +2160,49 @@ public sealed partial class ManagerForm
                 names,
                 ct);
 
-            if (!verified.Ok)
+            verifiedOk = verified.Ok;
+            verificationError = verified.Error;
+
+            if (!verifiedOk && !toleratePostRenameValidationFailure)
+            {
                 throw new AutoProfilePauseException(
                     "PAUSED_NAME_VERIFY",
                     "RENAME",
                     verified.Error);
+            }
+
+            if (!verifiedOk)
+            {
+                _log.Warn(
+                    $"[AUTO_PROFILE_PRECREATE_NAME_PENDING] profile={item.ProfileName} account={item.Account.Username} "
+                    + $"renameSucceeded=true error={verificationError}");
+            }
         }
 
-        if (writeExcelDone)
+        var excelDone = false;
+        var excelError = "";
+        var mayWriteDone = writeExcelDone && (!verifyNameAfterUpdate || verifiedOk);
+        if (mayWriteDone)
         {
-            var excelDone = await MarkIdentityDoneVerifiedAsync(
+            var excelResult = await MarkIdentityDoneVerifiedAsync(
                 item.Account.Username, item.ProfileName, ct);
-            if (!excelDone.Ok)
+            excelDone = excelResult.Ok;
+            excelError = excelResult.Error;
+
+            if (!excelDone && !toleratePostRenameValidationFailure)
+            {
                 throw new AutoProfilePauseException(
                     "PAUSED_RENAME_EXCEL",
                     "RENAME",
-                    "TikTok đã xử lý tên/ảnh nhưng Excel chưa ghi/xác minh được DONE: " + excelDone.Error);
+                    "TikTok đã xử lý tên/ảnh nhưng Excel chưa ghi/xác minh được DONE: " + excelResult.Error);
+            }
+
+            if (!excelDone)
+            {
+                _log.Warn(
+                    $"[AUTO_PROFILE_PRECREATE_EXCEL_DONE_PENDING] profile={item.ProfileName} account={item.Account.Username} "
+                    + $"renameSucceeded=true verified={verifiedOk} error={excelError}");
+            }
         }
 
         if (reply.AvatarChanged && !string.IsNullOrWhiteSpace(avatarPath))
@@ -2039,10 +2210,19 @@ public sealed partial class ManagerForm
             state.LastAvatarByProfile[ctx.Profile.Name] = avatarPath;
             SaveIdentityToolState(state);
         }
+
         _log.Info(
             $"[AUTO_PROFILE_RENAME_DONE] profile={item.ProfileName} account={item.Account.Username} "
             + $"nameChanged={reply.NameChanged} alreadyConfigured={reply.AlreadyConfigured} "
-            + $"verifyName={verifyNameAfterUpdate} excelDone={writeExcelDone}");
+            + $"verifyRequested={verifyNameAfterUpdate} verified={verifiedOk} "
+            + $"excelRequested={writeExcelDone} excelDone={excelDone}");
+
+        return new AutoProfileIdentityApplyOutcome(
+            RenameSucceeded: true,
+            Verified: verifyNameAfterUpdate && verifiedOk,
+            ExcelDone: writeExcelDone && excelDone,
+            VerificationError: verificationError,
+            ExcelError: excelError);
     }
 
     async Task<(bool Ok, string Error)> VerifyPreparedProfileNameAsync(
@@ -2054,7 +2234,8 @@ public sealed partial class ManagerForm
         NameGuardProbeReply? lastProbe = null;
 
         // Tạo trước ưu tiên chậm mà chắc: sau khi Save tên, đợi trang ổn định
-        // rồi đọc tên thực tế tối đa 3 lần trước khi quyết định có đưa PRF vào Chờ.
+        // rồi đọc tên thực tế tối đa 3 lần. Kết quả probe chỉ quyết định PRF có
+        // được tính vào quota DONE hay không; PRF đã đổi tên thành công vẫn vào CHỜ.
         await Task.Delay(TimeSpan.FromSeconds(2), ct);
 
         for (var attempt = 1; attempt <= 3; attempt++)
