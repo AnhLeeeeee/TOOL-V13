@@ -124,7 +124,7 @@ public sealed partial class ManagerForm
         var config = new TableLayoutPanel
         {
             Dock = DockStyle.Top,
-            Height = 150,
+            Height = 154,
             Padding = new Padding(14, 8, 14, 8),
             ColumnCount = 4,
             RowCount = 3,
@@ -305,10 +305,12 @@ public sealed partial class ManagerForm
         };
 
         var start = new Button { Text = "Bắt đầu", Size = new Size(120, 42) };
+        var prepare = new Button { Text = "Tạo trước PRF chờ", Size = new Size(170, 42) };
         var pause = new Button { Text = "Tạm dừng", Size = new Size(120, 42), Enabled = false };
         var stop = new Button { Text = "Dừng", Size = new Size(110, 42), Enabled = false };
         var close = new Button { Text = "Đóng", Size = new Size(100, 42) };
         ModernDialog.StylePrimaryButton(start);
+        ModernDialog.StyleSecondaryButton(prepare);
         ModernDialog.StyleSecondaryButton(pause);
         ModernDialog.StyleSecondaryButton(stop);
         ModernDialog.StyleSecondaryButton(close);
@@ -318,6 +320,7 @@ public sealed partial class ManagerForm
         footerFlow.Controls.Add(close);
         footerFlow.Controls.Add(stop);
         footerFlow.Controls.Add(pause);
+        footerFlow.Controls.Add(prepare);
         footerFlow.Controls.Add(start);
         footer.Controls.Add(footerFlow);
 
@@ -330,6 +333,8 @@ public sealed partial class ManagerForm
         CancellationTokenSource? runCts = null;
         var running = false;
         var paused = false;
+        var preCreateRunning = false;
+        var preCreateStopRequested = false;
 
         void SetInputsEnabled(bool enabled)
         {
@@ -340,6 +345,7 @@ public sealed partial class ManagerForm
             retryPaused.Enabled = enabled;
             autoRename.Enabled = enabled;
             autoStart.Enabled = enabled;
+            prepare.Enabled = enabled;
             start.Enabled = enabled;
             close.Enabled = enabled;
             pause.Enabled = !enabled;
@@ -425,15 +431,518 @@ public sealed partial class ManagerForm
         {
             if (!running) return;
             stop.Enabled = false;
+
+            if (preCreateRunning)
+            {
+                preCreateStopRequested = true;
+                status.Text = "Đã yêu cầu dừng. PRF hiện tại sẽ được đóng an toàn rồi mới dừng.";
+                return;
+            }
+
             status.Text = "Đang yêu cầu dừng sau bước hiện tại...";
             try { runCts?.Cancel(); } catch { }
         };
 
         close.Click += (_, _) => form.Close();
 
+        prepare.Click += (_, _) =>
+        {
+            if (running || preCreateRunning) return;
+
+            var preCreateForm = new Form
+            {
+                Text = "Tạo PRF trước",
+                Width = 500,
+                Height = 430,
+                MinimumSize = new Size(470, 405),
+                StartPosition = FormStartPosition.CenterParent,
+                FormBorderStyle = FormBorderStyle.FixedDialog,
+                MinimizeBox = false,
+                MaximizeBox = false,
+                ShowInTaskbar = false,
+                AutoScaleMode = AutoScaleMode.Dpi,
+                Font = new Font("Segoe UI", 10F)
+            };
+            ModernDialog.Apply(preCreateForm, fixedDialog: true);
+
+            var panel = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                Padding = new Padding(22, 18, 22, 18),
+                ColumnCount = 2,
+                RowCount = 8,
+                BackColor = ModernDialog.Canvas
+            };
+            panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 48));
+            panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 52));
+            panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+            panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
+            panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+            panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+            panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 50));
+            panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
+            panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
+
+            var title = new Label
+            {
+                Text = "────────  TẠO PRF TRƯỚC  ────────",
+                AutoSize = true,
+                Font = new Font("Segoe UI", 10F, FontStyle.Bold),
+                ForeColor = Color.FromArgb(35, 55, 78),
+                Margin = new Padding(0, 4, 0, 0)
+            };
+            panel.Controls.Add(title, 0, 0);
+            panel.SetColumnSpan(title, 2);
+
+            var qtyLabel = new Label
+            {
+                Text = "Số lượng cần tạo:",
+                AutoSize = true,
+                Margin = new Padding(0, 10, 8, 0),
+                ForeColor = Color.FromArgb(46, 65, 88)
+            };
+            var qty = new NumericUpDown
+            {
+                Minimum = 1,
+                Maximum = 200,
+                Value = 1,
+                Increment = 1,
+                Width = 105,
+                Anchor = AnchorStyles.Left,
+                Margin = new Padding(0, 5, 0, 0)
+            };
+            panel.Controls.Add(qtyLabel, 0, 1);
+            panel.Controls.Add(qty, 1, 1);
+
+            var verifyLabel = new Label
+            {
+                Text = "Kiểm tra tên:",
+                AutoSize = true,
+                Margin = new Padding(0, 7, 8, 0),
+                ForeColor = Color.FromArgb(46, 65, 88)
+            };
+            panel.Controls.Add(verifyLabel, 0, 2);
+            panel.SetColumnSpan(verifyLabel, 2);
+
+            var verifyChoices = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.LeftToRight,
+                WrapContents = false,
+                Margin = Padding.Empty
+            };
+            var verifyYes = new RadioButton
+            {
+                Text = "Có",
+                Checked = true,
+                AutoSize = true,
+                Margin = new Padding(0, 4, 30, 0)
+            };
+            var verifyNo = new RadioButton
+            {
+                Text = "Không",
+                AutoSize = true,
+                Margin = new Padding(0, 4, 0, 0)
+            };
+            verifyChoices.Controls.Add(verifyYes);
+            verifyChoices.Controls.Add(verifyNo);
+            panel.Controls.Add(verifyChoices, 0, 3);
+            panel.SetColumnSpan(verifyChoices, 2);
+
+            var writeDone = new CheckBox
+            {
+                Text = "Ghi DONE vào Excel khi tên đúng",
+                Checked = true,
+                AutoSize = true,
+                Margin = new Padding(0, 8, 0, 0)
+            };
+            panel.Controls.Add(writeDone, 0, 4);
+            panel.SetColumnSpan(writeDone, 2);
+
+            void SyncDoneOption()
+            {
+                writeDone.Enabled = verifyYes.Checked;
+            }
+            verifyYes.CheckedChanged += (_, _) => SyncDoneOption();
+            verifyNo.CheckedChanged += (_, _) => SyncDoneOption();
+            SyncDoneOption();
+
+            var info = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 1,
+                RowCount = 3,
+                Margin = Padding.Empty,
+                Padding = Padding.Empty
+            };
+            var progressLabel = new Label
+            {
+                Text = "Tiến độ: 0 / 0",
+                AutoSize = true,
+                Margin = new Padding(0, 2, 0, 2),
+                ForeColor = Color.FromArgb(46, 65, 88)
+            };
+            var currentLabel = new Label
+            {
+                Text = "Đang xử lý: —",
+                AutoSize = true,
+                AutoEllipsis = true,
+                MaximumSize = new Size(420, 0),
+                Margin = new Padding(0, 2, 0, 2),
+                ForeColor = Color.FromArgb(46, 65, 88)
+            };
+            var waitingLabel = new Label
+            {
+                Text = $"PRF chờ hiện có: {GetReusableProfileQueueCount()}",
+                AutoSize = true,
+                Margin = new Padding(0, 2, 0, 2),
+                ForeColor = Color.FromArgb(35, 91, 152)
+            };
+            info.Controls.Add(progressLabel, 0, 0);
+            info.Controls.Add(currentLabel, 0, 1);
+            info.Controls.Add(waitingLabel, 0, 2);
+            panel.Controls.Add(info, 0, 5);
+            panel.SetColumnSpan(info, 2);
+
+            var detailLabel = new Label
+            {
+                Text = "Sẵn sàng. PRF được tạo lần lượt, PRF hiện tại phải đóng sạch mới chuyển sang PRF tiếp theo.",
+                Dock = DockStyle.Fill,
+                AutoEllipsis = true,
+                ForeColor = Color.DimGray,
+                Margin = new Padding(0, 8, 0, 0)
+            };
+            panel.Controls.Add(detailLabel, 0, 6);
+            panel.SetColumnSpan(detailLabel, 2);
+
+            var actions = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.LeftToRight,
+                WrapContents = false,
+                Margin = Padding.Empty,
+                Padding = new Padding(0, 8, 0, 0)
+            };
+            var beginPreCreate = new Button { Text = "Tạo trước", Size = new Size(130, 40) };
+            var stopPreCreate = new Button { Text = "Dừng", Size = new Size(110, 40), Enabled = false };
+            ModernDialog.StylePrimaryButton(beginPreCreate);
+            ModernDialog.StyleSecondaryButton(stopPreCreate);
+            actions.Controls.Add(beginPreCreate);
+            actions.Controls.Add(stopPreCreate);
+            panel.Controls.Add(actions, 0, 7);
+            panel.SetColumnSpan(actions, 2);
+
+            preCreateForm.Controls.Add(panel);
+
+            void SetPopupInputsEnabled(bool enabled)
+            {
+                qty.Enabled = enabled;
+                verifyYes.Enabled = enabled;
+                verifyNo.Enabled = enabled;
+                writeDone.Enabled = enabled && verifyYes.Checked;
+                beginPreCreate.Enabled = enabled;
+                stopPreCreate.Enabled = !enabled;
+            }
+
+            stopPreCreate.Click += (_, _) =>
+            {
+                if (!preCreateRunning) return;
+                stopPreCreate.Enabled = false;
+                preCreateStopRequested = true;
+                detailLabel.Text = "Đã yêu cầu dừng. PRF hiện tại sẽ được đóng an toàn rồi mới dừng.";
+                status.Text = detailLabel.Text;
+            };
+
+            preCreateForm.FormClosing += (_, e) =>
+            {
+                if (!preCreateRunning) return;
+                e.Cancel = true;
+                if (!preCreateStopRequested)
+                {
+                    preCreateStopRequested = true;
+                    stopPreCreate.Enabled = false;
+                    detailLabel.Text = "Đang dừng an toàn. PRF hiện tại sẽ được đóng trước khi cửa sổ có thể đóng.";
+                    status.Text = detailLabel.Text;
+                }
+            };
+
+            beginPreCreate.Click += async (_, _) =>
+            {
+                if (running || preCreateRunning) return;
+
+                preCreateRunning = true;
+                preCreateStopRequested = false;
+                running = true;
+                paused = false;
+                pause.Text = "Tạm dừng";
+                runCts = new CancellationTokenSource();
+                SetInputsEnabled(false);
+                SetPopupInputsEnabled(false);
+
+                var requestedNew = (int)qty.Value;
+                var verifyName = verifyYes.Checked;
+                var writeIdentityDone = verifyName && writeDone.Checked;
+                progressLabel.Text = $"Tiến độ: 0 / {requestedNew}";
+                currentLabel.Text = "Đang xử lý: chuẩn bị hàng đợi...";
+                waitingLabel.Text = $"PRF chờ hiện có: {GetReusableProfileQueueCount()}";
+                detailLabel.Text = "Đang chuẩn bị dữ liệu Excel và hàng đợi...";
+
+                try
+                {
+                    await RunAccountPoolIoAsync(
+                        () =>
+                        {
+                            if (!string.IsNullOrWhiteSpace(_accountPoolService.CurrentSourcePath))
+                                _accountPoolService.ReloadCurrentExcel();
+                            _accountPoolService.EnsureAutoColumns();
+                        },
+                        CancellationToken.None);
+
+                    var requestedStartName = nextProfile.Text.Trim();
+
+                    if (requestedNew <= 0)
+                        throw new InvalidOperationException("Số lượng PRF tạo trước phải lớn hơn 0.");
+
+                    if (!TryParseAutoProfileName(requestedStartName, out _, out _, out _))
+                        throw new InvalidOperationException("Tên profile bắt đầu phải kết thúc bằng số, ví dụ 46 hoặc a02.");
+
+                    var identity = LoadIdentityToolState();
+                    var names = SplitIdentityNames(identity.NamesText);
+                    if (names.Count == 0)
+                        throw new InvalidOperationException("Tạo trước PRF chờ cần đổi tên nhưng danh sách tên trong mục ‘Tên & ảnh TikTok’ đang trống.");
+
+                    RememberAutoProfileSequenceStart(requestedStartName);
+
+                    var queue = await RunAccountPoolIoAsync(
+                        () => BuildAutoProfileQueue(
+                            requestedNew,
+                            requestedStartName,
+                            resumeIncomplete: false,
+                            retryPaused: false),
+                        CancellationToken.None);
+
+                    if (queue.Count == 0)
+                        throw new InvalidOperationException("Không còn tài khoản chưa gán phù hợp để tạo PRF chờ.");
+
+                    grid.Rows.Clear();
+                    status.Text =
+                        $"Tạo trước {requestedNew} PRF chờ — tuần tự 1 PRF/lần | "
+                        + (verifyName
+                            ? (writeIdentityDone ? "kiểm tra tên + ghi DONE Excel" : "kiểm tra tên, không ghi DONE Excel")
+                            : "không kiểm tra tên");
+                    detailLabel.Text = status.Text;
+
+                    await _autoProfileQueueGate.WaitAsync(runCts.Token);
+                    var preparedSuccess = 0;
+                    var attempts = 0;
+                    var failed = 0;
+
+                    try
+                    {
+                        foreach (var item in queue)
+                        {
+                            if (preparedSuccess >= requestedNew || preCreateStopRequested)
+                                break;
+
+                            await WaitAutoProfilePausePointAsync(() => paused, runCts.Token);
+
+                            attempts++;
+                            var rowIndex = grid.Rows.Add(
+                                "Tạo trước",
+                                item.ProfileName,
+                                $"Dòng {item.Account.SourceRow}: {item.Account.Username}",
+                                "WAITING",
+                                "Chờ tới lượt");
+                            grid.Rows[rowIndex].Tag = item;
+
+                            progressLabel.Text = $"Tiến độ: {preparedSuccess} / {requestedNew}";
+                            currentLabel.Text = $"Đang xử lý: PRF {item.ProfileName}";
+                            detailLabel.Text = $"Đang tạo PRF {item.ProfileName} — {item.Account.Username}";
+                            status.Text =
+                                $"Tạo trước PRF chờ: {preparedSuccess}/{requestedNew} | "
+                                + $"đang xử lý {item.ProfileName} — {item.Account.Username}";
+                            UpdateGridRow(item, "PREPARE", "Đang tạo PRF tuần tự...", Color.RoyalBlue);
+
+                            AutoProfileProcessOutcome outcome;
+                            _autoReplacementCleanupProfiles.Add(item.ProfileName);
+                            try
+                            {
+                                outcome = await ProcessAutoProfileQueueItemAsync(
+                                    item,
+                                    autoRename: true,
+                                    autoStart: false,
+                                    isPaused: () => paused,
+                                    ct: runCts.Token,
+                                    ui: (stepText, resultText, color) =>
+                                    {
+                                        UpdateGridRow(item, stepText, resultText, color);
+                                        if (!preCreateForm.IsDisposed)
+                                        {
+                                            currentLabel.Text = $"Đang xử lý: PRF {item.ProfileName} — {stepText}";
+                                            detailLabel.Text = resultText;
+                                        }
+                                    },
+                                    verifyIdentityAfterRename: verifyName,
+                                    writeIdentityDoneToExcel: writeIdentityDone);
+
+                                UpdateGridRow(item, "CLOSING", "Đang đóng Chrome/Worker an toàn...", Color.RoyalBlue);
+                                currentLabel.Text = $"Đang xử lý: PRF {item.ProfileName} — CLOSING";
+                                detailLabel.Text = "Đang đóng Chrome/Worker an toàn...";
+                                await ClosePreparedProfileRuntimeAsync(item.ProfileName, item.Account.Username);
+
+                                if (outcome.Success)
+                                {
+                                    if (!TryAddReusableProfileManual(
+                                            item.Account.Id,
+                                            item.Account.Username,
+                                            item.ProfileName,
+                                            item.Account.Note,
+                                            out var queueMessage))
+                                    {
+                                        failed++;
+                                        UpdateGridRow(item, "QUEUE_FAIL", queueMessage, Color.Firebrick);
+                                        detailLabel.Text = queueMessage;
+                                        _log.Warn(
+                                            $"[AUTO_PROFILE_PRECREATE_QUEUE_FAIL] profile={item.ProfileName} account={item.Account.Username} message={queueMessage}");
+                                    }
+                                    else
+                                    {
+                                        preparedSuccess++;
+                                        progressLabel.Text = $"Tiến độ: {preparedSuccess} / {requestedNew}";
+                                        waitingLabel.Text = $"PRF chờ hiện có: {GetReusableProfileQueueCount()}";
+                                        UpdateGridRow(
+                                            item,
+                                            "CHỜ",
+                                            $"Đã đóng sạch và thêm vào PRF chờ ({preparedSuccess}/{requestedNew}).",
+                                            Color.DarkGreen);
+                                        detailLabel.Text = $"PRF {item.ProfileName} đã vào CHỜ. Hoàn thành {preparedSuccess}/{requestedNew}.";
+                                        WriteAutoActivityLog(
+                                            action: "TẠO TRƯỚC PRF",
+                                            profile: item.ProfileName,
+                                            account: item.Account.Username,
+                                            result: "CHỜ",
+                                            detail: verifyName
+                                                ? (writeIdentityDone
+                                                    ? "Đổi tên + kiểm tra tên OK + ghi DONE Excel; đã đóng runtime và đưa vào PRF chờ."
+                                                    : "Đổi tên + kiểm tra tên OK; không ghi DONE Excel; đã đóng runtime và đưa vào PRF chờ.")
+                                                : "Đổi tên không kiểm tra lại; đã đóng runtime và đưa vào PRF chờ.");
+                                    }
+                                }
+                                else
+                                {
+                                    failed++;
+                                    UpdateGridRow(
+                                        item,
+                                        outcome.Step,
+                                        $"Không đưa vào chờ: {outcome.Note}",
+                                        outcome.Paused ? Color.DarkOrange : Color.Firebrick);
+                                    detailLabel.Text = $"PRF {item.ProfileName} không vào CHỜ: {outcome.Note}";
+                                }
+                            }
+                            catch (OperationCanceledException)
+                            {
+                                await TryClosePreparedProfileRuntimeQuietlyAsync(item.ProfileName, item.Account.Username);
+                                throw;
+                            }
+                            catch (Exception ex)
+                            {
+                                failed++;
+                                await TryClosePreparedProfileRuntimeQuietlyAsync(item.ProfileName, item.Account.Username);
+                                UpdateGridRow(item, "ERROR", "Lỗi tạo trước: " + ex.Message, Color.Firebrick);
+                                detailLabel.Text = "Lỗi tạo trước: " + ex.Message;
+                                _log.Error(
+                                    $"[AUTO_PROFILE_PRECREATE_ERROR] profile={item.ProfileName} account={item.Account.Username} {ex}");
+
+                                if (ex.Message.Contains("Không đóng sạch PRF", StringComparison.OrdinalIgnoreCase))
+                                    preCreateStopRequested = true;
+                            }
+                            finally
+                            {
+                                _autoReplacementCleanupProfiles.Remove(item.ProfileName);
+                            }
+
+                            if (preCreateStopRequested)
+                                break;
+
+                            if (preparedSuccess < requestedNew)
+                            {
+                                currentLabel.Text = "Đang xử lý: chờ PRF tiếp theo...";
+                                detailLabel.Text =
+                                    $"Đã có {preparedSuccess}/{requestedNew} PRF chờ. "
+                                    + $"Nghỉ {(int)AutoProfileBetweenProfilesDelay.TotalSeconds}s trước PRF tiếp theo...";
+                                status.Text = detailLabel.Text;
+                                await Task.Delay(AutoProfileBetweenProfilesDelay, runCts.Token);
+                            }
+                        }
+
+                        waitingLabel.Text = $"PRF chờ hiện có: {GetReusableProfileQueueCount()}";
+                        progressLabel.Text = $"Tiến độ: {preparedSuccess} / {requestedNew}";
+                        currentLabel.Text = "Đang xử lý: —";
+
+                        if (preCreateStopRequested)
+                        {
+                            detailLabel.Text =
+                                $"Đã dừng an toàn. PRF chờ đã tạo: {preparedSuccess}/{requestedNew} | "
+                                + $"đã thử: {attempts} | lỗi/chưa đạt: {failed}.";
+                        }
+                        else if (preparedSuccess >= requestedNew)
+                        {
+                            detailLabel.Text =
+                                $"Hoàn tất tạo trước. PRF CHỜ: {preparedSuccess}/{requestedNew} | "
+                                + $"đã thử: {attempts} | lỗi/chưa đạt: {failed}.";
+                        }
+                        else
+                        {
+                            detailLabel.Text =
+                                $"Đã hết tài khoản phù hợp trước khi đủ mục tiêu. PRF CHỜ: {preparedSuccess}/{requestedNew} | "
+                                + $"đã thử: {attempts} | lỗi/chưa đạt: {failed}.";
+                        }
+
+                        status.Text = detailLabel.Text;
+                    }
+                    finally
+                    {
+                        _autoProfileQueueGate.Release();
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    currentLabel.Text = "Đang xử lý: —";
+                    detailLabel.Text = "Đã dừng tạo trước PRF chờ.";
+                    status.Text = detailLabel.Text;
+                }
+                catch (Exception ex)
+                {
+                    _log.Error("[AUTO_PROFILE_PRECREATE_MANAGER] " + ex);
+                    currentLabel.Text = "Đang xử lý: —";
+                    detailLabel.Text = "Lỗi tạo trước PRF chờ: " + ex.Message;
+                    status.Text = detailLabel.Text;
+                    ModernDialog.ShowMessage(preCreateForm, ex.Message, "Tạo trước PRF chờ", MessageBoxIcon.Error);
+                }
+                finally
+                {
+                    running = false;
+                    paused = false;
+                    preCreateRunning = false;
+                    preCreateStopRequested = false;
+                    try { runCts?.Dispose(); } catch { }
+                    runCts = null;
+                    SetInputsEnabled(true);
+                    SetPopupInputsEnabled(true);
+                    pause.Text = "Tạm dừng";
+                    stop.Enabled = false;
+                }
+            };
+
+            preCreateForm.ShowDialog(form);
+        };
+
         start.Click += async (_, _) =>
         {
             if (running) return;
+            preCreateRunning = false;
+            preCreateStopRequested = false;
             try
             {
                 // Người dùng có thể sửa Excel trong lúc cửa sổ Auto Profile đang mở.
@@ -635,6 +1144,8 @@ public sealed partial class ManagerForm
             {
                 running = false;
                 paused = false;
+                preCreateRunning = false;
+                preCreateStopRequested = false;
                 try { runCts?.Dispose(); } catch { }
                 runCts = null;
                 SetInputsEnabled(true);
@@ -953,7 +1464,9 @@ public sealed partial class ManagerForm
         bool autoStart,
         Func<bool> isPaused,
         CancellationToken ct,
-        Action<string, string, Color> ui)
+        Action<string, string, Color> ui,
+        bool verifyIdentityAfterRename = false,
+        bool writeIdentityDoneToExcel = true)
     {
         var stopwatch = Stopwatch.StartNew();
         var step = "RESERVE";
@@ -1112,9 +1625,10 @@ public sealed partial class ManagerForm
 
             await Task.Delay(TimeSpan.FromMilliseconds(1200), ct);
             var workerHealthy = await IsAutoProfileWorkerHealthyAsync(ctx);
-            var identityDone = !autoRename || await RunAccountPoolIoAsync(
-                () => _accountPoolService.IsIdentityDone(item.Account.Username),
-                ct);
+            var identityDone = !autoRename
+                || (writeIdentityDoneToExcel && await RunAccountPoolIoAsync(
+                    () => _accountPoolService.IsIdentityDone(item.Account.Username),
+                    ct));
 
             // SELF-HEAL nhanh: lần trước Excel còn FAIL nhưng trạng thái thực tế
             // đã hoàn tất (Tên/ảnh DONE + Worker RUNNING/RECOVERING). Không login,
@@ -1152,9 +1666,10 @@ public sealed partial class ManagerForm
 
             if (autoRename)
             {
-                identityDone = await RunAccountPoolIoAsync(
-                    () => _accountPoolService.IsIdentityDone(item.Account.Username),
-                    ct);
+                identityDone = writeIdentityDoneToExcel
+                    && await RunAccountPoolIoAsync(
+                        () => _accountPoolService.IsIdentityDone(item.Account.Username),
+                        ct);
 
                 if (identityDone)
                 {
@@ -1168,11 +1683,29 @@ public sealed partial class ManagerForm
                     ui(step, "Đang đổi tên / áp dụng Tên & ảnh TikTok...", Color.RoyalBlue);
                     await SetAutoCheckpointWithRetryAsync(item.Account.Id, "RENAMING", step,
                         AutoProfileNote("Bắt đầu luồng Tên & ảnh TikTok."), ct);
-                    await ApplyAutoProfileIdentityAsync(ctx, item, ct);
+                    await ApplyAutoProfileIdentityAsync(
+                        ctx,
+                        item,
+                        ct,
+                        verifyNameAfterUpdate: verifyIdentityAfterRename,
+                        writeExcelDone: writeIdentityDoneToExcel);
                     await SetAutoCheckpointWithRetryAsync(item.Account.Id, "RENAMED", step,
-                        AutoProfileNote("Tên/ảnh đã xử lý và Excel đã xác minh DONE."), ct);
+                        AutoProfileNote(
+                            writeIdentityDoneToExcel
+                                ? "Tên/ảnh đã xử lý và Excel đã xác minh DONE."
+                                : (verifyIdentityAfterRename
+                                    ? "Tên/ảnh đã xử lý và tên thực tế đã kiểm tra đúng; không ghi DONE Excel."
+                                    : "Tên/ảnh đã xử lý; bỏ qua kiểm tra tên và không ghi DONE Excel.")),
+                        ct);
                     identityDone = true;
-                    ui("RENAMED", "Đổi tên/ảnh hoàn tất.", Color.DarkGreen);
+                    ui(
+                        "RENAMED",
+                        writeIdentityDoneToExcel
+                            ? "Đổi tên/ảnh hoàn tất + DONE Excel."
+                            : (verifyIdentityAfterRename
+                                ? "Đổi tên/ảnh hoàn tất + kiểm tra tên OK (không ghi DONE Excel)."
+                                : "Đổi tên/ảnh hoàn tất (không kiểm tra tên)."),
+                        Color.DarkGreen);
                 }
             }
 
@@ -1200,8 +1733,14 @@ public sealed partial class ManagerForm
                 item.Account.Id,
                 AutoProfileNote($"Hoàn tất Auto Profile sau {(int)stopwatch.Elapsed.TotalMinutes:00}:{stopwatch.Elapsed.Seconds:00}."),
                 ct);
-            _autoIdentityHandledSession.Add(item.ProfileName);
-            _autoIdentityHandledSession.Add("account:" + item.Account.Username.Trim().ToLowerInvariant());
+            // Với chế độ tạo trước không kiểm tra tên + không ghi DONE, không khóa
+            // scheduler Tên/ảnh bằng một "đã xử lý" giả. Profile sẽ được đóng ngay
+            // và lần mở sau vẫn có quyền kiểm tra tên nếu cấu hình yêu cầu.
+            if (!autoRename || verifyIdentityAfterRename || writeIdentityDoneToExcel)
+            {
+                _autoIdentityHandledSession.Add(item.ProfileName);
+                _autoIdentityHandledSession.Add("account:" + item.Account.Username.Trim().ToLowerInvariant());
+            }
             ui("DONE", autoStart ? "READY — tool đang chạy." : "READY — chưa tự Bắt đầu theo cấu hình.", Color.DarkGreen);
             _log.Info($"[AUTO_PROFILE_READY] profile={item.ProfileName} account={item.Account.Username} elapsed={stopwatch.Elapsed}");
             return new AutoProfileProcessOutcome(true, false, "READY", "DONE", "Hoàn tất");
@@ -1408,9 +1947,15 @@ public sealed partial class ManagerForm
         return false;
     }
 
-    async Task ApplyAutoProfileIdentityAsync(ProfileContext ctx, AutoProfileQueueItem item, CancellationToken ct)
+    async Task ApplyAutoProfileIdentityAsync(
+        ProfileContext ctx,
+        AutoProfileQueueItem item,
+        CancellationToken ct,
+        bool verifyNameAfterUpdate = false,
+        bool writeExcelDone = true)
     {
-        if (await RunAccountPoolIoAsync(
+        if (writeExcelDone
+            && await RunAccountPoolIoAsync(
                 () => _accountPoolService.IsIdentityDone(item.Account.Username),
                 ct))
         {
@@ -1463,20 +2008,182 @@ public sealed partial class ManagerForm
         if (reply.Skipped && !reply.AlreadyConfigured)
             throw new AutoProfilePauseException("PAUSED_RENAME", "RENAME", string.IsNullOrWhiteSpace(reply.Message) ? "TikTok bỏ qua thao tác đổi tên." : reply.Message);
 
-        var excelDone = await MarkIdentityDoneVerifiedAsync(
-            item.Account.Username, item.ProfileName, ct);
-        if (!excelDone.Ok)
-            throw new AutoProfilePauseException(
-                "PAUSED_RENAME_EXCEL",
-                "RENAME",
-                "TikTok đã xử lý tên/ảnh nhưng Excel chưa ghi/xác minh được DONE: " + excelDone.Error);
+        if (verifyNameAfterUpdate)
+        {
+            var verified = await VerifyPreparedProfileNameAsync(
+                ctx,
+                item.Account.Username,
+                names,
+                ct);
+
+            if (!verified.Ok)
+                throw new AutoProfilePauseException(
+                    "PAUSED_NAME_VERIFY",
+                    "RENAME",
+                    verified.Error);
+        }
+
+        if (writeExcelDone)
+        {
+            var excelDone = await MarkIdentityDoneVerifiedAsync(
+                item.Account.Username, item.ProfileName, ct);
+            if (!excelDone.Ok)
+                throw new AutoProfilePauseException(
+                    "PAUSED_RENAME_EXCEL",
+                    "RENAME",
+                    "TikTok đã xử lý tên/ảnh nhưng Excel chưa ghi/xác minh được DONE: " + excelDone.Error);
+        }
 
         if (reply.AvatarChanged && !string.IsNullOrWhiteSpace(avatarPath))
         {
             state.LastAvatarByProfile[ctx.Profile.Name] = avatarPath;
             SaveIdentityToolState(state);
         }
-        _log.Info($"[AUTO_PROFILE_RENAME_DONE] profile={item.ProfileName} account={item.Account.Username} nameChanged={reply.NameChanged} alreadyConfigured={reply.AlreadyConfigured} Excel=DONE verified=true");
+        _log.Info(
+            $"[AUTO_PROFILE_RENAME_DONE] profile={item.ProfileName} account={item.Account.Username} "
+            + $"nameChanged={reply.NameChanged} alreadyConfigured={reply.AlreadyConfigured} "
+            + $"verifyName={verifyNameAfterUpdate} excelDone={writeExcelDone}");
+    }
+
+    async Task<(bool Ok, string Error)> VerifyPreparedProfileNameAsync(
+        ProfileContext ctx,
+        string username,
+        IReadOnlyList<string> names,
+        CancellationToken ct)
+    {
+        NameGuardProbeReply? lastProbe = null;
+
+        // Tạo trước ưu tiên chậm mà chắc: sau khi Save tên, đợi trang ổn định
+        // rồi đọc tên thực tế tối đa 3 lần trước khi quyết định có đưa PRF vào Chờ.
+        await Task.Delay(TimeSpan.FromSeconds(2), ct);
+
+        for (var attempt = 1; attempt <= 3; attempt++)
+        {
+            ct.ThrowIfCancellationRequested();
+            lastProbe = await ProbeNameGuardFastAsync(ctx, username, names);
+
+            _log.Info(
+                $"[AUTO_PROFILE_PRECREATE_NAME_VERIFY] profile={ctx.Profile.Name} account={username} "
+                + $"attempt={attempt}/3 ok={lastProbe.Ok} matched={lastProbe.Matched} "
+                + $"currentName={lastProbe.CurrentName} source={lastProbe.Source} message={lastProbe.Message}");
+
+            if (lastProbe.Ok && lastProbe.Matched)
+                return (true, "");
+
+            if (attempt < 3)
+                await Task.Delay(TimeSpan.FromSeconds(3), ct);
+        }
+
+        if (lastProbe is null)
+            return (false, "Không đọc được tên TikTok sau khi đổi.");
+
+        if (!lastProbe.Ok)
+        {
+            var detail = string.IsNullOrWhiteSpace(lastProbe.Message)
+                ? "Worker/CDP chưa đọc được tên TikTok."
+                : lastProbe.Message;
+            return (false, "Kiểm tra tên chưa thành công sau 3 lần: " + detail);
+        }
+
+        var currentName = string.IsNullOrWhiteSpace(lastProbe.CurrentName)
+            ? "(trống)"
+            : lastProbe.CurrentName.Trim();
+        return (
+            false,
+            $"Tên TikTok thực tế vẫn chưa khớp danh sách cấu hình sau 3 lần kiểm tra. Đang đọc: {currentName}.");
+    }
+
+    async Task ClosePreparedProfileRuntimeAsync(string profileName, string? username = null)
+    {
+        profileName = (profileName ?? "").Trim();
+        if (profileName.Length == 0)
+            return;
+
+        ProfileContext? ctx = null;
+        if (!_contexts.TryGetValue(profileName, out ctx))
+        {
+            try
+            {
+                var catalog = _profileService.Load();
+                RefreshContextsFromCatalog(catalog);
+                _contexts.TryGetValue(profileName, out ctx);
+            }
+            catch { }
+        }
+
+        if (ctx is not null)
+        {
+            try
+            {
+                if (ctx.Worker is not null && !ctx.Worker.HasExited)
+                {
+                    try
+                    {
+                        await SendCommandAsync(ctx, "stop", TimeSpan.FromSeconds(5));
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.Warn($"[AUTO_PROFILE_PRECREATE_STOP_WARN] profile={profileName} error={ex.Message}");
+                    }
+
+                    try
+                    {
+                        await SendCloseChromeCommandAsync(ctx);
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.Warn($"[AUTO_PROFILE_PRECREATE_CLOSE_CHROME_WARN] profile={profileName} error={ex.Message}");
+                    }
+                }
+
+                await EnsureAutoCloseWorkerStoppedAsync(ctx);
+                await EnsureAutoCloseChromeStoppedAsync(ctx);
+
+                if (ctx.Tab is not null && !ctx.Tab.IsDisposed && ctx.Tab.Parent == _tabs)
+                    RemoveTab(ctx);
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException(
+                    $"Không đóng sạch PRF {profileName}; dừng đưa vào hàng chờ để tránh dùng profile còn mở.",
+                    ex);
+            }
+        }
+        else
+        {
+            var catalog = _profileService.Load();
+            var profile = catalog.Profiles.FirstOrDefault(x =>
+                x.Name.Equals(profileName, StringComparison.OrdinalIgnoreCase));
+
+            if (profile is not null)
+            {
+                await EnsureAutoCloseChromeStoppedByPathAsync(
+                    profileName,
+                    profile.ProfilePath);
+            }
+        }
+
+        ClearAutoCloseExpectedRunning(profileName, "auto_profile_precreate_waiting");
+        _autoIdentityHandledSession.Remove(profileName);
+        if (!string.IsNullOrWhiteSpace(username))
+            _autoIdentityHandledSession.Remove("account:" + username.Trim().ToLowerInvariant());
+        _autoIdentityNextProbeUtc.Remove(profileName);
+        _nameGuardVerifiedSessionAccount.Remove(profileName);
+
+        _log.Info($"[AUTO_PROFILE_PRECREATE_CLOSED] profile={profileName} account={username} chrome=0 worker=closed");
+    }
+
+    async Task TryClosePreparedProfileRuntimeQuietlyAsync(string profileName, string? username = null)
+    {
+        try
+        {
+            await ClosePreparedProfileRuntimeAsync(profileName, username);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn(
+                $"[AUTO_PROFILE_PRECREATE_CLEANUP_WARN] profile={profileName} error={ex.Message}");
+        }
     }
 
     async Task StartAutoProfileWorkerWithRetryAsync(

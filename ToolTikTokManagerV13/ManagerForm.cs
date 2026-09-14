@@ -1128,6 +1128,9 @@ public sealed partial class ManagerForm : Form
     {
         foreach (var ctx in _contexts.Values.Where(c => c.Worker is not null && !c.Worker.HasExited).ToList())
         {
+            // Dừng tất cả là thao tác thủ công: giảm target trước khi STOP để reconcile
+            // không kịp nhìn thấy khoảng trống và mở bù trở lại.
+            RegisterManagerManualCloseIntent(ctx, "MANAGER_STOP_ALL");
             try { await SendCommandAsync(ctx, "stop", TimeSpan.FromSeconds(5)); } catch { }
         }
     }
@@ -1140,20 +1143,10 @@ public sealed partial class ManagerForm : Form
             if (MessageBox.Show($"Đóng worker V13 của '{ctx.Profile.Name}'?\nChrome/profile đăng nhập không bị xóa.", "Đóng profile", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
         }
 
-        // Nút X trên tab là ý định ĐÓNG THỦ CÔNG của người dùng.
-        // Trước đây nhánh này chỉ shutdown Worker + gỡ tab, nhưng không giảm target
-        // Tự bù. Sau khi tab biến mất, capacity reconcile thấy thiếu 1 slot và có thể
-        // tự mở profile bù trở lại.
-        //
-        // Chỉ giảm target khi profile này thực sự đang chiếm một slot và không nằm
-        // trong AutoClose/cleanup tự động; nhờ vậy X thủ công không sinh suất bù,
-        // còn BAN/TIME/FAULT thật vẫn giữ nguyên cơ chế bù hiện tại.
-        if (!_autoCloseInProgressProfiles.Contains(ctx.Profile.Name)
-            && !_autoReplacementClaimedProfiles.Contains(ctx.Profile.Name)
-            && IsAutoReplacementSlotCurrentlyCounted(ctx.Profile.Name))
-        {
-            RegisterManagerManualCloseIntent(ctx, "MANAGER_TAB_X_CLOSE");
-        }
+        // Nút X trên tab luôn là intent thủ công. Helper tự kiểm tra profile có thật sự
+        // thuộc target hay không; CLAIMED/STABILIZING vẫn được coi là member để user
+        // có thể hủy một suất đang khởi động mà không bị queue mở profile khác thay thế.
+        RegisterManagerManualCloseIntent(ctx, "MANAGER_TAB_X_CLOSE");
 
         if (worker is not null && !worker.HasExited)
         {

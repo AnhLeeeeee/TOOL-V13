@@ -552,6 +552,13 @@ public sealed partial class ManagerForm
 
                     if (!filled)
                     {
+                        if (SuppressAutoReplacementRequestIfTargetSatisfied(
+                                request,
+                                "after_reuse"))
+                        {
+                            continue;
+                        }
+
                         if (!IsAutoReplacementExecutionAllowed(execution.Generation))
                         {
                             _log.Warn(
@@ -573,6 +580,13 @@ public sealed partial class ManagerForm
 
                     if (!filled)
                     {
+                        if (SuppressAutoReplacementRequestIfTargetSatisfied(
+                                request,
+                                "after_name_sync_reuse"))
+                        {
+                            continue;
+                        }
+
                         if (!IsAutoReplacementExecutionAllowed(execution.Generation))
                         {
                             _log.Warn(
@@ -603,6 +617,14 @@ public sealed partial class ManagerForm
                                 execution.Generation,
                                 execution.Token);
                         }
+                    }
+
+                    if (!filled
+                        && SuppressAutoReplacementRequestIfTargetSatisfied(
+                            request,
+                            "after_fallback_new"))
+                    {
+                        continue;
                     }
 
                     if (!filled && string.IsNullOrWhiteSpace(lastError))
@@ -1171,6 +1193,16 @@ public sealed partial class ManagerForm
                                 $"[AUTO_REPLACE_CREATE_PROGRESS] profile={item.ProfileName} step={step} result={result}");
                         });
 
+                    if (IsManualCloseSuppressed(item.ProfileName))
+                    {
+                        _log.Warn(
+                            $"[AUTO_REPLACE_CREATE_MANUAL_ABORT] closed={request.ClosedProfileName} profile={item.ProfileName} stage=after_process");
+                        await CleanupCreatedReplacementAttemptAsync(
+                            item.ProfileName,
+                            "manual_close_after_process");
+                        return false;
+                    }
+
                     if (outcome.Success)
                     {
                         if (!_contexts.TryGetValue(item.ProfileName, out var createdCtx))
@@ -1194,6 +1226,16 @@ public sealed partial class ManagerForm
 
                         if (!healthy)
                         {
+                            if (IsManualCloseSuppressed(item.ProfileName))
+                            {
+                                _log.Warn(
+                                    $"[AUTO_REPLACE_CREATE_MANUAL_ABORT] closed={request.ClosedProfileName} profile={item.ProfileName} stage=healthy_wait");
+                                await CleanupCreatedReplacementAttemptAsync(
+                                    item.ProfileName,
+                                    "manual_close_during_healthy_wait");
+                                return false;
+                            }
+
                             MarkReplacementProfileFailed(item.ProfileName, "created_started_but_not_healthy");
 
                             _log.Warn(
@@ -1315,6 +1357,16 @@ public sealed partial class ManagerForm
                                 "created_start_recovery",
                                 executionGeneration,
                                 executionToken);
+
+                            if (IsManualCloseSuppressed(item.ProfileName))
+                            {
+                                _log.Warn(
+                                    $"[AUTO_REPLACE_CREATE_MANUAL_ABORT] closed={request.ClosedProfileName} profile={item.ProfileName} stage=stabilize");
+                                await CleanupCreatedReplacementAttemptAsync(
+                                    item.ProfileName,
+                                    "manual_close_during_stabilize");
+                                return false;
+                            }
 
                             if (stabilization.NameSyncPending)
                             {
@@ -1498,6 +1550,20 @@ public sealed partial class ManagerForm
 
         while (!_closing && DateTime.UtcNow < deadlineUtc)
         {
+            if (IsManualCloseSuppressed(ctx.Profile.Name))
+            {
+                ClearAutoCloseExpectedRunning(
+                    ctx.Profile.Name,
+                    "auto_replace_manual_close_during_stabilize");
+
+                _log.Warn(
+                    $"[AUTO_REPLACE_STABILIZE_MANUAL_ABORT] id={request.Id} profile={ctx.Profile.Name} source={source}");
+
+                return new AutoReplacementStabilizationResult(
+                    false, false, true,
+                    "MANUAL_CLOSE: user đã chủ động đóng profile trong lúc ổn định.");
+            }
+
             if (!IsAutoReplacementExecutionAllowed(executionGeneration))
                 throw new OperationCanceledException(executionToken);
 
@@ -1694,6 +1760,13 @@ public sealed partial class ManagerForm
 
         while (!_closing && DateTime.UtcNow < deadlineUtc)
         {
+            if (IsManualCloseSuppressed(ctx.Profile.Name))
+            {
+                _log.Warn(
+                    $"[AUTO_REPLACE_PROBE_GRACE_MANUAL_ABORT] id={request.Id} profile={ctx.Profile.Name} source={source}");
+                return false;
+            }
+
             if (!IsAutoReplacementExecutionAllowed(executionGeneration))
                 throw new OperationCanceledException(executionToken);
 
@@ -1873,6 +1946,29 @@ public sealed partial class ManagerForm
             _log.Info(
                 $"[AUTO_REPLACE_PROFILE_ATTEMPT_ONCE] id={request.Id} closed={request.ClosedProfileName} profile={profileName} source={source} attemptedCount={GetAutoReplacementAttemptedProfileCount(request)}");
         }
+    }
+
+    bool SuppressAutoReplacementRequestIfTargetSatisfied(
+        AutoReplacementRequest request,
+        string source)
+    {
+        var gate = EvaluateAutoReplacementFixedSlotGate(request);
+        if (!gate.AlreadySatisfied)
+            return false;
+
+        RemoveAutoReplacementRequest(request.Id);
+
+        _log.Warn(
+            $"[AUTO_REPLACE_DYNAMIC_TARGET_SUPPRESSED] id={request.Id} closed={request.ClosedProfileName} source={source} target={gate.TargetSlots} occupied={gate.OccupiedSlots}");
+
+        WriteAutoActivityLog(
+            action: "SUẤT BÙ",
+            profile: request.ClosedProfileName,
+            reason: request.Reason,
+            result: "BỎ QUA - TARGET ĐÃ GIẢM",
+            detail: $"source={source}; target={gate.TargetSlots}; occupied={gate.OccupiedSlots}. Manual close/target change đã làm suất này không còn cần thiết.");
+
+        return true;
     }
 
     int GetAutoReplacementPendingCount()

@@ -1356,6 +1356,13 @@ public sealed partial class ManagerForm
                 continue;
             }
 
+            if (IsManualCloseSuppressed(profileName))
+            {
+                _log.Info(
+                    $"[NAME_SYNC_RECOVERY_SKIP_MANUAL_CLOSE] id={request.Id} profile={profileName}");
+                continue;
+            }
+
             // 1 profile chỉ được thử 1 lần trong CÙNG một suất bù, kể cả request
             // đã RETRY sau 2/3/5 phút. Không mở đi mở lại khi tên TikTok chưa kịp sync.
             if (HasAutoReplacementProfileBeenAttempted(request, profileName))
@@ -1522,6 +1529,16 @@ public sealed partial class ManagerForm
 
                 if (!probeReady)
                 {
+                    if (IsManualCloseSuppressed(profileName))
+                    {
+                        await CleanupCreatedReplacementAttemptAsync(
+                            profileName,
+                            "name_sync_recovery_manual_close_during_probe_grace");
+                        _log.Warn(
+                            $"[NAME_SYNC_RECOVERY_MANUAL_ABORT] profile={profileName} stage=probe_grace");
+                        return false;
+                    }
+
                     await CleanupCreatedReplacementAttemptAsync(
                         profileName,
                         "name_sync_recovery_probe_ready_10m_timeout");
@@ -1634,6 +1651,16 @@ public sealed partial class ManagerForm
                 }
 
                 executionToken.ThrowIfCancellationRequested();
+
+                if (IsManualCloseSuppressed(profileName))
+                {
+                    await CleanupCreatedReplacementAttemptAsync(
+                        profileName,
+                        "name_sync_recovery_manual_close_during_stabilize");
+                    _log.Warn(
+                        $"[NAME_SYNC_RECOVERY_MANUAL_ABORT] profile={profileName} stage=stabilize");
+                    return false;
+                }
 
                 if (stabilization.NameSyncPending)
                 {
@@ -1800,6 +1827,13 @@ public sealed partial class ManagerForm
             if (_autoReplacementClaimedProfiles.Contains(profileName))
                 continue;
 
+            if (IsManualCloseSuppressed(profileName))
+            {
+                _log.Info(
+                    $"[REUSE_QUEUE_SKIP_MANUAL_CLOSE] id={request.Id} profile={profileName}");
+                continue;
+            }
+
             if (HasAutoReplacementProfileBeenAttempted(request, profileName))
             {
                 _log.Info(
@@ -1934,6 +1968,14 @@ public sealed partial class ManagerForm
 
                 executionToken.ThrowIfCancellationRequested();
 
+                if (IsManualCloseSuppressed(profileName))
+                {
+                    await CloseFailedReplacementRuntimeAsync(ctx);
+                    _log.Warn(
+                        $"[REUSE_QUEUE_MANUAL_ABORT] profile={profileName} stage=after_open");
+                    return false;
+                }
+
                 // Profile mới mở/VM chậm có tối đa 10 phút để ổn định. Trong grace
                 // chỉ recovery CHÍNH profile này; slot vẫn bị claim nên không mở bù chồng.
                 var stabilization = await StabilizeReplacementRuntimeAsync(
@@ -1962,6 +2004,14 @@ public sealed partial class ManagerForm
                 }
 
                 executionToken.ThrowIfCancellationRequested();
+
+                if (IsManualCloseSuppressed(profileName))
+                {
+                    await CloseFailedReplacementRuntimeAsync(ctx);
+                    _log.Warn(
+                        $"[REUSE_QUEUE_MANUAL_ABORT] profile={profileName} stage=stabilize");
+                    return false;
+                }
 
                 if (stabilization.NameSyncPending)
                 {

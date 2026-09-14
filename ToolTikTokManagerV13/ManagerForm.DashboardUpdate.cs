@@ -447,7 +447,12 @@ public sealed partial class ManagerForm
         flow.Controls.Add(ActionButton("■ Stop", UiButtonKind.Danger, async ctx =>
         {
             if (ctx.Worker is not null && !ctx.Worker.HasExited)
+            {
+                // Đánh dấu intent TRƯỚC khi gửi STOP. Nếu đợi Worker báo STOPPED rồi mới
+                // giảm target, capacity reconcile có thể kịp tạo một suất bù mới.
+                RegisterManagerManualCloseIntent(ctx, "DASHBOARD_STOP");
                 await SendCommandAsync(ctx, "stop", TimeSpan.FromSeconds(8));
+            }
         }));
         flow.Controls.Add(ActionButton("↻ Restart Chrome", UiButtonKind.Neutral, async ctx =>
         {

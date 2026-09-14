@@ -17,6 +17,10 @@ public sealed partial class ManagerForm
 
     readonly object _autoReplacementFixedSlotLock = new();
     int _autoReplacementTargetSlots;
+    // Phân biệt target=0 do user chủ động đóng hết với trạng thái "chưa từng capture".
+    // Nếu không có cờ này, slot gate cũ thấy target<=0 sẽ tự dựng lại target=1 và
+    // vô tình mở bù profile user vừa đóng thủ công.
+    bool _autoReplacementTargetInitialized;
 
     // Capacity reconcile chỉ hoạt động trong phiên hiện tại. Không persist target qua restart.
     bool _autoReplacementCapacityReconcileRunning;
@@ -35,6 +39,7 @@ public sealed partial class ManagerForm
             // Start All là intent mới rõ ràng: target phải BẰNG đúng số tab đang mở,
             // không giữ target lớn hơn từ một lượt Start All cũ trong cùng phiên.
             _autoReplacementTargetSlots = requestedSlots;
+            _autoReplacementTargetInitialized = true;
 
             _log.Info(
                 $"[AUTO_REPLACE_TARGET_START_ALL] old={old} requested={requestedSlots} target={_autoReplacementTargetSlots}");
@@ -60,10 +65,14 @@ public sealed partial class ManagerForm
         }
 
         int target;
+        bool targetInitialized;
         lock (_autoReplacementFixedSlotLock)
+        {
             target = _autoReplacementTargetSlots;
+            targetInitialized = _autoReplacementTargetInitialized;
+        }
 
-        if (target <= 0)
+        if (!targetInitialized || target <= 0)
             return;
 
         var nowUtc = DateTime.UtcNow;
@@ -115,6 +124,30 @@ public sealed partial class ManagerForm
                 return;
             }
 
+            // Target có thể vừa bị user giảm trong lúc pass 1 đang chờ 1-2 giây.
+            // Luôn re-read trước pass 2 để reconcile không dùng quota cũ.
+            int liveTarget;
+            bool liveTargetInitialized;
+            lock (_autoReplacementFixedSlotLock)
+            {
+                liveTarget = _autoReplacementTargetSlots;
+                liveTargetInitialized = _autoReplacementTargetInitialized;
+            }
+
+            if (!liveTargetInitialized || liveTarget <= 0)
+            {
+                _log.Info(
+                    $"[AUTO_REPLACE_CAPACITY_ABORT_TARGET_CHANGED] source={source} oldTarget={target} liveTarget={liveTarget} initialized={liveTargetInitialized}");
+                return;
+            }
+
+            if (liveTarget != target)
+            {
+                _log.Info(
+                    $"[AUTO_REPLACE_CAPACITY_TARGET_REFRESH] source={source} oldTarget={target} liveTarget={liveTarget}");
+                target = liveTarget;
+            }
+
             var occupiedPass2 = CountAutoReplacementOccupiedSlots();
             var pendingPass2 = GetAutoReplacementPendingCount();
 
@@ -159,6 +192,15 @@ public sealed partial class ManagerForm
             || !_autoCloseSettings.OpenReplacementAfterAutoClose)
         {
             return;
+        }
+
+        lock (_autoReplacementFixedSlotLock)
+        {
+            if (!_autoReplacementTargetInitialized || _autoReplacementTargetSlots <= 0)
+                return;
+
+            // Không tin target snapshot của caller nếu user vừa đổi quota.
+            target = _autoReplacementTargetSlots;
         }
 
         var queued = new List<AutoReplacementRequest>();
@@ -226,6 +268,7 @@ public sealed partial class ManagerForm
             {
                 var old = _autoReplacementTargetSlots;
                 _autoReplacementTargetSlots = occupied;
+                _autoReplacementTargetInitialized = true;
 
                 _log.Info(
                     $"[AUTO_REPLACE_TARGET_CAPTURE] old={old} target={_autoReplacementTargetSlots} profile={ctx.Profile.Name} reason={reason}");
@@ -240,17 +283,24 @@ public sealed partial class ManagerForm
         command = (command ?? "").Trim().ToLowerInvariant();
         var profileName = ctx.Profile.Name;
 
-        // start_auto là profile do Tự bù/Auto Profile tạo; không được tự làm target phình lên.
+        // START thủ công là intent tăng/khôi phục suất. Đồng thời cho phép profile
+        // vừa bị user đóng được sử dụng lại ngay nếu chính user chủ động Start lại.
         if (command == "start")
         {
+            ClearManualCloseSuppression(
+                profileName,
+                "runtime_command:start");
+
             var occupied = CountAutoReplacementOccupiedSlots();
 
             lock (_autoReplacementFixedSlotLock)
             {
-                if (occupied > _autoReplacementTargetSlots)
+                if (!_autoReplacementTargetInitialized
+                    || occupied > _autoReplacementTargetSlots)
                 {
                     var old = _autoReplacementTargetSlots;
-                    _autoReplacementTargetSlots = occupied;
+                    _autoReplacementTargetSlots = Math.Max(occupied, 1);
+                    _autoReplacementTargetInitialized = true;
                     _log.Info(
                         $"[AUTO_REPLACE_TARGET_MANUAL_EXPAND] old={old} target={_autoReplacementTargetSlots} profile={profileName}");
                 }
@@ -262,29 +312,12 @@ public sealed partial class ManagerForm
         if (command != "stop")
             return;
 
-        // STOP do AutoClose/cleanup của profile bù lỗi không phải ý định giảm số suất của user.
-        if (_autoCloseInProgressProfiles.Contains(profileName)
-            || _autoReplacementClaimedProfiles.Contains(profileName))
-        {
-            return;
-        }
-
-        lock (_autoReplacementFixedSlotLock)
-        {
-            if (_autoReplacementTargetSlots <= 0)
-                return;
-
-            var old = _autoReplacementTargetSlots;
-            _autoReplacementTargetSlots = Math.Max(
-                CountAutoReplacementOccupiedSlots(),
-                _autoReplacementTargetSlots - 1);
-
-            if (old != _autoReplacementTargetSlots)
-            {
-                _log.Info(
-                    $"[AUTO_REPLACE_TARGET_MANUAL_SHRINK] old={old} target={_autoReplacementTargetSlots} profile={profileName}");
-            }
-        }
+        // Không suy đoán manual/automatic từ một lệnh STOP chung nữa. Nhiều flow nội bộ
+        // (rename/login/cleanup) cũng gửi STOP. Manual Stop được đánh dấu TRƯỚC khi gửi
+        // command tại Dashboard/StopAll; X Worker dùng worker_manual_close_intent.json.
+        // Nhờ vậy STOP nội bộ không làm target co sai, còn manual close không bị bù lại.
+        _log.Info(
+            $"[AUTO_REPLACE_TARGET_STOP_OBSERVED] profile={profileName} manualSuppressed={IsManualCloseSuppressed(profileName)} autoClose={_autoCloseInProgressProfiles.Contains(profileName)} claimed={_autoReplacementClaimedProfiles.Contains(profileName)} action=NO_IMPLICIT_TARGET_CHANGE");
     }
 
     bool IsAutoReplacementSlotCurrentlyCounted(string profileName)
@@ -531,15 +564,20 @@ public sealed partial class ManagerForm
 
         lock (_autoReplacementFixedSlotLock)
         {
-            // Nếu target chưa được capture (ví dụ Manager adopt Worker cũ),
-            // tối thiểu giữ đúng số suất hiện có + request đang cần bù.
-            if (_autoReplacementTargetSlots <= 0)
+            // Chỉ fallback khi target CHƯA TỪNG được capture trong phiên. Target=0 đã
+            // initialized nghĩa là user chủ động đóng hết; tuyệt đối không dựng lại 1 suất.
+            if (!_autoReplacementTargetInitialized)
+            {
                 _autoReplacementTargetSlots = Math.Max(1, occupied + 1);
+                _autoReplacementTargetInitialized = true;
+                _log.Info(
+                    $"[AUTO_REPLACE_TARGET_FALLBACK_INIT] target={_autoReplacementTargetSlots} occupied={occupied} request={request.Id}");
+            }
 
             target = _autoReplacementTargetSlots;
         }
 
-        if (occupied >= target)
+        if (target <= 0 || occupied >= target)
         {
             return new AutoReplacementSlotGateResult(
                 false,
