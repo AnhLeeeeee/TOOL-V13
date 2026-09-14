@@ -2277,26 +2277,63 @@ public sealed partial class ManagerForm : Form
             return items.FirstOrDefault(x => x.Id == id);
         }
 
-        var openExcel = new Button { Text = "Mở Excel", AutoSize = true, Height = 36 };
-        var reload = new Button { Text = "Tải lại", AutoSize = true, Height = 36 };
-        var scanReuse = new Button { Text = "Quét chờ", AutoSize = true, Height = 36 };
-        var addReuseManual = new Button { Text = "+ Vào chờ", AutoSize = true, Height = 36 };
-        var removeReuseManual = new Button { Text = "- Bỏ chờ", AutoSize = true, Height = 36 };
-        var add = new Button { Text = "+ Thêm dòng", AutoSize = true, Height = 36 };
-        var edit = new Button { Text = "Sửa", AutoSize = true, Height = 36 };
-        var release = new Button { Text = "Bỏ gán profile", AutoSize = true, Height = 36 };
-        var delete = new Button { Text = "Xóa dòng", AutoSize = true, Height = 36 };
-        var close = new Button { Text = "Đóng", DialogResult = DialogResult.Cancel, AutoSize = true, Height = 36 };
+        var openExcel = new Button { Text = "Mở Excel", AutoSize = true, Height = 34 };
+        var reload = new Button { Text = "Tải lại", AutoSize = true, Height = 34 };
+        var scanReuse = new Button { Text = "Quét chờ", AutoSize = true, Height = 34 };
+        var drainReuse = new Button { Text = "Dọn PRF chờ", AutoSize = true, Height = 34 };
+        var addReuseManual = new Button { Text = "+ Vào chờ", AutoSize = true, Height = 34 };
+        var removeReuseManual = new Button { Text = "- Bỏ chờ", AutoSize = true, Height = 34 };
+        var add = new Button { Text = "+ Thêm", AutoSize = true, Height = 34 };
+        var edit = new Button { Text = "Sửa", AutoSize = true, Height = 34 };
+        var moreActions = new Button { Text = "Thao tác khác ▼", AutoSize = true, Height = 34 };
+        var close = new Button { Text = "Đóng", DialogResult = DialogResult.Cancel, AutoSize = false, Width = 92, Height = 34 };
+
+        var moreActionsMenu = new ContextMenuStrip
+        {
+            ShowImageMargin = false,
+            Font = form.Font
+        };
+        var releaseMenu = new ToolStripMenuItem("Bỏ gán profile");
+        var deleteMenu = new ToolStripMenuItem("Xóa dòng")
+        {
+            ForeColor = Color.Firebrick
+        };
+        moreActionsMenu.Items.Add(releaseMenu);
+        moreActionsMenu.Items.Add(new ToolStripSeparator());
+        moreActionsMenu.Items.Add(deleteMenu);
+
         ModernDialog.StylePrimaryButton(openExcel);
         ModernDialog.StyleSecondaryButton(reload);
         ModernDialog.StyleSecondaryButton(scanReuse);
+        ModernDialog.StylePrimaryButton(drainReuse);
         ModernDialog.StylePrimaryButton(addReuseManual);
         ModernDialog.StyleSecondaryButton(removeReuseManual);
         ModernDialog.StylePrimaryButton(add);
         ModernDialog.StyleSecondaryButton(edit);
-        ModernDialog.StyleSecondaryButton(release);
-        ModernDialog.StyleSecondaryButton(delete);
+        ModernDialog.StyleSecondaryButton(moreActions);
         ModernDialog.StyleSecondaryButton(close);
+
+        moreActions.Click += (_, _) =>
+        {
+            if (!moreActions.Enabled) return;
+            moreActionsMenu.Show(moreActions, new Point(0, moreActions.Height));
+        };
+
+        void UpdateActionAvailability()
+        {
+            var current = SelectedItem();
+            var hasSelection = current is not null;
+            var assignedProfile = (current?.AssignedProfile ?? "").Trim();
+            var inReuseQueue = assignedProfile.Length > 0
+                               && GetReusableProfileQueueSnapshot().ContainsKey(assignedProfile);
+
+            addReuseManual.Enabled = hasSelection && assignedProfile.Length > 0 && !inReuseQueue;
+            removeReuseManual.Enabled = hasSelection && assignedProfile.Length > 0 && inReuseQueue;
+            edit.Enabled = hasSelection;
+            releaseMenu.Enabled = hasSelection && assignedProfile.Length > 0;
+            deleteMenu.Enabled = hasSelection;
+            moreActions.Enabled = releaseMenu.Enabled || deleteMenu.Enabled;
+        }
 
         openExcel.Click += (_, _) =>
         {
@@ -2384,6 +2421,69 @@ public sealed partial class ManagerForm : Form
             finally
             {
                 scanReuse.Enabled = true;
+            }
+        };
+
+        drainReuse.Click += async (_, _) =>
+        {
+            var pending = GetNameSyncPendingReusableProfileCount();
+            if (pending <= 0)
+            {
+                ModernDialog.ShowMessage(
+                    form,
+                    "Hiện không có PRF CHỜ ĐỒNG BỘ TÊN cần dọn.",
+                    "Dọn kho PRF chờ",
+                    MessageBoxIcon.Information);
+                return;
+            }
+
+            if (ModernDialog.ShowConfirm(
+                    form,
+                    $"Dọn {pending} PRF đang CHỜ ĐỒNG BỘ TÊN?\n\n"
+                    + "Tool sẽ xử lý tuần tự từng PRF: mở → kiểm tra tên → đóng sạch → PRF kế tiếp.\n"
+                    + "Mỗi PRF vừa kiểm tra chưa đủ 60 giây sẽ được bỏ qua để tránh mở lặp quá nhanh.\n"
+                    + "PRF có tên đã đồng bộ sẽ được chuyển về SẴN SÀNG DÙNG LẠI; không Start automation và không tạo PRF mới.",
+                    "Dọn kho PRF chờ") != DialogResult.Yes)
+            {
+                return;
+            }
+
+            drainReuse.Enabled = false;
+            var oldSourceText = sourceInfo.Text;
+            try
+            {
+                var summary = await DrainReusableProfileNameSyncQueueAsync(
+                    text =>
+                    {
+                        if (!form.IsDisposed && !sourceInfo.IsDisposed)
+                            sourceInfo.Text = text;
+                    });
+
+                RefreshGrid();
+                ModernDialog.ShowMessage(
+                    form,
+                    $"Dọn kho hoàn tất.\n\n"
+                    + $"Đã kiểm tra: {summary.Checked}\n"
+                    + $"Tên đã đồng bộ / sẵn sàng: {summary.Ready}\n"
+                    + $"Vẫn phải chờ: {summary.StillWaiting}\n"
+                    + $"Bỏ qua (đang chạy / chưa đủ cooldown / không hợp lệ): {summary.Skipped}\n"
+                    + $"Cleanup chưa sạch: {summary.CleanupFailed}",
+                    "Dọn kho PRF chờ",
+                    summary.CleanupFailed > 0 ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                ModernDialog.ShowMessage(
+                    form,
+                    "Dọn kho bị dừng.\n\n" + ex.Message,
+                    "Dọn kho PRF chờ",
+                    MessageBoxIcon.Warning);
+            }
+            finally
+            {
+                drainReuse.Enabled = true;
+                if (!form.IsDisposed && !sourceInfo.IsDisposed && sourceInfo.Text.StartsWith("Đang kiểm tra PRF", StringComparison.OrdinalIgnoreCase))
+                    sourceInfo.Text = oldSourceText;
             }
         };
 
@@ -2499,7 +2599,7 @@ public sealed partial class ManagerForm : Form
             }
         };
 
-        release.Click += (_, _) =>
+        releaseMenu.Click += (_, _) =>
         {
             var current = SelectedItem();
             if (current is null || string.IsNullOrWhiteSpace(current.AssignedProfile)) return;
@@ -2507,7 +2607,7 @@ public sealed partial class ManagerForm : Form
             RefreshGrid();
         };
 
-        delete.Click += (_, _) =>
+        deleteMenu.Click += (_, _) =>
         {
             var current = SelectedItem();
             if (current is null) return;
@@ -2524,7 +2624,11 @@ public sealed partial class ManagerForm : Form
                 ModernDialog.ShowMessage(form, ex.Message, "Không xóa được trong Excel", MessageBoxIcon.Warning);
             }
         };
-        grid.SelectionChanged += (_, _) => UpdateDetailInfo();
+        grid.SelectionChanged += (_, _) =>
+        {
+            UpdateDetailInfo();
+            UpdateActionAvailability();
+        };
         grid.CellDoubleClick += (_, _) => edit.PerformClick();
 
         var autoRefreshTimer = new System.Windows.Forms.Timer
@@ -2579,25 +2683,82 @@ public sealed partial class ManagerForm : Form
             }
         };
 
-        var footer = new FlowLayoutPanel
+        var footer = new TableLayoutPanel
         {
             Dock = DockStyle.Bottom,
-            Height = 106,
-            Padding = new Padding(14, 10, 14, 10),
-            WrapContents = true,
-            FlowDirection = FlowDirection.LeftToRight,
+            Height = 104,
+            Padding = new Padding(14, 7, 14, 7),
+            ColumnCount = 2,
+            RowCount = 1,
             BackColor = ModernDialog.Canvas
         };
-        footer.Controls.Add(openExcel);
-        footer.Controls.Add(reload);
-        footer.Controls.Add(scanReuse);
-        footer.Controls.Add(addReuseManual);
-        footer.Controls.Add(removeReuseManual);
-        footer.Controls.Add(add);
-        footer.Controls.Add(edit);
-        footer.Controls.Add(release);
-        footer.Controls.Add(delete);
-        footer.Controls.Add(close);
+        footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        footer.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        footer.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+
+        var footerRows = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty
+        };
+        footerRows.RowStyles.Add(new RowStyle(SizeType.Percent, 50F));
+        footerRows.RowStyles.Add(new RowStyle(SizeType.Percent, 50F));
+
+        var primaryActions = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            WrapContents = false,
+            FlowDirection = FlowDirection.LeftToRight,
+            Margin = Padding.Empty,
+            Padding = new Padding(0, 1, 0, 1)
+        };
+        primaryActions.Controls.Add(openExcel);
+        primaryActions.Controls.Add(reload);
+        primaryActions.Controls.Add(scanReuse);
+        primaryActions.Controls.Add(drainReuse);
+
+        var secondaryActions = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            WrapContents = false,
+            FlowDirection = FlowDirection.LeftToRight,
+            Margin = Padding.Empty,
+            Padding = new Padding(0, 1, 0, 1)
+        };
+        secondaryActions.Controls.Add(addReuseManual);
+        secondaryActions.Controls.Add(removeReuseManual);
+        secondaryActions.Controls.Add(new Label
+        {
+            AutoSize = false,
+            Width = 1,
+            Height = 26,
+            BackColor = Color.FromArgb(210, 216, 224),
+            Margin = new Padding(9, 5, 9, 0)
+        });
+        secondaryActions.Controls.Add(add);
+        secondaryActions.Controls.Add(edit);
+        secondaryActions.Controls.Add(moreActions);
+
+        footerRows.Controls.Add(primaryActions, 0, 0);
+        footerRows.Controls.Add(secondaryActions, 0, 1);
+
+        var closeArea = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            FlowDirection = FlowDirection.TopDown,
+            WrapContents = false,
+            Margin = Padding.Empty,
+            Padding = new Padding(12, 27, 0, 0)
+        };
+        closeArea.Controls.Add(close);
+
+        footer.Controls.Add(footerRows, 0, 0);
+        footer.Controls.Add(closeArea, 1, 0);
+        UpdateActionAvailability();
 
         form.Controls.Add(grid);
         form.Controls.Add(detailInfo);
@@ -2608,6 +2769,7 @@ public sealed partial class ManagerForm : Form
         {
             try { autoRefreshTimer.Stop(); } catch { }
             try { autoRefreshTimer.Dispose(); } catch { }
+            try { moreActionsMenu.Dispose(); } catch { }
         };
         form.Shown += async (_, _) =>
         {

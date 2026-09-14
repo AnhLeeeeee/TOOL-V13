@@ -965,6 +965,228 @@ public sealed partial class ManagerForm
                || tabOpen;
     }
 
+    sealed record ReusableProfileDrainSummary(
+        int Checked,
+        int Ready,
+        int StillWaiting,
+        int Skipped,
+        int CleanupFailed);
+
+    void PromoteNameSyncPendingProfileToReady(string profileName, string currentName)
+    {
+        profileName = (profileName ?? "").Trim();
+        if (profileName.Length == 0) return;
+
+        lock (_reusableProfileQueueLock)
+        {
+            var document = CloneReusableProfileQueueDocument(
+                EnsureReusableProfileQueueLoadedUnsafe());
+
+            var entry = document.Pending.FirstOrDefault(x =>
+                x.ProfileName.Equals(profileName, StringComparison.OrdinalIgnoreCase));
+            if (entry is null) return;
+
+            entry.NameSyncPending = false;
+            entry.NameSyncQueuedUtc = null;
+            entry.LastCheckedUtc = DateTime.UtcNow;
+            // Giữ AddedUtc cũ để profile tồn lâu được ưu tiên dùng trước.
+
+            document.Pending = OrderReusableProfileEntries(document.Pending);
+            document.Version = 3;
+            _reusableProfileQueueCache = document;
+            _reusableProfileQueueLoaded = true;
+            _reusableProfileReasonCache[profileName] =
+                string.IsNullOrWhiteSpace(currentName)
+                    ? "SẴN SÀNG DÙNG LẠI"
+                    : $"SẴN SÀNG · TÊN: {currentName}";
+            SaveReusableProfileQueueUnsafe(document);
+        }
+
+        _log.Info($"[REUSE_QUEUE_DRAIN_READY] profile={profileName} currentName={currentName}");
+    }
+
+    async Task<ReusableProfileDrainSummary> DrainReusableProfileNameSyncQueueAsync(
+        Action<string>? progress,
+        CancellationToken ct = default)
+    {
+        await RefreshReusableProfileQueueAsync("manual_drain_name_sync", ct);
+
+        List<ReusableProfileQueueEntry> candidates;
+        lock (_reusableProfileQueueLock)
+        {
+            candidates = EnsureReusableProfileQueueLoadedUnsafe()
+                .Pending
+                .Where(x => x.NameSyncPending)
+                .OrderBy(x => x.AddedUtc)
+                .ThenBy(x => x.ProfileName, NaturalProfileNameOrder)
+                .Select(CloneReusableProfileQueueEntry)
+                .ToList();
+        }
+
+        var checkedCount = 0;
+        var readyCount = 0;
+        var waitingCount = 0;
+        var skippedCount = 0;
+        var cleanupFailed = 0;
+
+        foreach (var candidate in candidates)
+        {
+            ct.ThrowIfCancellationRequested();
+            var profileName = (candidate.ProfileName ?? "").Trim();
+            if (profileName.Length == 0) { skippedCount++; continue; }
+
+            // Không mở lại profile vừa mới kiểm tra: cho TikTok ít nhất 60 giây đồng bộ.
+            if ((DateTime.UtcNow - candidate.LastCheckedUtc) < AutoReplacementNameSyncMinRetryAge)
+            {
+                skippedCount++;
+                continue;
+            }
+
+            if (IsReusableProfileBusy(profileName)
+                || _autoReplacementClaimedProfiles.Contains(profileName))
+            {
+                skippedCount++;
+                continue;
+            }
+
+            TikTokAccountPoolItem? account = null;
+            try
+            {
+                account = await RunAccountPoolIoAsync(
+                    () =>
+                    {
+                        if (!string.IsNullOrWhiteSpace(_accountPoolService.CurrentSourcePath))
+                            _accountPoolService.ReloadCurrentExcel();
+                        return _accountPoolService.Load().FirstOrDefault(x =>
+                            x.Id.Equals(candidate.AccountId, StringComparison.OrdinalIgnoreCase)
+                            || (x.Username.Equals(candidate.Username, StringComparison.OrdinalIgnoreCase)
+                                && (x.AssignedProfile ?? "").Equals(profileName, StringComparison.OrdinalIgnoreCase)));
+                    }, ct);
+            }
+            catch { }
+
+            if (account is null
+                || (account.Note ?? "").Trim().Equals("ban", StringComparison.OrdinalIgnoreCase)
+                || !string.Equals((account.AssignedProfile ?? "").Trim(), profileName, StringComparison.OrdinalIgnoreCase))
+            {
+                skippedCount++;
+                continue;
+            }
+
+            try
+            {
+                var catalog = _profileService.Load();
+                RefreshContextsFromCatalog(catalog);
+            }
+            catch { }
+
+            if (!_contexts.TryGetValue(profileName, out var ctx))
+            {
+                skippedCount++;
+                continue;
+            }
+
+            checkedCount++;
+            progress?.Invoke($"Đang kiểm tra PRF {profileName} ({checkedCount}/{candidates.Count})...");
+            _autoReplacementClaimedProfiles.Add(profileName);
+
+            try
+            {
+                _ = await OpenProfileAsync(ctx, $"Dọn kho: kiểm tra tên PRF {profileName}...");
+
+                // Dọn kho chỉ cần đủ điều kiện đọc tên, không Start automation. Cho VM chậm
+                // tối đa 90 giây để Worker/Chrome/CDP sẵn sàng trước khi kết luận CHỜ tiếp.
+                var readyDeadline = DateTime.UtcNow.AddSeconds(90);
+                var probeReady = false;
+                while (DateTime.UtcNow < readyDeadline)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    try { await RefreshStatusAsync(ctx); } catch { }
+
+                    var workerAlive = IsNameGuardWorkerAlive(ctx);
+                    var chromeConnected = string.Equals(
+                        ctx.LastSnapshot?.Chrome, "CONNECTED", StringComparison.OrdinalIgnoreCase);
+
+                    if (workerAlive && chromeConnected)
+                    {
+                        probeReady = true;
+                        break;
+                    }
+
+                    if (!workerAlive)
+                    {
+                        try { _ = await OpenProfileAsync(ctx, $"Dọn kho: chờ Worker PRF {profileName}..."); }
+                        catch { }
+                    }
+                    else if (!chromeConnected)
+                    {
+                        try { await OpenChromeForProfileAsync(ctx); }
+                        catch { }
+                    }
+
+                    await Task.Delay(TimeSpan.FromSeconds(2), ct);
+                }
+
+                if (!probeReady)
+                {
+                    waitingCount++;
+                    TouchReusableProfileNameSyncPending(profileName, "manual_drain_probe_not_ready");
+                    continue;
+                }
+
+                var names = SplitIdentityNames(LoadIdentityToolState().NamesText);
+                if (names.Count == 0)
+                {
+                    waitingCount++;
+                    TouchReusableProfileNameSyncPending(profileName, "manual_drain_names_empty");
+                    continue;
+                }
+
+                var probe = await ProbeNameGuardFastAsync(ctx, account.Username, names);
+                if (!probe.Ok || !probe.Matched)
+                {
+                    waitingCount++;
+                    TouchReusableProfileNameSyncPending(
+                        profileName,
+                        probe.Ok ? "manual_drain_name_not_updated" : "manual_drain_probe_transient");
+                    continue;
+                }
+
+                var identityDone = await MarkIdentityDoneVerifiedAsync(account.Username, profileName, ct);
+                if (!identityDone.Ok)
+                {
+                    waitingCount++;
+                    TouchReusableProfileNameSyncPending(profileName, "manual_drain_identity_done_write_failed");
+                    continue;
+                }
+
+                PromoteNameSyncPendingProfileToReady(profileName, probe.CurrentName);
+                readyCount++;
+            }
+            finally
+            {
+                try
+                {
+                    await CleanupCreatedReplacementAttemptAsync(profileName, "manual_reuse_queue_drain");
+                }
+                catch (Exception ex)
+                {
+                    cleanupFailed++;
+                    _log.Warn($"[REUSE_QUEUE_DRAIN_CLEANUP_WARN] profile={profileName} error={ex.Message}");
+                }
+
+                _autoReplacementClaimedProfiles.Remove(profileName);
+            }
+
+            // Không mở/đóng liên tục quá nhanh trên VM.
+            await Task.Delay(TimeSpan.FromSeconds(10), ct);
+        }
+
+        await RefreshReusableProfileQueueAsync("manual_drain_name_sync_done", ct);
+        return new ReusableProfileDrainSummary(
+            checkedCount, readyCount, waitingCount, skippedCount, cleanupFailed);
+    }
+
     int GetNameSyncPendingReusableProfileCount()
     {
         lock (_reusableProfileQueueLock)

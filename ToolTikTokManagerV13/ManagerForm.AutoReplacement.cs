@@ -580,18 +580,32 @@ public sealed partial class ManagerForm
                             return;
                         }
 
-                        // Chỉ sau khi đã vét profile có sẵn (thường + NAME_SYNC_PENDING)
-                        // mới tiêu account chưa gán để tạo profile mới.
-                        _log.Info(
-                            $"[AUTO_REPLACE_REUSE_EXHAUSTED_FALLBACK_NEW] id={request.Id} closed={request.ClosedProfileName} attemptedProfiles={GetAutoReplacementAttemptedProfileCount(request)}");
+                        if (_autoCloseSettings.ReuseOnlyNoCreateProfile)
+                        {
+                            // Chế độ dọn kho: tuyệt đối không tiêu account mới. Sau khi đã
+                            // thử mỗi PRF chờ tối đa 1 lần trong vòng hiện tại, giữ slot
+                            // ở trạng thái CHỜ và bắt đầu một vòng mới sau 5 phút.
+                            lastError =
+                                "Chế độ CHỈ PRF CHỜ: đã thử hết profile chờ phù hợp; không tạo profile mới.";
 
-                        filled = await TryCreateReplacementAsync(
-                            request,
-                            execution.Generation,
-                            execution.Token);
+                            _log.Warn(
+                                $"[AUTO_REPLACE_REUSE_ONLY_EXHAUSTED] id={request.Id} closed={request.ClosedProfileName} attemptedProfiles={GetAutoReplacementAttemptedProfileCount(request)} action=wait_new_round");
+                        }
+                        else
+                        {
+                            // Chỉ sau khi đã vét profile có sẵn (thường + NAME_SYNC_PENDING)
+                            // mới tiêu account chưa gán để tạo profile mới.
+                            _log.Info(
+                                $"[AUTO_REPLACE_REUSE_EXHAUSTED_FALLBACK_NEW] id={request.Id} closed={request.ClosedProfileName} attemptedProfiles={GetAutoReplacementAttemptedProfileCount(request)}");
+
+                            filled = await TryCreateReplacementAsync(
+                                request,
+                                execution.Generation,
+                                execution.Token);
+                        }
                     }
 
-                    if (!filled)
+                    if (!filled && string.IsNullOrWhiteSpace(lastError))
                     {
                         lastError =
                             "Không dùng lại được profile chờ và chưa tạo được profile mới từ tài khoản chưa gán; giữ suất bù để thử lại.";
@@ -651,7 +665,15 @@ public sealed partial class ManagerForm
                 }
                 else
                 {
-                    ScheduleAutoReplacementRetry(request.Id, lastError);
+                    if (_autoCloseSettings.ReuseOnlyNoCreateProfile
+                        && lastError.StartsWith("Chế độ CHỈ PRF CHỜ", StringComparison.OrdinalIgnoreCase))
+                    {
+                        ScheduleAutoReplacementReuseOnlyRoundRetry(request.Id, lastError);
+                    }
+                    else
+                    {
+                        ScheduleAutoReplacementRetry(request.Id, lastError);
+                    }
 
                     // Cleanup profile bù lỗi là GLOBAL BARRIER của queue bù.
                     // Chưa dọn sạch A thì RunAutoReplacementQueueAsync đứng tại đây,
@@ -1867,6 +1889,42 @@ public sealed partial class ManagerForm
                 x.Id.Equals(requestId, StringComparison.OrdinalIgnoreCase));
 
             SaveAutoReplacementQueueUnsafe();
+        }
+    }
+
+    void ScheduleAutoReplacementReuseOnlyRoundRetry(string requestId, string lastError)
+    {
+        lock (_autoReplacementQueueLock)
+        {
+            var request = _autoReplacementQueue.FirstOrDefault(x =>
+                x.Id.Equals(requestId, StringComparison.OrdinalIgnoreCase));
+
+            if (request is null)
+                return;
+
+            request.AttemptCount++;
+            request.LastError = (lastError ?? "").Trim();
+
+            // Một VÒNG: mỗi profile tối đa 1 lần. Hết vòng thì nghỉ đủ lâu cho TikTok
+            // đồng bộ tên rồi mới cho phép các profile cũ tham gia vòng kế tiếp.
+            request.AttemptedProfiles ??= new List<string>();
+            var previousAttempted = request.AttemptedProfiles.Count;
+            request.AttemptedProfiles.Clear();
+
+            var delay = TimeSpan.FromMinutes(5);
+            request.NextAttemptUtc = DateTime.UtcNow.Add(delay);
+            SaveAutoReplacementQueueUnsafe();
+
+            _log.Warn(
+                $"[AUTO_REPLACE_REUSE_ONLY_NEW_ROUND] id={request.Id} closed={request.ClosedProfileName} " +
+                $"round={request.AttemptCount} clearedAttempted={previousAttempted} retryIn={delay:c} next={request.NextAttemptUtc:O}");
+
+            WriteAutoActivityLog(
+                action: "TỰ BÙ",
+                profile: request.ClosedProfileName,
+                reason: request.Reason,
+                result: "CHỜ PRF",
+                detail: $"Chỉ dùng PRF chờ; đã hết một vòng ({previousAttempted} PRF). Nghỉ 5 phút rồi quét lại, không tạo PRF mới.");
         }
     }
 

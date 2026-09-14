@@ -12,12 +12,16 @@ public sealed partial class ManagerForm
     {
         // V6: TIME mặc định 6 giờ. Bản cũ từng có default time=false / 3-5h,
         // khiến UI và runtime có thể lệch sau khi copy/cập nhật dist.
-        public int Version { get; set; } = 6;
+        public int Version { get; set; } = 7;
         public bool CloseOnBan { get; set; } = true;
         public bool CloseOnRunTime { get; set; } = true;
         public int RunHours { get; set; } = 6;
         public bool CloseOnNotRunning10Minutes { get; set; } = true;
         public bool OpenReplacementAfterAutoClose { get; set; } = true;
+
+        // V7: chế độ dọn kho - Tự bù chỉ dùng profile đã có trong Chờ dùng lại,
+        // tuyệt đối không tiêu account mới để tạo profile.
+        public bool ReuseOnlyNoCreateProfile { get; set; }
 
         // Chỉ xóa profile sau khi Excel đã ghi/xác minh:
         // BAN -> note=ban; hết vòng đời -> note=TIME_xH.
@@ -48,6 +52,7 @@ public sealed partial class ManagerForm
     readonly HashSet<string> _autoCloseVerifiedCleanProfiles = new(StringComparer.OrdinalIgnoreCase);
     AutoCloseSettingsDocument _autoCloseSettings = new();
     Button? _autoCloseToolbarButton;
+    string _autoCloseToolbarDisplayText = "Tự động";
 
     string AutoCloseSettingsPath => Path.Combine(_baseDir, "manager_auto_close.json");
 
@@ -66,7 +71,7 @@ public sealed partial class ManagerForm
         _refreshTimer.Tick += async (_, _) => await CheckAutoCloseRuntimeAsync();
 
         _log.Info(
-            $"[AUTO_CLOSE_INIT] ban={_autoCloseSettings.CloseOnBan} time={_autoCloseSettings.CloseOnRunTime} hours={_autoCloseSettings.RunHours} stuck10m={_autoCloseSettings.CloseOnNotRunning10Minutes} replace={_autoCloseSettings.OpenReplacementAfterAutoClose} deleteRetired={_autoCloseSettings.DeleteProfileAfterBanOrLifetime} settingsPath={AutoCloseSettingsPath}");
+            $"[AUTO_CLOSE_INIT] ban={_autoCloseSettings.CloseOnBan} time={_autoCloseSettings.CloseOnRunTime} hours={_autoCloseSettings.RunHours} stuck10m={_autoCloseSettings.CloseOnNotRunning10Minutes} replace={_autoCloseSettings.OpenReplacementAfterAutoClose} reuseOnly={_autoCloseSettings.ReuseOnlyNoCreateProfile} deleteRetired={_autoCloseSettings.DeleteProfileAfterBanOrLifetime} settingsPath={AutoCloseSettingsPath}");
     }
 
     AutoCloseSettingsDocument LoadAutoCloseSettings()
@@ -98,9 +103,12 @@ public sealed partial class ManagerForm
                 loaded.RunHours = 6;
             }
 
+            // V7 chỉ bổ sung một cờ mới, mặc định false để không thay đổi hành vi
+            // của máy khách sau khi nâng phiên bản.
+
             var normalized = NormalizeAutoCloseSettings(loaded);
 
-            if (oldVersion < 6)
+            if (oldVersion < 7)
             {
                 PersistAutoCloseSettingsMigration(
                     normalized,
@@ -119,7 +127,7 @@ public sealed partial class ManagerForm
 
     static AutoCloseSettingsDocument NormalizeAutoCloseSettings(AutoCloseSettingsDocument settings)
     {
-        settings.Version = 6;
+        settings.Version = 7;
         settings.RunHours = Math.Clamp(settings.RunHours, 3, 24);
         return settings;
     }
@@ -140,14 +148,14 @@ public sealed partial class ManagerForm
             File.Move(temp, AutoCloseSettingsPath, overwrite: true);
 
             _log.Info(
-                $"[AUTO_CLOSE_SETTINGS_MIGRATE_V6] oldVersion={oldVersion} time={settings.CloseOnRunTime} hours={settings.RunHours} reason={reason} path={AutoCloseSettingsPath}");
+                $"[AUTO_CLOSE_SETTINGS_MIGRATE_V7] oldVersion={oldVersion} time={settings.CloseOnRunTime} hours={settings.RunHours} reason={reason} path={AutoCloseSettingsPath}");
         }
         catch (Exception ex)
         {
             // Không chặn Manager khởi động chỉ vì không ghi được migration; runtime
             // hiện tại vẫn dùng settings đã normalize.
             _log.Warn(
-                $"[AUTO_CLOSE_SETTINGS_MIGRATE_V6_WARN] oldVersion={oldVersion} reason={reason} path={AutoCloseSettingsPath} error={ex.Message}");
+                $"[AUTO_CLOSE_SETTINGS_MIGRATE_V7_WARN] oldVersion={oldVersion} reason={reason} path={AutoCloseSettingsPath} error={ex.Message}");
         }
     }
 
@@ -167,7 +175,7 @@ public sealed partial class ManagerForm
         NotifyAutoReplacementSettingsChanged();
 
         _log.Info(
-            $"[AUTO_CLOSE_SETTINGS_SAVE] ban={_autoCloseSettings.CloseOnBan} time={_autoCloseSettings.CloseOnRunTime} hours={_autoCloseSettings.RunHours} stuck10m={_autoCloseSettings.CloseOnNotRunning10Minutes} replace={_autoCloseSettings.OpenReplacementAfterAutoClose} deleteRetired={_autoCloseSettings.DeleteProfileAfterBanOrLifetime}");
+            $"[AUTO_CLOSE_SETTINGS_SAVE] ban={_autoCloseSettings.CloseOnBan} time={_autoCloseSettings.CloseOnRunTime} hours={_autoCloseSettings.RunHours} stuck10m={_autoCloseSettings.CloseOnNotRunning10Minutes} replace={_autoCloseSettings.OpenReplacementAfterAutoClose} reuseOnly={_autoCloseSettings.ReuseOnlyNoCreateProfile} deleteRetired={_autoCloseSettings.DeleteProfileAfterBanOrLifetime}");
     }
 
     void InjectAutoCloseToolbarButton()
@@ -191,6 +199,7 @@ public sealed partial class ManagerForm
             "Tự đóng",
             (_, _) => ShowAutoCloseDialog(),
             UiButtonKind.Neutral);
+        _autoCloseToolbarButton.Paint += PaintAutoCloseToolbarButtonText;
 
         toolbar.Controls.Add(_autoCloseToolbarButton);
 
@@ -215,6 +224,42 @@ public sealed partial class ManagerForm
         }
     }
 
+    int MeasureAutoCloseToolbarTextWidth(Button button, string text)
+    {
+        using var bold = new Font(button.Font, FontStyle.Bold);
+        const string prefix = "Tự động:";
+        var suffix = text.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+            ? text[prefix.Length..]
+            : text;
+        var prefixWidth = TextRenderer.MeasureText(prefix, bold, Size.Empty, TextFormatFlags.NoPadding).Width;
+        var suffixWidth = TextRenderer.MeasureText(suffix, button.Font, Size.Empty, TextFormatFlags.NoPadding).Width;
+        return prefixWidth + suffixWidth;
+    }
+
+    void PaintAutoCloseToolbarButtonText(object? sender, PaintEventArgs e)
+    {
+        if (sender is not Button button || button.IsDisposed) return;
+        var text = _autoCloseToolbarDisplayText ?? "";
+        if (text.Length == 0) return;
+
+        const string prefix = "Tự động:";
+        var hasPrefix = text.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
+        var leftText = hasPrefix ? prefix : text;
+        var rightText = hasPrefix ? text[prefix.Length..] : "";
+
+        using var bold = new Font(button.Font, FontStyle.Bold);
+        var leftSize = TextRenderer.MeasureText(leftText, bold, Size.Empty, TextFormatFlags.NoPadding);
+        var rightSize = TextRenderer.MeasureText(rightText, button.Font, Size.Empty, TextFormatFlags.NoPadding);
+        var totalWidth = leftSize.Width + rightSize.Width;
+        var x = Math.Max(4, (button.ClientSize.Width - totalWidth) / 2);
+        var y = Math.Max(0, (button.ClientSize.Height - Math.Max(leftSize.Height, rightSize.Height)) / 2);
+        var flags = TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine;
+
+        TextRenderer.DrawText(e.Graphics, leftText, bold, new Point(x, y), button.ForeColor, flags);
+        if (rightText.Length > 0)
+            TextRenderer.DrawText(e.Graphics, rightText, button.Font, new Point(x + leftSize.Width, y), button.ForeColor, flags);
+    }
+
     void UpdateAutoCloseToolbarButtonText()
     {
         if (_autoCloseToolbarButton is null || _autoCloseToolbarButton.IsDisposed)
@@ -226,11 +271,23 @@ public sealed partial class ManagerForm
         if (_autoCloseSettings.CloseOnNotRunning10Minutes) parts.Add("Lỗi10p");
 
         if (parts.Count > 0 && _autoCloseSettings.OpenReplacementAfterAutoClose)
-            parts.Add(_autoReplacementSessionArmed ? "Bù" : "Bù: CHỜ");
+        {
+            if (_autoCloseSettings.ReuseOnlyNoCreateProfile)
+                parts.Add(_autoReplacementSessionArmed ? "Bù: CHỈ PRF CHỜ" : "Bù: CHỈ PRF CHỜ · CHỜ");
+            else
+                parts.Add(_autoReplacementSessionArmed ? "Bù" : "Bù: CHỜ");
+        }
 
-        _autoCloseToolbarButton.Text = parts.Count == 0
-            ? "Tự đóng: Tắt"
-            : $"Tự đóng: {string.Join(" + ", parts)}";
+        _autoCloseToolbarDisplayText = parts.Count == 0
+            ? "Tự động: Tắt"
+            : $"Tự động: {string.Join(" + ", parts)}";
+
+        // Button WinForms không hỗ trợ rich text. Để riêng chữ “Tự động:” đậm,
+        // phần còn lại giữ font thường và tự canh giữa trong cùng một nút.
+        _autoCloseToolbarButton.Text = "";
+        _autoCloseToolbarButton.AutoSize = false;
+        _autoCloseToolbarButton.Width = Math.Max(250, MeasureAutoCloseToolbarTextWidth(_autoCloseToolbarButton, _autoCloseToolbarDisplayText) + 30);
+        _autoCloseToolbarButton.Invalidate();
     }
 
     void ShowAutoCloseDialog()
@@ -382,19 +439,30 @@ public sealed partial class ManagerForm
             Location = new Point(18, 154)
         };
 
+        var reuseOnly = new CheckBox
+        {
+            Text = "Chỉ dùng PRF chờ — không tạo PRF mới",
+            Checked = _autoCloseSettings.ReuseOnlyNoCreateProfile,
+            AutoSize = true,
+            Location = new Point(42, 194),
+            ForeColor = Color.FromArgb(37, 77, 122)
+        };
+        reuseOnly.Enabled = openReplacement.Checked;
+        openReplacement.CheckedChanged += (_, _) => reuseOnly.Enabled = openReplacement.Checked;
+
         var deleteRetiredProfile = new CheckBox
         {
             Text = "Tự xóa profile sau khi đã ghi Excel (BAN + hết vòng đời TIME_xH)",
             Checked = _autoCloseSettings.DeleteProfileAfterBanOrLifetime,
             AutoSize = true,
-            Location = new Point(18, 194)
+            Location = new Point(18, 234)
         };
 
         var configGroup = new GroupBox
         {
             Text = "Cấu hình Tự đóng & Tự bù",
             Location = new Point(0, 0),
-            Size = new Size(666, 245),
+            Size = new Size(666, 285),
             Padding = new Padding(12),
             ForeColor = Color.FromArgb(45, 67, 94),
             Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
@@ -405,12 +473,13 @@ public sealed partial class ManagerForm
         configGroup.Controls.Add(hours);
         configGroup.Controls.Add(closeOnStuck);
         configGroup.Controls.Add(openReplacement);
+        configGroup.Controls.Add(reuseOnly);
         configGroup.Controls.Add(deleteRetiredProfile);
 
         var logGroup = new GroupBox
         {
             Text = "Nhật ký tự động",
-            Location = new Point(0, 257),
+            Location = new Point(0, 297),
             Size = new Size(666, 68),
             Padding = new Padding(12),
             ForeColor = Color.FromArgb(45, 67, 94),
@@ -487,6 +556,7 @@ public sealed partial class ManagerForm
             _autoCloseSettings.RunHours = runHourOptions[Math.Clamp(hours.SelectedIndex, 0, runHourOptions.Length - 1)];
             _autoCloseSettings.CloseOnNotRunning10Minutes = closeOnStuck.Checked;
             _autoCloseSettings.OpenReplacementAfterAutoClose = openReplacement.Checked;
+            _autoCloseSettings.ReuseOnlyNoCreateProfile = reuseOnly.Checked;
             _autoCloseSettings.DeleteProfileAfterBanOrLifetime = deleteRetiredProfile.Checked;
 
             try
