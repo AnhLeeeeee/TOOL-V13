@@ -187,7 +187,7 @@ public sealed partial class ManagerForm
             .OfType<FlowLayoutPanel>()
             .FirstOrDefault(panel => panel.Controls
                 .OfType<Button>()
-                .Any(button => button.Text.Equals("Dừng tất cả", StringComparison.OrdinalIgnoreCase)));
+                .Any(button => button.Text.Equals("Stop All", StringComparison.OrdinalIgnoreCase)));
 
         if (toolbar is null)
         {
@@ -260,6 +260,77 @@ public sealed partial class ManagerForm
             TextRenderer.DrawText(e.Graphics, rightText, button.Font, new Point(x + leftSize.Width, y), button.ForeColor, flags);
     }
 
+    string GetAutoReplacementUiStatusText()
+    {
+        var prefix = _autoCloseSettings.ReuseOnlyNoCreateProfile
+            ? "Bù PRF"
+            : "Bù";
+
+        if (!_autoCloseSettings.OpenReplacementAfterAutoClose)
+            return $"{prefix}: TẮT";
+
+        if (!_autoReplacementSessionArmed)
+            return $"{prefix}: CHỜ BẮT ĐẦU";
+
+        int target;
+        bool targetInitialized;
+        lock (_autoReplacementFixedSlotLock)
+        {
+            target = _autoReplacementTargetSlots;
+            targetInitialized = _autoReplacementTargetInitialized;
+        }
+
+        if (!targetInitialized || target <= 0)
+            return $"{prefix}: SẴN SÀNG";
+
+        var occupied = CountAutoReplacementOccupiedSlots();
+
+        int pending;
+        DateTime? earliestRetryUtc = null;
+        lock (_autoReplacementQueueLock)
+        {
+            pending = _autoReplacementQueue.Count;
+            if (pending > 0)
+                earliestRetryUtc = _autoReplacementQueue.Min(x => x.NextAttemptUtc);
+        }
+
+        if (occupied >= target)
+            return $"{prefix}: ĐỦ {occupied}/{target}";
+
+        var nowUtc = DateTime.UtcNow;
+        if (pending > 0
+            && earliestRetryUtc.HasValue
+            && earliestRetryUtc.Value > nowUtc.AddSeconds(1))
+        {
+            var wait = earliestRetryUtc.Value - nowUtc;
+            return $"{prefix}: CHỜ {FormatAutoReplacementUiWait(wait)} · {occupied}/{target}";
+        }
+
+        if (_autoReplacementStartAllInProgress || _autoReplacementQueueRunning)
+            return $"{prefix}: ĐANG XỬ LÝ · {occupied}/{target}";
+
+        if (pending > 0)
+            return $"{prefix}: XẾP HÀNG {pending} · {occupied}/{target}";
+
+        return $"{prefix}: CHỜ NGUỒN · {occupied}/{target}";
+    }
+
+    static string FormatAutoReplacementUiWait(TimeSpan wait)
+    {
+        if (wait < TimeSpan.Zero)
+            wait = TimeSpan.Zero;
+
+        var totalSeconds = Math.Max(0, (int)Math.Ceiling(wait.TotalSeconds));
+        if (totalSeconds < 60)
+            return $"{totalSeconds}s";
+
+        var minutes = totalSeconds / 60;
+        var seconds = totalSeconds % 60;
+        return seconds == 0
+            ? $"{minutes}m"
+            : $"{minutes}m{seconds:00}s";
+    }
+
     void UpdateAutoCloseToolbarButtonText()
     {
         if (_autoCloseToolbarButton is null || _autoCloseToolbarButton.IsDisposed)
@@ -271,12 +342,7 @@ public sealed partial class ManagerForm
         if (_autoCloseSettings.CloseOnNotRunning10Minutes) parts.Add("Lỗi10p");
 
         if (parts.Count > 0 && _autoCloseSettings.OpenReplacementAfterAutoClose)
-        {
-            if (_autoCloseSettings.ReuseOnlyNoCreateProfile)
-                parts.Add(_autoReplacementSessionArmed ? "Bù: CHỈ PRF CHỜ" : "Bù: CHỈ PRF CHỜ · CHỜ");
-            else
-                parts.Add(_autoReplacementSessionArmed ? "Bù" : "Bù: CHỜ");
-        }
+            parts.Add(GetAutoReplacementUiStatusText());
 
         _autoCloseToolbarDisplayText = parts.Count == 0
             ? "Tự động: Tắt"

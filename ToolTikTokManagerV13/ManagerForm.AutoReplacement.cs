@@ -305,6 +305,16 @@ public sealed partial class ManagerForm
         if (closedProfileName.Length == 0)
             return;
 
+        // Manual-close thắng AutoClose kể cả khi hai flow race nhau ở cuối cleanup.
+        // Nếu user đã chủ động đóng profile trong lúc AutoClose đang chạy, không retire
+        // profile và tuyệt đối không sinh request bù từ callback AutoClose muộn này.
+        if (IsManualCloseSuppressed(closedProfileName))
+        {
+            _log.Warn(
+                $"[AUTO_REPLACE_SKIP_AFTER_MANUAL_CLOSE] closed={closedProfileName} reason={reason} action=NO_RETIRE_NO_QUEUE");
+            return;
+        }
+
         // Profile đã Tự đóng là profile ĐÃ TREO/ĐÃ DÙNG.
         // Ghi bền vững để sau khi mở lại Manager cũng không bị lấy làm profile bù.
         _autoReplacementRetiredProfiles.Add(closedProfileName);
@@ -607,15 +617,35 @@ public sealed partial class ManagerForm
                         }
                         else
                         {
-                            // Chỉ sau khi đã vét profile có sẵn (thường + NAME_SYNC_PENDING)
-                            // mới tiêu account chưa gán để tạo profile mới.
-                            _log.Info(
-                                $"[AUTO_REPLACE_REUSE_EXHAUSTED_FALLBACK_NEW] id={request.Id} closed={request.ClosedProfileName} attemptedProfiles={GetAutoReplacementAttemptedProfileCount(request)}");
+                            // Safety guard cuối: bình thường hai sweep phía trên phải đã
+                            // thử/loại hợp lệ toàn bộ PRF dùng được NGAY BÂY GIỜ. Nếu vẫn
+                            // còn một PRF hợp lệ chưa được attempted thì đây là dấu hiệu
+                            // sweep bị rơi qua do lỗi/race; giữ suất để retry, không được
+                            // tiêu account mới và tạo PRF mới.
+                            if (TryFindUntestedEligibleReusableProfile(
+                                    request,
+                                    out var untestedProfile,
+                                    out var untestedLane,
+                                    out var untestedDetail))
+                            {
+                                lastError =
+                                    $"Còn PRF chờ hợp lệ chưa được thử: {untestedProfile} ({untestedLane}). {untestedDetail}";
 
-                            filled = await TryCreateReplacementAsync(
-                                request,
-                                execution.Generation,
-                                execution.Token);
+                                _log.Warn(
+                                    $"[AUTO_REPLACE_REUSE_GUARD_BLOCK_NEW] id={request.Id} closed={request.ClosedProfileName} profile={untestedProfile} lane={untestedLane} detail={untestedDetail} attemptedProfiles={GetAutoReplacementAttemptedProfileCount(request)}");
+                            }
+                            else
+                            {
+                                // Chỉ sau khi đã vét profile có sẵn (thường + NAME_SYNC_PENDING)
+                                // mới tiêu account chưa gán để tạo profile mới.
+                                _log.Info(
+                                    $"[AUTO_REPLACE_REUSE_EXHAUSTED_FALLBACK_NEW] id={request.Id} closed={request.ClosedProfileName} attemptedProfiles={GetAutoReplacementAttemptedProfileCount(request)}");
+
+                                filled = await TryCreateReplacementAsync(
+                                    request,
+                                    execution.Generation,
+                                    execution.Token);
+                            }
                         }
                     }
 

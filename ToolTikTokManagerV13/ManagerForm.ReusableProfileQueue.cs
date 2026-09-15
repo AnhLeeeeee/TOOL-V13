@@ -1381,6 +1381,7 @@ public sealed partial class ManagerForm
             }
 
             TikTokAccountPoolItem? account = null;
+            Exception? accountReadError = null;
             try
             {
                 account = await RunAccountPoolIoAsync(
@@ -1407,13 +1408,23 @@ public sealed partial class ManagerForm
             }
             catch (Exception ex)
             {
+                accountReadError = ex;
                 _log.Warn(
                     $"[NAME_SYNC_RECOVERY_ACCOUNT_READ_WARN] profile={profileName} error={ex.Message}");
             }
 
+            if (accountReadError is not null)
+            {
+                // Đây là lỗi I/O/Excel tạm thời, KHÔNG phải bằng chứng account đã mất.
+                // Không xóa PRF chờ và không cho flow rơi xuống tạo PRF mới.
+                throw new InvalidOperationException(
+                    $"Chưa xác minh được account của PRF chờ {profileName}; giữ queue và retry, không tạo PRF mới.",
+                    accountReadError);
+            }
+
             if (account is null)
             {
-                RemoveReusableProfileQueueEntry(profileName, "name_sync_account_missing");
+                RemoveReusableProfileQueueEntry(profileName, "name_sync_account_missing_verified");
                 continue;
             }
 
@@ -1424,16 +1435,31 @@ public sealed partial class ManagerForm
                 continue;
             }
 
+            Exception? catalogRefreshError = null;
             try
             {
                 var catalog = _profileService.Load();
                 RefreshContextsFromCatalog(catalog);
             }
-            catch { }
+            catch (Exception ex)
+            {
+                catalogRefreshError = ex;
+                _log.Warn(
+                    $"[NAME_SYNC_RECOVERY_CATALOG_REFRESH_WARN] profile={profileName} error={ex.Message}");
+            }
 
             if (!_contexts.TryGetValue(profileName, out var ctx))
             {
-                RemoveReusableProfileQueueEntry(profileName, "name_sync_context_missing");
+                if (catalogRefreshError is not null)
+                {
+                    // Không thể kết luận PRF đã mất nếu chính lượt load catalog vừa lỗi.
+                    // Giữ queue và chặn fallback tạo mới cho đến lượt retry sau.
+                    throw new InvalidOperationException(
+                        $"Chưa xác minh được catalog/context của PRF chờ {profileName}; giữ queue và retry, không tạo PRF mới.",
+                        catalogRefreshError);
+                }
+
+                RemoveReusableProfileQueueEntry(profileName, "name_sync_context_missing_verified");
                 continue;
             }
 
@@ -1770,6 +1796,80 @@ public sealed partial class ManagerForm
         return false;
     }
 
+    bool TryFindUntestedEligibleReusableProfile(
+        AutoReplacementRequest request,
+        out string profileName,
+        out string lane,
+        out string detail)
+    {
+        profileName = "";
+        lane = "";
+        detail = "";
+
+        List<ReusableProfileQueueEntry> snapshot;
+        lock (_reusableProfileQueueLock)
+        {
+            snapshot = OrderReusableProfileEntries(
+                    EnsureReusableProfileQueueLoadedUnsafe().Pending)
+                .Select(CloneReusableProfileQueueEntry)
+                .ToList();
+        }
+
+        foreach (var candidate in snapshot)
+        {
+            var name = (candidate.ProfileName ?? "").Trim();
+            if (name.Length == 0
+                || name.Equals(request.ClosedProfileName, StringComparison.OrdinalIgnoreCase)
+                || _autoReplacementClaimedProfiles.Contains(name)
+                || IsManualCloseSuppressed(name)
+                || HasAutoReplacementProfileBeenAttempted(request, name)
+                || IsNightReserveProfileProtected(name))
+            {
+                continue;
+            }
+
+            if (!candidate.IsManual)
+            {
+                var supplyState = GetProfileSupplyState(name);
+                var retired =
+                    _autoReplacementRetiredProfiles.Contains(name)
+                    || (supplyState is not null
+                        && (supplyState.State ?? "").Trim().Equals(
+                            "retired",
+                            StringComparison.OrdinalIgnoreCase));
+
+                if (retired || IsReplacementProfileCoolingDown(name))
+                    continue;
+            }
+
+            // NAME_SYNC_PENDING dưới 60s chưa phải candidate dùng được ngay; giữ nguyên
+            // logic hiện tại là có thể fallback tạo mới thay vì chờ profile quá fresh.
+            if (candidate.NameSyncPending
+                && DateTime.UtcNow - candidate.LastCheckedUtc < AutoReplacementNameSyncMinRetryAge)
+            {
+                continue;
+            }
+
+            // Busy/đang mở cũng là lý do loại hợp lệ trong logic hiện tại.
+            if (IsReusableProfileBusy(name))
+                continue;
+
+            // Context không tồn tại không coi là candidate mở được ngay. Refresh/sweep chịu
+            // trách nhiệm xác minh và xóa entry thật sự invalid.
+            if (!_contexts.ContainsKey(name))
+                continue;
+
+            profileName = name;
+            lane = candidate.NameSyncPending ? "NAME_SYNC_PENDING" : "REUSE_READY";
+            detail = candidate.NameSyncPending
+                ? $"age={DateTime.UtcNow - candidate.LastCheckedUtc:c}; entry vẫn còn trong queue và chưa attempted"
+                : "entry vẫn còn trong queue, không busy/cooldown/suppressed và chưa attempted";
+            return true;
+        }
+
+        return false;
+    }
+
     async Task<bool> TryUseReusableProfileQueueAsync(
         AutoReplacementRequest request,
         int executionGeneration,
@@ -1806,6 +1906,16 @@ public sealed partial class ManagerForm
                     .ToList();
         }
 
+        // Dự phòng đêm vẫn dùng CHÍNH queue cũ nhưng luôn xếp sau mọi PRF thường.
+        // Ban ngày/PREPARE còn bị hàng rào IsNightReserveProfileProtected chặn hẳn;
+        // OFFPEAK chỉ dùng reserve khi các candidate bình thường đã thử hết.
+        candidates = candidates
+            .Select((entry, index) => new { entry, index })
+            .OrderBy(x => IsNightReserveProfile(x.entry.ProfileName) ? 1 : 0)
+            .ThenBy(x => x.index)
+            .Select(x => x.entry)
+            .ToList();
+
         foreach (var candidate in candidates)
         {
             if (!IsAutoReplacementExecutionAllowed(executionGeneration))
@@ -1826,6 +1936,13 @@ public sealed partial class ManagerForm
 
             if (_autoReplacementClaimedProfiles.Contains(profileName))
                 continue;
+
+            if (IsNightReserveProfileProtected(profileName))
+            {
+                _log.Info(
+                    $"[REUSE_QUEUE_SKIP_NIGHT_RESERVE] id={request.Id} profile={profileName} reason={request.Reason}");
+                continue;
+            }
 
             if (IsManualCloseSuppressed(profileName))
             {
@@ -2080,6 +2197,7 @@ public sealed partial class ManagerForm
                     detail:
                         $"Đã dùng lại profile {profileName}; RUNNING khỏe {AutoReplacementHealthyStableSeconds}s.");
 
+                MarkNightReserveConsumed(profileName, request.Reason);
                 return true;
             }
             catch (OperationCanceledException)

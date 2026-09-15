@@ -575,11 +575,13 @@ public sealed partial class ManagerForm
 
         var start = new Button { Text = "Bắt đầu", Size = new Size(120, 42) };
         var prepare = new Button { Text = "Tạo trước PRF chờ", Size = new Size(170, 42) };
+        var nightReserve = new Button { Text = "Dự phòng đêm", Size = new Size(145, 42) };
         var pause = new Button { Text = "Tạm dừng", Size = new Size(120, 42), Enabled = false };
         var stop = new Button { Text = "Dừng", Size = new Size(110, 42), Enabled = false };
         var close = new Button { Text = "Đóng", Size = new Size(100, 42) };
         ModernDialog.StylePrimaryButton(start);
         ModernDialog.StyleSecondaryButton(prepare);
+        ModernDialog.StyleSecondaryButton(nightReserve);
         ModernDialog.StyleSecondaryButton(pause);
         ModernDialog.StyleSecondaryButton(stop);
         ModernDialog.StyleSecondaryButton(close);
@@ -589,6 +591,7 @@ public sealed partial class ManagerForm
         footerFlow.Controls.Add(close);
         footerFlow.Controls.Add(stop);
         footerFlow.Controls.Add(pause);
+        footerFlow.Controls.Add(nightReserve);
         footerFlow.Controls.Add(prepare);
         footerFlow.Controls.Add(start);
         footer.Controls.Add(footerFlow);
@@ -619,6 +622,7 @@ public sealed partial class ManagerForm
             protectionCooldownMinutes.Enabled = enabled;
             cooldownJitterSeconds.Enabled = enabled;
             prepare.Enabled = enabled;
+            nightReserve.Enabled = enabled;
             start.Enabled = enabled;
             close.Enabled = enabled;
             pause.Enabled = !enabled;
@@ -717,6 +721,7 @@ public sealed partial class ManagerForm
         };
 
         close.Click += (_, _) => form.Close();
+        nightReserve.Click += (_, _) => ShowNightReserveSettingsDialog(form);
 
         prepare.Click += (_, _) =>
         {

@@ -150,9 +150,11 @@ public sealed partial class ManagerForm : Form
         InitializeDashboardAndUpdater();
         UpdateManagerClock();
         _refreshTimer.Tick += (_, _) => UpdateManagerClock();
+        _refreshTimer.Tick += (_, _) => UpdateAutoCloseToolbarButtonText();
         _refreshTimer.Tick += async (_, _) => await RefreshOpenProfilesAsync();
         InitializeIdentityAutoFlow();
         InitializeMessageReplyAutoFlow();
+        InitializeNightReserveFeature();
         FormClosing += OnClosing;
     }
 
@@ -205,9 +207,9 @@ public sealed partial class ManagerForm : Form
         toolbarRow1.Controls.Add(Button("Tin nhắn TikTok", (_, _) => ShowTikTokMessageReplyDialog(), UiButtonKind.Neutral));
 
         var toolbarRow2 = ToolbarRow();
-        toolbarRow2.Controls.Add(Button("Xóa profile", (_, _) => ShowDeleteProfilesDialog(), UiButtonKind.Danger));
-        toolbarRow2.Controls.Add(Button("Chạy tất cả", async (_, _) => await StartAllAsync(), UiButtonKind.Primary));
-        toolbarRow2.Controls.Add(Button("Dừng tất cả", async (_, _) => await StopAllAsync(), UiButtonKind.Danger));
+        toolbarRow2.Controls.Add(Button("Delete", (_, _) => ShowDeleteProfilesDialog(), UiButtonKind.Danger));
+        toolbarRow2.Controls.Add(Button("Auto Run", async (_, _) => await ShowRunAllStrategyDialogAndStartAsync(), UiButtonKind.Primary));
+        toolbarRow2.Controls.Add(Button("Stop All", async (_, _) => await StopAllAsync(), UiButtonKind.Danger));
         // Không hiển thị "Profile chưa mở" trên toolbar; thông tin này không cần thiết
         // trong vận hành hằng ngày và làm hàng nút bị dài trên VM màn hình nhỏ.
 
@@ -269,8 +271,8 @@ public sealed partial class ManagerForm : Form
                 "Mở profile" => (Color.FromArgb(232, 242, 255), Color.FromArgb(35, 91, 152)),
                 "+ Profile" or "+ Auto Profile" => (Color.FromArgb(238, 246, 255), Color.FromArgb(35, 91, 152)),
                 "Kho tài khoản" or "Cấu hình mặc định" or "Tên & ảnh TikTok" or "Tin nhắn TikTok" => (Color.FromArgb(242, 246, 251), Color.FromArgb(55, 76, 103)),
-                "Xóa profile" or "Dừng tất cả" => (Color.FromArgb(255, 239, 239), Color.FromArgb(171, 62, 62)),
-                "Chạy tất cả" => (Color.FromArgb(234, 248, 238), Color.FromArgb(36, 119, 66)),
+                "Delete" or "Stop All" => (Color.FromArgb(255, 239, 239), Color.FromArgb(171, 62, 62)),
+                "Auto Run" => (Color.FromArgb(234, 248, 238), Color.FromArgb(36, 119, 66)),
                 _ => (UiTheme.Card, Color.FromArgb(42, 57, 76))
             };
             button.BackColor = background;
@@ -484,7 +486,7 @@ public sealed partial class ManagerForm : Form
             Margin = new Padding(8, 4, 12, 0)
         };
         var openChrome = Button("Mở Chrome", async (_, _) => { try { await OpenChromeForProfileAsync(ctx); } catch (Exception ex) { ShowError(ex); } }, UiButtonKind.Primary);
-        var closeChrome = Button("Đóng Chrome", async (_, _) => { try { await CloseChromeForProfileAsync(ctx); } catch (Exception ex) { ShowError(ex); } }, UiButtonKind.Danger);
+        var closeChrome = Button("Đóng Chrome", async (_, _) => { try { await CloseChromeForProfileAsync(ctx, manualIntent: true); } catch (Exception ex) { ShowError(ex); } }, UiButtonKind.Danger);
         var viewChrome = Button("👁 View", async (_, _) => { try { await ViewChromeForProfileAsync(ctx); } catch (Exception ex) { ShowError(ex); } }, UiButtonKind.Neutral);
         var account = Button("🔐 Tài khoản", (_, _) => ConfigureTikTokAccount(ctx));
         var detach = Button("Tách Worker", (_, _) => ToggleDetach(ctx));
@@ -1150,6 +1152,10 @@ public sealed partial class ManagerForm : Form
 
     async Task StopAllAsync()
     {
+        // Dừng tất cả cũng kết thúc phiên Giờ vàng. Nếu không tắt scheduler ở đây,
+        // vòng Tick kế tiếp có thể hiểu các slot vừa dừng là thiếu và chuẩn bị xoay lại.
+        StopRunStrategySession("stop_all");
+
         foreach (var ctx in _contexts.Values.Where(c => c.Worker is not null && !c.Worker.HasExited).ToList())
         {
             // Dừng tất cả là thao tác thủ công: giảm target trước khi STOP để reconcile
@@ -4643,7 +4649,7 @@ public sealed partial class ManagerForm : Form
         _tabs.Invalidate();
     }
 
-    async Task CloseChromeForProfileAsync(ProfileContext selected)
+    async Task CloseChromeForProfileAsync(ProfileContext selected, bool manualIntent = false)
     {
         SetStatus(selected, "Đang đóng Chrome theo đúng ProfilePath...", Color.DarkOrange);
 
@@ -4680,6 +4686,17 @@ public sealed partial class ManagerForm : Form
             // Dù Worker báo closed/not_running vẫn xác minh lại process thật theo ProfilePath.
             // Nếu Worker đã chết/CDP hỏng, hàm này vẫn đóng được Chrome mồ côi đúng profile.
             await EnsureAutoCloseChromeStoppedAsync(selected);
+
+            // Chỉ nút "Đóng Chrome" do user bấm mới co target. Các flow nội bộ
+            // (Name Guard, restart Chrome, cleanup...) gọi method này với mặc định false.
+            // Đăng ký SAU khi đã xác minh Chrome đóng thành công để không giảm target
+            // nếu thao tác close bị từ chối hoặc cleanup thất bại.
+            if (manualIntent)
+            {
+                RegisterManagerManualCloseIntent(
+                    selected,
+                    "MANAGER_CLOSE_CHROME");
+            }
 
             SetStatus(selected, "Đã xác minh Chrome của đúng profile đã đóng.", Color.DarkGreen);
             _log.Info($"[CHROME_CLOSE] profile={selected.Profile.Name} result=verified_closed workerReply={workerReply} profilePath={selected.Profile.ProfilePath} port={selected.Profile.CdpPort}");

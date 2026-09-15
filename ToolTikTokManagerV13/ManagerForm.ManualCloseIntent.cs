@@ -176,7 +176,50 @@ public sealed partial class ManagerForm
         }
 
         var state = GetEffectiveRuntimeState(ctx);
-        return state is RuntimeStateRunning or RuntimeStateRecovering or RuntimeStatePaused;
+        if (state is RuntimeStateRunning or RuntimeStateRecovering or RuntimeStatePaused)
+            return true;
+
+        // PHẢI khớp với CountAutoReplacementOccupiedSlots(): một profile có thể đã
+        // báo STOPPED nhưng tab/Worker/Opening vẫn còn và vẫn đang chiếm một slot vật lý.
+        // Nếu manual-close bỏ qua trường hợp này thì target không giảm; ngay sau khi
+        // tab/Worker biến mất, capacity reconcile sẽ hiểu nhầm là thiếu suất và mở bù.
+        var workerAlive = false;
+        try
+        {
+            workerAlive = ctx.Worker is not null && !ctx.Worker.HasExited;
+        }
+        catch
+        {
+            // Fail-closed giống bộ đếm slot: còn object Worker thì xem như vẫn chiếm suất.
+            workerAlive = ctx.Worker is not null;
+        }
+
+        var tabOpen =
+            ctx.Tab is not null
+            && !ctx.Tab.IsDisposed
+            && ctx.Tab.Parent == _tabs;
+
+        var physicallyOccupiesSlot = workerAlive || tabOpen || ctx.Opening;
+        if (!physicallyOccupiesSlot)
+            return false;
+
+        // Không giảm nhầm target khi đây chỉ là một tab/Worker mở thêm để xem ngoài quota.
+        // Chỉ coi fallback vật lý là target-member nếu bỏ chính slot này sẽ làm occupied
+        // tụt xuống dưới target hiện tại. Trường hợp occupied > target nghĩa là vẫn còn
+        // đủ slot khác để giữ quota, nên đóng tab phụ không được co target.
+        int targetSlots;
+        bool targetInitialized;
+        lock (_autoReplacementFixedSlotLock)
+        {
+            targetSlots = _autoReplacementTargetSlots;
+            targetInitialized = _autoReplacementTargetInitialized;
+        }
+
+        if (!_autoReplacementSessionArmed || !targetInitialized || targetSlots <= 0)
+            return false;
+
+        var occupiedSlots = CountAutoReplacementOccupiedSlots();
+        return Math.Max(0, occupiedSlots - 1) < targetSlots;
     }
 
     void ApplyManualCloseTargetShrink(
