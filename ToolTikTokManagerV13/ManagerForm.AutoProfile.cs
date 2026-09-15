@@ -1,4 +1,6 @@
 ﻿using System.Diagnostics;
+using System.Text;
+using System.Text.Json;
 using ToolTikTokV12.Controls;
 using ToolTikTokV12.Models;
 using ToolTikTokV12.Services;
@@ -40,7 +42,34 @@ public sealed partial class ManagerForm
 
     sealed class AutoProfileLoginBanException : Exception
     {
-        public AutoProfileLoginBanException(string message) : base(message) { }
+        public string Source { get; }
+        public string Detail { get; }
+
+        public AutoProfileLoginBanException(
+            string message,
+            string source = "auto_profile_login",
+            string detail = "LOGIN_BAN: TikTok xác nhận tài khoản bị cấm/đình chỉ/không tồn tại trong lúc đăng nhập.")
+            : base(message)
+        {
+            Source = string.IsNullOrWhiteSpace(source) ? "auto_profile_login" : source.Trim();
+            Detail = string.IsNullOrWhiteSpace(detail) ? message : detail.Trim();
+        }
+    }
+
+    sealed class AutoProfileCooldownSettings
+    {
+        public int Version { get; set; } = 1;
+        public int BetweenProfilesSeconds { get; set; } = 120;
+        public int LoginErrorSeconds { get; set; } = 300;
+        public int ProtectionSeconds { get; set; } = 600;
+        public int JitterSeconds { get; set; } = 30;
+    }
+
+    enum AutoProfileCooldownKind
+    {
+        Normal,
+        LoginError,
+        Protection
     }
 
     readonly SemaphoreSlim _autoProfileQueueGate = new(1, 1);
@@ -48,8 +77,160 @@ public sealed partial class ManagerForm
 
     static readonly TimeSpan AutoProfileAfterCreateDelay = TimeSpan.FromSeconds(2);
     static readonly TimeSpan AutoProfileAfterLoginDelay = TimeSpan.FromSeconds(3);
-    static readonly TimeSpan AutoProfileBetweenProfilesDelay = TimeSpan.FromSeconds(5);
     static readonly TimeSpan AutoProfileRetryDelay = TimeSpan.FromSeconds(4);
+    const int AutoProfileLoginErrorProtectionThreshold = 3;
+
+    string AutoProfileCooldownSettingsPath =>
+        Path.Combine(_baseDir, "manager_auto_profile_cooldown.json");
+
+    AutoProfileCooldownSettings LoadAutoProfileCooldownSettings()
+    {
+        var fallback = new AutoProfileCooldownSettings();
+        try
+        {
+            if (!File.Exists(AutoProfileCooldownSettingsPath))
+                return fallback;
+
+            var json = File.ReadAllText(AutoProfileCooldownSettingsPath, Encoding.UTF8);
+            var loaded = JsonSerializer.Deserialize<AutoProfileCooldownSettings>(json) ?? fallback;
+            loaded.BetweenProfilesSeconds = Math.Clamp(loaded.BetweenProfilesSeconds, 0, 3600);
+            loaded.LoginErrorSeconds = Math.Clamp(loaded.LoginErrorSeconds, 0, 7200);
+            loaded.ProtectionSeconds = Math.Clamp(loaded.ProtectionSeconds, 0, 14400);
+            loaded.JitterSeconds = Math.Clamp(loaded.JitterSeconds, 0, 300);
+            loaded.Version = 1;
+            return loaded;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"[AUTO_PROFILE_COOLDOWN_LOAD_WARN] {ex.Message}");
+            return fallback;
+        }
+    }
+
+    void SaveAutoProfileCooldownSettings(AutoProfileCooldownSettings settings)
+    {
+        try
+        {
+            settings.Version = 1;
+            settings.BetweenProfilesSeconds = Math.Clamp(settings.BetweenProfilesSeconds, 0, 3600);
+            settings.LoginErrorSeconds = Math.Clamp(settings.LoginErrorSeconds, 0, 7200);
+            settings.ProtectionSeconds = Math.Clamp(settings.ProtectionSeconds, 0, 14400);
+            settings.JitterSeconds = Math.Clamp(settings.JitterSeconds, 0, 300);
+
+            var json = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
+            var temp = AutoProfileCooldownSettingsPath + ".tmp";
+            File.WriteAllText(temp, json, new UTF8Encoding(false));
+            File.Move(temp, AutoProfileCooldownSettingsPath, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"[AUTO_PROFILE_COOLDOWN_SAVE_WARN] {ex.Message}");
+        }
+    }
+
+    static bool IsAutoProfileLoginCooldownOutcome(AutoProfileProcessOutcome? outcome)
+    {
+        if (outcome is null) return false;
+        if (!outcome.Step.Equals("WAIT_LOGIN", StringComparison.OrdinalIgnoreCase)) return false;
+
+        return outcome.Status.StartsWith("PAUSED_LOGIN", StringComparison.OrdinalIgnoreCase)
+               || outcome.Status.StartsWith("PAUSED_CAPTCHA_LOGIN", StringComparison.OrdinalIgnoreCase);
+    }
+
+    static AutoProfileCooldownKind ResolveAutoProfileCooldownKind(
+        AutoProfileProcessOutcome? outcome,
+        ref int consecutiveLoginErrors)
+    {
+        if (outcome is not null
+            && outcome.Status.Equals("LOGIN_BANNED", StringComparison.OrdinalIgnoreCase))
+        {
+            consecutiveLoginErrors = 0;
+            return AutoProfileCooldownKind.Protection;
+        }
+
+        if (IsAutoProfileLoginCooldownOutcome(outcome))
+        {
+            consecutiveLoginErrors++;
+            if (consecutiveLoginErrors >= AutoProfileLoginErrorProtectionThreshold)
+            {
+                consecutiveLoginErrors = 0;
+                return AutoProfileCooldownKind.Protection;
+            }
+
+            return AutoProfileCooldownKind.LoginError;
+        }
+
+        consecutiveLoginErrors = 0;
+        return AutoProfileCooldownKind.Normal;
+    }
+
+    static TimeSpan GetAutoProfileBaseCooldown(
+        AutoProfileCooldownSettings settings,
+        AutoProfileCooldownKind kind)
+        => kind switch
+        {
+            AutoProfileCooldownKind.LoginError => TimeSpan.FromSeconds(settings.LoginErrorSeconds),
+            AutoProfileCooldownKind.Protection => TimeSpan.FromSeconds(settings.ProtectionSeconds),
+            _ => TimeSpan.FromSeconds(settings.BetweenProfilesSeconds)
+        };
+
+    static string DescribeAutoProfileCooldownKind(AutoProfileCooldownKind kind)
+        => kind switch
+        {
+            AutoProfileCooldownKind.LoginError => "LOGIN lỗi",
+            AutoProfileCooldownKind.Protection => "BẢO VỆ BAN/lỗi liên tiếp",
+            _ => "nghỉ giữa PRF"
+        };
+
+    static TimeSpan ApplyAutoProfileCooldownJitter(TimeSpan baseDelay, int jitterSeconds)
+    {
+        jitterSeconds = Math.Clamp(jitterSeconds, 0, 300);
+        var delta = jitterSeconds == 0
+            ? 0
+            : Random.Shared.Next(-jitterSeconds, jitterSeconds + 1);
+        var seconds = Math.Max(0, (int)Math.Round(baseDelay.TotalSeconds) + delta);
+        return TimeSpan.FromSeconds(seconds);
+    }
+
+    async Task<bool> WaitAutoProfileCooldownAsync(
+        AutoProfileCooldownSettings settings,
+        AutoProfileCooldownKind kind,
+        Func<bool> isPaused,
+        CancellationToken ct,
+        Action<string> updateStatus,
+        Func<bool>? stopRequested = null)
+    {
+        var baseDelay = GetAutoProfileBaseCooldown(settings, kind);
+        var actualDelay = ApplyAutoProfileCooldownJitter(baseDelay, settings.JitterSeconds);
+        if (actualDelay <= TimeSpan.Zero)
+            return true;
+
+        var remainingSeconds = Math.Max(0, (int)Math.Ceiling(actualDelay.TotalSeconds));
+        var reason = DescribeAutoProfileCooldownKind(kind);
+
+        _log.Info(
+            $"[AUTO_PROFILE_COOLDOWN_BEGIN] kind={kind} base={baseDelay:c} jitter=±{settings.JitterSeconds}s actual={actualDelay:c}");
+
+        while (remainingSeconds > 0)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (stopRequested?.Invoke() == true)
+                return false;
+
+            await WaitAutoProfilePausePointAsync(isPaused, ct);
+
+            var remaining = TimeSpan.FromSeconds(remainingSeconds);
+            updateStatus(
+                $"Cooldown {reason}: {(int)remaining.TotalMinutes:00}:{remaining.Seconds:00} "
+                + $"(mốc {(int)baseDelay.TotalMinutes}' ± {settings.JitterSeconds}s)");
+
+            await Task.Delay(TimeSpan.FromSeconds(1), ct);
+            remainingSeconds--;
+        }
+
+        _log.Info($"[AUTO_PROFILE_COOLDOWN_END] kind={kind} actual={actualDelay:c}");
+        return true;
+    }
 
     void ShowAutoProfileDialog()
     {
@@ -96,12 +277,14 @@ public sealed partial class ManagerForm
                 retryPaused: false,
                 out _));
 
+        var cooldownSettings = LoadAutoProfileCooldownSettings();
+
         var form = new Form
         {
             Text = $"Tạo profile tự động — {AppVersionInfo.Display}",
-            Width = 1040,
-            Height = 700,
-            MinimumSize = new Size(900, 600),
+            Width = 1080,
+            Height = 760,
+            MinimumSize = new Size(940, 660),
             StartPosition = FormStartPosition.CenterParent,
             FormBorderStyle = FormBorderStyle.Sizable,
             MinimizeBox = false,
@@ -134,16 +317,22 @@ public sealed partial class ManagerForm
         var config = new TableLayoutPanel
         {
             Dock = DockStyle.Top,
-            Height = 154,
+            Height = 260,
             Padding = new Padding(14, 8, 14, 8),
             ColumnCount = 4,
-            RowCount = 3,
+            RowCount = 4,
             BackColor = ModernDialog.Canvas
         };
         config.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
         config.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
         config.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 170));
         config.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+        // Cố định chiều cao các hàng đầu để hàng Cooldown không bị Row 2 (vmHint dài)
+        // chiếm hết không gian ở DPI 125%/150%.
+        config.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
+        config.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+        config.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
+        config.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
         var nextProfile = new TextBox
         {
@@ -268,6 +457,73 @@ public sealed partial class ManagerForm
             Margin = new Padding(0, 8, 0, 0)
         };
 
+        NumericUpDown CooldownMinutes(int seconds, int maximumMinutes) => new()
+        {
+            Minimum = 0,
+            Maximum = maximumMinutes,
+            Value = Math.Clamp((int)Math.Round(seconds / 60d), 0, maximumMinutes),
+            Width = 58,
+            Margin = new Padding(4, 3, 3, 0)
+        };
+
+        var normalCooldownMinutes = CooldownMinutes(cooldownSettings.BetweenProfilesSeconds, 60);
+        var loginCooldownMinutes = CooldownMinutes(cooldownSettings.LoginErrorSeconds, 120);
+        var protectionCooldownMinutes = CooldownMinutes(cooldownSettings.ProtectionSeconds, 240);
+        var cooldownJitterSeconds = new NumericUpDown
+        {
+            Minimum = 0,
+            Maximum = 300,
+            Value = Math.Clamp(cooldownSettings.JitterSeconds, 0, 300),
+            Width = 62,
+            Margin = new Padding(4, 3, 3, 0)
+        };
+
+        var cooldownPanel = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            AutoSize = false,
+            WrapContents = false,
+            FlowDirection = FlowDirection.LeftToRight,
+            Margin = new Padding(0, 2, 0, 2),
+            Padding = new Padding(8, 4, 8, 3),
+            BackColor = Color.FromArgb(244, 248, 252),
+            BorderStyle = BorderStyle.FixedSingle
+        };
+        cooldownPanel.Controls.Add(new Label
+        {
+            Text = "⏱ Cooldown tạo PRF:",
+            AutoSize = true,
+            Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
+            ForeColor = Color.FromArgb(35, 91, 152),
+            Margin = new Padding(0, 7, 8, 0)
+        });
+        cooldownPanel.Controls.Add(new Label { Text = "Giữa PRF", AutoSize = true, Margin = new Padding(0, 7, 0, 0) });
+        cooldownPanel.Controls.Add(normalCooldownMinutes);
+        cooldownPanel.Controls.Add(new Label { Text = "phút", AutoSize = true, Margin = new Padding(0, 7, 12, 0) });
+        cooldownPanel.Controls.Add(new Label { Text = "Login lỗi", AutoSize = true, Margin = new Padding(0, 7, 0, 0) });
+        cooldownPanel.Controls.Add(loginCooldownMinutes);
+        cooldownPanel.Controls.Add(new Label { Text = "phút", AutoSize = true, Margin = new Padding(0, 7, 12, 0) });
+        cooldownPanel.Controls.Add(new Label { Text = "BAN / 3 lỗi login", AutoSize = true, Margin = new Padding(0, 7, 0, 0) });
+        cooldownPanel.Controls.Add(protectionCooldownMinutes);
+        cooldownPanel.Controls.Add(new Label { Text = "phút", AutoSize = true, Margin = new Padding(0, 7, 12, 0) });
+        cooldownPanel.Controls.Add(new Label { Text = "Dao động ±", AutoSize = true, Margin = new Padding(0, 7, 0, 0) });
+        cooldownPanel.Controls.Add(cooldownJitterSeconds);
+        cooldownPanel.Controls.Add(new Label { Text = "giây", AutoSize = true, Margin = new Padding(0, 7, 0, 0) });
+
+        void SyncCooldownSettingsFromUi()
+        {
+            cooldownSettings.BetweenProfilesSeconds = (int)normalCooldownMinutes.Value * 60;
+            cooldownSettings.LoginErrorSeconds = (int)loginCooldownMinutes.Value * 60;
+            cooldownSettings.ProtectionSeconds = (int)protectionCooldownMinutes.Value * 60;
+            cooldownSettings.JitterSeconds = (int)cooldownJitterSeconds.Value;
+            SaveAutoProfileCooldownSettings(cooldownSettings);
+        }
+
+        normalCooldownMinutes.ValueChanged += (_, _) => SyncCooldownSettingsFromUi();
+        loginCooldownMinutes.ValueChanged += (_, _) => SyncCooldownSettingsFromUi();
+        protectionCooldownMinutes.ValueChanged += (_, _) => SyncCooldownSettingsFromUi();
+        cooldownJitterSeconds.ValueChanged += (_, _) => SyncCooldownSettingsFromUi();
+
         config.Controls.Add(FieldLabel("Profile bắt đầu"), 0, 0);
         config.Controls.Add(profileStartPanel, 1, 0);
         config.Controls.Add(FieldLabel("Mục tiêu profile mới"), 2, 0);
@@ -281,7 +537,10 @@ public sealed partial class ManagerForm
         options.Controls.Add(autoStart);
         options.Controls.Add(availableLabel);
         options.Controls.Add(vmHint);
-        config.Controls.Add(options, 0, 2);
+        // Đặt Cooldown ở hàng riêng ngay dưới checkbox để luôn nhìn thấy.
+        config.Controls.Add(cooldownPanel, 0, 2);
+        config.SetColumnSpan(cooldownPanel, 4);
+        config.Controls.Add(options, 0, 3);
         config.SetColumnSpan(options, 4);
 
         var grid = new DataGridView
@@ -355,6 +614,10 @@ public sealed partial class ManagerForm
             retryPaused.Enabled = enabled;
             autoRename.Enabled = enabled;
             autoStart.Enabled = enabled;
+            normalCooldownMinutes.Enabled = enabled;
+            loginCooldownMinutes.Enabled = enabled;
+            protectionCooldownMinutes.Enabled = enabled;
+            cooldownJitterSeconds.Enabled = enabled;
             prepare.Enabled = enabled;
             start.Enabled = enabled;
             close.Enabled = enabled;
@@ -618,7 +881,7 @@ public sealed partial class ManagerForm
 
             var detailLabel = new Label
             {
-                Text = "Sẵn sàng. PRF được tạo lần lượt, PRF hiện tại phải đóng sạch mới chuyển sang PRF tiếp theo.",
+                Text = $"Sẵn sàng. Cooldown dùng chung: giữa PRF {cooldownSettings.BetweenProfilesSeconds / 60}' · login lỗi {cooldownSettings.LoginErrorSeconds / 60}' · bảo vệ {cooldownSettings.ProtectionSeconds / 60}' ± {cooldownSettings.JitterSeconds}s. PRF hiện tại phải đóng sạch mới chuyển sang PRF tiếp theo.",
                 Dock = DockStyle.Fill,
                 AutoEllipsis = true,
                 ForeColor = Color.DimGray,
@@ -755,6 +1018,7 @@ public sealed partial class ManagerForm
                     var pendingName = 0;
                     var attempts = 0;
                     var failed = 0;
+                    var consecutiveLoginErrors = 0;
 
                     try
                     {
@@ -784,7 +1048,7 @@ public sealed partial class ManagerForm
                                 + $"đang xử lý {item.ProfileName} — {item.Account.Username}";
                             UpdateGridRow(item, "PREPARE", "Đang tạo PRF tuần tự...", Color.RoyalBlue);
 
-                            AutoProfileProcessOutcome outcome;
+                            AutoProfileProcessOutcome? outcome = null;
                             _autoReplacementCleanupProfiles.Add(item.ProfileName);
                             try
                             {
@@ -927,16 +1191,29 @@ public sealed partial class ManagerForm
                             if (preCreateStopRequested)
                                 break;
 
-                            if (targetSuccess < requestedNew)
+                            if (targetSuccess < requestedNew && outcome?.Skipped != true)
                             {
-                                currentLabel.Text = "Đang xử lý: chờ PRF tiếp theo...";
-                                detailLabel.Text = verifyName
-                                    ? $"Đã có {targetSuccess}/{requestedNew} DONE; tổng PRF đã đưa vào CHỜ: {waitingAdded} "
-                                      + $"({pendingName} chưa xác nhận tên). Nghỉ {(int)AutoProfileBetweenProfilesDelay.TotalSeconds}s trước PRF tiếp theo..."
-                                    : $"Đã có {targetSuccess}/{requestedNew} PRF đổi tên thành công và vào CHỜ. "
-                                      + $"Nghỉ {(int)AutoProfileBetweenProfilesDelay.TotalSeconds}s trước PRF tiếp theo...";
-                                status.Text = detailLabel.Text;
-                                await Task.Delay(AutoProfileBetweenProfilesDelay, runCts.Token);
+                                var cooldownKind = ResolveAutoProfileCooldownKind(
+                                    outcome,
+                                    ref consecutiveLoginErrors);
+
+                                currentLabel.Text = "Đang xử lý: cooldown trước PRF tiếp theo...";
+                                var cooldownCompleted = await WaitAutoProfileCooldownAsync(
+                                    cooldownSettings,
+                                    cooldownKind,
+                                    () => paused,
+                                    runCts.Token,
+                                    text =>
+                                    {
+                                        if (preCreateForm.IsDisposed) return;
+                                        currentLabel.Text = "Đang xử lý: " + text;
+                                        detailLabel.Text = text;
+                                        status.Text = text;
+                                    },
+                                    () => preCreateStopRequested);
+
+                                if (!cooldownCompleted)
+                                    break;
                             }
                         }
 
@@ -1079,6 +1356,7 @@ public sealed partial class ManagerForm
                 var newAttempts = 0;
                 var newNotSuccessful = 0;
                 var resumeSuccess = 0;
+                var consecutiveLoginErrors = 0;
                 try
                 {
                     for (var i = 0; i < queue.Count; i++)
@@ -1156,15 +1434,24 @@ public sealed partial class ManagerForm
                             i + 1 < queue.Count
                             && (queue[i + 1].ResumeExisting || newSuccess < requestedNew);
 
-                        if (hasMoreRequiredWork)
+                        if (hasMoreRequiredWork && !outcome.Skipped)
                         {
-                            await WaitAutoProfilePausePointAsync(() => paused, runCts.Token);
-                            status.Text = item.ResumeExisting
-                                ? $"Nghỉ {(int)AutoProfileBetweenProfilesDelay.TotalSeconds}s để VM ổn định trước profile tiếp theo..."
-                                : $"Thành công {newSuccess}/{requestedNew}. "
-                                  + $"Account vừa rồi {(outcome.Success ? "đã đạt" : "chưa đạt")} — "
-                                  + $"tiếp tục account kế tiếp sau {(int)AutoProfileBetweenProfilesDelay.TotalSeconds}s...";
-                            await Task.Delay(AutoProfileBetweenProfilesDelay, runCts.Token);
+                            var cooldownKind = ResolveAutoProfileCooldownKind(
+                                outcome,
+                                ref consecutiveLoginErrors);
+
+                            await WaitAutoProfileCooldownAsync(
+                                cooldownSettings,
+                                cooldownKind,
+                                () => paused,
+                                runCts.Token,
+                                text =>
+                                {
+                                    status.Text = item.ResumeExisting
+                                        ? text + " trước profile tiếp theo..."
+                                        : $"Thành công {newSuccess}/{requestedNew}. "
+                                          + $"Account vừa rồi {(outcome.Success ? "đã đạt" : "chưa đạt")} — {text}.";
+                                });
                         }
                     }
 
@@ -1871,7 +2158,9 @@ public sealed partial class ManagerForm
         {
             _autoIdentityHandledSession.Add(item.ProfileName);
 
-            var detail = "LOGIN_BAN: TikTok xác nhận tài khoản bị cấm/đình chỉ/không tồn tại trong lúc đăng nhập.";
+            var detail = string.IsNullOrWhiteSpace(ex.Detail)
+                ? "TikTok xác nhận account không còn dùng được trong luồng Auto Profile."
+                : ex.Detail;
             var handled = false;
 
             if (ctx is not null)
@@ -1879,7 +2168,7 @@ public sealed partial class ManagerForm
                 handled = await HandleDetectedLoginBanAsync(
                     ctx,
                     item.Account,
-                    source: "auto_profile_login",
+                    source: ex.Source,
                     detail: detail,
                     CancellationToken.None);
             }
@@ -1895,8 +2184,8 @@ public sealed partial class ManagerForm
             }
 
             var note = handled
-                ? "TikTok xác nhận account bị BAN/đình chỉ/không tồn tại; đã note ban, ghi +auto=FAIL và đóng Chrome/Worker."
-                : "TikTok xác nhận account bị BAN/đình chỉ/không tồn tại; đã yêu cầu note ban + đóng Chrome/Worker, xem nhật ký nếu Excel/cleanup lỗi.";
+                ? "Account được xác định BAN/không còn dùng được (gồm trường hợp tên vẫn là user* sau khi thử đổi); đã note ban, ghi +auto=FAIL và đóng Chrome/Worker."
+                : "Account được xác định BAN/không còn dùng được; đã yêu cầu note ban + đóng Chrome/Worker, xem nhật ký nếu Excel/cleanup lỗi.";
 
             ui("WAIT_LOGIN", "LOGIN_BANNED — " + note, Color.Firebrick);
             _log.Warn($"[AUTO_PROFILE_LOGIN_BANNED] profile={item.ProfileName} account={item.Account.Username} handled={handled} message={ex.Message}");
@@ -2153,14 +2442,36 @@ public sealed partial class ManagerForm
         // profile có được tính vào quota DONE hay không.
         var verifiedOk = false;
         var verificationError = "";
+
+        // Tận dụng chính probe tên hiện có sau khi Save. Kể cả Auto Profile không bật
+        // "kiểm tra tên", vẫn đọc tên thực tế để nhận diện account bị TikTok ép về
+        // dạng user*. Account cũ đang là user* vẫn được thử đổi tên trước; chỉ khi
+        // đã thử Save mà tên thực tế VẪN bắt đầu bằng user mới coi là BAN.
+        var verified = await VerifyPreparedProfileNameAsync(
+            ctx,
+            item.Account.Username,
+            names,
+            ct);
+
+        var currentNameAfterRename = (verified.CurrentName ?? "").Trim();
+        if (currentNameAfterRename.StartsWith("user", StringComparison.OrdinalIgnoreCase))
+        {
+            var detail =
+                $"RENAME_USER_BAN: Sau khi thử đổi tên, TikTok vẫn trả tên '{currentNameAfterRename}'. "
+                + "Quy ước user* => account BAN; không đưa PRF vào hàng chờ.";
+
+            _log.Warn(
+                $"[AUTO_PROFILE_RENAME_USER_BAN] profile={item.ProfileName} account={item.Account.Username} "
+                + $"currentName={currentNameAfterRename} verified={verified.Ok}");
+
+            throw new AutoProfileLoginBanException(
+                detail,
+                source: "auto_profile_rename_user_prefix",
+                detail: detail);
+        }
+
         if (verifyNameAfterUpdate)
         {
-            var verified = await VerifyPreparedProfileNameAsync(
-                ctx,
-                item.Account.Username,
-                names,
-                ct);
-
             verifiedOk = verified.Ok;
             verificationError = verified.Error;
 
@@ -2176,7 +2487,7 @@ public sealed partial class ManagerForm
             {
                 _log.Warn(
                     $"[AUTO_PROFILE_PRECREATE_NAME_PENDING] profile={item.ProfileName} account={item.Account.Username} "
-                    + $"renameSucceeded=true error={verificationError}");
+                    + $"renameSucceeded=true currentName={currentNameAfterRename} error={verificationError}");
             }
         }
 
@@ -2226,7 +2537,7 @@ public sealed partial class ManagerForm
             ExcelError: excelError);
     }
 
-    async Task<(bool Ok, string Error)> VerifyPreparedProfileNameAsync(
+    async Task<(bool Ok, string Error, string CurrentName)> VerifyPreparedProfileNameAsync(
         ProfileContext ctx,
         string username,
         IReadOnlyList<string> names,
@@ -2250,21 +2561,24 @@ public sealed partial class ManagerForm
                 + $"currentName={lastProbe.CurrentName} source={lastProbe.Source} message={lastProbe.Message}");
 
             if (lastProbe.Ok && lastProbe.Matched)
-                return (true, "");
+                return (true, "", (lastProbe.CurrentName ?? "").Trim());
 
             if (attempt < 3)
                 await Task.Delay(TimeSpan.FromSeconds(3), ct);
         }
 
         if (lastProbe is null)
-            return (false, "Không đọc được tên TikTok sau khi đổi.");
+            return (false, "Không đọc được tên TikTok sau khi đổi.", "");
 
         if (!lastProbe.Ok)
         {
             var detail = string.IsNullOrWhiteSpace(lastProbe.Message)
                 ? "Worker/CDP chưa đọc được tên TikTok."
                 : lastProbe.Message;
-            return (false, "Kiểm tra tên chưa thành công sau 3 lần: " + detail);
+            return (
+                false,
+                "Kiểm tra tên chưa thành công sau 3 lần: " + detail,
+                (lastProbe.CurrentName ?? "").Trim());
         }
 
         var currentName = string.IsNullOrWhiteSpace(lastProbe.CurrentName)
@@ -2272,7 +2586,8 @@ public sealed partial class ManagerForm
             : lastProbe.CurrentName.Trim();
         return (
             false,
-            $"Tên TikTok thực tế vẫn chưa khớp danh sách cấu hình sau 3 lần kiểm tra. Đang đọc: {currentName}.");
+            $"Tên TikTok thực tế vẫn chưa khớp danh sách cấu hình sau 3 lần kiểm tra. Đang đọc: {currentName}.",
+            currentName == "(trống)" ? "" : currentName);
     }
 
     async Task ClosePreparedProfileRuntimeAsync(string profileName, string? username = null)

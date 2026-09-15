@@ -148,6 +148,8 @@ public sealed partial class ManagerForm : Form
         ReloadCatalog();
         EnsureAddTab();
         InitializeDashboardAndUpdater();
+        UpdateManagerClock();
+        _refreshTimer.Tick += (_, _) => UpdateManagerClock();
         _refreshTimer.Tick += async (_, _) => await RefreshOpenProfilesAsync();
         InitializeIdentityAutoFlow();
         InitializeMessageReplyAutoFlow();
@@ -226,6 +228,28 @@ public sealed partial class ManagerForm : Form
         UiTheme.Apply(this);
         StyleToolbarButtons(toolbarRow1);
         StyleToolbarButtons(toolbarRow2);
+    }
+
+    // Một nguồn giờ chung cho Manager. Các tính năng theo khung giờ sau này nên
+    // dùng hàm này thay vì tự gọi DateTime.Now ở nhiều nơi.
+    DateTimeOffset GetToolNow() => DateTimeOffset.Now;
+
+    string BuildManagerWindowTitle(DateTimeOffset now)
+    {
+        var selected = SelectedContext();
+        var baseTitle = selected is null
+            ? $"Tool TikTok Manager {AppVersionInfo.Display} — VM Optimized Multi Worker"
+            : $"Tool TikTok Manager {AppVersionInfo.Display} — {selected.Profile.Name}";
+
+        // Đồng hồ nằm ngay trên title bar, ngang hàng với tên Tool.
+        // Format theo yêu cầu: ngày/tháng | giờ:phút:giây.
+        return $"{baseTitle}    |    {now:dd/MM} | {now:HH:mm:ss}";
+    }
+
+    void UpdateManagerClock()
+    {
+        if (IsDisposed) return;
+        Text = BuildManagerWindowTitle(GetToolNow());
     }
 
     Button Button(string text, EventHandler action, UiButtonKind kind = UiButtonKind.Neutral)
@@ -4568,8 +4592,7 @@ public sealed partial class ManagerForm : Form
 
     void UpdateTitle()
     {
-        var selected = SelectedContext();
-        Text = selected is null ? $"Tool TikTok Manager {AppVersionInfo.Display} — VM Optimized Multi Worker" : $"Tool TikTok Manager {AppVersionInfo.Display} — {selected.Profile.Name}";
+        UpdateManagerClock();
         RefreshSelectedProfilePresentation();
     }
 
