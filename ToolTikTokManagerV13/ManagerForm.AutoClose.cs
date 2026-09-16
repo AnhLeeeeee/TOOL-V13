@@ -1467,7 +1467,11 @@ public sealed partial class ManagerForm
 
     // Được RuntimeState gọi khi chính Manager gửi START/RESUME/PAUSE/STOP thành công.
     // Nhờ vậy PAUSE/STOP thủ công không bị watchdog hiểu nhầm là lỗi.
-    void NotifyAutoCloseRuntimeCommand(ProfileContext ctx, string command, string confirmedState)
+    void NotifyAutoCloseRuntimeCommand(
+        ProfileContext ctx,
+        string command,
+        string confirmedState,
+        bool explicitUserStartIntent = false)
     {
         if (!_autoCloseFeatureInitialized)
             return;
@@ -1501,7 +1505,8 @@ public sealed partial class ManagerForm
 
             TrackAutoReplacementTargetRuntimeCommand(
                 ctx,
-                command);
+                command,
+                explicitUserStartIntent);
 
             // Người dùng/Manager vừa chủ động START/RESUME hoặc Auto Profile
             // đã gửi start_auto thành công.

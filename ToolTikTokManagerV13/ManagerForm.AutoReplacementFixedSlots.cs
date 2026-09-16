@@ -260,38 +260,55 @@ public sealed partial class ManagerForm
         var occupied = CountAutoReplacementOccupiedSlots();
 
         // Profile đang Tự đóng có thể chưa nằm trong expected set vì một race trạng thái.
-        // Bảo đảm chính slot đang đóng vẫn được tính vào target trước khi cleanup.
+        // Bảo đảm chính slot đang đóng vẫn được tính nếu đây là lần capture KHỞI TẠO.
         if (!IsAutoReplacementSlotCurrentlyCounted(ctx.Profile.Name))
             occupied++;
 
         lock (_autoReplacementFixedSlotLock)
         {
-            if (occupied > _autoReplacementTargetSlots)
+            // Target đã được Auto Run/Start All/manual intent xác định là nguồn sự thật.
+            // Tuyệt đối không lấy số occupied tạm thời (có thể dư do race/phục hồi muộn)
+            // để nâng target 5->6->7... Mọi flow tự động chỉ được bù khi thiếu target.
+            if (_autoReplacementTargetInitialized)
             {
-                var old = _autoReplacementTargetSlots;
-                _autoReplacementTargetSlots = occupied;
-                _autoReplacementTargetInitialized = true;
-
                 _log.Info(
-                    $"[AUTO_REPLACE_TARGET_CAPTURE] old={old} target={_autoReplacementTargetSlots} profile={ctx.Profile.Name} reason={reason}");
+                    $"[AUTO_REPLACE_TARGET_FIXED] target={_autoReplacementTargetSlots} occupied={occupied} profile={ctx.Profile.Name} reason={reason} action=KEEP_TARGET");
+                return;
             }
+
+            // Tương thích luồng cũ: chỉ khi phiên CHƯA HỀ có target rõ ràng mới capture
+            // từ runtime hiện tại. Sau đó target cũng được khóa như bình thường.
+            _autoReplacementTargetSlots = Math.Max(1, occupied);
+            _autoReplacementTargetInitialized = true;
+
+            _log.Info(
+                $"[AUTO_REPLACE_TARGET_INITIAL_CAPTURE] target={_autoReplacementTargetSlots} occupied={occupied} profile={ctx.Profile.Name} reason={reason}");
         }
     }
 
     void TrackAutoReplacementTargetRuntimeCommand(
         ProfileContext ctx,
-        string command)
+        string command,
+        bool explicitUserStartIntent = false)
     {
         command = (command ?? "").Trim().ToLowerInvariant();
         var profileName = ctx.Profile.Name;
 
-        // START thủ công là intent tăng/khôi phục suất. Đồng thời cho phép profile
-        // vừa bị user đóng được sử dụng lại ngay nếu chính user chủ động Start lại.
+        // Không được suy đoán "command=start" == user tăng target: nhiều flow nội bộ
+        // (đồng bộ tên, Tên/ảnh, restore runtime...) cũng phải START lại cùng PRF.
+        // Chỉ Start có intent user được truyền rõ ràng mới được mở rộng target.
         if (command == "start")
         {
+            if (!explicitUserStartIntent)
+            {
+                _log.Info(
+                    $"[AUTO_REPLACE_TARGET_INTERNAL_START] profile={profileName} target={_autoReplacementTargetSlots} action=NO_TARGET_CHANGE");
+                return;
+            }
+
             ClearManualCloseSuppression(
                 profileName,
-                "runtime_command:start");
+                "runtime_command:start:user_intent");
 
             // Chỉ dùng các slot THỰC SỰ đang chạy/được claim để mở rộng target.
             // Không dùng CountAutoReplacementOccupiedSlots() ở đây vì hàm đó cố ý

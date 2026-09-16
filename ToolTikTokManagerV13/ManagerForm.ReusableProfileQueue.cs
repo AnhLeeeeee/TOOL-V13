@@ -1937,12 +1937,21 @@ public sealed partial class ManagerForm
                     continue;
             }
 
-            // NAME_SYNC_PENDING dưới 60s chưa phải candidate dùng được ngay; giữ nguyên
-            // logic hiện tại là có thể fallback tạo mới thay vì chờ profile quá fresh.
-            if (candidate.NameSyncPending
-                && DateTime.UtcNow - candidate.LastCheckedUtc < AutoReplacementNameSyncMinRetryAge)
+            // NAME_SYNC_PENDING dưới 60s chưa được phép probe lại, nhưng vẫn là
+            // nguồn PRF CÓ SẴN. Không được vì còn thiếu vài giây mà tiêu account mới.
+            // Trả true để safety guard chặn CREATE; queue ngoài sẽ retry ngắn 5 giây
+            // cho tới khi entry đủ tuổi và recovery sweep thật sự kiểm tra nó.
+            if (candidate.NameSyncPending)
             {
-                continue;
+                var age = DateTime.UtcNow - candidate.LastCheckedUtc;
+                if (age < AutoReplacementNameSyncMinRetryAge)
+                {
+                    var remaining = AutoReplacementNameSyncMinRetryAge - age;
+                    profileName = name;
+                    lane = "NAME_SYNC_PENDING_WAIT";
+                    detail = $"chờ thêm {remaining:c} trước khi probe lại; chặn CREATE account mới";
+                    return true;
+                }
             }
 
             // Profile thật sự RUNNING/PAUSED/RECOVERING không còn là nguồn chờ.
@@ -2513,20 +2522,13 @@ public sealed partial class ManagerForm
             profileName,
             "reuse_queue:" + reason);
 
-        try
-        {
-            await RunAccountPoolIoAsync(
-                () =>
-                    _accountPoolService.SetAutoProfileResult(
-                        candidate.AccountId,
-                        "FAIL"),
-                CancellationToken.None);
-        }
-        catch (Exception ex)
-        {
-            _log.Warn(
-                $"[REUSE_QUEUE_FAIL_WRITE_WARN] profile={profileName} account={candidate.Username} error={ex.Message}");
-        }
+        // Lỗi khi MỞ LẠI một PRF có sẵn không được phép ghi đè lịch sử
+        // Auto Profile. PRF có thể đã tạo/login thành công từ trước; lỗi Name Guard,
+        // CDP hoặc runtime ở một lần reuse chỉ thuộc lifecycle lần mở hiện tại.
+        // Giữ nguyên +auto (DONE/PROCESSING/trống) và dùng FailedProfiles/cooldown
+        // riêng ở trên để quyết định khi nào được thử lại.
+        _log.Warn(
+            $"[REUSE_QUEUE_AUTO_PROFILE_PRESERVED] profile={profileName} account={candidate.Username} reason={reason} action=NO_AUTOPROFILE_FAIL_WRITE");
 
         WriteAutoActivityLog(
             action: "MỞ PROFILE BÙ",

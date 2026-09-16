@@ -75,7 +75,8 @@ public sealed partial class ManagerForm
         ProfileContext ctx,
         string command,
         TimeSpan timeout,
-        bool suppressStatus = false)
+        bool suppressStatus = false,
+        bool explicitUserStartIntent = false)
     {
         if (IsAutomationHalted)
         {
@@ -92,7 +93,11 @@ public sealed partial class ManagerForm
             var guard = await EnsureNameGuardBeforeStartAsync(ctx);
             if (guard.Allowed)
             {
-                var reply = await SendCommandAsync(ctx, command, timeout);
+                var reply = await SendCommandAsync(
+                    ctx,
+                    command,
+                    timeout,
+                    explicitUserStartIntent);
                 _log.Info(
                     $"[NAME_GUARD_START_ALLOWED] profile={ctx.Profile.Name} command={command} " +
                     $"attempt={attempt}/{NameGuardTransientStartMaxAttempts} changed={guard.ChangedName} reply={reply}");
@@ -416,6 +421,22 @@ public sealed partial class ManagerForm
                 : reply.NameCooldown
                     ? "TikTok đang giới hạn thời gian đổi tên."
                     : string.IsNullOrWhiteSpace(reply.Message) ? "Đổi Tên/ảnh không thành công." : reply.Message;
+
+            // Cooldown tên hoặc lỗi DOM/CDP/UI tạm thời KHÔNG phải bằng chứng account
+            // login hỏng hay Tên/ảnh hỏng vĩnh viễn. Giữ Excel ở PROCESSING (đã ghi ở
+            // trên), cho stabilizer/reuse retry; tuyệt đối không ghi Tên/ảnh=FAIL.
+            if (reply.NameCooldown
+                || IsNameGuardRetryableIdentityUpdateFailure(reply, reason))
+            {
+                return RegisterNameGuardTransientFailure(
+                    ctx,
+                    username,
+                    reason,
+                    reply.NameCooldown
+                        ? "identity_update_name_cooldown"
+                        : "identity_update_retryable_dom_or_cdp");
+            }
+
             await FailNameGuardAndCloseAsync(ctx, username, reason);
             return new NameGuardResult(false, reason);
         }
@@ -629,6 +650,44 @@ public sealed partial class ManagerForm
             $"account={username}; stage={stage}; workerAlive={workerAlive}; retryAt={retryUtc:O}; reason={reason}");
 
         return new NameGuardResult(false, reason, Transient: true);
+    }
+
+    static bool IsNameGuardRetryableIdentityUpdateFailure(
+        IdentityUpdateReply reply,
+        string reason)
+    {
+        var text = string.Join(
+            " | ",
+            new[] { reason, reply.Error, reply.Message }
+                .Where(x => !string.IsNullOrWhiteSpace(x)));
+
+        if (text.Length == 0)
+            return false;
+
+        // Các lỗi này thường xảy ra khi TikTok SPA/CDP vừa chuyển trang hoặc DOM
+        // Edit profile chưa dựng xong. Probe tên ngay trước đó đã đọc được Hồ sơ, nên
+        // chưa đủ căn cứ biến trạng thái Tên/ảnh thành FAIL.
+        return text.Contains(
+                   "Không tìm thấy nút Chỉnh sửa hồ sơ",
+                   StringComparison.OrdinalIgnoreCase)
+            || text.Contains(
+                   "Edit profile",
+                   StringComparison.OrdinalIgnoreCase)
+            || text.Contains(
+                   "CDP",
+                   StringComparison.OrdinalIgnoreCase)
+            || text.Contains(
+                   "disposed",
+                   StringComparison.OrdinalIgnoreCase)
+            || text.Contains(
+                   "timeout",
+                   StringComparison.OrdinalIgnoreCase)
+            || text.Contains(
+                   "timed out",
+                   StringComparison.OrdinalIgnoreCase)
+            || text.Contains(
+                   "Chrome chưa mở/kết nối",
+                   StringComparison.OrdinalIgnoreCase);
     }
 
     string ChooseNameGuardTargetName(

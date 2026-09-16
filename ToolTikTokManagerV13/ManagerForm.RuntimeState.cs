@@ -110,7 +110,11 @@ public sealed partial class ManagerForm
         ctx.RuntimeRecoveryInProgress = SnapshotIndicatesRecovery(snapshot);
     }
 
-    void ApplyCommandRuntimeConfirmation(ProfileContext ctx, string command, string response)
+    void ApplyCommandRuntimeConfirmation(
+        ProfileContext ctx,
+        string command,
+        string response,
+        bool explicitUserStartIntent = false)
     {
         var normalizedCommand = command.Trim().ToLowerInvariant();
         var normalizedResponse = response.Trim().ToLowerInvariant();
@@ -127,7 +131,11 @@ public sealed partial class ManagerForm
         if (confirmedState.Length > 0)
         {
             ConfirmRuntimeState(ctx, confirmedState, $"worker_command:{normalizedCommand}");
-            NotifyAutoCloseRuntimeCommand(ctx, normalizedCommand, confirmedState);
+            NotifyAutoCloseRuntimeCommand(
+                ctx,
+                normalizedCommand,
+                confirmedState,
+                explicitUserStartIntent);
         }
     }
 

@@ -1021,6 +1021,45 @@ public sealed partial class ManagerForm
             token);
     }
 
+    TimeSpan GetRunStrategyNameSyncRetryDelay(string? onlyProfileName = null)
+    {
+        List<DateTime> lastChecked;
+        lock (_reusableProfileQueueLock)
+        {
+            lastChecked = EnsureReusableProfileQueueLoadedUnsafe()
+                .Pending
+                .Where(x =>
+                    x.NameSyncPending
+                    && (string.IsNullOrWhiteSpace(onlyProfileName)
+                        || x.ProfileName.Equals(
+                            onlyProfileName,
+                            StringComparison.OrdinalIgnoreCase)))
+                .Select(x => x.LastCheckedUtc)
+                .ToList();
+        }
+
+        if (lastChecked.Count == 0)
+            return TimeSpan.Zero;
+
+        var nowUtc = DateTime.UtcNow;
+        var wait = TimeSpan.Zero;
+        foreach (var checkedUtc in lastChecked)
+        {
+            var age = nowUtc - checkedUtc;
+            var remaining = AutoReplacementNameSyncMinRetryAge - age;
+            if (remaining > wait)
+                wait = remaining;
+        }
+
+        if (wait <= TimeSpan.Zero)
+            return TimeSpan.Zero;
+
+        // Không bao giờ chờ quá cửa sổ retry chuẩn, kể cả clock hệ thống vừa nhảy.
+        return wait > AutoReplacementNameSyncMinRetryAge
+            ? AutoReplacementNameSyncMinRetryAge
+            : wait;
+    }
+
     async Task<bool> TryUseAnyRunStrategyReusableProfileAsync(
         string reason,
         CancellationToken token)
@@ -1042,7 +1081,33 @@ public sealed partial class ManagerForm
 
         try
         {
-            return await TryUseReusableProfileQueueAsync(
+            var opened = await TryUseReusableProfileQueueAsync(
+                request,
+                execution.Generation,
+                execution.Token);
+
+            if (opened)
+                return true;
+
+            // Run All/Run Strategy trước đây chỉ vét lane reuse thường rồi có thể
+            // rơi thẳng sang CREATE, trong khi NAME_SYNC_PENDING vẫn còn PRF đã tạo
+            // và đã login. Vét lane chờ đồng bộ tên bằng CHÍNH request này để giữ
+            // one-attempt/profile và tuyệt đối ưu tiên PRF có sẵn trước account mới.
+            _log.Info(
+                $"[RUN_ALL_NAME_SYNC_BEFORE_CREATE] id={request.Id} reason={reason} pending={GetNameSyncPendingReusableProfileCount()} attempted={GetAutoReplacementAttemptedProfileCount(request)}");
+
+            // Nếu PRF chờ tên vừa mới được kiểm tra, đợi tối đa cửa sổ 60s để TẤT CẢ
+            // entry pending đủ tuổi rồi mới sweep. Mục tiêu là không tiêu account mới
+            // chỉ vì PRF có sẵn còn thiếu vài giây để được probe lại.
+            var nameSyncWait = GetRunStrategyNameSyncRetryDelay();
+            if (nameSyncWait > TimeSpan.Zero)
+            {
+                _log.Info(
+                    $"[RUN_ALL_NAME_SYNC_WAIT_BEFORE_CREATE] id={request.Id} wait={nameSyncWait:c} pending={GetNameSyncPendingReusableProfileCount()}");
+                await Task.Delay(nameSyncWait, token);
+            }
+
+            return await TryRecoverNameSyncPendingReusableProfilesOnceAsync(
                 request,
                 execution.Generation,
                 execution.Token);
@@ -1702,8 +1767,7 @@ public sealed partial class ManagerForm
             snapshot = EnsureReusableProfileQueueLoadedUnsafe()
                 .Pending
                 .Where(entry =>
-                    !entry.NameSyncPending
-                    && !string.IsNullOrWhiteSpace(entry.ProfileName)
+                    !string.IsNullOrWhiteSpace(entry.ProfileName)
                     && (allowProtectedNightReserve
                         || !IsNightReserveProfileProtected(entry.ProfileName))
                     && !entry.ProfileName.Equals(
@@ -2078,12 +2142,24 @@ public sealed partial class ManagerForm
         if (!IsAutoReplacementExecutionAllowed(execution.Generation))
             return false;
 
-        // Tận dụng toàn bộ one-attempt / Name Guard / 10 phút stabilization / cleanup
-        // của queue reuse cũ. Để buộc helper chỉ lấy đúng lane đã chọn, đánh dấu mọi
-        // profile khác là attempted trong request tạm thời này.
+        // Tận dụng toàn bộ one-attempt / Name Guard / stabilization / cleanup của
+        // queue reuse cũ. Để buộc helper chỉ lấy đúng lane đã chọn, đánh dấu mọi
+        // profile khác là attempted trong request tạm thời này. Lấy cả tên đang có
+        // trong queue (không chỉ _contexts) để không lọt candidate do catalog refresh race.
+        List<ReusableProfileQueueEntry> reusableSnapshot;
+        lock (_reusableProfileQueueLock)
+        {
+            reusableSnapshot = EnsureReusableProfileQueueLoadedUnsafe()
+                .Pending
+                .Select(CloneReusableProfileQueueEntry)
+                .ToList();
+        }
+
         var attempted = _contexts.Keys
+            .Concat(reusableSnapshot.Select(x => x.ProfileName))
             .Where(name =>
-                !name.Equals(candidateProfileName, StringComparison.OrdinalIgnoreCase))
+                !string.IsNullOrWhiteSpace(name)
+                && !name.Equals(candidateProfileName, StringComparison.OrdinalIgnoreCase))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
 
@@ -2108,6 +2184,37 @@ public sealed partial class ManagerForm
 
         try
         {
+            var nameSyncPending = reusableSnapshot.Any(x =>
+                x.NameSyncPending
+                && x.ProfileName.Equals(
+                    candidateProfileName,
+                    StringComparison.OrdinalIgnoreCase));
+
+            if (nameSyncPending)
+            {
+                _log.Info(
+                    $"[RUN_STRATEGY_NAME_SYNC_CANDIDATE] candidate={candidateProfileName} outgoing={outgoingProfileName} reason={reason} action=PROBE_BEFORE_CREATE");
+
+                // Không bỏ qua candidate chỉ vì vừa check <60s rồi rơi sang CREATE.
+                // Chờ đúng phần còn lại của cửa sổ retry rồi probe PRF có sẵn trước.
+                var nameSyncWait = GetRunStrategyNameSyncRetryDelay(candidateProfileName);
+                if (nameSyncWait > TimeSpan.Zero)
+                {
+                    _log.Info(
+                        $"[RUN_STRATEGY_NAME_SYNC_WAIT] candidate={candidateProfileName} wait={nameSyncWait:c} reason={reason}");
+                    await Task.Delay(nameSyncWait, token);
+                }
+
+                // Request tạm đã đánh dấu mọi profile khác là attempted, vì vậy helper
+                // NAME_SYNC_PENDING chỉ được phép thử đúng candidate Run Strategy đã
+                // chọn theo lane/runtime. Nếu chưa sync, vòng ngoài sẽ chuyển sang PRF
+                // kế tiếp thay vì tạo mới ngay.
+                return await TryRecoverNameSyncPendingReusableProfilesOnceAsync(
+                    request,
+                    execution.Generation,
+                    execution.Token);
+            }
+
             return await TryUseReusableProfileQueueAsync(
                 request,
                 execution.Generation,

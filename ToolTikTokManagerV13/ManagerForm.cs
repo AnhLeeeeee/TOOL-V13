@@ -1056,7 +1056,11 @@ public sealed partial class ManagerForm : Form
         return snapshot;
     }
 
-    async Task<string> SendCommandAsync(ProfileContext ctx, string command, TimeSpan? timeout = null)
+    async Task<string> SendCommandAsync(
+        ProfileContext ctx,
+        string command,
+        TimeSpan? timeout = null,
+        bool explicitUserStartIntent = false)
     {
         if (IsCommandBlockedByEmergencyStop(command))
         {
@@ -1093,7 +1097,11 @@ public sealed partial class ManagerForm : Form
 
             await EnsureWorkerAsyncIfCommandNeedsIt(ctx, command);
             var response = await SendPipeAsync(ctx.Profile.Name, command, effectiveTimeout);
-            ApplyCommandRuntimeConfirmation(ctx, command, response);
+            ApplyCommandRuntimeConfirmation(
+                ctx,
+                command,
+                response,
+                explicitUserStartIntent);
             return response;
         }
         finally { ctx.CommandGate.Release(); }

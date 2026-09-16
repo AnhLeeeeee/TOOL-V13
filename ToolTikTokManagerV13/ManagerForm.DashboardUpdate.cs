@@ -435,7 +435,11 @@ public sealed partial class ManagerForm
         {
             if (!EnsureAutomationAllowedFromUi("Start profile")) return;
             await OpenProfileAsync(ctx);
-            await StartWithNameGuardAsync(ctx, "start", TimeSpan.FromSeconds(30));
+            await StartWithNameGuardAsync(
+                ctx,
+                "start",
+                TimeSpan.FromSeconds(30),
+                explicitUserStartIntent: true);
         }));
         flow.Controls.Add(ActionButton("⏯ Pause/Resume", UiButtonKind.Neutral, async ctx =>
         {

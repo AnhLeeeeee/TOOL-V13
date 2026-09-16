@@ -111,6 +111,18 @@ public sealed partial class ManagerForm
     readonly object _autoReplacementQueueLock = new();
     readonly object _profileSupplyStateLock = new();
     readonly object _autoReplacementExecutionLock = new();
+
+    // Cooldown CHỈ dành cho nhánh tạo PRF MỚI của Tự bù / Run Strategy.
+    // PRF đã có sẵn trong Chờ dùng lại không đi qua gate này nên vẫn được mở ngay.
+    // Deadline dùng chung cho mọi suất tạo mới để khi một suất vừa tạo xong/lỗi,
+    // suất kế tiếp cũng phải tôn trọng đúng cấu hình ở cửa sổ "+ Auto Profile".
+    readonly object _autoReplacementCreateCooldownLock = new();
+    DateTime _autoReplacementCreateNotBeforeUtc = DateTime.MinValue;
+    AutoProfileCooldownKind _autoReplacementCreateCooldownKind = AutoProfileCooldownKind.Normal;
+    TimeSpan _autoReplacementCreateCooldownBase = TimeSpan.Zero;
+    TimeSpan _autoReplacementCreateCooldownActual = TimeSpan.Zero;
+    int _autoReplacementCreateConsecutiveLoginErrors;
+
     CancellationTokenSource _autoReplacementExecutionCts = new();
     int _autoReplacementExecutionGeneration;
     bool _autoReplacementFeatureInitialized;
@@ -124,6 +136,114 @@ public sealed partial class ManagerForm
     string _autoReplacementUiDetail = "";
     string _autoReplacementUiRequestId = "";
     DateTime _autoReplacementUiPhaseUtc = DateTime.MinValue;
+
+    void RegisterAutoReplacementCreateCooldown(
+        AutoProfileProcessOutcome? outcome,
+        string profileName,
+        string requestId,
+        string source)
+    {
+        var settings = LoadAutoProfileCooldownSettings();
+        AutoProfileCooldownKind kind;
+        TimeSpan baseDelay;
+        TimeSpan actualDelay;
+        DateTime notBeforeUtc;
+        int consecutiveLoginErrors;
+
+        lock (_autoReplacementCreateCooldownLock)
+        {
+            kind = ResolveAutoProfileCooldownKind(
+                outcome,
+                ref _autoReplacementCreateConsecutiveLoginErrors);
+
+            baseDelay = GetAutoProfileBaseCooldown(settings, kind);
+            actualDelay = ApplyAutoProfileCooldownJitter(
+                baseDelay,
+                settings.JitterSeconds);
+
+            _autoReplacementCreateCooldownKind = kind;
+            _autoReplacementCreateCooldownBase = baseDelay;
+            _autoReplacementCreateCooldownActual = actualDelay;
+            _autoReplacementCreateNotBeforeUtc = DateTime.UtcNow.Add(actualDelay);
+
+            notBeforeUtc = _autoReplacementCreateNotBeforeUtc;
+            consecutiveLoginErrors = _autoReplacementCreateConsecutiveLoginErrors;
+        }
+
+        _log.Info(
+            $"[AUTO_REPLACE_CREATE_COOLDOWN_SET] request={requestId} profile={profileName} source={source} " +
+            $"kind={kind} base={baseDelay:c} jitter=±{settings.JitterSeconds}s actual={actualDelay:c} " +
+            $"nextCreate={notBeforeUtc:O} consecutiveLoginErrors={consecutiveLoginErrors}");
+    }
+
+    async Task<bool> WaitAutoReplacementCreateCooldownBeforeNewProfileAsync(
+        AutoReplacementRequest request,
+        string nextProfileName,
+        int executionGeneration,
+        CancellationToken executionToken)
+    {
+        var logged = false;
+        AutoProfileCooldownKind loggedKind = AutoProfileCooldownKind.Normal;
+        DateTime loggedDeadline = DateTime.MinValue;
+
+        while (true)
+        {
+            if (!IsAutoReplacementExecutionAllowed(executionGeneration))
+                return false;
+
+            executionToken.ThrowIfCancellationRequested();
+
+            DateTime notBeforeUtc;
+            AutoProfileCooldownKind kind;
+            TimeSpan baseDelay;
+            TimeSpan actualDelay;
+
+            lock (_autoReplacementCreateCooldownLock)
+            {
+                notBeforeUtc = _autoReplacementCreateNotBeforeUtc;
+                kind = _autoReplacementCreateCooldownKind;
+                baseDelay = _autoReplacementCreateCooldownBase;
+                actualDelay = _autoReplacementCreateCooldownActual;
+            }
+
+            var remaining = notBeforeUtc - DateTime.UtcNow;
+            if (remaining <= TimeSpan.Zero)
+            {
+                if (logged)
+                {
+                    _log.Info(
+                        $"[AUTO_REPLACE_CREATE_COOLDOWN_END] request={request.Id} profile={nextProfileName} " +
+                        $"kind={loggedKind} deadline={loggedDeadline:O}");
+                }
+
+                return true;
+            }
+
+            if (!logged)
+            {
+                logged = true;
+                loggedKind = kind;
+                loggedDeadline = notBeforeUtc;
+
+                _log.Info(
+                    $"[AUTO_REPLACE_CREATE_COOLDOWN_BEGIN] request={request.Id} profile={nextProfileName} " +
+                    $"kind={kind} base={baseDelay:c} actual={actualDelay:c} remaining={remaining:c} deadline={notBeforeUtc:O}");
+            }
+
+            var reason = DescribeAutoProfileCooldownKind(kind);
+            SetAutoReplacementUiPhase(
+                "CHỜ COOLDOWN TẠO PRF",
+                $"{reason} · {FormatAutoReplacementUiWait(remaining)} · kế tiếp {nextProfileName}",
+                request.Id);
+
+            var slice = remaining > TimeSpan.FromSeconds(1)
+                ? TimeSpan.FromSeconds(1)
+                : remaining;
+
+            if (slice > TimeSpan.Zero)
+                await Task.Delay(slice, executionToken);
+        }
+    }
 
     void SetAutoReplacementUiPhase(
         string phase,
@@ -1313,12 +1433,20 @@ public sealed partial class ManagerForm
             return false;
 
         // CAPTCHA/config là lỗi cần xử lý riêng, không phải trường hợp TikTok
-        // Save xong nhưng tên cập nhật chậm. Các PAUSED_RENAME còn lại đều đáng
-        // giữ lại để một sweep sau chỉ PROBE tên thực tế.
+        // Save xong nhưng tên cập nhật chậm. COOLDOWN cũng KHÔNG phải name-sync:
+        // TikTok đã từ chối thao tác đổi tên nên sweep chỉ-PROBE sẽ không bao giờ
+        // tự sửa được. Để COOLDOWN quay về lane reuse thường; Name Guard sẽ thử
+        // thao tác tên lại ở một lượt mở sau.
         if (!outcome.Status.StartsWith("PAUSED_RENAME", StringComparison.OrdinalIgnoreCase))
             return false;
 
-        return !outcome.Status.Equals("PAUSED_RENAME_CONFIG", StringComparison.OrdinalIgnoreCase);
+        if (outcome.Status.Equals("PAUSED_RENAME_CONFIG", StringComparison.OrdinalIgnoreCase)
+            || outcome.Status.Equals("PAUSED_RENAME_COOLDOWN", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return true;
     }
 
     static bool IsAutoReplacementRuntimeStabilizationEligible(AutoProfileProcessOutcome outcome)
@@ -1430,6 +1558,18 @@ public sealed partial class ManagerForm
                 }
 
                 executionToken.ThrowIfCancellationRequested();
+
+                // Chỉ CREATE profile mới mới phải chờ cooldown. Các lane mở PRF đã có
+                // (TryUseReusableProfileQueueAsync / TryOpenNextExistingReplacementAsync)
+                // không đi qua đây nên không bị chậm bởi 4'/7'/15' của Auto Profile.
+                var createCooldownCompleted = await WaitAutoReplacementCreateCooldownBeforeNewProfileAsync(
+                    request,
+                    item.ProfileName,
+                    executionGeneration,
+                    executionToken);
+
+                if (!createCooldownCompleted)
+                    return false;
 
                 attemptedAccountIds.Add(item.Account.Id);
                 attempt++;
@@ -1545,6 +1685,11 @@ public sealed partial class ManagerForm
                                 item.ProfileName,
                                 "created_started_but_not_healthy");
 
+                            RegisterAutoReplacementCreateCooldown(
+                                outcome,
+                                item.ProfileName,
+                                request.Id,
+                                "created_started_but_not_healthy");
                             continue;
                         }
 
@@ -1563,6 +1708,13 @@ public sealed partial class ManagerForm
                             result: "THÀNH CÔNG",
                             detail: $"Profile {item.ProfileName} đã RUNNING khỏe 30 giây.");
 
+                        // Dù suất hiện tại đã đủ, lần CREATE mới kế tiếp (nếu còn thiếu
+                        // target khác) vẫn phải nghỉ đúng "Giữa PRF" như + Auto Profile.
+                        RegisterAutoReplacementCreateCooldown(
+                            outcome,
+                            item.ProfileName,
+                            request.Id,
+                            "created_healthy_success");
                         return true;
                     }
 
@@ -1620,6 +1772,11 @@ public sealed partial class ManagerForm
 
                         // CỐ Ý KHÔNG gọi QueueAutoDeleteRetiredProfileAfterExcelNote ở đây.
                         // Profile/account lỗi non-BAN được giữ lại; chỉ runtime bị đóng.
+                        RegisterAutoReplacementCreateCooldown(
+                            outcome,
+                            item.ProfileName,
+                            request.Id,
+                            "paused_nonban");
                         continue;
                     }
 
@@ -1667,6 +1824,11 @@ public sealed partial class ManagerForm
                                 QueueReusableProfileNameSyncPending(
                                     item,
                                     "created_start_recovery:name_sync_pending");
+                                RegisterAutoReplacementCreateCooldown(
+                                    outcome,
+                                    item.ProfileName,
+                                    request.Id,
+                                    "stabilize_name_sync_pending");
                                 continue;
                             }
 
@@ -1698,6 +1860,11 @@ public sealed partial class ManagerForm
                                     result: "THÀNH CÔNG",
                                     detail: "Profile gặp lỗi START ban đầu nhưng đã tự phục hồi trong cửa sổ ổn định 10 phút.");
 
+                                RegisterAutoReplacementCreateCooldown(
+                                    outcome,
+                                    item.ProfileName,
+                                    request.Id,
+                                    "stabilize_recovered_success");
                                 return true;
                             }
 
@@ -1742,6 +1909,15 @@ public sealed partial class ManagerForm
                             item.ProfileName,
                             "BAN");
                     }
+
+                    // Cùng đúng bộ phân loại cooldown của + Auto Profile:
+                    // login lỗi -> LoginError; BAN / lỗi login lần 3 -> Protection;
+                    // RENAME/START/healthy fail thông thường -> Normal.
+                    RegisterAutoReplacementCreateCooldown(
+                        outcome,
+                        item.ProfileName,
+                        request.Id,
+                        "outcome_fail");
                 }
                 catch (OperationCanceledException)
                     when (executionToken.IsCancellationRequested
@@ -1807,6 +1983,14 @@ public sealed partial class ManagerForm
                             $"Profile bù {item.ProfileName} lỗi và cleanup chưa hoàn tất; chặn mở profile kế tiếp.",
                             cleanupEx);
                     }
+
+                    // Exception ngoài outcome vẫn là một lần CREATE thật đã được thử.
+                    // Không có tín hiệu login/BAN đáng tin => dùng cooldown Normal.
+                    RegisterAutoReplacementCreateCooldown(
+                        null,
+                        item.ProfileName,
+                        request.Id,
+                        "exception:" + ex.GetType().Name);
                 }
                 finally
                 {
@@ -2384,18 +2568,26 @@ public sealed partial class ManagerForm
     {
         wait = TimeSpan.Zero;
 
-        DateTime? createNotBeforeUtc;
+        DateTime? requestDeadlineUtc;
         lock (_autoReplacementQueueLock)
         {
             var live = _autoReplacementQueue.FirstOrDefault(x =>
                 x.Id.Equals(request.Id, StringComparison.OrdinalIgnoreCase));
-            createNotBeforeUtc = live?.CreateNotBeforeUtc ?? request.CreateNotBeforeUtc;
+            requestDeadlineUtc = live?.CreateNotBeforeUtc ?? request.CreateNotBeforeUtc;
         }
 
-        if (!createNotBeforeUtc.HasValue)
+        DateTime sharedDeadlineUtc;
+        lock (_autoReplacementCreateCooldownLock)
+            sharedDeadlineUtc = _autoReplacementCreateNotBeforeUtc;
+
+        var effectiveDeadlineUtc = requestDeadlineUtc ?? DateTime.MinValue;
+        if (sharedDeadlineUtc > effectiveDeadlineUtc)
+            effectiveDeadlineUtc = sharedDeadlineUtc;
+
+        if (effectiveDeadlineUtc == DateTime.MinValue)
             return false;
 
-        wait = createNotBeforeUtc.Value - DateTime.UtcNow;
+        wait = effectiveDeadlineUtc - DateTime.UtcNow;
         if (wait <= TimeSpan.Zero)
         {
             wait = TimeSpan.Zero;
@@ -2434,6 +2626,10 @@ public sealed partial class ManagerForm
         string requestId,
         string lastError)
     {
+        DateTime sharedDeadlineUtc;
+        lock (_autoReplacementCreateCooldownLock)
+            sharedDeadlineUtc = _autoReplacementCreateNotBeforeUtc;
+
         lock (_autoReplacementQueueLock)
         {
             var request = _autoReplacementQueue.FirstOrDefault(x =>
@@ -2445,6 +2641,12 @@ public sealed partial class ManagerForm
             request.LastError = (lastError ?? "").Trim();
             var now = DateTime.UtcNow;
             var deadline = request.CreateNotBeforeUtc ?? now;
+            if (sharedDeadlineUtc > deadline)
+                deadline = sharedDeadlineUtc;
+
+            // Ghi deadline dùng chung vào request để WakeAutoReplacementForReusableSupply
+            // vẫn có thể đánh thức request này nếu PRF chờ xuất hiện trong lúc CREATE bị khóa.
+            request.CreateNotBeforeUtc = deadline;
             request.NextAttemptUtc = deadline > now ? deadline : now;
             SaveAutoReplacementQueueUnsafe();
 
@@ -2455,6 +2657,10 @@ public sealed partial class ManagerForm
 
     void ScheduleAutoReplacementCreateRetry(string requestId, string lastError)
     {
+        DateTime sharedCreateDeadlineUtc;
+        lock (_autoReplacementCreateCooldownLock)
+            sharedCreateDeadlineUtc = _autoReplacementCreateNotBeforeUtc;
+
         lock (_autoReplacementQueueLock)
         {
             var request = _autoReplacementQueue.FirstOrDefault(x =>
@@ -2466,29 +2672,47 @@ public sealed partial class ManagerForm
             request.AttemptCount++;
             request.LastError = (lastError ?? "").Trim();
 
-            var delay = request.AttemptCount switch
-            {
-                <= 1 => TimeSpan.FromMinutes(2),
-                2 => TimeSpan.FromMinutes(3),
-                _ => TimeSpan.FromMinutes(5)
-            };
+            var now = DateTime.UtcNow;
+            TimeSpan delay;
+            var source = "fallback_backoff";
 
-            // Quan trọng: timer phút chỉ khóa TẠO PRF MỚI. NextAttempt cũng đặt tại
-            // deadline để không quét Excel liên tục; nếu PRF chờ xuất hiện, hàm wake
-            // từ queue dùng lại sẽ kéo NextAttemptUtc về ngay lập tức.
-            request.CreateNotBeforeUtc = DateTime.UtcNow.Add(delay);
+            if (sharedCreateDeadlineUtc > now)
+            {
+                // TryCreateReplacementAsync vừa thực sự thử CREATE một PRF và đã
+                // đặt cooldown theo đúng cấu hình + Auto Profile (Normal/Login/Bảo vệ).
+                // Không chồng thêm backoff 2/3/5 phút vì như vậy sẽ làm sai mốc user đặt.
+                request.CreateNotBeforeUtc = sharedCreateDeadlineUtc;
+                delay = sharedCreateDeadlineUtc - now;
+                source = "auto_profile_cooldown";
+            }
+            else
+            {
+                // Không có CREATE thật ngay trước đó (ví dụ kho account đang rỗng):
+                // giữ backoff vận hành cũ để không quét Excel liên tục.
+                delay = request.AttemptCount switch
+                {
+                    <= 1 => TimeSpan.FromMinutes(2),
+                    2 => TimeSpan.FromMinutes(3),
+                    _ => TimeSpan.FromMinutes(5)
+                };
+                request.CreateNotBeforeUtc = now.Add(delay);
+            }
+
             request.NextAttemptUtc = request.CreateNotBeforeUtc.Value;
             SaveAutoReplacementQueueUnsafe();
 
             _log.Warn(
-                $"[AUTO_REPLACE_CREATE_RETRY] id={request.Id} closed={request.ClosedProfileName} attempt={request.AttemptCount} createRetryIn={delay:c} createAt={request.CreateNotBeforeUtc:O} error={request.LastError}");
+                $"[AUTO_REPLACE_CREATE_RETRY] id={request.Id} closed={request.ClosedProfileName} attempt={request.AttemptCount} " +
+                $"source={source} createRetryIn={delay:c} createAt={request.CreateNotBeforeUtc:O} error={request.LastError}");
 
             WriteAutoActivityLog(
                 action: "TỰ BÙ",
                 profile: request.ClosedProfileName,
                 reason: request.Reason,
                 result: "CHỜ TẠO PRF MỚI",
-                detail: $"Lần tạo mới {request.AttemptCount}; PRF chờ nếu xuất hiện vẫn được mở ngay; chỉ nhánh tạo mới chờ {delay.TotalMinutes:0} phút. lỗi={request.LastError}");
+                detail: source == "auto_profile_cooldown"
+                    ? $"Đang tôn trọng cooldown + Auto Profile còn {FormatAutoReplacementUiWait(delay)}; PRF chờ nếu xuất hiện vẫn được mở ngay. lỗi={request.LastError}"
+                    : $"Không có CREATE thật ngay trước đó; backoff kiểm tra kho {delay.TotalMinutes:0} phút. lỗi={request.LastError}");
         }
     }
 

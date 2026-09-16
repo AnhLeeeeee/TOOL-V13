@@ -146,7 +146,10 @@ public sealed partial class ManagerForm
         // Khôi phục quota theo đúng occupied hiện tại và bỏ suppression cũ.
         ClearManualCloseSuppression(profileName, "worker_user_start");
         MarkAutoCloseExpectedRunning(profileName, "worker_user_start");
-        TrackAutoReplacementTargetRuntimeCommand(ctx, "start");
+        TrackAutoReplacementTargetRuntimeCommand(
+            ctx,
+            "start",
+            explicitUserStartIntent: true);
         ArmAutoReplacementSession("worker_user_start:" + profileName);
 
         _log.Info(
