@@ -1572,6 +1572,17 @@ public sealed partial class ManagerForm : Form
         var loadingEditor = false;
         var editorDirty = false;
 
+        bool ConfirmDiscardEditorChanges(string action)
+        {
+            if (!editorDirty) return true;
+
+            var confirm = ModernDialog.ShowConfirm(
+                form,
+                $"Nội dung đang có thay đổi chưa lưu.\r\n\r\n{action} sẽ bỏ các thay đổi này. Tiếp tục?",
+                "Nội dung chưa lưu");
+            return confirm == DialogResult.Yes;
+        }
+
         int CountValidContentLines(string text)
         {
             if (string.IsNullOrEmpty(text)) return 0;
@@ -1709,6 +1720,7 @@ public sealed partial class ManagerForm : Form
                 Multiselect = false
             };
             if (picker.ShowDialog(form) != DialogResult.OK) return;
+            if (!ConfirmDiscardEditorChanges("Nhập cấu hình ZIP")) return;
             try
             {
                 ImportManagerDefaultConfigZip(picker.FileName);
@@ -1734,6 +1746,7 @@ public sealed partial class ManagerForm : Form
             if (profileBox.SelectedItem is not string profileName) return;
             var profile = profiles.FirstOrDefault(p => p.Name.Equals(profileName, StringComparison.OrdinalIgnoreCase));
             if (profile is null) return;
+            if (!ConfirmDiscardEditorChanges($"Dùng cấu hình của profile {profile.Name}")) return;
             try
             {
                 var sourceRoot = _profileService.ResolveDataRoot(profile);
@@ -1764,9 +1777,12 @@ public sealed partial class ManagerForm : Form
 
         clear.Click += (_, _) =>
         {
+            var clearMessage = editorDirty
+                ? "Nội dung đang có thay đổi chưa lưu. Chuyển về defaults gốc của Tool sẽ bỏ các thay đổi này và cấu hình mặc định hiện tại. Tiếp tục?"
+                : "Chuyển về defaults gốc của Tool?";
             var confirm = ModernDialog.ShowConfirm(form,
-                "Chuyển về defaults gốc của Tool?",
-                "Cấu hình mặc định");
+                clearMessage,
+                editorDirty ? "Nội dung chưa lưu" : "Cấu hình mặc định");
             if (confirm != DialogResult.Yes) return;
             try
             {

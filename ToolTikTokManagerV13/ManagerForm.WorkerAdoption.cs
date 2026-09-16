@@ -1,5 +1,6 @@
 ﻿using System.Diagnostics;
 using System.Text.Json;
+using ToolTikTokV12.Services;
 
 namespace ToolTikTokManagerV13;
 
@@ -194,10 +195,14 @@ public sealed partial class ManagerForm
                 // Manager restart chỉ cần nhận lại Worker còn thực sự hoạt động.
                 // Worker STOPPED còn sót từ phiên trước không được tự tạo tab PRF
                 // khi vừa mở Tool; dọn Worker orphan rồi để profile ở trạng thái đóng.
+                // Ngoại lệ: nếu Manager đang Dừng khẩn cấp thì tuyệt đối không cleanup;
+                // cho nhánh adoption bên dưới nhận lại Worker/tab để giữ và nhìn thấy
+                // đúng hiện trạng đã được đóng băng.
                 if (string.Equals(
                         snapshot.RunState,
                         RuntimeStateStopped,
-                        StringComparison.OrdinalIgnoreCase))
+                        StringComparison.OrdinalIgnoreCase)
+                    && !IsAutomationHalted)
                 {
                     _log.Info(
                         $"[WORKER_ADOPT_SKIP_STOPPED] profile={ctx.Profile.Name} pid={snapshot.Pid} action=shutdown_orphan_no_tab");
@@ -218,7 +223,14 @@ public sealed partial class ManagerForm
                     try
                     {
                         if (!await WaitForProcessExitAsync(process, TimeSpan.FromSeconds(5)))
+                        {
                             process.Kill(true);
+                            if (!await WaitForProcessExitAsync(process, TimeSpan.FromSeconds(3)))
+                            {
+                                _log.Warn(
+                                    $"[WORKER_ADOPT_SKIP_STOPPED_STILL_ALIVE] profile={ctx.Profile.Name} pid={snapshot.Pid}");
+                            }
+                        }
                     }
                     catch (Exception killEx)
                     {
@@ -231,6 +243,55 @@ public sealed partial class ManagerForm
                     ctx.WorkerWindow = IntPtr.Zero;
                     ctx.Detached = false;
                     ctx.Opening = false;
+
+                    // Worker STOPPED còn sót mà Chrome của cùng ProfilePath vẫn sống
+                    // sẽ tạo một orphan khó nhìn thấy sau khi Manager restart. Dọn đúng
+                    // Chrome gắn với ProfilePath này trước khi bỏ qua profile. Đây chỉ là
+                    // cleanup startup của Worker STOPPED; không tác động profile khác.
+                    try
+                    {
+                        var stoppedPids = await Task.Run(
+                            () => ChromeProfileNameSyncService.StopChromeUsingProfile(ctx.Profile.ProfilePath));
+
+                        await Task.Delay(250);
+
+                        var verify = await Task.Run(
+                            () => ChromeProfileNameSyncService.ProbeProfileProcesses(ctx.Profile.ProfilePath));
+
+                        if (verify.Succeeded && verify.ProcessIds.Count > 0)
+                        {
+                            var retryPids = await Task.Run(
+                                () => ChromeProfileNameSyncService.StopChromeUsingProfile(ctx.Profile.ProfilePath));
+                            await Task.Delay(500);
+                            verify = await Task.Run(
+                                () => ChromeProfileNameSyncService.ProbeProfileProcesses(ctx.Profile.ProfilePath));
+
+                            _log.Warn(
+                                $"[WORKER_ADOPT_SKIP_STOPPED_CHROME_RETRY] profile={ctx.Profile.Name} first={string.Join(",", stoppedPids)} retry={string.Join(",", retryPids)} remaining={(verify.Succeeded ? string.Join(",", verify.ProcessIds) : "UNKNOWN")}");
+                        }
+
+                        if (!verify.Succeeded)
+                        {
+                            _log.Warn(
+                                $"[WORKER_ADOPT_SKIP_STOPPED_CHROME_VERIFY_WARN] profile={ctx.Profile.Name} error={verify.Error}");
+                        }
+                        else if (verify.ProcessIds.Count > 0)
+                        {
+                            _log.Warn(
+                                $"[WORKER_ADOPT_SKIP_STOPPED_CHROME_STILL_ALIVE] profile={ctx.Profile.Name} pids={string.Join(",", verify.ProcessIds)}");
+                        }
+                        else
+                        {
+                            _log.Info(
+                                $"[WORKER_ADOPT_SKIP_STOPPED_CHROME_CLEAN] profile={ctx.Profile.Name} stopped={string.Join(",", stoppedPids)}");
+                        }
+                    }
+                    catch (Exception chromeCleanupEx)
+                    {
+                        _log.Warn(
+                            $"[WORKER_ADOPT_SKIP_STOPPED_CHROME_WARN] profile={ctx.Profile.Name} error={chromeCleanupEx.Message}");
+                    }
+
                     continue;
                 }
 
@@ -301,7 +362,11 @@ public sealed partial class ManagerForm
         _log.Info($"[WORKER_ADOPT_SCAN_DONE] adopted={adopted}/{candidates.Count}");
 
         if (IsAutomationHalted && adopted > 0)
-            await StopAllWorkerAutomationForEmergencyAsync();
+        {
+            var stopped = await StopAllWorkerAutomationForEmergencyAsync();
+            _log.Warn(
+                $"[EMERGENCY_STOP_STARTUP_ENFORCED] adopted={adopted} workersStopped={stopped}");
+        }
     }
 
     async Task<WorkerSnapshot?> ProbeExistingWorkerSnapshotAsync(ProfileContext ctx)

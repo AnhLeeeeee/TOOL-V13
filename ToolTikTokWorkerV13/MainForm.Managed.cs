@@ -81,6 +81,16 @@ public sealed partial class MainForm
                 case "stop":
                     _engine.Stop();
                     return "stopped";
+                case "emergency_stop":
+                {
+                    // Khác STOP thường: Dừng khẩn cấp phải chờ vòng AutomationEngine
+                    // thật sự unwind. Nếu quá hạn, Manager sẽ fallback kill CHỈ Worker
+                    // (không kill process tree) để giữ nguyên Chrome.
+                    StopManagedMessageReply();
+                    _engine.Stop("Dừng khẩn cấp từ Manager");
+                    var fullyStopped = await _engine.WaitForStopAsync(TimeSpan.FromSeconds(2.5));
+                    return fullyStopped ? "stopped" : "stop_pending";
+                }
                 case "launch":
                     await LaunchChromeAsync();
                     if (!_chrome.Connected) return "not_opened";

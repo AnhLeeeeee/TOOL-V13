@@ -28,6 +28,11 @@ public sealed partial class ManagerForm
         public DateTime QueuedUtc { get; set; } = DateTime.UtcNow;
         public int AttemptCount { get; set; }
         public DateTime NextAttemptUtc { get; set; } = DateTime.UtcNow;
+
+        // Retry dài chỉ dành cho NHÁNH TẠO PRF MỚI. Trong thời gian này request
+        // vẫn có thể được đánh thức ngay nếu xuất hiện PRF Chờ dùng lại phù hợp.
+        public DateTime? CreateNotBeforeUtc { get; set; }
+
         public string LastError { get; set; } = "";
 
         // Mỗi profile bù chỉ được mở/thử tối đa 1 lần trong cùng một suất bù.
@@ -42,7 +47,7 @@ public sealed partial class ManagerForm
 
     sealed class AutoReplacementQueueDocument
     {
-        public int Version { get; set; } = 2;
+        public int Version { get; set; } = 3;
         public List<AutoReplacementRequest> Pending { get; set; } = new();
     }
 
@@ -78,6 +83,8 @@ public sealed partial class ManagerForm
     static readonly TimeSpan AutoReplacementStabilizationRecoveryInterval = TimeSpan.FromSeconds(30);
     static readonly TimeSpan AutoReplacementFailedProfileCooldown = TimeSpan.FromMinutes(5);
     static readonly TimeSpan AutoReplacementQueueWaitSlice = TimeSpan.FromSeconds(5);
+    static readonly TimeSpan AutoReplacementReusableStateRetry = TimeSpan.FromSeconds(5);
+    static readonly TimeSpan AutoReplacementOperationalRetry = TimeSpan.FromSeconds(10);
     const int AutoReplacementCleanupBarrierRetrySeconds = 15;
     const int AutoReplacementCleanupBarrierMaxAttempts = 4;
 
@@ -101,6 +108,78 @@ public sealed partial class ManagerForm
     bool _autoReplacementFeatureInitialized;
     bool _autoReplacementQueueRunning;
     bool _autoReplacementSessionArmed;
+
+    // Trạng thái quan sát (UI-only) của luồng Tự bù. Không tham gia quyết định logic.
+    // Mục tiêu là giúp phân biệt Tool đang thật sự xử lý/chờ retry với trường hợp bị treo.
+    readonly object _autoReplacementUiPhaseLock = new();
+    string _autoReplacementUiPhase = "";
+    string _autoReplacementUiDetail = "";
+    string _autoReplacementUiRequestId = "";
+    DateTime _autoReplacementUiPhaseUtc = DateTime.MinValue;
+
+    void SetAutoReplacementUiPhase(
+        string phase,
+        string detail = "",
+        string requestId = "")
+    {
+        phase = (phase ?? "").Trim();
+        detail = (detail ?? "").Trim();
+        requestId = (requestId ?? "").Trim();
+
+        lock (_autoReplacementUiPhaseLock)
+        {
+            // Nếu chỉ detail thay đổi trong cùng phase/request thì vẫn reset tuổi vì
+            // đây là một bước mới (ví dụ từ a18 sang a19).
+            if (!string.Equals(_autoReplacementUiPhase, phase, StringComparison.Ordinal)
+                || !string.Equals(_autoReplacementUiDetail, detail, StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(_autoReplacementUiRequestId, requestId, StringComparison.OrdinalIgnoreCase))
+            {
+                _autoReplacementUiPhaseUtc = DateTime.UtcNow;
+            }
+
+            _autoReplacementUiPhase = phase;
+            _autoReplacementUiDetail = detail;
+            _autoReplacementUiRequestId = requestId;
+
+            if (phase.Length == 0)
+                _autoReplacementUiPhaseUtc = DateTime.MinValue;
+        }
+    }
+
+    void ClearAutoReplacementUiPhase(string requestId = "")
+    {
+        requestId = (requestId ?? "").Trim();
+
+        lock (_autoReplacementUiPhaseLock)
+        {
+            if (requestId.Length > 0
+                && _autoReplacementUiRequestId.Length > 0
+                && !_autoReplacementUiRequestId.Equals(requestId, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            _autoReplacementUiPhase = "";
+            _autoReplacementUiDetail = "";
+            _autoReplacementUiRequestId = "";
+            _autoReplacementUiPhaseUtc = DateTime.MinValue;
+        }
+    }
+
+    (string Phase, string Detail, TimeSpan Age) GetAutoReplacementUiPhaseSnapshot()
+    {
+        lock (_autoReplacementUiPhaseLock)
+        {
+            var age = _autoReplacementUiPhaseUtc == DateTime.MinValue
+                ? TimeSpan.Zero
+                : DateTime.UtcNow - _autoReplacementUiPhaseUtc;
+
+            if (age < TimeSpan.Zero)
+                age = TimeSpan.Zero;
+
+            return (_autoReplacementUiPhase, _autoReplacementUiDetail, age);
+        }
+    }
 
     (int Generation, CancellationToken Token) CaptureAutoReplacementExecution()
     {
@@ -447,6 +526,11 @@ public sealed partial class ManagerForm
                     continue;
                 }
 
+                SetAutoReplacementUiPhase(
+                    "XỬ LÝ SUẤT",
+                    request.Reason,
+                    request.Id);
+
                 var execution =
                     CaptureAutoReplacementExecution();
 
@@ -476,6 +560,11 @@ public sealed partial class ManagerForm
                 // không có profile nguồn nên bỏ qua source-cleanup và đi thẳng tới slot gate.
                 if (request.RequiresSourceCleanup)
                 {
+                    SetAutoReplacementUiPhase(
+                        "DỌN PRF CŨ",
+                        request.ClosedProfileName,
+                        request.Id);
+
                     var cleanup = await EnsureAutoReplacementSourceCleanupAsync(request);
 
                     if (!cleanup.Succeeded)
@@ -490,9 +579,11 @@ public sealed partial class ManagerForm
                             result: "CHỜ DỌN PROFILE CŨ",
                             detail: cleanup.Detail);
 
-                        ScheduleAutoReplacementRetry(
+                        ClearAutoReplacementUiPhase(request.Id);
+                        ScheduleAutoReplacementOperationalRetry(
                             request.Id,
-                            "Cleanup chưa hoàn tất: " + cleanup.Detail);
+                            "Cleanup chưa hoàn tất: " + cleanup.Detail,
+                            AutoReplacementOperationalRetry);
 
                         continue;
                     }
@@ -514,6 +605,11 @@ public sealed partial class ManagerForm
                 // runtime vật lý. Nếu marker cũ bị sót sau khi Chrome/Worker đã đóng,
                 // CountAutoReplacementOccupiedSlots() có thể tưởng đã đủ suất và xóa
                 // request Tự bù. Xác minh các marker nghi stale 2 lượt trước khi đếm.
+                SetAutoReplacementUiPhase(
+                    "KIỂM TRA SUẤT",
+                    "xác minh slot đang chạy",
+                    request.Id);
+
                 await PruneStaleAutoReplacementExpectedRunningAsync(request);
 
                 if (!IsAutoReplacementExecutionAllowed(execution.Generation))
@@ -527,6 +623,7 @@ public sealed partial class ManagerForm
 
                 if (slotGate.AlreadySatisfied)
                 {
+                    ClearAutoReplacementUiPhase(request.Id);
                     RemoveAutoReplacementRequest(request.Id);
 
                     _log.Warn(
@@ -544,14 +641,19 @@ public sealed partial class ManagerForm
 
                 if (!slotGate.CanOpenReplacement)
                 {
-                    ScheduleAutoReplacementRetry(
+                    ClearAutoReplacementUiPhase(request.Id);
+                    ScheduleAutoReplacementOperationalRetry(
                         request.Id,
-                        slotGate.Detail);
+                        slotGate.Detail,
+                        AutoReplacementReusableStateRetry);
                     continue;
                 }
 
                 var filled = false;
                 var lastError = "";
+                var reusableGuardBlocked = false;
+                var createDeferredByCooldown = false;
+                var createAttempted = false;
                 AutoReplacementCleanupBarrierException? cleanupBarrier = null;
 
                 try
@@ -561,6 +663,11 @@ public sealed partial class ManagerForm
                     // không quét PowerShell/IsProfileInUse trên toàn bộ catalog.
                     _log.Info(
                         $"[AUTO_REPLACE_REUSE_FIRST] id={request.Id} closed={request.ClosedProfileName} reusePending={GetReusableProfileQueueCount()}");
+
+                    SetAutoReplacementUiPhase(
+                        "TÌM PRF CHỜ",
+                        $"{GetReusableProfileQueueCount()} PRF",
+                        request.Id);
 
                     filled = await TryOpenNextExistingReplacementAsync(
                         request,
@@ -588,6 +695,11 @@ public sealed partial class ManagerForm
                         // 1 lần/profile/suất. Profile vừa tạo/kiểm tra chưa đủ 60s sẽ bỏ qua.
                         _log.Info(
                             $"[AUTO_REPLACE_NAME_SYNC_BEFORE_NEW] id={request.Id} closed={request.ClosedProfileName} pending={GetNameSyncPendingReusableProfileCount()} attemptedProfiles={GetAutoReplacementAttemptedProfileCount(request)}");
+
+                        SetAutoReplacementUiPhase(
+                            "KIỂM TRA CHỜ TÊN",
+                            $"{GetNameSyncPendingReusableProfileCount()} PRF",
+                            request.Id);
 
                         filled = await TryRecoverNameSyncPendingReusableProfilesOnceAsync(
                             request,
@@ -635,11 +747,28 @@ public sealed partial class ManagerForm
                                     out var untestedLane,
                                     out var untestedDetail))
                             {
+                                reusableGuardBlocked = true;
                                 lastError =
                                     $"Còn PRF chờ hợp lệ chưa được thử: {untestedProfile} ({untestedLane}). {untestedDetail}";
 
                                 _log.Warn(
                                     $"[AUTO_REPLACE_REUSE_GUARD_BLOCK_NEW] id={request.Id} closed={request.ClosedProfileName} profile={untestedProfile} lane={untestedLane} detail={untestedDetail} attemptedProfiles={GetAutoReplacementAttemptedProfileCount(request)}");
+                            }
+                            else if (TryGetAutoReplacementCreateCooldown(
+                                         request,
+                                         out var createWait))
+                            {
+                                // Retry dài chỉ khóa NHÁNH TẠO MỚI. Nếu trong lúc chờ có
+                                // PRF dùng lại xuất hiện, WakeAutoReplacementForReusableSupply
+                                // sẽ đánh thức request để dùng PRF đó ngay, không chờ hết timer.
+                                createDeferredByCooldown = true;
+                                lastError =
+                                    $"Chưa có PRF chờ phù hợp; chờ {FormatAutoReplacementUiWait(createWait)} trước khi thử tạo PRF mới lại.";
+
+                                SetAutoReplacementUiPhase(
+                                    "CHỜ TẠO PRF MỚI",
+                                    FormatAutoReplacementUiWait(createWait),
+                                    request.Id);
                             }
                             else
                             {
@@ -648,6 +777,12 @@ public sealed partial class ManagerForm
                                 _log.Info(
                                     $"[AUTO_REPLACE_REUSE_EXHAUSTED_FALLBACK_NEW] id={request.Id} closed={request.ClosedProfileName} attemptedProfiles={GetAutoReplacementAttemptedProfileCount(request)}");
 
+                                SetAutoReplacementUiPhase(
+                                    "TẠO PRF MỚI",
+                                    "đã vét PRF chờ phù hợp",
+                                    request.Id);
+
+                                createAttempted = true;
                                 filled = await TryCreateReplacementAsync(
                                     request,
                                     execution.Generation,
@@ -717,6 +852,7 @@ public sealed partial class ManagerForm
 
                 if (filled)
                 {
+                    ClearAutoReplacementUiPhase(request.Id);
                     RemoveAutoReplacementRequest(request.Id);
 
                     _log.Info(
@@ -724,14 +860,43 @@ public sealed partial class ManagerForm
                 }
                 else
                 {
+                    ClearAutoReplacementUiPhase(request.Id);
+
                     if (_autoCloseSettings.ReuseOnlyNoCreateProfile
                         && lastError.StartsWith("Chế độ CHỈ PRF CHỜ", StringComparison.OrdinalIgnoreCase))
                     {
                         ScheduleAutoReplacementReuseOnlyRoundRetry(request.Id, lastError);
                     }
+                    else if (cleanupBarrier is not null)
+                    {
+                        ScheduleAutoReplacementOperationalRetry(
+                            request.Id,
+                            lastError,
+                            TimeSpan.FromSeconds(AutoReplacementCleanupBarrierRetrySeconds));
+                    }
+                    else if (reusableGuardBlocked)
+                    {
+                        // Có PRF chờ nhưng state còn OPENING/UNKNOWN hoặc sweep vừa race:
+                        // chỉ chờ ngắn để kiểm tra lại, tuyệt đối không đẩy sang timer tạo mới.
+                        ScheduleAutoReplacementOperationalRetry(
+                            request.Id,
+                            lastError,
+                            AutoReplacementReusableStateRetry);
+                    }
+                    else if (createDeferredByCooldown)
+                    {
+                        ScheduleAutoReplacementAtCreateDeadline(request.Id, lastError);
+                    }
+                    else if (createAttempted)
+                    {
+                        ScheduleAutoReplacementCreateRetry(request.Id, lastError);
+                    }
                     else
                     {
-                        ScheduleAutoReplacementRetry(request.Id, lastError);
+                        ScheduleAutoReplacementOperationalRetry(
+                            request.Id,
+                            lastError,
+                            AutoReplacementOperationalRetry);
                     }
 
                     // Cleanup profile bù lỗi là GLOBAL BARRIER của queue bù.
@@ -777,6 +942,19 @@ public sealed partial class ManagerForm
 
     async Task CloseFailedReplacementRuntimeAsync(ProfileContext ctx)
     {
+        void ThrowIfEmergencyStopRequested(string phase)
+        {
+            if (!IsAutomationHalted)
+                return;
+
+            _log.Warn(
+                $"[AUTO_REPLACE_CLEANUP_ABORT_EMERGENCY] profile={ctx.Profile.Name} phase={phase}");
+            throw new OperationCanceledException(
+                $"EMERGENCY_STOP_REPLACEMENT_CLEANUP: {phase}");
+        }
+
+        ThrowIfEmergencyStopRequested("begin");
+
         var cleanupProfileName = (ctx.Profile.Name ?? "").Trim();
         if (cleanupProfileName.Length > 0)
             _autoReplacementCleanupProfiles.Add(cleanupProfileName);
@@ -792,6 +970,8 @@ public sealed partial class ManagerForm
         {
             // Một profile bù thất bại phải được dọn SẠCH trước khi queue được phép
             // mở profile bù khác. Không nuốt cleanup failure.
+            ThrowIfEmergencyStopRequested("before_stop_worker");
+
             if (ctx.Worker is not null && !ctx.Worker.HasExited)
             {
                 try
@@ -806,6 +986,8 @@ public sealed partial class ManagerForm
                     _log.Warn(
                         $"[AUTO_REPLACE_FAILED_STOP_WARN] profile={ctx.Profile.Name} error={ex.Message}");
                 }
+
+                ThrowIfEmergencyStopRequested("before_close_chrome");
 
                 try
                 {
@@ -822,8 +1004,11 @@ public sealed partial class ManagerForm
 
             // Shutdown Worker trước để không còn nguồn tái sinh Chrome. Sau đó chỉ
             // chạy một cleanup probe theo đúng ProfilePath.
-            await EnsureAutoCloseWorkerStoppedAsync(ctx);
-            await EnsureAutoCloseChromeStoppedAsync(ctx);
+            ThrowIfEmergencyStopRequested("before_shutdown_worker");
+            await EnsureAutoCloseWorkerStoppedAsync(ctx, respectEmergencyStop: true);
+            ThrowIfEmergencyStopRequested("before_chrome_cleanup");
+            await EnsureAutoCloseChromeStoppedAsync(ctx, respectEmergencyStop: true);
+            ThrowIfEmergencyStopRequested("before_remove_tab");
 
             if (ctx.Tab is not null && !ctx.Tab.IsDisposed && ctx.Tab.Parent == _tabs)
                 RemoveTab(ctx);
@@ -844,6 +1029,12 @@ public sealed partial class ManagerForm
                 "REPLACEMENT_FAILED",
                 "CLOSED",
                 "chrome=0; worker=closed; tab=removed");
+        }
+        catch (OperationCanceledException ex)
+            when (IsAutomationHalted
+                  || ex.Message.StartsWith("EMERGENCY_STOP_", StringComparison.Ordinal))
+        {
+            throw;
         }
         catch (AutoReplacementCleanupBarrierException)
         {
@@ -873,6 +1064,14 @@ public sealed partial class ManagerForm
         profileName = (profileName ?? "").Trim();
         if (profileName.Length == 0)
             return;
+
+        if (IsAutomationHalted)
+        {
+            _log.Warn(
+                $"[AUTO_REPLACE_CREATE_CLEANUP_ABORT_EMERGENCY] profile={profileName} source={source}");
+            throw new OperationCanceledException(
+                $"EMERGENCY_STOP_REPLACEMENT_CLEANUP: created:{source}");
+        }
 
         _autoReplacementCleanupProfiles.Add(profileName);
 
@@ -913,12 +1112,19 @@ public sealed partial class ManagerForm
                 _log.Warn($"[AUTO_REPLACE_FAILED_CLEANUP_BEGIN] profile={profileName} source={source}:path_only");
                 await EnsureAutoCloseChromeStoppedByPathAsync(
                     profileName,
-                    profile.ProfilePath);
+                    profile.ProfilePath,
+                    respectEmergencyStop: true);
                 ClearAutoCloseExpectedRunning(
                     profileName,
                     "auto_replacement_path_cleanup_done");
                 _autoReplacementCleanupProfiles.Remove(profileName);
                 return;
+            }
+            catch (OperationCanceledException ex)
+                when (IsAutomationHalted
+                      || ex.Message.StartsWith("EMERGENCY_STOP_", StringComparison.Ordinal))
+            {
+                throw;
             }
             catch (AutoReplacementCleanupBarrierException)
             {
@@ -945,6 +1151,11 @@ public sealed partial class ManagerForm
         if (profileName.Length == 0)
             return;
 
+        SetAutoReplacementUiPhase(
+            "DỌN PRF BÙ LỖI",
+            profileName,
+            request.Id);
+
         // Không profile bù lỗi nào được phép khóa GLOBAL queue vô hạn. Thử cleanup
         // tối đa 4 lượt (~60s chưa tính thời gian probe). Nếu vẫn UNKNOWN, cô lập
         // profile lỗi bằng cooldown và trả quyền điều khiển cho queue để các suất bù
@@ -956,6 +1167,12 @@ public sealed partial class ManagerForm
              && !Disposing;
              attempt++)
         {
+            if (IsAutomationHalted)
+            {
+                _log.Warn($"[AUTO_REPLACE_CLEANUP_BARRIER_ABORT_EMERGENCY] profile={profileName} stage=before_wait");
+                return;
+            }
+
             _log.Warn(
                 $"[AUTO_REPLACE_CLEANUP_BARRIER_WAIT] blockedProfile={profileName} request={request.Id} " +
                 $"attempt={attempt}/{AutoReplacementCleanupBarrierMaxAttempts} retryIn={AutoReplacementCleanupBarrierRetrySeconds}s");
@@ -971,6 +1188,12 @@ public sealed partial class ManagerForm
                     $"{attempt}/{AutoReplacementCleanupBarrierMaxAttempts} sau {AutoReplacementCleanupBarrierRetrySeconds}s.");
 
             await Task.Delay(TimeSpan.FromSeconds(AutoReplacementCleanupBarrierRetrySeconds));
+
+            if (IsAutomationHalted)
+            {
+                _log.Warn($"[AUTO_REPLACE_CLEANUP_BARRIER_ABORT_EMERGENCY] profile={profileName} stage=after_wait");
+                return;
+            }
 
             try
             {
@@ -1007,7 +1230,8 @@ public sealed partial class ManagerForm
                 // Context không còn: chỉ còn khả năng Chrome mồ côi theo ProfilePath.
                 await EnsureAutoCloseChromeStoppedByPathAsync(
                     profileName,
-                    profile.ProfilePath);
+                    profile.ProfilePath,
+                    respectEmergencyStop: true);
 
                 ClearAutoCloseExpectedRunning(
                     profileName,
@@ -1015,6 +1239,13 @@ public sealed partial class ManagerForm
                 _autoReplacementCleanupProfiles.Remove(profileName);
                 _log.Info(
                     $"[AUTO_REPLACE_CLEANUP_BARRIER_CLEARED] profile={profileName} source=profile_path attempt={attempt}");
+                return;
+            }
+            catch (OperationCanceledException ex)
+                when (IsAutomationHalted
+                      || ex.Message.StartsWith("EMERGENCY_STOP_", StringComparison.Ordinal))
+            {
+                _log.Warn($"[AUTO_REPLACE_CLEANUP_BARRIER_ABORT_EMERGENCY] profile={profileName} stage=cleanup detail={ex.Message}");
                 return;
             }
             catch (AutoReplacementCleanupBarrierException ex)
@@ -1218,6 +1449,11 @@ public sealed partial class ManagerForm
                         result: "BẮT ĐẦU",
                         detail: $"Lần thử {attempt}; tiếp tục đến khi có 1 profile RUNNING khỏe hoặc hết kho.");
 
+                    SetAutoReplacementUiPhase(
+                        "TẠO PRF MỚI",
+                        item.ProfileName,
+                        request.Id);
+
                     var outcome = await ProcessAutoProfileQueueItemAsync(
                         item,
                         autoRename: true,
@@ -1226,6 +1462,11 @@ public sealed partial class ManagerForm
                         ct: executionToken,
                         ui: (step, result, _) =>
                         {
+                            SetAutoReplacementUiPhase(
+                                "TẠO PRF MỚI",
+                                $"{item.ProfileName} · {step}",
+                                request.Id);
+
                             _log.Info(
                                 $"[AUTO_REPLACE_CREATE_PROGRESS] profile={item.ProfileName} step={step} result={result}");
                         });
@@ -1252,6 +1493,11 @@ public sealed partial class ManagerForm
                             }
                             catch { }
                         }
+
+                        SetAutoReplacementUiPhase(
+                            "CHỜ PRF MỚI ỔN ĐỊNH",
+                            item.ProfileName,
+                            request.Id);
 
                         var healthy = createdCtx is not null
                             && await WaitForReplacementHealthyRunningAsync(
@@ -1496,19 +1742,26 @@ public sealed partial class ManagerForm
                     _log.Warn(
                         $"[AUTO_REPLACE_CREATE_HARD_STOP] closed={request.ClosedProfileName} profile={item.ProfileName} generation={executionGeneration}");
 
-                    // Nếu lệnh Dừng đến đúng lúc Worker/Chrome của candidate đang mở,
-                    // dọn runtime candidate hiện tại nhưng tuyệt đối không chuyển sang
-                    // account/profile kế tiếp.
-                    try
+                    // Dừng khẩn cấp = đóng băng hiện trạng: không đóng candidate
+                    // đang mở. Các hard-stop khác vẫn cleanup như logic cũ.
+                    if (!IsAutomationHalted)
                     {
-                        await CleanupCreatedReplacementAttemptAsync(
-                            item.ProfileName,
-                            "manual_hard_stop");
+                        try
+                        {
+                            await CleanupCreatedReplacementAttemptAsync(
+                                item.ProfileName,
+                                "manual_hard_stop");
+                        }
+                        catch (Exception cleanupEx)
+                        {
+                            _log.Warn(
+                                $"[AUTO_REPLACE_CREATE_HARD_STOP_CLEANUP_WARN] profile={item.ProfileName} error={cleanupEx.Message}");
+                        }
                     }
-                    catch (Exception cleanupEx)
+                    else
                     {
                         _log.Warn(
-                            $"[AUTO_REPLACE_CREATE_HARD_STOP_CLEANUP_WARN] profile={item.ProfileName} error={cleanupEx.Message}");
+                            $"[AUTO_REPLACE_CREATE_EMERGENCY_PRESERVE] profile={item.ProfileName} action=leave_runtime_as_is");
                     }
 
                     return false;
@@ -2061,7 +2314,82 @@ public sealed partial class ManagerForm
         }
     }
 
-    void ScheduleAutoReplacementRetry(string requestId, string lastError)
+    bool TryGetAutoReplacementCreateCooldown(
+        AutoReplacementRequest request,
+        out TimeSpan wait)
+    {
+        wait = TimeSpan.Zero;
+
+        DateTime? createNotBeforeUtc;
+        lock (_autoReplacementQueueLock)
+        {
+            var live = _autoReplacementQueue.FirstOrDefault(x =>
+                x.Id.Equals(request.Id, StringComparison.OrdinalIgnoreCase));
+            createNotBeforeUtc = live?.CreateNotBeforeUtc ?? request.CreateNotBeforeUtc;
+        }
+
+        if (!createNotBeforeUtc.HasValue)
+            return false;
+
+        wait = createNotBeforeUtc.Value - DateTime.UtcNow;
+        if (wait <= TimeSpan.Zero)
+        {
+            wait = TimeSpan.Zero;
+            return false;
+        }
+
+        return true;
+    }
+
+    void ScheduleAutoReplacementOperationalRetry(
+        string requestId,
+        string lastError,
+        TimeSpan delay)
+    {
+        if (delay < TimeSpan.FromSeconds(1))
+            delay = TimeSpan.FromSeconds(1);
+
+        lock (_autoReplacementQueueLock)
+        {
+            var request = _autoReplacementQueue.FirstOrDefault(x =>
+                x.Id.Equals(requestId, StringComparison.OrdinalIgnoreCase));
+
+            if (request is null)
+                return;
+
+            request.LastError = (lastError ?? "").Trim();
+            request.NextAttemptUtc = DateTime.UtcNow.Add(delay);
+            SaveAutoReplacementQueueUnsafe();
+
+            _log.Info(
+                $"[AUTO_REPLACE_OPERATIONAL_RETRY] id={request.Id} closed={request.ClosedProfileName} retryIn={delay:c} next={request.NextAttemptUtc:O} error={request.LastError}");
+        }
+    }
+
+    void ScheduleAutoReplacementAtCreateDeadline(
+        string requestId,
+        string lastError)
+    {
+        lock (_autoReplacementQueueLock)
+        {
+            var request = _autoReplacementQueue.FirstOrDefault(x =>
+                x.Id.Equals(requestId, StringComparison.OrdinalIgnoreCase));
+
+            if (request is null)
+                return;
+
+            request.LastError = (lastError ?? "").Trim();
+            var now = DateTime.UtcNow;
+            var deadline = request.CreateNotBeforeUtc ?? now;
+            request.NextAttemptUtc = deadline > now ? deadline : now;
+            SaveAutoReplacementQueueUnsafe();
+
+            _log.Info(
+                $"[AUTO_REPLACE_WAIT_CREATE_DEADLINE] id={request.Id} closed={request.ClosedProfileName} createAt={request.CreateNotBeforeUtc:O} next={request.NextAttemptUtc:O}");
+        }
+    }
+
+    void ScheduleAutoReplacementCreateRetry(string requestId, string lastError)
     {
         lock (_autoReplacementQueueLock)
         {
@@ -2081,19 +2409,67 @@ public sealed partial class ManagerForm
                 _ => TimeSpan.FromMinutes(5)
             };
 
-            request.NextAttemptUtc = DateTime.UtcNow.Add(delay);
+            // Quan trọng: timer phút chỉ khóa TẠO PRF MỚI. NextAttempt cũng đặt tại
+            // deadline để không quét Excel liên tục; nếu PRF chờ xuất hiện, hàm wake
+            // từ queue dùng lại sẽ kéo NextAttemptUtc về ngay lập tức.
+            request.CreateNotBeforeUtc = DateTime.UtcNow.Add(delay);
+            request.NextAttemptUtc = request.CreateNotBeforeUtc.Value;
             SaveAutoReplacementQueueUnsafe();
 
             _log.Warn(
-                $"[AUTO_REPLACE_SLOT_RETRY] id={request.Id} closed={request.ClosedProfileName} attempt={request.AttemptCount} retryIn={delay:c} next={request.NextAttemptUtc:O} error={request.LastError}");
+                $"[AUTO_REPLACE_CREATE_RETRY] id={request.Id} closed={request.ClosedProfileName} attempt={request.AttemptCount} createRetryIn={delay:c} createAt={request.CreateNotBeforeUtc:O} error={request.LastError}");
 
             WriteAutoActivityLog(
                 action: "TỰ BÙ",
                 profile: request.ClosedProfileName,
                 reason: request.Reason,
-                result: "RETRY",
-                detail: $"Lần {request.AttemptCount}; thử lại sau {delay.TotalMinutes:0} phút; lỗi={request.LastError}");
+                result: "CHỜ TẠO PRF MỚI",
+                detail: $"Lần tạo mới {request.AttemptCount}; PRF chờ nếu xuất hiện vẫn được mở ngay; chỉ nhánh tạo mới chờ {delay.TotalMinutes:0} phút. lỗi={request.LastError}");
         }
+    }
+
+    void WakeAutoReplacementForReusableSupply(string source)
+    {
+        if (IsAutomationHalted
+            || !_autoReplacementFeatureInitialized
+            || !_autoReplacementSessionArmed
+            || !_autoCloseSettings.OpenReplacementAfterAutoClose)
+        {
+            return;
+        }
+
+        var woke = 0;
+        var now = DateTime.UtcNow;
+
+        lock (_autoReplacementQueueLock)
+        {
+            foreach (var request in _autoReplacementQueue)
+            {
+                if (request.NextAttemptUtc <= now)
+                    continue;
+
+                // Chỉ đánh thức request đang chờ nhánh tạo mới. Retry cleanup/slot-gate
+                // ngắn giữ nguyên để không mở PRF trước khi hàng rào an toàn hoàn tất.
+                if (!request.CreateNotBeforeUtc.HasValue
+                    || request.CreateNotBeforeUtc.Value <= now)
+                {
+                    continue;
+                }
+
+                request.NextAttemptUtc = now;
+                woke++;
+            }
+
+            if (woke > 0)
+                SaveAutoReplacementQueueUnsafe();
+        }
+
+        if (woke <= 0)
+            return;
+
+        _log.Info(
+            $"[AUTO_REPLACE_REUSE_SUPPLY_WAKE] source={source} woke={woke}");
+        _ = RunAutoReplacementQueueAsync();
     }
 
     AutoReplacementQueueDocument LoadAutoReplacementQueueDocument()
@@ -2124,7 +2500,7 @@ public sealed partial class ManagerForm
     {
         var document = new AutoReplacementQueueDocument
         {
-            Version = 2,
+            Version = 3,
             Pending = _autoReplacementQueue
                 .OrderBy(x => x.QueuedUtc)
                 .ToList()

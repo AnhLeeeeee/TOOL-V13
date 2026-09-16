@@ -151,8 +151,21 @@ public sealed partial class ManagerForm
     }
 
     async Task EnsureAutoCloseChromeStoppedAsync(
-        ProfileContext ctx)
+        ProfileContext ctx,
+        bool respectEmergencyStop = false)
     {
+        void ThrowIfEmergencyStopRequested(string phase)
+        {
+            if (!respectEmergencyStop || !IsAutomationHalted)
+                return;
+
+            _log.Warn(
+                $"[AUTO_CLOSE_ABORT_EMERGENCY] profile={ctx.Profile.Name} phase=chrome_cleanup:{phase}");
+            throw new OperationCanceledException(
+                $"EMERGENCY_STOP_AUTOCLOSE: chrome_cleanup:{phase}");
+        }
+
+        ThrowIfEmergencyStopRequested("begin");
         // CHẬM MÀ CHẮC: Worker/window/CDP chỉ là tín hiệu nhanh để log, KHÔNG còn
         // được dùng để kết luận Chrome đã đóng. Chrome có thể mất CDP/cửa sổ trước
         // nhưng process theo đúng --user-data-dir/ProfilePath vẫn còn sống.
@@ -180,9 +193,11 @@ public sealed partial class ManagerForm
         {
             for (var pass = 1; pass <= 2; pass++)
             {
+                ThrowIfEmergencyStopRequested($"before_pass_{pass}");
                 await EnsureAutoCloseChromeStoppedByPathAsync(
                     ctx.Profile.Name,
-                    ctx.Profile.ProfilePath);
+                    ctx.Profile.ProfilePath,
+                    respectEmergencyStop);
 
                 _log.Info(
                     $"[AUTO_CLOSE_CHROME_STRICT_PASS] profile={ctx.Profile.Name} pass={pass}/2 state=profile_path_closed");
@@ -193,6 +208,7 @@ public sealed partial class ManagerForm
                     _log.Info(
                         $"[AUTO_CLOSE_CHROME_STRICT_WAIT] profile={ctx.Profile.Name} delayMs={delayMs} nextPass=2/2");
                     await Task.Delay(delayMs);
+                    ThrowIfEmergencyStopRequested("between_passes");
                 }
             }
 
@@ -205,7 +221,11 @@ public sealed partial class ManagerForm
             // hệ thống bị timeout, dùng các tín hiệu runtime độc lập (Worker, cửa sổ,
             // CDP, PID top-level đã biết) hai lượt liên tiếp. Chỉ fallback nếu TẤT CẢ
             // đều sạch; nếu còn bất kỳ tín hiệu sống nào vẫn fail-closed như cũ.
-            var fallbackClosed = await TryConfirmAutoCloseChromeStoppedWithoutCimAsync(ctx, ex.Message);
+            ThrowIfEmergencyStopRequested("before_fallback");
+            var fallbackClosed = await TryConfirmAutoCloseChromeStoppedWithoutCimAsync(
+                ctx,
+                ex.Message,
+                respectEmergencyStop);
             if (!fallbackClosed)
                 throw;
 
@@ -235,10 +255,24 @@ public sealed partial class ManagerForm
 
     async Task EnsureAutoCloseChromeStoppedByPathAsync(
         string profileName,
-        string profilePath)
+        string profilePath,
+        bool respectEmergencyStop = false)
     {
         profileName = (profileName ?? "").Trim();
         profilePath = (profilePath ?? "").Trim();
+
+        void ThrowIfEmergencyStopRequested(string phase)
+        {
+            if (!respectEmergencyStop || !IsAutomationHalted)
+                return;
+
+            _log.Warn(
+                $"[AUTO_CLOSE_ABORT_EMERGENCY] profile={profileName} phase=chrome_path:{phase}");
+            throw new OperationCanceledException(
+                $"EMERGENCY_STOP_AUTOCLOSE: chrome_path:{phase}");
+        }
+
+        ThrowIfEmergencyStopRequested("before_probe");
 
         // V13.7.9 HOTFIX:
         // Chỉ chạy MỘT lượt CIM để xác định chính xác process thuộc ProfilePath.
@@ -246,6 +280,8 @@ public sealed partial class ManagerForm
         // khiến một profile giữ watchdog khoảng 40-45 giây.
         var probe = await Task.Run(
             () => ChromeProfileNameSyncService.ProbeProfileProcesses(profilePath));
+
+        ThrowIfEmergencyStopRequested("after_probe");
 
         if (!probe.Succeeded)
         {
@@ -281,6 +317,7 @@ public sealed partial class ManagerForm
 
         foreach (var pid in detectedPids)
         {
+            ThrowIfEmergencyStopRequested($"before_kill_pid_{pid}");
             try
             {
                 using var process = System.Diagnostics.Process.GetProcessById(pid);
@@ -320,6 +357,7 @@ public sealed partial class ManagerForm
 
         do
         {
+            ThrowIfEmergencyStopRequested("wait_known_pids");
             remaining = detectedPids
                 .Where(IsPidAlive)
                 .ToArray();
@@ -352,8 +390,21 @@ public sealed partial class ManagerForm
 
     async Task<bool> TryConfirmAutoCloseChromeStoppedWithoutCimAsync(
         ProfileContext ctx,
-        string probeError)
+        string probeError,
+        bool respectEmergencyStop = false)
     {
+        void ThrowIfEmergencyStopRequested(string phase)
+        {
+            if (!respectEmergencyStop || !IsAutomationHalted)
+                return;
+
+            _log.Warn(
+                $"[AUTO_CLOSE_ABORT_EMERGENCY] profile={ctx.Profile.Name} phase=chrome_fallback:{phase}");
+            throw new OperationCanceledException(
+                $"EMERGENCY_STOP_AUTOCLOSE: chrome_fallback:{phase}");
+        }
+
+        ThrowIfEmergencyStopRequested("begin");
         static bool IsPidAlive(int pid)
         {
             if (pid <= 0) return false;
@@ -385,6 +436,7 @@ public sealed partial class ManagerForm
         // xác minh. Không quét/kill Chrome profile khác.
         if (knownChromePid > 0 && IsPidAlive(knownChromePid))
         {
+            ThrowIfEmergencyStopRequested("before_known_pid_kill");
             try
             {
                 using var chrome = System.Diagnostics.Process.GetProcessById(knownChromePid);
@@ -401,6 +453,7 @@ public sealed partial class ManagerForm
 
         for (var pass = 1; pass <= 2; pass++)
         {
+            ThrowIfEmergencyStopRequested($"before_pass_{pass}");
             var workerAlive = false;
             try
             {
@@ -425,7 +478,10 @@ public sealed partial class ManagerForm
                 return false;
 
             if (pass == 1)
+            {
                 await Task.Delay(Random.Shared.Next(900, 1401));
+                ThrowIfEmergencyStopRequested("between_passes");
+            }
         }
 
         return true;

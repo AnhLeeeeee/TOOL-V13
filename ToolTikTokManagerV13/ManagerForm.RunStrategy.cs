@@ -22,8 +22,17 @@ public sealed partial class ManagerForm
 
     sealed class RunAllStrategySettings
     {
-        public int Version { get; set; } = 2;
+        public int Version { get; set; } = 3;
         public RunAllStrategyMode Mode { get; set; } = RunAllStrategyMode.Time;
+
+        // V3: khi user đã chọn Giờ vàng + Bắt đầu, giữ "ý định vận hành" này
+        // qua Stop All / Dừng khẩn cấp / restart Manager. Chỉ khi user chọn lại
+        // chế độ Theo thời gian rồi Bắt đầu thì mới disarm Giờ vàng.
+        public bool PrimeModeArmed { get; set; }
+
+        // Mode vẫn được nhớ nhưng Stop All / Dừng khẩn cấp đặt scheduler vào trạng thái
+        // chờ. Một START mới (target > 0) sẽ tự bỏ cờ này mà không cần chọn Giờ vàng lại.
+        public bool PrimeModeSuspended { get; set; }
 
         // V2: "Chạy tất cả" có target độc lập với số tab đang mở.
         // Mặc định Tool tự bảo đảm đủ target; user vẫn có thể chọn chỉ chạy tab đang mở.
@@ -93,6 +102,17 @@ public sealed partial class ManagerForm
             var loaded = JsonSerializer.Deserialize<RunAllStrategySettings>(
                 File.ReadAllText(RunStrategySettingsPath));
 
+            // Migration V2 -> V3: Mode=PrimeFresh chỉ từng được ghi khi user đã
+            // bấm Bắt đầu trong Auto Run, nên có thể an toàn coi đó là ý định đã arm.
+            // Nhờ vậy cập nhật patch không bắt user phải chọn Giờ vàng lại một lần.
+            if (loaded is not null
+                && loaded.Version < 3
+                && loaded.Mode == RunAllStrategyMode.PrimeFresh)
+            {
+                loaded.PrimeModeArmed = true;
+                loaded.PrimeModeSuspended = false;
+            }
+
             return NormalizeRunStrategySettings(
                 loaded ?? new RunAllStrategySettings());
         }
@@ -106,7 +126,13 @@ public sealed partial class ManagerForm
     static RunAllStrategySettings NormalizeRunStrategySettings(
         RunAllStrategySettings settings)
     {
-        settings.Version = 2;
+        settings.Version = 3;
+        if (settings.Mode != RunAllStrategyMode.PrimeFresh)
+        {
+            settings.PrimeModeArmed = false;
+            settings.PrimeModeSuspended = false;
+        }
+
         settings.TargetSlots = Math.Clamp(settings.TargetSlots, 1, 50);
         settings.PrimeStartHour = Math.Clamp(settings.PrimeStartHour, 0, 23);
         settings.PrimeEndHour = Math.Clamp(settings.PrimeEndHour, 1, 24);
@@ -150,6 +176,8 @@ public sealed partial class ManagerForm
         {
             Version = _runStrategySettings.Version,
             Mode = _runStrategySettings.Mode,
+            PrimeModeArmed = _runStrategySettings.PrimeModeArmed,
+            PrimeModeSuspended = _runStrategySettings.PrimeModeSuspended,
             AutoEnsureTarget = _runStrategySettings.AutoEnsureTarget,
             TargetSlots = _runStrategySettings.TargetSlots,
             PrimeStartHour = _runStrategySettings.PrimeStartHour,
@@ -551,8 +579,10 @@ public sealed partial class ManagerForm
 
         var selected = NormalizeRunStrategySettings(new RunAllStrategySettings
         {
-            Version = 2,
+            Version = 3,
             Mode = primeMode.Checked ? RunAllStrategyMode.PrimeFresh : RunAllStrategyMode.Time,
+            PrimeModeArmed = primeMode.Checked,
+            PrimeModeSuspended = false,
             AutoEnsureTarget = autoEnsureTarget.Checked,
             TargetSlots = (int)targetSlots.Value,
             PrimeStartHour = (int)startHour.Value,
@@ -719,6 +749,7 @@ public sealed partial class ManagerForm
 
         ArmAutoReplacementSession(
             $"run_all_target:{targetSlots}:{source}");
+        MarkNightReservePrimaryRunIntent(targetSlots, source);
     }
 
     async Task<int> EnsureRunAllTargetSequentialAsync(
@@ -1052,13 +1083,17 @@ public sealed partial class ManagerForm
         ArmAutoReplacementSession("run_strategy_prime_start");
 
         _log.Info(
-            $"[RUN_STRATEGY_START] mode=PRIME target={targetSlots} prime={settings.PrimeStartHour:00}:00-{settings.PrimeEndHour:00}:00 " +
+            $"[RUN_STRATEGY_START] mode=PRIME armed={settings.PrimeModeArmed} target={targetSlots} prime={settings.PrimeStartHour:00}:00-{settings.PrimeEndHour:00}:00 " +
             $"freshTarget={Math.Min(settings.FreshTarget, targetSlots)} freshUnder={settings.FreshHours}h oldFrom={settings.OldHours}h " +
             $"interval={settings.RotationIntervalMinutes}m prepare={settings.PrepareMinutes}m preserveOffPeak={settings.PreserveFreshOffPeak}");
     }
 
     void StopRunStrategySession(string source)
     {
+        // Mỗi lần kết thúc/chuyển phiên Auto Run đều kết thúc quyền tạo reserve của
+        // phiên cũ. Auto Run mới sẽ arm lại sau khi capture target mới.
+        ResetNightReservePrimaryRunIntent(source);
+
         CancellationTokenSource? oldCts = null;
         CancellationTokenSource? startCts = null;
         var wasActive = false;
@@ -1097,15 +1132,140 @@ public sealed partial class ManagerForm
                 "[RUN_ALL_TARGET_STOP_ALL] target=0 initialized=true");
         }
 
+        // Không disarm Giờ vàng; chỉ persist trạng thái "đang chờ START mới".
+        // Điều này phân biệt restart bình thường (được tự restore nếu Worker còn RUNNING)
+        // với restart sau Stop All / Dừng khẩn cấp (không được tự bật lại do Worker sót).
+        if (source.Equals("stop_all", StringComparison.OrdinalIgnoreCase)
+            || source.Equals("emergency_stop", StringComparison.OrdinalIgnoreCase)
+            || source.Equals("emergency_resume_resync", StringComparison.OrdinalIgnoreCase))
+        {
+            var persistSuspended = false;
+            RunAllStrategySettings? settingsToSave = null;
+            lock (_runStrategyLock)
+            {
+                if (_runStrategySettings.Mode == RunAllStrategyMode.PrimeFresh
+                    && _runStrategySettings.PrimeModeArmed
+                    && !_runStrategySettings.PrimeModeSuspended)
+                {
+                    _runStrategySettings.PrimeModeSuspended = true;
+                    settingsToSave = _runStrategySettings;
+                    persistSuspended = true;
+                }
+            }
+
+            if (persistSuspended && settingsToSave is not null)
+            {
+                try { SaveRunStrategySettings(settingsToSave); }
+                catch (Exception ex)
+                {
+                    _log.Warn($"[RUN_STRATEGY_SUSPEND_SAVE_WARN] source={source} error={ex.Message}");
+                }
+            }
+        }
+
         if (wasActive || startCts is not null)
             _log.Info($"[RUN_STRATEGY_STOP] source={source}");
+    }
+
+    void RestoreArmedRunStrategySessionIfNeeded(string source)
+    {
+        if (IsAutomationHalted
+            || !_runStrategyFeatureInitialized
+            || _closing
+            || IsDisposed
+            || Disposing)
+        {
+            return;
+        }
+
+        RunAllStrategySettings settings;
+        bool sessionActive;
+        int currentTarget;
+
+        lock (_runStrategyLock)
+        {
+            settings = _runStrategySettings;
+            sessionActive = _runStrategySessionActive;
+            currentTarget = _runStrategyTargetSlots;
+        }
+
+        if (settings.Mode != RunAllStrategyMode.PrimeFresh
+            || !settings.PrimeModeArmed)
+        {
+            return;
+        }
+
+        // Target của Tự bù là nguồn sự thật khi đã được khởi tạo. Đặc biệt target=0
+        // sau Stop All / Dừng khẩn cấp là CHỦ Ý, nên không được suy ngược từ các tab
+        // RUNNING còn đang unwind trong vài giây.
+        int desiredTarget;
+        bool targetInitialized;
+        lock (_autoReplacementFixedSlotLock)
+        {
+            desiredTarget = _autoReplacementTargetSlots;
+            targetInitialized = _autoReplacementTargetInitialized;
+        }
+
+        if (settings.PrimeModeSuspended)
+        {
+            // Chỉ một target MỚI được thiết lập bởi Start/Auto Run trong phiên hiện tại
+            // mới bỏ trạng thái chờ. target chưa initialized sau restart không đủ bằng chứng.
+            if (!targetInitialized || desiredTarget <= 0)
+                return;
+
+            settings.PrimeModeSuspended = false;
+            try
+            {
+                SaveRunStrategySettings(settings);
+                _log.Info(
+                    $"[RUN_STRATEGY_RESUME_ARMED] source={source} target={desiredTarget}");
+            }
+            catch (Exception ex)
+            {
+                // Không mở scheduler nếu chưa persist được trạng thái resume; nếu Manager
+                // crash ngay sau đó thì lần mở sau vẫn phải hiểu đúng là đang chờ START.
+                settings.PrimeModeSuspended = true;
+                _log.Warn(
+                    $"[RUN_STRATEGY_RESUME_SAVE_WARN] source={source} error={ex.Message}");
+                return;
+            }
+        }
+
+        if (!targetInitialized)
+        {
+            // Manager vừa restart không mang target session cũ sang. Nếu Worker cũ
+            // thực sự đang RUNNING/RECOVERING thì khôi phục Giờ vàng theo đúng số
+            // runtime đang hoạt động; tab STOPPED không được tính.
+            desiredTarget = _contexts.Values.Count(ctx =>
+            {
+                if (ctx.Tab is null
+                    || ctx.Tab.IsDisposed
+                    || ctx.Tab.Parent != _tabs)
+                {
+                    return false;
+                }
+
+                var state = GetEffectiveRuntimeState(ctx);
+                return state is RuntimeStateRunning or RuntimeStateRecovering;
+            });
+        }
+
+        if (desiredTarget <= 0)
+            return;
+
+        if (sessionActive && currentTarget == desiredTarget)
+            return;
+
+        _log.Info(
+            $"[RUN_STRATEGY_RESTORE_ARMED] source={source} target={desiredTarget} previousActive={sessionActive} previousTarget={currentTarget}");
+
+        StartRunStrategySession(settings, desiredTarget);
     }
 
     async Task CheckRunStrategyAsync()
     {
         if (IsAutomationHalted
             || !_runStrategyFeatureInitialized
-            || !_runStrategySessionActive
             || _runStrategyTickBusy
             || _runStrategyRotationRunning
             || _closing
@@ -1114,6 +1274,14 @@ public sealed partial class ManagerForm
         {
             return;
         }
+
+        // Giờ vàng là mode đã "arm", không còn phụ thuộc lifetime của một phiên
+        // Auto Run. Stop All/Emergency chỉ pause runtime; khi target hợp lệ quay lại
+        // (Start thủ công hoặc Worker cũ sau restart) scheduler tự khôi phục.
+        RestoreArmedRunStrategySessionIfNeeded("tick");
+
+        if (!_runStrategySessionActive)
+            return;
 
         _runStrategyTickBusy = true;
         try

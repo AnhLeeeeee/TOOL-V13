@@ -83,22 +83,13 @@ public sealed partial class ManagerForm
 
             foreach (var ctx in _contexts.Values.ToList())
             {
-                var workerAlive = false;
-
-                try
-                {
-                    workerAlive =
-                        ctx.Worker is not null
-                        && !ctx.Worker.HasExited;
-                }
-                catch { }
-
-                var tabOpen =
-                    ctx.Tab is not null
-                    && !ctx.Tab.IsDisposed
-                    && ctx.Tab.Parent == _tabs;
-
-                if (tabOpen || workerAlive || ctx.Opening)
+                // Với kho Chờ dùng lại, Worker/tab còn tồn tại KHÔNG đồng nghĩa
+                // profile đang bận. Sau Stop/AutoClose, Worker hoặc tab có thể còn sống
+                // một nhịp trong khi runtime đã STOPPED; đây chính là cửa sổ race làm
+                // PRF chờ tự động bị loại rồi rơi sang tạo PRF mới.
+                // IsReusableProfileBusy() chỉ coi RUNNING/PAUSED/RECOVERING hoặc
+                // trạng thái chưa xác minh là bận; STOPPED vẫn được phép reuse.
+                if (IsReusableProfileBusy(ctx.Profile.Name))
                     busyProfiles.Add(ctx.Profile.Name);
             }
 
@@ -382,6 +373,31 @@ public sealed partial class ManagerForm
 
                 if (busyProfiles.Contains(profileName))
                 {
+                    // Entry auto đã có từ trước nhưng đúng lúc refresh Worker/tab đang
+                    // OPENING hoặc runtime chưa xác minh được thì KHÔNG được làm rơi
+                    // khỏi queue. Giữ entry để lượt bù chờ xác minh lại, thay vì coi
+                    // như đã hết PRF chờ rồi tạo PRF mới. Profile thực sự RUNNING/PAUSED/
+                    // RECOVERING vẫn bị loại như cũ.
+                    if (hasOldEntry
+                        && !oldEntry!.IsManual
+                        && !oldEntry.NameSyncPending
+                        && IsReusableProfileTransientBusy(profileName))
+                    {
+                        reasons[profileName] = "ĐANG CHỜ · TỰ ĐỘNG · ĐANG XÁC MINH TRẠNG THÁI";
+                        eligible.Add(
+                            new ReusableProfileQueueEntry
+                            {
+                                ProfileName = profileName,
+                                AccountId = account.Id,
+                                Username = account.Username,
+                                TotalRunSeconds = totalSeconds,
+                                IsManual = false,
+                                AddedUtc = oldEntry.AddedUtc,
+                                LastCheckedUtc = oldEntry.LastCheckedUtc
+                            });
+                        continue;
+                    }
+
                     reasons[profileName] = "ĐANG MỞ/CHẠY";
                     continue;
                 }
@@ -559,6 +575,11 @@ public sealed partial class ManagerForm
 
             _log.Info(
                 $"[REUSE_QUEUE_REFRESH] source={source} eligible={eligible.Count} manual={eligible.Count(x => x.IsManual)} auto={eligible.Count(x => !x.IsManual)} busy={busyProfiles.Count} maxAutoTotal={automaticMaxHours}h");
+
+            // Nếu một suất bù đang chờ timer TẠO MỚI mà queue dùng lại vừa có
+            // nguồn, đánh thức suất đó ngay. Timer phút không được giữ PRF đã tồn tại.
+            if (eligible.Count > 0)
+                WakeAutoReplacementForReusableSupply("reuse_refresh:" + source);
         }
         catch (OperationCanceledException)
         {
@@ -875,6 +896,10 @@ public sealed partial class ManagerForm
         _log.Info(
             $"[REUSE_QUEUE_MANUAL_ADD] profile={profileName} account={username} total={TimeSpan.FromSeconds(totalSeconds):c}");
 
+        // PRF thủ công đã được user xác nhận sẵn sàng: nếu Tự bù đang chờ tạo mới,
+        // kéo request về xử lý ngay thay vì bắt user chờ hết 2/3/5 phút.
+        WakeAutoReplacementForReusableSupply("manual_reuse_add:" + profileName);
+
         message =
             $"Đã thêm Profile {profileName} ({username}) vào Chờ dùng lại thủ công.";
         return true;
@@ -945,13 +970,51 @@ public sealed partial class ManagerForm
         if (!_contexts.TryGetValue(profileName, out var ctx))
             return false;
 
-        var workerAlive = false;
+        if (ctx.Opening)
+            return true;
 
+        var state = GetEffectiveRuntimeState(ctx);
+        if (state is RuntimeStateRunning or RuntimeStatePaused or RuntimeStateRecovering)
+            return true;
+
+        // STOPPED là profile có thể dùng lại, kể cả Worker/tab vẫn còn tồn tại.
+        // OpenProfileAsync/EnsureWorkerAsync có thể tái sử dụng Worker sống sẵn.
+        if (state == RuntimeStateStopped)
+            return false;
+
+        // UNKNOWN + còn Worker/tab: chưa đủ bằng chứng để mở chồng lên. Lượt bù sẽ
+        // chủ động RefreshStatus một lần và, nếu vẫn UNKNOWN, giữ suất để retry.
+        return HasReusableProfilePhysicalRuntime(ctx);
+    }
+
+    bool IsReusableProfileTransientBusy(string profileName)
+    {
+        profileName = (profileName ?? "").Trim();
+        if (profileName.Length == 0
+            || !_contexts.TryGetValue(profileName, out var ctx))
+        {
+            return false;
+        }
+
+        if (ctx.Opening)
+            return true;
+
+        var state = GetEffectiveRuntimeState(ctx);
+        if (state is RuntimeStateRunning or RuntimeStatePaused or RuntimeStateRecovering
+            || state == RuntimeStateStopped)
+        {
+            return false;
+        }
+
+        return HasReusableProfilePhysicalRuntime(ctx);
+    }
+
+    bool HasReusableProfilePhysicalRuntime(ProfileContext ctx)
+    {
+        var workerAlive = false;
         try
         {
-            workerAlive =
-                ctx.Worker is not null
-                && !ctx.Worker.HasExited;
+            workerAlive = ctx.Worker is not null && !ctx.Worker.HasExited;
         }
         catch { }
 
@@ -960,9 +1023,7 @@ public sealed partial class ManagerForm
             && !ctx.Tab.IsDisposed
             && ctx.Tab.Parent == _tabs;
 
-        return ctx.Opening
-               || workerAlive
-               || tabOpen;
+        return workerAlive || tabOpen;
     }
 
     sealed record ReusableProfileDrainSummary(
@@ -1501,6 +1562,11 @@ public sealed partial class ManagerForm
 
                 executionToken.ThrowIfCancellationRequested();
 
+                SetAutoReplacementUiPhase(
+                    "MỞ CHỜ TÊN",
+                    profileName,
+                    request.Id);
+
                 _ = await OpenProfileAsync(
                     ctx,
                     $"Kiểm tra lại tên profile chờ dùng lại {profileName}...");
@@ -1527,6 +1593,11 @@ public sealed partial class ManagerForm
                 // Worker/Chrome trên VM có thể cần nhiều thời gian để ổn định. Không kết
                 // luận lỗi ngay sau pipe timeout 10s; giữ đúng slot này tối đa 10 phút và
                 // chỉ recovery CHÍNH profile đang thử.
+                SetAutoReplacementUiPhase(
+                    "CHỜ TÊN ỔN ĐỊNH",
+                    profileName,
+                    request.Id);
+
                 var probeReady = await WaitForReplacementProbeReadyAsync(
                     ctx,
                     request,
@@ -1850,9 +1921,28 @@ public sealed partial class ManagerForm
                 continue;
             }
 
-            // Busy/đang mở cũng là lý do loại hợp lệ trong logic hiện tại.
+            // Profile thật sự RUNNING/PAUSED/RECOVERING không còn là nguồn chờ.
+            // Nhưng OPENING/UNKNOWN của một entry vẫn đang trong queue là trạng thái
+            // tạm thời; phải CHẶN fallback tạo PRF mới và để request retry, nếu không
+            // kết quả sẽ phụ thuộc timing (lúc reuse, lúc tạo mới).
             if (IsReusableProfileBusy(name))
+            {
+                if (_contexts.TryGetValue(name, out var busyCtx))
+                {
+                    var busyState = GetEffectiveRuntimeState(busyCtx);
+                    if (busyCtx.Opening || busyState == RuntimeStateUnknown)
+                    {
+                        profileName = name;
+                        lane = candidate.IsManual
+                            ? "REUSE_MANUAL_STATE_PENDING"
+                            : "REUSE_AUTO_STATE_PENDING";
+                        detail = $"profile đang chờ xác minh trạng thái; state={busyState}; opening={busyCtx.Opening}";
+                        return true;
+                    }
+                }
+
                 continue;
+            }
 
             // Context không tồn tại không coi là candidate mở được ngay. Refresh/sweep chịu
             // trách nhiệm xác minh và xóa entry thật sự invalid.
@@ -1996,29 +2086,43 @@ public sealed partial class ManagerForm
                 continue;
             }
 
-            var workerAlive = false;
-
-            try
+            // Candidate auto có thể còn Worker/tab STOPPED từ lần chạy trước.
+            // Trường hợp đó KHÔNG phải bận và OpenProfileAsync có thể reuse Worker.
+            // Nếu state đang UNKNOWN, poll đúng profile này một lần để tránh quyết định
+            // theo snapshot cũ; không quét toàn bộ catalog.
+            if (!candidate.IsManual
+                && IsReusableProfileBusy(profileName)
+                && GetEffectiveRuntimeState(ctx) == RuntimeStateUnknown)
             {
-                workerAlive =
-                    ctx.Worker is not null
-                    && !ctx.Worker.HasExited;
-            }
-            catch { }
-
-            if (ctx.Opening
-                || workerAlive
-                || (ctx.Tab is not null
-                    && !ctx.Tab.IsDisposed
-                    && ctx.Tab.Parent == _tabs))
-            {
-                // Queue thủ công được giữ lại nếu profile tạm thời đang mở.
-                // Queue tự động thì bỏ để lần scan sau tự đánh giá lại.
-                if (!candidate.IsManual)
+                try
                 {
+                    await RefreshStatusAsync(ctx);
+                }
+                catch (Exception ex)
+                {
+                    _log.Info(
+                        $"[REUSE_QUEUE_BUSY_RECHECK_WARN] profile={profileName} error={ex.Message}");
+                }
+            }
+
+            if (IsReusableProfileBusy(profileName))
+            {
+                var state = GetEffectiveRuntimeState(ctx);
+
+                if (!candidate.IsManual
+                    && state is RuntimeStateRunning or RuntimeStatePaused or RuntimeStateRecovering)
+                {
+                    // Profile thực sự đang hoạt động thì không còn là nguồn chờ auto.
                     RemoveReusableProfileQueueEntry(
                         profileName,
-                        "profile_now_busy");
+                        "profile_now_actively_running");
+                }
+                else
+                {
+                    // OPENING/UNKNOWN là trạng thái tạm thời: giữ entry, để safety guard
+                    // chặn tạo PRF mới và retry sau khi state được xác minh.
+                    _log.Info(
+                        $"[REUSE_QUEUE_DEFER_TRANSIENT_BUSY] profile={profileName} manual={candidate.IsManual} state={state} opening={ctx.Opening}");
                 }
 
                 continue;
@@ -2061,6 +2165,11 @@ public sealed partial class ManagerForm
 
                 // KHÔNG quét IsProfileInUse() theo từng profile.
                 // Chỉ mở đúng candidate đang đứng đầu queue.
+                SetAutoReplacementUiPhase(
+                    "MỞ PRF CHỜ",
+                    profileName,
+                    request.Id);
+
                 _ = await OpenProfileAsync(
                     ctx,
                     $"Tự bù cho {request.ClosedProfileName}: dùng lại profile {profileName}...");
@@ -2068,16 +2177,19 @@ public sealed partial class ManagerForm
                 if (!IsAutoReplacementExecutionAllowed(executionGeneration))
                 {
                     _log.Warn(
-                        $"[REUSE_QUEUE_HARD_STOP_AFTER_OPEN] profile={profileName} generation={executionGeneration}");
+                        $"[REUSE_QUEUE_HARD_STOP_AFTER_OPEN] profile={profileName} generation={executionGeneration} emergency={IsAutomationHalted}");
 
-                    try
+                    if (!IsAutomationHalted)
                     {
-                        await CloseFailedReplacementRuntimeAsync(ctx);
-                    }
-                    catch (Exception cleanupEx)
-                    {
-                        _log.Warn(
-                            $"[REUSE_QUEUE_HARD_STOP_CLEANUP_WARN] profile={profileName} error={cleanupEx.Message}");
+                        try
+                        {
+                            await CloseFailedReplacementRuntimeAsync(ctx);
+                        }
+                        catch (Exception cleanupEx)
+                        {
+                            _log.Warn(
+                                $"[REUSE_QUEUE_HARD_STOP_CLEANUP_WARN] profile={profileName} error={cleanupEx.Message}");
+                        }
                     }
 
                     return false;
@@ -2095,6 +2207,11 @@ public sealed partial class ManagerForm
 
                 // Profile mới mở/VM chậm có tối đa 10 phút để ổn định. Trong grace
                 // chỉ recovery CHÍNH profile này; slot vẫn bị claim nên không mở bù chồng.
+                SetAutoReplacementUiPhase(
+                    "CHỜ PRF ỔN ĐỊNH",
+                    profileName,
+                    request.Id);
+
                 var stabilization = await StabilizeReplacementRuntimeAsync(
                     ctx,
                     request,
@@ -2105,16 +2222,19 @@ public sealed partial class ManagerForm
                 if (!IsAutoReplacementExecutionAllowed(executionGeneration))
                 {
                     _log.Warn(
-                        $"[REUSE_QUEUE_HARD_STOP_AFTER_STABILIZE] profile={profileName} generation={executionGeneration}");
+                        $"[REUSE_QUEUE_HARD_STOP_AFTER_STABILIZE] profile={profileName} generation={executionGeneration} emergency={IsAutomationHalted}");
 
-                    try
+                    if (!IsAutomationHalted)
                     {
-                        await CloseFailedReplacementRuntimeAsync(ctx);
-                    }
-                    catch (Exception cleanupEx)
-                    {
-                        _log.Warn(
-                            $"[REUSE_QUEUE_HARD_STOP_CLEANUP_WARN] profile={profileName} error={cleanupEx.Message}");
+                        try
+                        {
+                            await CloseFailedReplacementRuntimeAsync(ctx);
+                        }
+                        catch (Exception cleanupEx)
+                        {
+                            _log.Warn(
+                                $"[REUSE_QUEUE_HARD_STOP_CLEANUP_WARN] profile={profileName} error={cleanupEx.Message}");
+                        }
                     }
 
                     return false;
@@ -2205,34 +2325,58 @@ public sealed partial class ManagerForm
                       || !IsAutoReplacementExecutionAllowed(executionGeneration))
             {
                 _log.Warn(
-                    $"[REUSE_QUEUE_HARD_STOP] profile={profileName} generation={executionGeneration}");
+                    $"[REUSE_QUEUE_HARD_STOP] profile={profileName} generation={executionGeneration} emergency={IsAutomationHalted}");
 
-                try
+                // Dừng khẩn cấp có nghĩa là đóng băng hiện trạng: không tiếp tục cleanup
+                // Chrome/Worker sau thời điểm user bấm dừng. Các hard-stop khác (ví dụ
+                // manual close co target) vẫn cleanup candidate đang mở như trước.
+                if (!IsAutomationHalted)
                 {
-                    await CloseFailedReplacementRuntimeAsync(ctx);
-                }
-                catch (Exception cleanupEx)
-                {
-                    _log.Warn(
-                        $"[REUSE_QUEUE_HARD_STOP_CLEANUP_WARN] profile={profileName} error={cleanupEx.Message}");
+                    try
+                    {
+                        await CloseFailedReplacementRuntimeAsync(ctx);
+                    }
+                    catch (Exception cleanupEx)
+                    {
+                        _log.Warn(
+                            $"[REUSE_QUEUE_HARD_STOP_CLEANUP_WARN] profile={profileName} error={cleanupEx.Message}");
+                    }
                 }
 
                 return false;
             }
             catch (Exception ex)
             {
-                await MarkReusableProfileFailedAsync(
-                    request,
-                    candidate,
-                    "exception:" + ex.Message);
-
-                _log.Warn(
-                    $"[REUSE_QUEUE_OPEN_ERROR] profile={profileName} error={ex.Message}");
-
-                // Nếu cleanup vừa fail thì đây là barrier thật: không được nuốt lỗi
-                // rồi foreach sang candidate kế tiếp.
+                // Lỗi cứng của PRF đã được phân loại ở nhánh stabilization.Healthy=false
+                // phía trên và chỉ nhánh đó mới được đưa PRF vào Failed/cooldown.
+                //
+                // Exception rơi tới đây chủ yếu là lỗi kỹ thuật (IPC/CDP/I/O/UI race...).
+                // Không được xóa PRF khỏi queue hay ghi +auto=FAIL chỉ vì một lỗi hạ tầng
+                // tạm thời; nếu làm vậy lượt hiện tại có thể "vét" sai PRF rồi rơi xuống
+                // tạo profile mới dù PRF cũ chưa được thử hợp lệ.
                 if (ex is AutoReplacementCleanupBarrierException)
                     throw;
+
+                if (IsAutomationHalted
+                    || executionToken.IsCancellationRequested
+                    || !IsAutoReplacementExecutionAllowed(executionGeneration))
+                {
+                    _log.Warn(
+                        $"[REUSE_QUEUE_TRANSIENT_ABORTED_BY_STOP] profile={profileName} error={ex.Message}");
+                    return false;
+                }
+
+                _log.Warn(
+                    $"[REUSE_QUEUE_TRANSIENT_ERROR] profile={profileName} action=KEEP_QUEUE_RETRY_NEXT_ROUND error={ex.Message}");
+
+                WriteAutoActivityLog(
+                    action: "MỞ PROFILE BÙ",
+                    profile: request.ClosedProfileName,
+                    account: candidate.Username,
+                    reason: request.Reason,
+                    replacementProfile: profileName,
+                    result: "LỖI TẠM THỜI",
+                    detail: $"Giữ PRF trong Chờ dùng lại; không đánh FAIL. {ex.Message}");
 
                 try
                 {
@@ -2242,9 +2386,16 @@ public sealed partial class ManagerForm
                 {
                     throw new AutoReplacementCleanupBarrierException(
                         profileName,
-                        $"Profile bù {profileName} lỗi và cleanup chưa hoàn tất; chặn mở profile bù kế tiếp.",
+                        $"PRF chờ {profileName} gặp lỗi kỹ thuật và cleanup chưa hoàn tất; chặn mở profile bù kế tiếp.",
                         cleanupEx);
                 }
+
+                // Dừng sweep của lượt hiện tại. Request sẽ retry theo backoff; vì
+                // AttemptedProfiles đã ghi profile này, retry cùng suất sẽ chuyển sang
+                // PRF chờ tiếp theo thay vì mở lại profile vừa lỗi ngay lập tức.
+                throw new InvalidOperationException(
+                    $"PRF chờ {profileName} gặp lỗi kỹ thuật tạm thời; đã cleanup và giữ lại queue để retry. Không tạo PRF mới trong lượt này.",
+                    ex);
             }
             finally
             {

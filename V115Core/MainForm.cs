@@ -1349,8 +1349,20 @@ public sealed partial class MainForm : Form
         }
     }
 
-    async Task EnsureChromeAsync()
+    async Task EnsureChromeAsync(bool respectEmergencyStop = false)
     {
+        void ThrowIfEmergencyStopRequested(string phase)
+        {
+            if (!respectEmergencyStop || !IsManagerEmergencyStopActive())
+                return;
+
+            _log.Warn($"[EMERGENCY_STOP_CHROME_ABORT] phase={phase}");
+            throw new OperationCanceledException(
+                $"EMERGENCY_STOP_START: chrome:{phase}");
+        }
+
+        ThrowIfEmergencyStopRequested("begin");
+
         if (!_chrome.Connected)
         {
             SaveFromUi();
@@ -1360,17 +1372,26 @@ public sealed partial class MainForm : Form
             {
                 SetChromeStatus("Trạng thái Chrome: 🟡 Đang kết nối CDP...", Color.Goldenrod, "TikTok: 🟡 Đang kết nối CDP...", Color.Goldenrod);
                 await _chrome.ConnectAsync(_settings.ChromePort);
+                ThrowIfEmergencyStopRequested("after_connect");
                 _chrome.AttachManagedWindow(CurrentProfilePath, _settings.ChromePort);
+            }
+            catch (OperationCanceledException) when (respectEmergencyStop && IsManagerEmergencyStopActive())
+            {
+                throw;
             }
             catch
             {
+                ThrowIfEmergencyStopRequested("before_launch");
                 SetChromeStatus("Trạng thái Chrome: 🟡 Đang mở Chrome...", Color.Goldenrod, "TikTok: —", Color.DimGray);
                 await _chrome.LaunchAsync(_settings.ChromePort, _settings.ChromeProfileDir, SyncChromeProfileNameBeforeLaunch);
+                ThrowIfEmergencyStopRequested("after_launch");
                 SetChromeStatus("Trạng thái Chrome: 🟡 Đang kết nối CDP...", Color.Goldenrod, "TikTok: 🟡 Đang kết nối CDP...", Color.Goldenrod);
                 await _chrome.ConnectAsync(_settings.ChromePort);
+                ThrowIfEmergencyStopRequested("after_launch_connect");
                 _chrome.AttachManagedWindow(CurrentProfilePath, _settings.ChromePort);
             }
         }
+        ThrowIfEmergencyStopRequested("before_refresh");
         RefreshChromeStatus();
     }
 
@@ -1715,6 +1736,16 @@ public sealed partial class MainForm : Form
 
     async Task StartAsync(bool suppressDialogs = false)
     {
+        void ThrowIfEmergencyStopRequested(string phase)
+        {
+            if (!IsManagerEmergencyStopActive())
+                return;
+
+            _log.Warn($"[EMERGENCY_STOP_START_ABORT] phase={phase}");
+            throw new OperationCanceledException(
+                $"EMERGENCY_STOP_START: {phase}");
+        }
+
         if (_engine.Running || _startStopCommandInFlight) return;
         if (IsManagerEmergencyStopActive())
         {
@@ -1734,7 +1765,9 @@ public sealed partial class MainForm : Form
         try
         {
             SaveFromUi();
-            await EnsureChromeAsync();
+            ThrowIfEmergencyStopRequested("before_ensure_chrome");
+            await EnsureChromeAsync(respectEmergencyStop: true);
+            ThrowIfEmergencyStopRequested("after_ensure_chrome");
 
             // V13.5: giữ nguyên LIVE hiện tại nếu các XPath thao tác chính đã có.
             // Trước đây mỗi lần bấm Bắt đầu đều chạy PrepareTikTokProfileStartupAsync(),
@@ -1742,6 +1775,7 @@ public sealed partial class MainForm : Form
             // và TikTok chọn sang một LIVE ngẫu nhiên khác.
             var liveUrlBeforeProbe = LooksLikeTikTokLiveUrl(_chrome.Page?.Url ?? "");
             var alreadyOnReadyLive = await IsCurrentLiveReadyForStartAsync();
+            ThrowIfEmergencyStopRequested("after_live_ready_probe");
             if (alreadyOnReadyLive)
             {
                 _startupPreparationState = "READY";
@@ -1767,6 +1801,7 @@ public sealed partial class MainForm : Form
                 // và điều hướng TikTok vào /live như logic cũ.
                 _log.Info("[TIKTOK_STARTUP_NEED_LIVE] currentUrlIsLive=false action=PREPARE_TIKTOK_LIVE");
                 await PrepareTikTokProfileStartupAsync();
+                ThrowIfEmergencyStopRequested("after_prepare_tiktok_startup");
                 if (!string.Equals(_startupPreparationState, "READY", StringComparison.OrdinalIgnoreCase))
                 {
                     var detail = _startupPreparationState switch
@@ -1783,7 +1818,14 @@ public sealed partial class MainForm : Form
             }
 
             if (!await ValidateCoreXpathsBeforeStartAsync(suppressDialogs)) return;
+            ThrowIfEmergencyStopRequested("after_xpath_validation");
             _engine.Start(_settings, GetAutomationContents());
+        }
+        catch (OperationCanceledException ex)
+            when (IsManagerEmergencyStopActive()
+                  || ex.Message.StartsWith("EMERGENCY_STOP_START:", StringComparison.Ordinal))
+        {
+            _log.Warn($"[EMERGENCY_STOP_START_ABORTED] detail={ex.Message}");
         }
         catch (Exception ex) { ShowUiProblem("START_FAILED", "Không thể bắt đầu", ex, showDialog: !suppressDialogs); }
         finally

@@ -27,6 +27,10 @@ public sealed partial class ManagerForm
     bool _nightReserveInitialized;
     bool _nightReserveTickBusy;
     DateTime _nightReserveNextCheckUtc = DateTime.MinValue;
+    DateTime _nightReservePrimaryStableSinceUtc = DateTime.MinValue;
+    int _nightReservePrimaryStableTarget;
+    bool _nightReservePrimaryRunIntentActive;
+    static readonly TimeSpan NightReservePrimaryStableDelay = TimeSpan.FromSeconds(20);
     CancellationTokenSource _nightReserveCts = new();
     int _nightReserveConsecutiveLoginErrors;
     NightReserveSettings _nightReserveSettings = new();
@@ -157,6 +161,19 @@ public sealed partial class ManagerForm
         }
     }
 
+    int CountNightReservePrimaryLiveSlots()
+    {
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var ctx in _contexts.Values)
+        {
+            var state = GetEffectiveRuntimeState(ctx);
+            if (state is RuntimeStateRunning or RuntimeStatePaused or RuntimeStateRecovering)
+                names.Add(ctx.Profile.Name);
+        }
+
+        return names.Count;
+    }
+
     bool IsNightReserveProfileProtected(string profileName)
     {
         if (!_nightReserveInitialized || !_nightReserveSettings.Enabled)
@@ -165,8 +182,26 @@ public sealed partial class ManagerForm
         if (!IsNightReserveProfile(profileName))
             return false;
 
-        // Dự phòng chỉ được tiêu ở OFFPEAK. Từ PREPARE trở đi phải giữ lại,
-        // tránh giờ vàng lấy mất kho vừa chuẩn bị ban ngày.
+        // Target chạy chính luôn ưu tiên cao hơn kho dự phòng. Nếu đang thiếu slot
+        // thì reserve trở thành buffer mềm và được phép lấy ngay, kể cả PREPARE/PRIME.
+        // Chỉ bảo vệ reserve khi target chính đã đủ để tránh rotation tiêu mất kho.
+        int target;
+        bool targetInitialized;
+        lock (_autoReplacementFixedSlotLock)
+        {
+            target = _autoReplacementTargetSlots;
+            targetInitialized = _autoReplacementTargetInitialized;
+        }
+
+        if (targetInitialized
+            && target > 0
+            && CountNightReservePrimaryLiveSlots() < target)
+        {
+            return false;
+        }
+
+        // Khi chưa có target phiên hiện tại, không có nhu cầu chạy chính để mượn reserve.
+        // Từ PREPARE trở đi vẫn giữ lại kho cho Giờ vàng như logic cũ.
         var phase = GetRunStrategyPhase(GetToolNow(), _runStrategySettings);
         return !phase.Equals("OFFPEAK", StringComparison.OrdinalIgnoreCase);
     }
@@ -250,54 +285,74 @@ public sealed partial class ManagerForm
             "night_reserve_reconcile",
             token);
 
-        IReadOnlyDictionary<string, string> identityResults;
-        try
-        {
-            identityResults = await RunAccountPoolIoAsync(
-                () => _accountPoolService.GetIdentityResults(),
-                token);
-        }
-        catch
-        {
-            identityResults = new Dictionary<string, string>(
-                StringComparer.OrdinalIgnoreCase);
-        }
-
-        List<ReusableProfileQueueEntry> ready;
+        // Kho dự phòng là phần PRF MỚI đang idle SAU KHI target chạy chính đã đủ.
+        // Cả READY và NAME_SYNC_PENDING đều là supply đã tồn tại, vì vậy đều phải
+        // được tính vào quota để Tool không tạo thêm PRF chỉ vì tên đang đồng bộ.
+        List<ReusableProfileQueueEntry> supply;
         lock (_reusableProfileQueueLock)
         {
-            ready = EnsureReusableProfileQueueLoadedUnsafe()
+            supply = EnsureReusableProfileQueueLoadedUnsafe()
                 .Pending
-                .Where(x =>
-                    !x.NameSyncPending
-                    && !string.IsNullOrWhiteSpace(x.ProfileName))
+                .Where(x => !string.IsNullOrWhiteSpace(x.ProfileName))
                 .Select(CloneReusableProfileQueueEntry)
                 .ToList();
         }
 
-        var byProfile = ready.ToDictionary(
-            x => x.ProfileName,
-            x => x,
-            StringComparer.OrdinalIgnoreCase);
-
         var freshLimit = TimeSpan.FromHours(
             Math.Max(1, _runStrategySettings.FreshHours)).TotalSeconds;
+
+        var freshSupplyByName = supply
+            .Where(x => x.TotalRunSeconds < freshLimit)
+            .GroupBy(x => x.ProfileName, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                x => x.Key,
+                x => x.OrderBy(e => e.NameSyncPending ? 1 : 0).First(),
+                StringComparer.OrdinalIgnoreCase);
+
+        var freshIdle = supply
+            .Where(x =>
+                x.TotalRunSeconds < freshLimit
+                && !IsReusableProfileBusy(x.ProfileName))
+            .OrderBy(x => x.NameSyncPending ? 1 : 0)
+            .ThenBy(x => x.TotalRunSeconds)
+            .ThenBy(x => x.ProfileName, NaturalProfileNameOrder)
+            .ToList();
+
+        int adopted = 0;
+        int count;
 
         lock (_nightReserveLock)
         {
             var before = _nightReserveState.Profiles.Count;
 
-            // Bỏ marker đã không còn nằm trong queue READY (đã dùng, bị BAN,
-            // chuyển NAME_SYNC_PENDING hoặc bị người dùng bỏ chờ).
+            // Marker chỉ còn hợp lệ khi PRF vẫn là MỚI + idle + còn trong queue supply.
+            // Như vậy PRF vừa được mượn lên chạy hoặc đã già khỏi ngưỡng MỚI sẽ tự
+            // rời quota reserve ngay cả khi event CONSUMED bị trễ.
             _nightReserveState.Profiles.RemoveAll(name =>
-                !byProfile.ContainsKey(name));
+            {
+                if (!freshSupplyByName.ContainsKey(name))
+                    return true;
 
-            // Nếu user giảm target, giữ những PRF trẻ nhất làm dự phòng.
+                // UNKNOWN/OPENING ngắn hạn chưa đủ bằng chứng reserve đã bị dùng; giữ
+                // marker để không tạo dư. RUNNING/PAUSED/RECOVERING thật sẽ không phải
+                // transient và sẽ bị loại (hoặc event CONSUMED đã loại trước đó).
+                if (IsReusableProfileBusy(name)
+                    && !IsReusableProfileTransientBusy(name))
+                {
+                    return true;
+                }
+
+                return false;
+            });
+
+            // Nếu user giảm target, giữ các PRF READY trẻ nhất trước rồi mới đến
+            // NAME_SYNC_PENDING. PENDING vẫn tính quota nhưng READY hữu dụng hơn.
             if (_nightReserveState.Profiles.Count > _nightReserveSettings.TargetCount)
             {
                 var keep = _nightReserveState.Profiles
-                    .Where(byProfile.ContainsKey)
-                    .OrderBy(name => byProfile[name].TotalRunSeconds)
+                    .Where(freshSupplyByName.ContainsKey)
+                    .OrderBy(name => freshSupplyByName[name].NameSyncPending ? 1 : 0)
+                    .ThenBy(name => freshSupplyByName[name].TotalRunSeconds)
                     .ThenBy(name => name, NaturalProfileNameOrder)
                     .Take(_nightReserveSettings.TargetCount)
                     .ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -309,32 +364,125 @@ public sealed partial class ManagerForm
                 && _nightReserveState.Profiles.Count < _nightReserveSettings.TargetCount)
             {
                 var need = _nightReserveSettings.TargetCount - _nightReserveState.Profiles.Count;
-                var candidates = ready
-                    .Where(x =>
-                        x.TotalRunSeconds < freshLimit
-                        && !_nightReserveState.Profiles.Any(r =>
-                            r.Equals(x.ProfileName, StringComparison.OrdinalIgnoreCase))
-                        && !IsReusableProfileBusy(x.ProfileName)
-                        && identityResults.TryGetValue(x.Username, out var result)
-                        && string.Equals(
-                            (result ?? "").Trim(),
-                            "DONE",
-                            StringComparison.OrdinalIgnoreCase))
-                    .OrderBy(x => x.TotalRunSeconds)
-                    .ThenBy(x => x.ProfileName, NaturalProfileNameOrder)
+                var candidates = freshIdle
+                    .Where(x => !_nightReserveState.Profiles.Any(r =>
+                        r.Equals(x.ProfileName, StringComparison.OrdinalIgnoreCase)))
                     .Take(need)
                     .Select(x => x.ProfileName)
                     .ToList();
 
                 foreach (var profileName in candidates)
+                {
                     _nightReserveState.Profiles.Add(profileName);
+                    adopted++;
+                }
             }
 
             if (before != _nightReserveState.Profiles.Count || adoptExistingFresh)
                 SaveNightReserveStateUnsafe();
 
-            return _nightReserveState.Profiles.Count;
+            count = _nightReserveState.Profiles.Count;
         }
+
+        var readyCount = freshIdle.Count(x => !x.NameSyncPending);
+        var pendingNameCount = freshIdle.Count(x => x.NameSyncPending);
+        _log.Info(
+            $"[NIGHT_RESERVE_RECONCILE] reserve={count}/{_nightReserveSettings.TargetCount} "
+            + $"freshIdle={freshIdle.Count} ready={readyCount} nameSyncPending={pendingNameCount} adopted={adopted} adopt={adoptExistingFresh}");
+
+        return count;
+    }
+
+    void MarkNightReservePrimaryRunIntent(int target, string source)
+    {
+        if (target <= 0)
+            return;
+
+        _nightReservePrimaryRunIntentActive = true;
+        ResetNightReservePrimaryStability("RUN_INTENT:" + source);
+        _nightReserveNextCheckUtc = DateTime.MinValue;
+        _log.Info($"[NIGHT_RESERVE_RUN_INTENT] active=true target={target} source={source}");
+    }
+
+    void ResetNightReservePrimaryRunIntent(string source)
+    {
+        var wasActive = _nightReservePrimaryRunIntentActive;
+        _nightReservePrimaryRunIntentActive = false;
+        ResetNightReservePrimaryStability("RUN_INTENT_RESET:" + source);
+        _nightReserveNextCheckUtc = DateTime.MinValue;
+
+        if (wasActive)
+            _log.Info($"[NIGHT_RESERVE_RUN_INTENT] active=false source={source}");
+    }
+
+    void ResetNightReservePrimaryStability(string reason)
+    {
+        if (_nightReservePrimaryStableSinceUtc != DateTime.MinValue
+            || _nightReservePrimaryStableTarget != 0)
+        {
+            _log.Info(
+                $"[NIGHT_RESERVE_PRIMARY_RESET] reason={reason} target={_nightReservePrimaryStableTarget}");
+        }
+
+        _nightReservePrimaryStableSinceUtc = DateTime.MinValue;
+        _nightReservePrimaryStableTarget = 0;
+    }
+
+    bool TryGetNightReservePrimaryReady(
+        out int target,
+        out int fulfilled,
+        out int pending,
+        out string reason)
+    {
+        if (!_nightReservePrimaryRunIntentActive)
+        {
+            target = 0;
+            fulfilled = 0;
+            pending = 0;
+            reason = "NO_AUTO_RUN_INTENT";
+            return false;
+        }
+
+        lock (_autoReplacementFixedSlotLock)
+        {
+            target = _autoReplacementTargetSlots;
+            if (!_autoReplacementTargetInitialized || target <= 0)
+            {
+                fulfilled = 0;
+                pending = 0;
+                reason = "NO_ACTIVE_TARGET";
+                return false;
+            }
+        }
+
+        // Reserve chỉ được tính SAU nhu cầu chạy chính. Một request bù/open/rotation
+        // còn tồn tại nghĩa là inventory chưa ổn định, tuyệt đối chưa tạo dự phòng.
+        fulfilled = CountNightReservePrimaryLiveSlots();
+        pending = GetAutoReplacementPendingCount();
+
+        if (!_autoReplacementSessionArmed)
+        {
+            reason = "AUTO_REPLACE_NOT_ARMED";
+            return false;
+        }
+
+        if (_autoReplacementQueueRunning
+            || _autoReplacementStartAllInProgress
+            || _runStrategyRotationRunning
+            || pending > 0)
+        {
+            reason = "PRIMARY_BUSY";
+            return false;
+        }
+
+        if (fulfilled < target)
+        {
+            reason = $"PRIMARY_DEFICIT_{fulfilled}/{target}";
+            return false;
+        }
+
+        reason = "READY";
+        return true;
     }
 
     async Task CheckNightReserveAsync()
@@ -351,23 +499,55 @@ public sealed partial class ManagerForm
             return;
         }
 
-        _nightReserveNextCheckUtc = DateTime.UtcNow.AddMinutes(2);
-
         if (!IsHourInsideNightReserveCreateWindow(
                 GetToolNow(),
                 _nightReserveSettings))
         {
+            ResetNightReservePrimaryStability("OUTSIDE_CREATE_WINDOW");
+            _nightReserveNextCheckUtc = DateTime.UtcNow.AddMinutes(2);
             return;
         }
 
-        // Không chen vào Tự bù/Prime rotation đang xử lý một slot.
-        if (_autoReplacementQueueRunning
-            || _autoReplacementStartAllInProgress
-            || GetAutoReplacementPendingCount() > 0
-            || _runStrategyRotationRunning)
+        // QUY TẮC MỚI: mở Manager chỉ inventory, KHÔNG được tự tạo dự phòng.
+        // Chỉ sau khi phiên hiện tại đã có target chạy chính >0, target đã đủ và
+        // toàn bộ bù/open/rotation đứng yên thì mới bắt đầu tính phần PRF dư.
+        if (!TryGetNightReservePrimaryReady(
+                out var target,
+                out var fulfilled,
+                out var pending,
+                out var primaryReason))
         {
+            ResetNightReservePrimaryStability(primaryReason);
+            _nightReserveNextCheckUtc = DateTime.UtcNow.AddSeconds(5);
             return;
         }
+
+        var nowUtc = DateTime.UtcNow;
+        if (_nightReservePrimaryStableTarget != target
+            || _nightReservePrimaryStableSinceUtc == DateTime.MinValue)
+        {
+            _nightReservePrimaryStableTarget = target;
+            _nightReservePrimaryStableSinceUtc = nowUtc;
+            _nightReserveNextCheckUtc = nowUtc.AddSeconds(5);
+            _log.Info(
+                $"[NIGHT_RESERVE_PRIMARY_SETTLE] target={target} fulfilled={fulfilled} pending={pending} "
+                + $"wait={NightReservePrimaryStableDelay.TotalSeconds:0}s action=WAIT_BEFORE_RESERVE");
+            return;
+        }
+
+        var stableFor = nowUtc - _nightReservePrimaryStableSinceUtc;
+        if (stableFor < NightReservePrimaryStableDelay)
+        {
+            var remaining = NightReservePrimaryStableDelay - stableFor;
+            _nightReserveNextCheckUtc = nowUtc.AddSeconds(
+                Math.Clamp(remaining.TotalSeconds, 2, 5));
+            return;
+        }
+
+        // Từ đây target chạy chính đã đủ ổn định. Mỗi reconcile dự phòng cách nhau
+        // tối thiểu 2 phút; nếu reserve vừa bị mượn lên chạy, gate phía trên sẽ chờ
+        // target chính được bù đủ + ổn định lại 20 giây rồi mới bổ sung reserve.
+        _nightReserveNextCheckUtc = nowUtc.AddMinutes(2);
 
         _nightReserveTickBusy = true;
         try
@@ -382,16 +562,49 @@ public sealed partial class ManagerForm
                 // Gate dùng chung với +Auto Profile và "Tạo trước PRF chờ".
                 // Không bao giờ login/create xen kẽ hai luồng.
                 if (!await _autoProfileQueueGate.WaitAsync(0, token))
+                {
+                    _nightReserveNextCheckUtc = DateTime.UtcNow.AddSeconds(10);
                     return;
+                }
 
                 try
                 {
+                    // Recheck ngay trước inventory vì target có thể vừa mất slot trong
+                    // lúc chờ gate. Nếu không còn đủ, trả quyền ưu tiên cho Tự bù.
+                    if (!TryGetNightReservePrimaryReady(
+                            out target,
+                            out fulfilled,
+                            out pending,
+                            out primaryReason))
+                    {
+                        ResetNightReservePrimaryStability("PRE_RECONCILE_" + primaryReason);
+                        _nightReserveNextCheckUtc = DateTime.UtcNow.AddSeconds(5);
+                        return;
+                    }
+
                     var count = await ReconcileNightReserveAsync(
                         adoptExistingFresh: true,
                         token);
 
                     if (count >= _nightReserveSettings.TargetCount)
                         return;
+
+                    // Recheck lần cuối trước CREATE. Inventory refresh có thể kéo dài và
+                    // đúng lúc đó target chính phát sinh thiếu slot. Không bao giờ tạo
+                    // reserve trong khi phiên chạy chính đang cần capacity.
+                    if (!TryGetNightReservePrimaryReady(
+                            out target,
+                            out fulfilled,
+                            out pending,
+                            out primaryReason))
+                    {
+                        ResetNightReservePrimaryStability("PRE_CREATE_" + primaryReason);
+                        _nightReserveNextCheckUtc = DateTime.UtcNow.AddSeconds(5);
+                        return;
+                    }
+
+                    _log.Info(
+                        $"[NIGHT_RESERVE_NEED_CREATE] primary={fulfilled}/{target} reserve={count}/{_nightReserveSettings.TargetCount} action=CREATE_ONE");
 
                     var outcome = await CreateOneNightReserveProfileAsync(token);
                     if (outcome is not null && outcome.Skipped != true)
@@ -503,9 +716,9 @@ public sealed partial class ManagerForm
                 return outcome;
             }
 
-            // Kho dự phòng chỉ nhận PRF đã xác minh tên + ghi DONE Excel. Nếu TikTok
-            // chưa kịp cập nhật tên hoặc Excel chưa ghi được DONE, tận dụng CHÍNH lane
-            // NAME_SYNC_PENDING cũ để profile không bị lấy chạy như một PRF READY.
+            // PRF đã tạo xong nhưng tên chưa đồng bộ vẫn là supply thật đã tồn tại.
+            // Đưa vào NAME_SYNC_PENDING VÀ tính luôn quota reserve để lượt kế tiếp
+            // không tạo dư thêm một PRF chỉ vì TikTok/Excel cập nhật tên chậm.
             if (!outcome.IdentityVerified || !outcome.IdentityExcelDone)
             {
                 QueueReusableProfileNameSyncPending(
@@ -514,9 +727,13 @@ public sealed partial class ManagerForm
                         ? "night_reserve_identity_done_pending"
                         : "night_reserve_name_not_verified");
 
+                AddNightReserveProfile(
+                    item.ProfileName,
+                    "auto_daytime_create_pending_name_sync");
+
                 _log.Info(
                     $"[NIGHT_RESERVE_PENDING] profile={item.ProfileName} account={item.Account.Username} "
-                    + $"verified={outcome.IdentityVerified} excelDone={outcome.IdentityExcelDone} action=NAME_SYNC_PENDING_NOT_RESERVE");
+                    + $"verified={outcome.IdentityVerified} excelDone={outcome.IdentityExcelDone} action=NAME_SYNC_PENDING_COUNTS_AS_RESERVE");
                 return outcome;
             }
 
@@ -687,8 +904,8 @@ public sealed partial class ManagerForm
             AutoEllipsis = true,
             ForeColor = Color.DimGray,
             Text =
-                "Tận dụng đúng pipeline ‘Tạo trước PRF chờ’: tạo tuần tự 1 PRF/lần, dùng cooldown chung, login + đổi tên + xác nhận tên DONE rồi đóng sạch. "
-                + "PRF dự phòng được bảo vệ trong PRIME/PREPARE; ngoài giờ vàng chỉ dùng sau các PRF thường phù hợp. Nếu kho đã có PRF MỚI + Tên/ảnh=DONE thì Tool ưu tiên đánh dấu chúng làm dự phòng trước, không tạo dư.",
+                "Dự phòng chỉ được tính sau khi target chạy chính của phiên hiện tại đã đủ và ổn định. Tool dùng PRF MỚI đang idle còn dư trước; "
+                + "PRF đang chờ đồng bộ tên vẫn tính quota để không tạo dư. Nếu target chính thiếu slot, reserve được phép mượn lên chạy trước rồi mới bổ sung lại sau.",
             Margin = new Padding(0, 8, 0, 0)
         };
         panel.Controls.Add(info, 0, 5);
@@ -724,11 +941,14 @@ public sealed partial class ManagerForm
 
             SaveNightReserveSettings(updated);
             _nightReserveNextCheckUtc = DateTime.MinValue;
+            ResetNightReservePrimaryStability("SETTINGS_CHANGED");
 
             try
             {
+                // Lưu cấu hình chỉ inventory/prune marker cũ; KHÔNG adopt supply mới
+                // và không tạo reserve trước khi target chạy chính của phiên hiện tại đủ.
                 await ReconcileNightReserveAsync(
-                    adoptExistingFresh: updated.Enabled,
+                    adoptExistingFresh: false,
                     CancellationToken.None);
             }
             catch (Exception ex)

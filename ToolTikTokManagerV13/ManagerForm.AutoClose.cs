@@ -269,9 +269,6 @@ public sealed partial class ManagerForm
         if (!_autoCloseSettings.OpenReplacementAfterAutoClose)
             return $"{prefix}: TẮT";
 
-        if (!_autoReplacementSessionArmed)
-            return $"{prefix}: CHỜ BẮT ĐẦU";
-
         int target;
         bool targetInitialized;
         lock (_autoReplacementFixedSlotLock)
@@ -280,39 +277,130 @@ public sealed partial class ManagerForm
             targetInitialized = _autoReplacementTargetInitialized;
         }
 
+        // CHỜ BẮT ĐẦU chỉ đúng khi chưa có target thật. Trước đây return quá sớm
+        // tại đây nên có thể che mất trạng thái 4/5 đang reconcile/xếp hàng.
         if (!targetInitialized || target <= 0)
-            return $"{prefix}: SẴN SÀNG";
+        {
+            return _autoReplacementSessionArmed
+                ? $"{prefix}: SẴN SÀNG"
+                : $"{prefix}: CHỜ BẮT ĐẦU";
+        }
 
-        var occupied = CountAutoReplacementOccupiedSlots();
+        var occupied = CountAutoReplacementFulfilledSlots();
 
+        AutoReplacementRequest? firstPending = null;
         int pending;
         DateTime? earliestRetryUtc = null;
         lock (_autoReplacementQueueLock)
         {
             pending = _autoReplacementQueue.Count;
             if (pending > 0)
+            {
+                firstPending = _autoReplacementQueue
+                    .OrderBy(x => x.NextAttemptUtc)
+                    .ThenBy(x => x.QueuedUtc)
+                    .FirstOrDefault();
                 earliestRetryUtc = _autoReplacementQueue.Min(x => x.NextAttemptUtc);
+            }
         }
 
         if (occupied >= target)
             return $"{prefix}: ĐỦ {occupied}/{target}";
 
+        // Có target nhưng session đang bị giữ: hiển thị đúng trạng thái thay vì
+        // "CHỜ BẮT ĐẦU" chung chung. Start thủ công/Auto Run bình thường sẽ arm lại.
+        if (!_autoReplacementSessionArmed)
+            return $"{prefix}: CHỜ KÍCH HOẠT · {occupied}/{target}";
+
         var nowUtc = DateTime.UtcNow;
+
+        if (_autoReplacementStartAllInProgress)
+            return $"{prefix}: AUTO RUN ĐANG BỔ SUNG · {occupied}/{target}";
+
+        if (_autoReplacementQueueRunning)
+        {
+            var live = GetAutoReplacementUiPhaseSnapshot();
+            if (!string.IsNullOrWhiteSpace(live.Phase))
+            {
+                var detail = FormatAutoReplacementUiPhaseDetail(live.Detail);
+                var detailText = detail.Length > 0 ? $" {detail}" : "";
+                var ageText = live.Age >= TimeSpan.FromSeconds(2)
+                    ? $" · {FormatAutoReplacementUiWait(live.Age)}"
+                    : "";
+
+                return $"{prefix}: {live.Phase}{detailText}{ageText} · {occupied}/{target}";
+            }
+        }
+
+        // Nếu đang cooldown riêng cho NHÁNH TẠO MỚI, ưu tiên nói rõ liệu đã có
+        // PRF chờ sẵn hay chưa. PRF chờ có thể đánh thức request ngay, không phải
+        // chờ hết countdown tạo mới.
+        if (firstPending is not null
+            && firstPending.CreateNotBeforeUtc.HasValue
+            && firstPending.CreateNotBeforeUtc.Value > nowUtc)
+        {
+            if (TryFindUntestedEligibleReusableProfile(
+                    firstPending,
+                    out var reusableProfile,
+                    out var reusableLane,
+                    out _))
+            {
+                if (reusableLane.Equals("REUSE_READY", StringComparison.OrdinalIgnoreCase))
+                    return $"{prefix}: PRF CHỜ SẴN {reusableProfile} · {occupied}/{target}";
+
+                if (reusableLane.Contains("STATE_PENDING", StringComparison.OrdinalIgnoreCase))
+                    return $"{prefix}: CHỜ PRF {reusableProfile} RẢNH · {occupied}/{target}";
+
+                if (reusableLane.Equals("NAME_SYNC_PENDING", StringComparison.OrdinalIgnoreCase))
+                    return $"{prefix}: CHỜ PRF {reusableProfile} ĐỒNG BỘ · {occupied}/{target}";
+            }
+
+            var createWait = firstPending.CreateNotBeforeUtc.Value - nowUtc;
+            return $"{prefix}: CHỜ TẠO PRF MỚI {FormatAutoReplacementUiWait(createWait)} · {occupied}/{target}";
+        }
+
         if (pending > 0
             && earliestRetryUtc.HasValue
             && earliestRetryUtc.Value > nowUtc.AddSeconds(1))
         {
             var wait = earliestRetryUtc.Value - nowUtc;
-            return $"{prefix}: CHỜ {FormatAutoReplacementUiWait(wait)} · {occupied}/{target}";
+            return $"{prefix}: CHỜ KIỂM TRA {FormatAutoReplacementUiWait(wait)} · {occupied}/{target}";
         }
 
-        if (_autoReplacementStartAllInProgress || _autoReplacementQueueRunning)
+        if (_autoReplacementQueueRunning)
             return $"{prefix}: ĐANG XỬ LÝ · {occupied}/{target}";
 
         if (pending > 0)
             return $"{prefix}: XẾP HÀNG {pending} · {occupied}/{target}";
 
-        return $"{prefix}: CHỜ NGUỒN · {occupied}/{target}";
+        // Chưa có request không đồng nghĩa Tool bị treo. Capacity reconcile cố ý
+        // xác nhận thiếu suất 2 pass rồi mới xếp request để tránh mở bù thừa.
+        if (_autoReplacementCapacityReconcileRunning)
+            return $"{prefix}: XÁC NHẬN THIẾU · {occupied}/{target}";
+
+        if (_autoReplacementNextCapacityReconcileUtc > nowUtc.AddSeconds(1))
+        {
+            var wait = _autoReplacementNextCapacityReconcileUtc - nowUtc;
+            return $"{prefix}: CHỜ KIỂM TRA {FormatAutoReplacementUiWait(wait)} · {occupied}/{target}";
+        }
+
+        return $"{prefix}: SẮP KIỂM TRA · {occupied}/{target}";
+    }
+
+    static string FormatAutoReplacementUiPhaseDetail(string detail)
+    {
+        detail = (detail ?? "")
+            .Replace('\r', ' ')
+            .Replace('\n', ' ')
+            .Trim();
+
+        while (detail.Contains("  ", StringComparison.Ordinal))
+            detail = detail.Replace("  ", " ", StringComparison.Ordinal);
+
+        const int maxLength = 24;
+        return detail.Length <= maxLength
+            ? detail
+            : detail[..(maxLength - 1)] + "…";
     }
 
     static string FormatAutoReplacementUiWait(TimeSpan wait)
@@ -1516,8 +1604,23 @@ public sealed partial class ManagerForm
         return chromePresence != AutoCloseChromePresence.Closed;
     }
 
-    async Task EnsureAutoCloseWorkerStoppedAsync(ProfileContext ctx)
+    async Task EnsureAutoCloseWorkerStoppedAsync(
+        ProfileContext ctx,
+        bool respectEmergencyStop = false)
     {
+        void ThrowIfEmergencyStopRequested(string phase)
+        {
+            if (!respectEmergencyStop || !IsAutomationHalted)
+                return;
+
+            _log.Warn(
+                $"[AUTO_CLOSE_ABORT_EMERGENCY] profile={ctx.Profile.Name} phase=worker_stop:{phase}");
+            throw new OperationCanceledException(
+                $"EMERGENCY_STOP_AUTOCLOSE: worker_stop:{phase}");
+        }
+
+        ThrowIfEmergencyStopRequested("begin");
+
         var worker = ctx.Worker;
         if (worker is null)
             return;
@@ -1535,6 +1638,7 @@ public sealed partial class ManagerForm
 
         if (!IsExited())
         {
+            ThrowIfEmergencyStopRequested("before_shutdown");
             try
             {
                 await SendPipeAsync(
@@ -1550,6 +1654,7 @@ public sealed partial class ManagerForm
 
             if (!await WaitForProcessExitAsync(worker, TimeSpan.FromSeconds(7)))
             {
+                ThrowIfEmergencyStopRequested("before_force_kill");
                 try
                 {
                     worker.Kill(true);
@@ -1565,11 +1670,14 @@ public sealed partial class ManagerForm
 
                 if (!await WaitForProcessExitAsync(worker, TimeSpan.FromSeconds(3)))
                 {
+                    ThrowIfEmergencyStopRequested("after_force_kill_wait");
                     throw new InvalidOperationException(
                         $"Worker profile {ctx.Profile.Name} vẫn còn sống sau shutdown + force kill. Cleanup Barrier chặn Tự bù.");
                 }
             }
         }
+
+        ThrowIfEmergencyStopRequested("before_final_verify");
 
         if (!IsExited())
         {
@@ -1734,7 +1842,13 @@ public sealed partial class ManagerForm
             // Worker phải chết THẬT trước khi được phép giải phóng slot.
             WriteAutoDiagnosticEvent(
                 ctx, source, reason, "STEP", "step=SHUTDOWN_WORKER");
-            await EnsureAutoCloseWorkerStoppedAsync(ctx);
+            await EnsureAutoCloseWorkerStoppedAsync(ctx, respectEmergencyStop: true);
+
+            if (IsAutomationHalted)
+            {
+                _log.Warn($"[AUTO_CLOSE_ABORT_EMERGENCY] profile={ctx.Profile.Name} phase=after_shutdown_worker");
+                return;
+            }
 
             // Dù Worker trả "closed"/"not_running" cũng KHÔNG được coi CDP tắt là
             // bằng chứng cuối cùng. Chrome có thể mất CDP trước nhưng process theo
@@ -1746,7 +1860,13 @@ public sealed partial class ManagerForm
                     ? "step=FINAL_CHROME_STRICT_VERIFY_AFTER_WORKER_CLOSE"
                     : "step=FINAL_CHROME_STRICT_CLEANUP_FALLBACK");
 
-            await EnsureAutoCloseChromeStoppedAsync(ctx);
+            await EnsureAutoCloseChromeStoppedAsync(ctx, respectEmergencyStop: true);
+
+            if (IsAutomationHalted)
+            {
+                _log.Warn($"[AUTO_CLOSE_ABORT_EMERGENCY] profile={ctx.Profile.Name} phase=after_chrome_cleanup");
+                return;
+            }
 
             _autoCloseVerifiedCleanProfiles.Add(ctx.Profile.Name);
 
@@ -1755,6 +1875,12 @@ public sealed partial class ManagerForm
 
             WriteAutoDiagnosticEvent(
                 ctx, source, reason, "STEP", "step=REMOVE_TAB");
+
+            if (IsAutomationHalted)
+            {
+                _log.Warn($"[AUTO_CLOSE_ABORT_EMERGENCY] profile={ctx.Profile.Name} phase=before_remove_tab");
+                return;
+            }
 
             if (ctx.Tab is not null && !ctx.Tab.IsDisposed && ctx.Tab.Parent == _tabs)
                 RemoveTab(ctx);
@@ -1793,7 +1919,35 @@ public sealed partial class ManagerForm
             WriteAutoDiagnosticEvent(
                 ctx, source, reason, "DONE", "cleanup=success; replacementQueue=next");
 
+            if (IsAutomationHalted)
+            {
+                _log.Warn($"[AUTO_CLOSE_ABORT_EMERGENCY] profile={ctx.Profile.Name} phase=before_queue_replacement");
+                return;
+            }
+
             QueueAutoReplacementAfterAutoClose(ctx.Profile.Name, reason);
+        }
+        catch (OperationCanceledException ex)
+            when (IsAutomationHalted
+                  || ex.Message.StartsWith("EMERGENCY_STOP_AUTOCLOSE:", StringComparison.Ordinal))
+        {
+            _log.Warn(
+                $"[AUTO_CLOSE_ABORT_EMERGENCY] profile={ctx.Profile.Name} phase=cleanup_cancelled detail={ex.Message}");
+
+            WriteAutoDiagnosticEvent(
+                ctx,
+                source,
+                reason,
+                "EMERGENCY_STOP",
+                $"cleanup_cancelled={ex.Message}");
+
+            WriteAutoActivityLog(
+                action: "TỰ ĐÓNG",
+                profile: ctx.Profile.Name,
+                account: ResolveAutoActivityAccount(ctx.Profile.Name),
+                reason: reason,
+                result: "DỪNG KHẨN CẤP",
+                detail: "Đã dừng cleanup tự động ngay khi nhận Dừng khẩn cấp; không tạo suất bù.");
         }
         catch (Exception ex)
         {

@@ -17,6 +17,7 @@ public sealed partial class ManagerForm
     bool _autoReplacementManualControlInitialized;
     bool _emergencyStopStateInitialized;
     volatile bool _emergencyStopActive;
+    volatile bool _emergencyResumeInProgress;
     readonly object _emergencyStopLock = new();
     CancellationTokenSource _emergencyAutomationCts = new();
 
@@ -211,8 +212,11 @@ public sealed partial class ManagerForm
 
     async Task ToggleEmergencyStopFromUiAsync()
     {
+        if (_emergencyResumeInProgress)
+            return;
+
         if (IsAutomationHalted)
-            ResumeAutomationFromEmergencyStop();
+            await ResumeAutomationFromEmergencyStopAsync();
         else
             await EnterEmergencyStopAsync("manual_ui");
     }
@@ -269,64 +273,205 @@ public sealed partial class ManagerForm
             result: "ĐÃ DỪNG",
             detail: $"Hủy automation đang chạy, xóa {clearedPending} suất bù tạm và đặt target=0. Chrome/PRF được giữ nguyên.");
 
-        await StopAllWorkerAutomationForEmergencyAsync();
+        var workersStopped = await StopAllWorkerAutomationForEmergencyAsync();
+        if (!workersStopped)
+        {
+            _log.Error("[EMERGENCY_STOP_INCOMPLETE] Một hoặc nhiều Worker không xác nhận STOP và cũng không thể force-exit Worker-only.");
+            ModernDialog.ShowMessage(
+                this,
+                "Dừng khẩn cấp đã được bật nhưng có Worker không phản hồi và không thể dừng cưỡng bức. Hãy kiểm tra Log/Task Manager trước khi tiếp tục.",
+                "Dừng khẩn cấp chưa hoàn tất",
+                MessageBoxIcon.Warning);
+        }
     }
 
-    void ResumeAutomationFromEmergencyStop()
+    async Task ResumeAutomationFromEmergencyStopAsync()
     {
         InitializeEmergencyStopState();
-        if (!IsAutomationHalted)
+        if (!IsAutomationHalted || _emergencyResumeInProgress)
             return;
 
-        CancellationTokenSource? previous;
-        lock (_emergencyStopLock)
-        {
-            previous = _emergencyAutomationCts;
-            _emergencyAutomationCts = new CancellationTokenSource();
-        }
-        try { previous.Dispose(); } catch { }
+        _emergencyResumeInProgress = true;
+        UpdateEmergencyStopButton();
 
-        // Dự phòng đêm dùng CTS lâu sống; tạo token mới sau Emergency Stop.
         try
         {
-            var oldNight = _nightReserveCts;
-            _nightReserveCts = new CancellationTokenSource();
-            try { oldNight.Dispose(); } catch { }
+            // QUAN TRỌNG: vẫn giữ Halted=true trong toàn bộ pha đồng bộ. Như vậy mọi
+            // timer/job nền tiếp tục bị gate trong lúc Manager đang quét lại runtime.
+            // Chỉ mở khóa ở bước cuối sau khi target/queue cũ đã được reset lần nữa.
+            try { StopRunStrategySession("emergency_resume_resync"); } catch { }
+            try { InvalidateAutoReplacementExecution("emergency_resume_resync"); } catch { }
+            _autoReplacementSessionArmed = false;
+
+            lock (_autoReplacementQueueLock)
+            {
+                _autoReplacementQueue.Clear();
+                try { SaveAutoReplacementQueueUnsafe(); } catch { }
+            }
+
+            lock (_autoReplacementFixedSlotLock)
+            {
+                _autoReplacementTargetSlots = 0;
+                _autoReplacementTargetInitialized = true;
+                _autoReplacementNextCapacityReconcileUtc = DateTime.MinValue;
+            }
+
+            _autoMessageReplyNextRunUtc.Clear();
+            _autoIdentityNextProbeUtc.Clear();
+
+            // Đồng bộ catalog/context nhưng tuyệt đối không spawn Worker/Chrome.
+            try
+            {
+                var catalog = await Task.Run(() => _profileService.Load());
+                RefreshContextsFromCatalog(catalog);
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"[EMERGENCY_RESUME_CATALOG_WARN] error={ex.Message}");
+            }
+
+            // Dừng lại lần cuối các Worker còn sống. Emergency state vẫn đang được
+            // persist=true nên Worker cũng tự chặn START/RESUME mới trong lúc này.
+            // Nếu một Worker không thể dừng kể cả fallback Worker-only thì KHÔNG mở khóa.
+            var workersStopped = await StopAllWorkerAutomationForEmergencyAsync();
+            if (!workersStopped)
+            {
+                _log.Error("[EMERGENCY_RESUME_BLOCKED] reason=worker_stop_not_confirmed");
+                ModernDialog.ShowMessage(
+                    this,
+                    "Chưa thể Tiếp tục vì còn Worker không xác nhận đã dừng. Trạng thái Dừng khẩn cấp vẫn được giữ nguyên.",
+                    "Chưa thể tiếp tục",
+                    MessageBoxIcon.Warning);
+                return;
+            }
+
+            // Chỉ đọc status để Manager bỏ snapshot cũ trước khi mở khóa. Không gọi
+            // EnsureWorkerAsync/Adopt nên không thể sinh process mới ở pha Resume.
+            foreach (var ctx in _contexts.Values.ToList())
+            {
+                if (_closing || IsDisposed || Disposing)
+                    return;
+
+                var workerAlive = false;
+                try { workerAlive = ctx.Worker is not null && !ctx.Worker.HasExited; }
+                catch { workerAlive = ctx.Worker is not null; }
+
+                if (!workerAlive)
+                {
+                    if (ctx.Worker is not null)
+                        ConfirmRuntimeState(ctx, RuntimeStateStopped, "emergency_resume_worker_not_alive");
+                    continue;
+                }
+
+                try
+                {
+                    var raw = await SendPipeAsync(
+                        ctx.Profile.Name,
+                        "status",
+                        TimeSpan.FromSeconds(2));
+
+                    var snapshot = JsonSerializer.Deserialize<WorkerSnapshot>(
+                        raw,
+                        WorkerSnapshotJson);
+
+                    if (snapshot is null
+                        || !snapshot.Profile.Equals(ctx.Profile.Name, StringComparison.OrdinalIgnoreCase)
+                        || snapshot.CdpPort != ctx.Profile.CdpPort
+                        || !IsWorkerReportedRuntimeState(snapshot.RunState))
+                    {
+                        throw new InvalidDataException("Worker status không hợp lệ sau Dừng khẩn cấp.");
+                    }
+
+                    ctx.LastSnapshot = snapshot;
+                    ctx.LastStatusRefreshUtc = DateTime.UtcNow;
+                    ctx.ConsecutiveStatusPollFailures = 0;
+                    ctx.LastStatusPollFailure = "";
+                    ApplyWorkerSnapshotRuntimeState(ctx, snapshot);
+                }
+                catch (Exception ex)
+                {
+                    _log.Warn(
+                        $"[EMERGENCY_RESUME_STATUS_WARN] profile={ctx.Profile.Name} error={ex.Message}");
+                }
+            }
+
+            // Race cuối: một task cũ có thể vừa unwind trong lúc quét. Reset lại queue,
+            // generation và quota TRƯỚC khi đổi Halted=false để nó không sống lại.
+            try { InvalidateAutoReplacementExecution("emergency_resume_final_reset"); } catch { }
+            _autoReplacementSessionArmed = false;
+
+            lock (_autoReplacementQueueLock)
+            {
+                _autoReplacementQueue.Clear();
+                try { SaveAutoReplacementQueueUnsafe(); } catch { }
+            }
+
+            lock (_autoReplacementFixedSlotLock)
+            {
+                _autoReplacementTargetSlots = 0;
+                _autoReplacementTargetInitialized = true;
+                _autoReplacementNextCapacityReconcileUtc = DateTime.MinValue;
+            }
+
+            // Không mang marker phiên cũ qua Resume. Nếu giữ ExpectedRunning/Claimed
+            // của trước Emergency Stop thì lần Start thủ công đầu tiên có thể tính nhầm
+            // nhiều slot cũ và làm target nhảy từ 0 lên quá cao.
+            _autoCloseExpectedRunningProfiles.Clear();
+            _autoReplacementClaimedProfiles.Clear();
+            _autoReplacementCleanupProfiles.Clear();
+
+            CancellationTokenSource? previous;
+            lock (_emergencyStopLock)
+            {
+                previous = _emergencyAutomationCts;
+                _emergencyAutomationCts = new CancellationTokenSource();
+            }
+            try { previous.Dispose(); } catch { }
+
+            // Dự phòng đêm dùng CTS lâu sống; tạo token mới sau Emergency Stop.
+            try
+            {
+                var oldNight = _nightReserveCts;
+                _nightReserveCts = new CancellationTokenSource();
+                try { oldNight.Dispose(); } catch { }
+            }
+            catch { }
+
+            _emergencyStopActive = false;
+            SaveEmergencyStopState();
+
+            _log.Info(
+                "[EMERGENCY_STOP_OFF] action=resync_then_unlock old_tasks_not_resumed target=0");
+            WriteAutoActivityLog(
+                action: "DỪNG KHẨN CẤP",
+                result: "TIẾP TỤC",
+                detail: "Đã quét lại Worker/runtime rồi mới mở khóa. Không chạy lại task/queue cũ; target vẫn 0 cho tới khi Start thủ công hoặc Auto Run mới.");
         }
-        catch { }
-
-        _emergencyStopActive = false;
-        SaveEmergencyStopState();
-
-        // Không phục hồi queue/task cũ. Chỉ mở khóa để các hành động MỚI được chạy.
-        _autoReplacementSessionArmed = false;
-        _autoMessageReplyNextRunUtc.Clear();
-        _autoIdentityNextProbeUtc.Clear();
-
-        UpdateEmergencyStopButton();
-        UpdateAutoCloseToolbarButtonText();
-
-        _log.Info("[EMERGENCY_STOP_OFF] action=unlock_only old_tasks_not_resumed target=0");
-        WriteAutoActivityLog(
-            action: "DỪNG KHẨN CẤP",
-            result: "TIẾP TỤC",
-            detail: "Đã mở khóa automation. Không chạy lại task/queue cũ; target vẫn 0 cho tới khi Start thủ công hoặc Auto Run mới.");
+        finally
+        {
+            _emergencyResumeInProgress = false;
+            UpdateEmergencyStopButton();
+            UpdateAutoCloseToolbarButtonText();
+            try { RefreshAvailability(); } catch { }
+            try { UpdateTitle(); } catch { }
+        }
     }
 
-    async Task StopAllWorkerAutomationForEmergencyAsync()
+    async Task<bool> StopAllWorkerAutomationForEmergencyAsync()
     {
         var contexts = _contexts.Values
             .Where(c => c.Worker is not null && !c.Worker.HasExited)
             .ToList();
 
         if (contexts.Count == 0)
-            return;
+            return true;
 
         var tasks = contexts.Select(async ctx =>
         {
             try
             {
-                // Tin nhắn có engine riêng, dừng trước.
+                // Tin nhắn có engine riêng, dừng trước. Lỗi ở đây không ngăn bước
+                // dừng AutomationEngine chính và fallback Worker-only phía dưới.
                 try
                 {
                     await SendPipeAsync(
@@ -336,24 +481,117 @@ public sealed partial class ManagerForm
                 }
                 catch { }
 
-                // Lệnh stop chỉ dừng AutomationEngine; không đóng Chrome và không shutdown Worker.
+                var stopConfirmed = false;
+                string lastStopError = "";
+
+                // Thử IPC hai lần. emergency_stop ở Worker chỉ trả "stopped" sau
+                // khi AutomationEngine đã unwind thật sự; stop_pending sẽ đi tới retry
+                // rồi fallback Worker-only nếu vẫn chưa dừng hết.
+                for (var attempt = 1; attempt <= 2 && !stopConfirmed; attempt++)
+                {
+                    try
+                    {
+                        var reply = await SendPipeAsync(
+                            ctx.Profile.Name,
+                            "emergency_stop",
+                            TimeSpan.FromSeconds(attempt == 1 ? 4 : 3));
+
+                        stopConfirmed = string.Equals(
+                            (reply ?? "").Trim(),
+                            "stopped",
+                            StringComparison.OrdinalIgnoreCase);
+
+                        if (!stopConfirmed)
+                        {
+                            lastStopError = "reply=" + (reply ?? "<null>");
+                            _log.Warn(
+                                $"[EMERGENCY_STOP_WORKER_UNCONFIRMED] profile={ctx.Profile.Name} attempt={attempt}/2 {lastStopError}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        lastStopError = ex.Message;
+                        _log.Warn(
+                            $"[EMERGENCY_STOP_WORKER_WARN] profile={ctx.Profile.Name} attempt={attempt}/2 error={ex.Message}");
+                    }
+                }
+
+                if (stopConfirmed)
+                {
+                    ConfirmRuntimeState(
+                        ctx,
+                        RuntimeStateStopped,
+                        "emergency_stop_ipc_confirmed");
+                    return true;
+                }
+
+                // IPC không phản hồi: để đạt đúng nghĩa Dừng khẩn cấp, chấm dứt CHỈ
+                // process Worker. Tuyệt đối không Kill(entireProcessTree:true), vì cây
+                // process có thể chứa Chrome và yêu cầu Emergency Stop là giữ Chrome.
+                var worker = ctx.Worker;
+                if (worker is null)
+                    return true;
+
                 try
                 {
-                    await SendPipeAsync(
-                        ctx.Profile.Name,
-                        "stop",
-                        TimeSpan.FromSeconds(3));
+                    if (!worker.HasExited)
+                    {
+                        _log.Error(
+                            $"[EMERGENCY_STOP_WORKER_FORCE_EXIT_ONLY] profile={ctx.Profile.Name} pid={worker.Id} preserveChrome=true ipcError={lastStopError}");
+                        worker.Kill(entireProcessTree: false);
+                    }
+
+                    if (!await WaitForProcessExitAsync(worker, TimeSpan.FromSeconds(4)))
+                    {
+                        _log.Error(
+                            $"[EMERGENCY_STOP_WORKER_FORCE_EXIT_FAILED] profile={ctx.Profile.Name} pid={worker.Id} preserveChrome=true");
+                        return false;
+                    }
+
+                    ConfirmRuntimeState(
+                        ctx,
+                        RuntimeStateStopped,
+                        "emergency_stop_worker_only_exit");
+
+                    try { worker.Dispose(); } catch { }
+                    if (ReferenceEquals(ctx.Worker, worker))
+                        ctx.Worker = null;
+                    ctx.WorkerWindow = IntPtr.Zero;
+                    ctx.Opening = false;
+
+                    return true;
                 }
                 catch (Exception ex)
                 {
-                    _log.Warn($"[EMERGENCY_STOP_WORKER_WARN] profile={ctx.Profile.Name} error={ex.Message}");
+                    _log.Error(
+                        $"[EMERGENCY_STOP_WORKER_FORCE_EXIT_ERROR] profile={ctx.Profile.Name} error={ex.Message} preserveChrome=true");
+                    return false;
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                _log.Error(
+                    $"[EMERGENCY_STOP_WORKER_FATAL] profile={ctx.Profile.Name} error={ex}");
+                return false;
+            }
         }).ToArray();
 
-        try { await Task.WhenAll(tasks); } catch { }
-        _log.Warn($"[EMERGENCY_STOP_WORKERS_DONE] requested={contexts.Count}");
+        bool[] results;
+        try
+        {
+            results = await Task.WhenAll(tasks);
+        }
+        catch (Exception ex)
+        {
+            _log.Error("[EMERGENCY_STOP_WORKERS_TASK_ERROR] " + ex);
+            return false;
+        }
+
+        var stopped = results.Count(x => x);
+        var allStopped = stopped == results.Length;
+        _log.Warn(
+            $"[EMERGENCY_STOP_WORKERS_DONE] requested={contexts.Count} stopped={stopped} failed={results.Length - stopped} allStopped={allStopped}");
+        return allStopped;
     }
 
     void UpdateEmergencyStopButton()
@@ -364,9 +602,18 @@ public sealed partial class ManagerForm
             return;
         }
 
-        if (IsAutomationHalted)
+        if (_emergencyResumeInProgress)
+        {
+            _autoReplacementManualControlButton.Text = "⏳ Đang kiểm tra...";
+            _autoReplacementManualControlButton.Enabled = false;
+            _autoReplacementManualControlButton.BackColor = Color.FromArgb(244, 244, 244);
+            _autoReplacementManualControlButton.ForeColor = Color.DimGray;
+            _autoReplacementManualControlButton.FlatAppearance.BorderColor = Color.Silver;
+        }
+        else if (IsAutomationHalted)
         {
             _autoReplacementManualControlButton.Text = "▶ Tiếp tục";
+            _autoReplacementManualControlButton.Enabled = true;
             _autoReplacementManualControlButton.BackColor = Color.FromArgb(232, 247, 236);
             _autoReplacementManualControlButton.ForeColor = Color.FromArgb(32, 122, 60);
             _autoReplacementManualControlButton.FlatAppearance.BorderColor = Color.FromArgb(112, 184, 128);
@@ -374,6 +621,7 @@ public sealed partial class ManagerForm
         else
         {
             _autoReplacementManualControlButton.Text = "🛑 Dừng khẩn cấp";
+            _autoReplacementManualControlButton.Enabled = true;
             _autoReplacementManualControlButton.BackColor = Color.FromArgb(255, 235, 235);
             _autoReplacementManualControlButton.ForeColor = Color.FromArgb(175, 34, 34);
             _autoReplacementManualControlButton.FlatAppearance.BorderColor = Color.FromArgb(221, 92, 92);

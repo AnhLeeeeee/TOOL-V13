@@ -47,6 +47,7 @@ public sealed partial class ManagerForm
 
         // Chạy tất cả là intent rõ ràng của user muốn duy trì đúng số tab đang mở.
         ArmAutoReplacementSession($"start_all_target:{requestedSlots}");
+        MarkNightReservePrimaryRunIntent(requestedSlots, "start_all_target");
     }
 
     async Task MaybeReconcileAutoReplacementCapacityAsync(
@@ -99,7 +100,7 @@ public sealed partial class ManagerForm
 
             await PruneStaleAutoReplacementExpectedRunningAsync(probeRequest);
 
-            var occupiedPass1 = CountAutoReplacementOccupiedSlots();
+            var occupiedPass1 = CountAutoReplacementFulfilledSlots();
             var pendingPass1 = GetAutoReplacementPendingCount();
             var initialDeficit = target - occupiedPass1 - pendingPass1;
 
@@ -149,7 +150,7 @@ public sealed partial class ManagerForm
                 target = liveTarget;
             }
 
-            var occupiedPass2 = CountAutoReplacementOccupiedSlots();
+            var occupiedPass2 = CountAutoReplacementFulfilledSlots();
             var pendingPass2 = GetAutoReplacementPendingCount();
 
             // Lấy occupied lớn hơn của 2 pass để fail-safe chống mở thừa.
@@ -292,18 +293,23 @@ public sealed partial class ManagerForm
                 profileName,
                 "runtime_command:start");
 
-            var occupied = CountAutoReplacementOccupiedSlots();
+            // Chỉ dùng các slot THỰC SỰ đang chạy/được claim để mở rộng target.
+            // Không dùng CountAutoReplacementOccupiedSlots() ở đây vì hàm đó cố ý
+            // tính cả tab/Worker STOPPED như một "slot vật lý" để chống bù chồng.
+            // Sau Stop All, các tab STOPPED vẫn còn mở; nếu lấy occupied vật lý thì
+            // Start thủ công 1 PRF có thể làm target nhảy từ 0 lên toàn bộ số tab cũ.
+            var activeForTarget = CountAutoReplacementActiveTargetSlots();
 
             lock (_autoReplacementFixedSlotLock)
             {
                 if (!_autoReplacementTargetInitialized
-                    || occupied > _autoReplacementTargetSlots)
+                    || activeForTarget > _autoReplacementTargetSlots)
                 {
                     var old = _autoReplacementTargetSlots;
-                    _autoReplacementTargetSlots = Math.Max(occupied, 1);
+                    _autoReplacementTargetSlots = Math.Max(activeForTarget, 1);
                     _autoReplacementTargetInitialized = true;
                     _log.Info(
-                        $"[AUTO_REPLACE_TARGET_MANUAL_EXPAND] old={old} target={_autoReplacementTargetSlots} profile={profileName}");
+                        $"[AUTO_REPLACE_TARGET_MANUAL_EXPAND] old={old} target={_autoReplacementTargetSlots} active={activeForTarget} profile={profileName}");
                 }
             }
 
@@ -339,6 +345,105 @@ public sealed partial class ManagerForm
 
         var state = GetEffectiveRuntimeState(ctx);
         return state is RuntimeStateRunning or RuntimeStateRecovering;
+    }
+
+    int CountAutoReplacementActiveTargetSlots()
+    {
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // ExpectedRunning là các profile đã được xác nhận Start/Resume trong vòng đời hiện tại.
+        foreach (var name in _autoCloseExpectedRunningProfiles)
+            names.Add(name);
+
+        // Candidate Tự bù đang được claim cũng là một suất chủ động đang hình thành.
+        foreach (var name in _autoReplacementClaimedProfiles)
+            names.Add(name);
+
+        foreach (var ctx in _contexts.Values)
+        {
+            var state = GetEffectiveRuntimeState(ctx);
+            if (state is RuntimeStateRunning or RuntimeStateRecovering)
+                names.Add(ctx.Profile.Name);
+        }
+
+        return names.Count;
+    }
+
+    int CountAutoReplacementFulfilledSlots()
+    {
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // Claim/Cleanup là reservation thật: dù runtime chưa RUNNING vẫn phải giữ slot
+        // để queue không mở chồng một PRF khác trong lúc cùng suất đang hình thành/dọn.
+        foreach (var name in _autoReplacementClaimedProfiles)
+            names.Add(name);
+
+        foreach (var name in _autoReplacementCleanupProfiles)
+            names.Add(name);
+
+        // ExpectedRunning chỉ là intent marker. Nếu profile đã được xác nhận STOPPED thì
+        // marker đó KHÔNG còn thỏa target, kể cả tab/Worker/Chrome cũ vẫn còn tồn tại.
+        // UNKNOWN vẫn fail-closed để tránh mở chồng khi chưa xác minh được runtime.
+        foreach (var name in _autoCloseExpectedRunningProfiles)
+        {
+            if (_autoReplacementClaimedProfiles.Contains(name)
+                || _autoReplacementCleanupProfiles.Contains(name))
+            {
+                names.Add(name);
+                continue;
+            }
+
+            if (_contexts.TryGetValue(name, out var expectedCtx))
+            {
+                var expectedState = GetEffectiveRuntimeState(expectedCtx);
+                if (expectedState == RuntimeStateStopped && !expectedCtx.Opening)
+                    continue;
+            }
+
+            names.Add(name);
+        }
+
+        foreach (var ctx in _contexts.Values)
+        {
+            var state = GetEffectiveRuntimeState(ctx);
+
+            if (state is RuntimeStateRunning or RuntimeStatePaused or RuntimeStateRecovering)
+            {
+                names.Add(ctx.Profile.Name);
+                continue;
+            }
+
+            if (ctx.Opening)
+            {
+                names.Add(ctx.Profile.Name);
+                continue;
+            }
+
+            // STOPPED là trạng thái đã xác nhận không còn phục vụ target. Worker/tab/Chrome
+            // còn sót chỉ là runtime vật lý cần cleanup, không được làm Tool tưởng 5/5 khi
+            // thực tế chỉ còn 4 PRF RUNNING. Đây là nguyên nhân bù bị kẹt ngẫu nhiên.
+            if (state == RuntimeStateStopped)
+                continue;
+
+            if (IsReplacementProfileCoolingDown(ctx.Profile.Name))
+                continue;
+
+            // UNKNOWN + còn runtime vật lý: chưa đủ bằng chứng rằng slot đã mất, nên giữ
+            // fail-closed cho tới khi status/probe xác minh rõ RUNNING hoặc STOPPED.
+            var workerAlive = false;
+            try { workerAlive = ctx.Worker is not null && !ctx.Worker.HasExited; }
+            catch { workerAlive = ctx.Worker is not null; }
+
+            var tabOpen =
+                ctx.Tab is not null
+                && !ctx.Tab.IsDisposed
+                && ctx.Tab.Parent == _tabs;
+
+            if (workerAlive || tabOpen)
+                names.Add(ctx.Profile.Name);
+        }
+
+        return names.Count;
     }
 
     int CountAutoReplacementOccupiedSlots()
@@ -431,6 +536,24 @@ public sealed partial class ManagerForm
             var windowAlive = HasAutoCloseCachedLiveChromeWindow(ctx);
             var cdpListening = await IsAutoCloseCdpPortListeningAsync(ctx.Profile.CdpPort);
             var opening = ctx.Opening;
+            var state = GetEffectiveRuntimeState(ctx);
+
+            // Một Worker/tab/Chrome còn sống nhưng Worker đã xác nhận STOPPED chỉ là
+            // phần runtime còn sót. Nó không được giữ ExpectedRunning và chặn bù mãi.
+            // Claim/Cleanup đã được xử lý ở các marker riêng nên vẫn an toàn tuần tự.
+            if (state == RuntimeStateStopped
+                && !opening
+                && !_autoReplacementClaimedProfiles.Contains(profileName)
+                && !_autoReplacementCleanupProfiles.Contains(profileName))
+            {
+                return new AutoReplacementExpectedRuntimeProbe(
+                    false,
+                    workerAlive,
+                    windowAlive,
+                    cdpListening,
+                    opening,
+                    "context_explicit_stopped");
+            }
 
             return new AutoReplacementExpectedRuntimeProbe(
                 workerAlive || windowAlive || cdpListening || opening,
@@ -560,7 +683,7 @@ public sealed partial class ManagerForm
     AutoReplacementSlotGateResult EvaluateAutoReplacementFixedSlotGate(
         AutoReplacementRequest request)
     {
-        var occupied = CountAutoReplacementOccupiedSlots();
+        var occupied = CountAutoReplacementFulfilledSlots();
         int target;
 
         lock (_autoReplacementFixedSlotLock)
