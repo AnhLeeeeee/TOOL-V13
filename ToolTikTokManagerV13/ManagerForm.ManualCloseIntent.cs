@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 
 namespace ToolTikTokManagerV13;
 
@@ -25,6 +25,7 @@ public sealed partial class ManagerForm
         public string Origin { get; set; } = "";
         public string OperationId { get; set; } = "";
         public DateTime CreatedUtc { get; set; }
+        public bool WasRunning { get; set; }
     }
 
     void TryConsumeWorkerManualCloseIntent(
@@ -53,14 +54,12 @@ public sealed partial class ManagerForm
                 return;
             }
 
-            if (document is null
-                || !string.Equals(
-                    (document.Origin ?? "").Trim(),
-                    "USER_X_CLOSE",
-                    StringComparison.OrdinalIgnoreCase))
-            {
+            if (document is null)
                 return;
-            }
+
+            var origin = (document.Origin ?? "").Trim().ToUpperInvariant();
+            if (origin is not ("USER_X_CLOSE" or "USER_STOP" or "USER_START"))
+                return;
 
             var profileName = (document.ProfileName ?? "").Trim();
             if (!profileName.Equals(ctx.Profile.Name, StringComparison.OrdinalIgnoreCase))
@@ -85,17 +84,6 @@ public sealed partial class ManagerForm
             if (operationId.Length == 0)
                 return;
 
-            // X trực tiếp cửa sổ Worker cũng chỉ giảm target nếu profile thật sự đang
-            // thuộc quota hiện tại. Worker của một tab mở để xem nhưng chưa Start không
-            // được làm target giảm nhầm.
-            if (!IsManualCloseTargetMember(ctx))
-            {
-                _log.Info(
-                    $"[MANUAL_CLOSE_INTENT_NOT_TARGET_MEMBER] profile={ctx.Profile.Name} source={source} operationId={operationId}");
-                try { File.Delete(path); } catch { }
-                return;
-            }
-
             // Marker rất cũ cũng không được áp dụng cho phiên hiện tại.
             var age = DateTime.UtcNow - document.CreatedUtc;
             if (document.CreatedUtc == default
@@ -111,9 +99,28 @@ public sealed partial class ManagerForm
                     return;
             }
 
+            if (origin == "USER_START")
+            {
+                ApplyWorkerManualStartIntent(ctx, operationId, source);
+                try { File.Delete(path); } catch { }
+                return;
+            }
+
+            // USER_STOP được ghi TRƯỚC khi Worker gọi _engine.Stop(), nên WasRunning=true
+            // là bằng chứng trực tiếp profile đang chiếm một suất tại thời điểm user bấm
+            // Dừng. Điều này tránh race: đến lúc Manager đọc marker, runtime đã STOPPED.
+            // Marker V1 cũ không có WasRunning thì vẫn dùng fallback runtime hiện tại.
+            if (!document.WasRunning && !IsManualCloseTargetMember(ctx))
+            {
+                _log.Info(
+                    $"[MANUAL_CLOSE_INTENT_NOT_TARGET_MEMBER] profile={ctx.Profile.Name} origin={origin} source={source} operationId={operationId} wasRunning={document.WasRunning}");
+                try { File.Delete(path); } catch { }
+                return;
+            }
+
             ApplyManualCloseTargetShrink(
                 ctx.Profile.Name,
-                "USER_X_CLOSE",
+                origin,
                 operationId,
                 source);
 
@@ -124,6 +131,26 @@ public sealed partial class ManagerForm
             _log.Warn(
                 $"[MANUAL_CLOSE_INTENT_CONSUME_WARN] profile={ctx.Profile.Name} source={source} error={ex.Message}");
         }
+    }
+
+    void ApplyWorkerManualStartIntent(
+        ProfileContext ctx,
+        string operationId,
+        string source)
+    {
+        var profileName = (ctx.Profile.Name ?? "").Trim();
+        if (profileName.Length == 0)
+            return;
+
+        // Người dùng bấm Start trực tiếp trong Worker sau một lần manual Stop.
+        // Khôi phục quota theo đúng occupied hiện tại và bỏ suppression cũ.
+        ClearManualCloseSuppression(profileName, "worker_user_start");
+        MarkAutoCloseExpectedRunning(profileName, "worker_user_start");
+        TrackAutoReplacementTargetRuntimeCommand(ctx, "start");
+        ArmAutoReplacementSession("worker_user_start:" + profileName);
+
+        _log.Info(
+            $"[MANUAL_START_INTENT_APPLIED] profile={profileName} operationId={operationId} source={source} target={_autoReplacementTargetSlots}");
     }
 
     bool IsManualCloseSuppressed(string profileName)
@@ -273,6 +300,49 @@ public sealed partial class ManagerForm
             // Cho reconcile kế tiếp chạy ngay; reconcile đang chạy cũng sẽ re-read
             // target trước pass 2 nên không thể dùng quota cũ để mở bù lại.
             _autoReplacementNextCapacityReconcileUtc = DateTime.MinValue;
+        }
+
+        // Target vừa co xuống thì mọi lượt Tự bù/Auto Run bootstrap đang chạy với
+        // snapshot target CŨ phải dừng ngay. Nếu không, một request đã qua slot-gate
+        // trước lúc user đóng vẫn có thể mở PRF mới dù target đã giảm.
+        if (targetChanged)
+        {
+            InvalidateAutoReplacementExecution(
+                $"manual_close_target_shrink:{profileName}:{origin}");
+
+            CancellationTokenSource? runAllStartToCancel = null;
+            CancellationTokenSource? runStrategyToCancel = null;
+            int oldRunStrategyTarget = 0;
+            int newRunStrategyTarget = 0;
+
+            lock (_runStrategyLock)
+            {
+                if (!_runAllStartCts.IsCancellationRequested)
+                    runAllStartToCancel = _runAllStartCts;
+
+                if (_runStrategySessionActive && _runStrategyTargetSlots > 0)
+                {
+                    oldRunStrategyTarget = _runStrategyTargetSlots;
+                    _runStrategyTargetSlots = Math.Max(0, _runStrategyTargetSlots - 1);
+                    newRunStrategyTarget = _runStrategyTargetSlots;
+
+                    if (_runStrategyTargetSlots == 0)
+                    {
+                        _runStrategySessionActive = false;
+                        if (!_runStrategyCts.IsCancellationRequested)
+                            runStrategyToCancel = _runStrategyCts;
+                    }
+                }
+            }
+
+            try { runAllStartToCancel?.Cancel(); } catch { }
+            try { runStrategyToCancel?.Cancel(); } catch { }
+
+            if (oldRunStrategyTarget > 0)
+            {
+                _log.Info(
+                    $"[RUN_STRATEGY_TARGET_MANUAL_CLOSE] profile={profileName} old={oldRunStrategyTarget} target={newRunStrategyTarget} origin={origin}");
+            }
         }
 
         // Manual close là intent mạnh: bỏ request quota tổng quát và cả request AutoClose

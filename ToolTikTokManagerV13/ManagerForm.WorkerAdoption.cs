@@ -21,6 +21,14 @@ public sealed partial class ManagerForm
 
         StartManagerUiWatchdog();
 
+        // Fallback sau khi Form đã hiện: nếu patch UI trước đó đổi label toolbar
+        // khiến lần inject trong constructor bị trượt, thử lại ở đây.
+        try
+        {
+            InjectProfileLifecycleDiagnosticButton();
+        }
+        catch { }
+
         try
         {
             InitializeAutoReplacementManualControl();
@@ -183,6 +191,49 @@ public sealed partial class ManagerForm
                     continue;
                 }
 
+                // Manager restart chỉ cần nhận lại Worker còn thực sự hoạt động.
+                // Worker STOPPED còn sót từ phiên trước không được tự tạo tab PRF
+                // khi vừa mở Tool; dọn Worker orphan rồi để profile ở trạng thái đóng.
+                if (string.Equals(
+                        snapshot.RunState,
+                        RuntimeStateStopped,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    _log.Info(
+                        $"[WORKER_ADOPT_SKIP_STOPPED] profile={ctx.Profile.Name} pid={snapshot.Pid} action=shutdown_orphan_no_tab");
+
+                    try
+                    {
+                        await SendPipeAsync(
+                            ctx.Profile.Name,
+                            "shutdown",
+                            TimeSpan.FromSeconds(3));
+                    }
+                    catch (Exception shutdownEx)
+                    {
+                        _log.Warn(
+                            $"[WORKER_ADOPT_SKIP_STOPPED_SHUTDOWN_WARN] profile={ctx.Profile.Name} pid={snapshot.Pid} error={shutdownEx.Message}");
+                    }
+
+                    try
+                    {
+                        if (!await WaitForProcessExitAsync(process, TimeSpan.FromSeconds(5)))
+                            process.Kill(true);
+                    }
+                    catch (Exception killEx)
+                    {
+                        _log.Warn(
+                            $"[WORKER_ADOPT_SKIP_STOPPED_KILL_WARN] profile={ctx.Profile.Name} pid={snapshot.Pid} error={killEx.Message}");
+                    }
+
+                    try { process.Dispose(); } catch { }
+                    ctx.Worker = null;
+                    ctx.WorkerWindow = IntPtr.Zero;
+                    ctx.Detached = false;
+                    ctx.Opening = false;
+                    continue;
+                }
+
                 if (ctx.Worker is not null && !ReferenceEquals(ctx.Worker, process))
                 {
                     try { ctx.Worker.Dispose(); } catch { }
@@ -248,6 +299,9 @@ public sealed partial class ManagerForm
         UpdateTitle();
 
         _log.Info($"[WORKER_ADOPT_SCAN_DONE] adopted={adopted}/{candidates.Count}");
+
+        if (IsAutomationHalted && adopted > 0)
+            await StopAllWorkerAutomationForEmergencyAsync();
     }
 
     async Task<WorkerSnapshot?> ProbeExistingWorkerSnapshotAsync(ProfileContext ctx)

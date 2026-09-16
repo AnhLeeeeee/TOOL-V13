@@ -62,10 +62,12 @@ public sealed partial class MainForm
             switch (command)
             {
                 case "start":
+                    if (IsManagerEmergencyStopActive()) return "emergency_stopped";
                     if (IsMessageReplyRunning) return "message_reply_running";
                     await StartAsync();
                     return _engine.Running ? "started" : "not_started";
                 case "start_auto":
+                    if (IsManagerEmergencyStopActive()) return "emergency_stopped";
                     if (IsMessageReplyRunning) return "message_reply_running";
                     await StartAsync(suppressDialogs: true);
                     return _engine.Running ? "started" : "not_started";
@@ -73,6 +75,7 @@ public sealed partial class MainForm
                     if (_engine.Running && !_engine.Paused) _engine.TogglePause();
                     return _engine.Paused ? "paused" : "not_paused";
                 case "resume":
+                    if (IsManagerEmergencyStopActive()) return "emergency_stopped";
                     if (_engine.Running && _engine.Paused) _engine.TogglePause();
                     return _engine.Running && !_engine.Paused ? "running" : "not_running";
                 case "stop":
@@ -83,6 +86,7 @@ public sealed partial class MainForm
                     if (!_chrome.Connected) return "not_opened";
                     return MapManagedLaunchState();
                 case "launch_auto":
+                    if (IsManagerEmergencyStopActive()) return "emergency_stopped";
                     // Auto Profile không giữ cả hàng đợi 15 phút khi gặp CAPTCHA.
                     // Chrome vẫn được giữ nguyên để người dùng xử lý thủ công sau.
                     await LaunchChromeAsync(stopOnCaptcha: true, suppressDialogs: true);
@@ -103,6 +107,7 @@ public sealed partial class MainForm
                     StopManagedMessageReply();
                     return await CloseChromeAsync();
                 case "message_reply_start":
+                    if (IsManagerEmergencyStopActive()) return "emergency_stopped";
                     return await StartManagedMessageReplyAsync(commandPayload);
                 case "identity_ready":
                 {
@@ -157,6 +162,7 @@ public sealed partial class MainForm
                 }
                 case "update_tiktok_identity":
                 {
+                    if (IsManagerEmergencyStopActive()) return "emergency_stopped";
                     try
                     {
                         if (IsMessageReplyRunning)

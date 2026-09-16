@@ -2,6 +2,7 @@
 using System.Runtime.InteropServices;
 using System.Collections.Concurrent;
 using System.Text;
+using System.Text.Json;
 using ToolTikTokV12.Controls;
 using ToolTikTokV11.Models;
 using ToolTikTokV11.Services;
@@ -11,6 +12,11 @@ namespace ToolTikTokV11;
 
 public sealed partial class MainForm : Form
 {
+    // Optional hooks implemented only by the managed Worker build.
+    // Standalone V115Core compiles them away when there is no implementation.
+    partial void OnManagedUserStartIntent();
+    partial void OnManagedUserStopIntent();
+
     readonly StartupOptions _startupOptions;
     readonly bool _managedMode;
     readonly string _baseDir;
@@ -1648,7 +1654,18 @@ public sealed partial class MainForm : Form
         if (_startStopCommandInFlight) return;
         if (!_engine.Running)
         {
+            if (IsManagerEmergencyStopActive())
+            {
+                MessageBox.Show(
+                    "Manager đang ở trạng thái Dừng khẩn cấp. Hãy bấm ‘Tiếp tục’ trên Manager trước.",
+                    "Đã dừng khẩn cấp",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
             await StartAsync();
+            if (_engine.Running)
+                OnManagedUserStartIntent();
             return;
         }
 
@@ -1657,6 +1674,10 @@ public sealed partial class MainForm : Form
         UpdateRunControlButtons();
         try
         {
+            // This path is the red Stop button clicked by the user inside the Worker UI.
+            // Manager-issued IPC stop bypasses this handler, so internal/automatic STOPs
+            // are not misclassified as manual intent.
+            OnManagedUserStopIntent();
             _engine.Stop();
         }
         finally
@@ -1670,6 +1691,15 @@ public sealed partial class MainForm : Form
     void HandlePauseResume()
     {
         if (_startStopCommandInFlight || _pauseResumeCommandInFlight || !_engine.Running) return;
+        if (_engine.Paused && IsManagerEmergencyStopActive())
+        {
+            MessageBox.Show(
+                "Manager đang ở trạng thái Dừng khẩn cấp. Hãy bấm ‘Tiếp tục’ trên Manager trước.",
+                "Đã dừng khẩn cấp",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
         _pauseResumeCommandInFlight = true;
         UpdateRunControlButtons();
         try
@@ -1686,6 +1716,19 @@ public sealed partial class MainForm : Form
     async Task StartAsync(bool suppressDialogs = false)
     {
         if (_engine.Running || _startStopCommandInFlight) return;
+        if (IsManagerEmergencyStopActive())
+        {
+            _log.Warn("[EMERGENCY_STOP_START_BLOCKED] Manager đang HALTED.");
+            if (!suppressDialogs)
+            {
+                MessageBox.Show(
+                    "Manager đang ở trạng thái Dừng khẩn cấp. Hãy bấm ‘Tiếp tục’ trên Manager trước.",
+                    "Đã dừng khẩn cấp",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
+            return;
+        }
         _startStopCommandInFlight = true;
         UpdateRunControlButtons();
         try
@@ -1747,6 +1790,29 @@ public sealed partial class MainForm : Form
         {
             _startStopCommandInFlight = false;
             UpdateRunControlButtons();
+        }
+    }
+
+    bool IsManagerEmergencyStopActive()
+    {
+        if (!_managedMode)
+            return false;
+
+        try
+        {
+            var path = Path.Combine(AppContext.BaseDirectory, "manager_emergency_stop.json");
+            if (!File.Exists(path))
+                return false;
+
+            using var doc = JsonDocument.Parse(File.ReadAllText(path));
+            return doc.RootElement.TryGetProperty("Halted", out var halted)
+                   && halted.ValueKind is JsonValueKind.True or JsonValueKind.False
+                   && halted.GetBoolean();
+        }
+        catch
+        {
+            // Fail-open ở Worker để file state hỏng không khóa vĩnh viễn thao tác tay.
+            return false;
         }
     }
 
@@ -2260,9 +2326,28 @@ public sealed partial class MainForm : Form
         if (m.Msg == WM_HOTKEY)
         {
             var id = m.WParam.ToInt32();
-            if (id == HOTKEY_START) _ = StartAsync(); else if (id == HOTKEY_PAUSE) HandlePauseResume(); else if (id == HOTKEY_STOP) _engine.Stop();
+            if (id == HOTKEY_START)
+            {
+                _ = StartFromHotkeyAsync();
+            }
+            else if (id == HOTKEY_PAUSE)
+            {
+                HandlePauseResume();
+            }
+            else if (id == HOTKEY_STOP)
+            {
+                OnManagedUserStopIntent();
+                _engine.Stop();
+            }
         }
         base.WndProc(ref m);
+    }
+
+    async Task StartFromHotkeyAsync()
+    {
+        await StartAsync();
+        if (_engine.Running)
+            OnManagedUserStartIntent();
     }
 
     void OnClosing(object? sender, FormClosingEventArgs e)

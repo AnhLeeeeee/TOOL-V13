@@ -949,13 +949,14 @@ public sealed partial class ManagerForm
             beginPreCreate.Click += async (_, _) =>
             {
                 if (running || preCreateRunning) return;
+                if (!EnsureAutomationAllowedFromUi("tạo PRF tự động")) return;
 
                 preCreateRunning = true;
                 preCreateStopRequested = false;
                 running = true;
                 paused = false;
                 pause.Text = "Tạm dừng";
-                runCts = new CancellationTokenSource();
+                runCts = CreateEmergencyLinkedCancellationSource();
                 SetInputsEnabled(false);
                 SetPopupInputsEnabled(false);
 
@@ -1290,6 +1291,7 @@ public sealed partial class ManagerForm
         start.Click += async (_, _) =>
         {
             if (running) return;
+            if (!EnsureAutomationAllowedFromUi("chạy Auto Profile")) return;
             preCreateRunning = false;
             preCreateStopRequested = false;
             try
@@ -1348,7 +1350,7 @@ public sealed partial class ManagerForm
                 running = true;
                 paused = false;
                 pause.Text = "Tạm dừng";
-                runCts = new CancellationTokenSource();
+                runCts = CreateEmergencyLinkedCancellationSource();
                 SetInputsEnabled(false);
                 status.Text = requestedNew > 0
                     ? $"Mục tiêu: tạo đủ {requestedNew} profile mới thành công | Có {newCandidates} account phù hợp trong kho | Resume: {resumeQueued}."

@@ -77,6 +77,13 @@ public sealed partial class ManagerForm
         TimeSpan timeout,
         bool suppressStatus = false)
     {
+        if (IsAutomationHalted)
+        {
+            if (!suppressStatus)
+                SetStatus(ctx, "Đã dừng khẩn cấp; không Start.", Color.Firebrick);
+            return "emergency_stopped";
+        }
+
         // Lỗi kỹ thuật tạm thời của Name Guard (DOM/CDP/IPC chậm) không được biến
         // ngay thành một profile bù hỏng. Giữ nguyên Chrome/Worker và thử lại cùng
         // profile tối đa 3 lượt, cách nhau 15 giây. Chỉ lỗi cứng mới BLOCK ngay.

@@ -433,11 +433,13 @@ public sealed partial class ManagerForm
         flow.Controls.Add(ActionButton("👁 View", UiButtonKind.Primary, ViewChromeForProfileAsync));
         flow.Controls.Add(ActionButton("▶ Start", UiButtonKind.Primary, async ctx =>
         {
+            if (!EnsureAutomationAllowedFromUi("Start profile")) return;
             await OpenProfileAsync(ctx);
             await StartWithNameGuardAsync(ctx, "start", TimeSpan.FromSeconds(30));
         }));
         flow.Controls.Add(ActionButton("⏯ Pause/Resume", UiButtonKind.Neutral, async ctx =>
         {
+            if (!EnsureAutomationAllowedFromUi("Pause/Resume profile")) return;
             if (ctx.Worker is null || ctx.Worker.HasExited)
                 await OpenProfileAsync(ctx);
             try { await RefreshStatusAsync(ctx); } catch { }
@@ -456,6 +458,7 @@ public sealed partial class ManagerForm
         }));
         flow.Controls.Add(ActionButton("↻ Restart Chrome", UiButtonKind.Neutral, async ctx =>
         {
+            if (!EnsureAutomationAllowedFromUi("Restart Chrome")) return;
             if (ctx.Worker is null || ctx.Worker.HasExited)
                 await OpenProfileAsync(ctx);
             try { await CloseChromeForProfileAsync(ctx); } catch { }

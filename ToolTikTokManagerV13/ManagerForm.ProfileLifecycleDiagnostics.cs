@@ -176,9 +176,7 @@ public sealed partial class ManagerForm
         {
             var toolbar = EnumerateProfileLifecycleControls(this)
                 .OfType<FlowLayoutPanel>()
-                .FirstOrDefault(panel => panel.Controls
-                    .OfType<Button>()
-                    .Any(button => button.Text.Contains("Dừng tất cả", StringComparison.OrdinalIgnoreCase)));
+                .FirstOrDefault(IsManagerActionToolbar);
 
             if (toolbar is null)
                 return;
@@ -212,6 +210,29 @@ public sealed partial class ManagerForm
             return;
 
         menu.Show(button, new Point(0, button.Height));
+    }
+
+    static bool IsManagerActionToolbar(FlowLayoutPanel panel)
+    {
+        var buttons = panel.Controls.OfType<Button>().ToList();
+
+        // Không phụ thuộc ngôn ngữ của label. Các patch UI có thể đổi
+        // "Dừng tất cả" <-> "Stop All" mà Log vẫn phải tìm đúng hàng 2.
+        if (buttons.Any(button =>
+                button.Text.Equals("Stop All", StringComparison.OrdinalIgnoreCase)
+                || button.Text.Equals("Dừng tất cả", StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
+        var hasRun = buttons.Any(button =>
+            button.Text.Equals("Auto Run", StringComparison.OrdinalIgnoreCase)
+            || button.Text.Equals("Chạy tất cả", StringComparison.OrdinalIgnoreCase));
+        var hasDelete = buttons.Any(button =>
+            button.Text.Equals("Delete", StringComparison.OrdinalIgnoreCase)
+            || button.Text.Equals("Xóa profile", StringComparison.OrdinalIgnoreCase));
+
+        return hasRun && hasDelete;
     }
 
     static IEnumerable<Control> EnumerateProfileLifecycleControls(Control root)

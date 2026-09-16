@@ -6,17 +6,44 @@ public sealed partial class MainForm
 {
     const string ManagedManualCloseIntentFileName = "worker_manual_close_intent.json";
     bool _managedShutdownRequested;
-    string? _manualCloseIntentOperationId;
     bool _manualCloseIntentWritten;
+    bool _manualStopIntentPending;
 
     sealed class ManagedManualCloseIntentDocument
     {
-        public int Version { get; set; } = 1;
+        public int Version { get; set; } = 2;
         public string ProfileName { get; set; } = "";
         public int WorkerPid { get; set; }
         public string Origin { get; set; } = "";
         public string OperationId { get; set; } = "";
         public DateTime CreatedUtc { get; set; }
+        public bool WasRunning { get; set; }
+    }
+
+    // Implement the optional hooks declared in V115Core/MainForm.cs. These are invoked
+    // only for a Start/Stop initiated from the visible Worker UI (or its user hotkey).
+    // IPC commands from Manager call _engine directly and therefore never enter here.
+    partial void OnManagedUserStopIntent()
+    {
+        if (!_managedMode)
+            return;
+
+        var wasRunning = _engine.Running || _engine.Paused;
+        if (!wasRunning)
+            return;
+
+        _manualStopIntentPending = true;
+        TryWriteManualRuntimeIntent("USER_STOP", wasRunning: true);
+    }
+
+    partial void OnManagedUserStartIntent()
+    {
+        if (!_managedMode)
+            return;
+
+        _manualStopIntentPending = false;
+        _manualCloseIntentWritten = false;
+        TryWriteManualRuntimeIntent("USER_START", wasRunning: _engine.Running || _engine.Paused);
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
@@ -34,13 +61,18 @@ public sealed partial class MainForm
             && !_manualCloseIntentWritten
             && e.CloseReason == CloseReason.UserClosing)
         {
-            _manualCloseIntentWritten = TryWriteManualCloseIntent("USER_X_CLOSE");
+            // Nếu user vừa bấm Stop rồi bấm X trước khi Manager kịp đọc marker Stop,
+            // giữ bằng chứng rằng profile thực sự đang RUNNING tại thời điểm user Stop.
+            var wasRunning = _engine.Running || _engine.Paused || _manualStopIntentPending;
+            _manualCloseIntentWritten = TryWriteManualRuntimeIntent(
+                "USER_X_CLOSE",
+                wasRunning);
         }
 
         base.OnFormClosing(e);
     }
 
-    bool TryWriteManualCloseIntent(string origin)
+    bool TryWriteManualRuntimeIntent(string origin, bool wasRunning)
     {
         try
         {
@@ -50,15 +82,14 @@ public sealed partial class MainForm
 
             Directory.CreateDirectory(dataRoot);
 
-            _manualCloseIntentOperationId ??= Guid.NewGuid().ToString("N");
-
             var document = new ManagedManualCloseIntentDocument
             {
                 ProfileName = (_startupOptions.ProfileName ?? "").Trim(),
                 WorkerPid = Environment.ProcessId,
                 Origin = (origin ?? "").Trim(),
-                OperationId = _manualCloseIntentOperationId,
-                CreatedUtc = DateTime.UtcNow
+                OperationId = Guid.NewGuid().ToString("N"),
+                CreatedUtc = DateTime.UtcNow,
+                WasRunning = wasRunning
             };
 
             var path = Path.Combine(dataRoot, ManagedManualCloseIntentFileName);
@@ -71,13 +102,13 @@ public sealed partial class MainForm
             File.Move(temp, path, overwrite: true);
 
             _log.Warn(
-                $"[MANUAL_CLOSE_INTENT] profile={document.ProfileName} origin={document.Origin} operationId={document.OperationId} pid={document.WorkerPid}");
+                $"[MANUAL_RUNTIME_INTENT] profile={document.ProfileName} origin={document.Origin} operationId={document.OperationId} pid={document.WorkerPid} wasRunning={document.WasRunning}");
             return true;
         }
         catch (Exception ex)
         {
-            // Không chặn người dùng đóng Worker chỉ vì log intent thất bại.
-            try { _log.Warn("[MANUAL_CLOSE_INTENT_WRITE_FAILED] " + ex.Message); } catch { }
+            // Không chặn thao tác của người dùng chỉ vì ghi marker thất bại.
+            try { _log.Warn("[MANUAL_RUNTIME_INTENT_WRITE_FAILED] " + ex.Message); } catch { }
             return false;
         }
     }

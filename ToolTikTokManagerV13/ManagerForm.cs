@@ -143,6 +143,8 @@ public sealed partial class ManagerForm : Form
         MinimumSize = new Size(980, 620);
         StartPosition = FormStartPosition.CenterScreen;
         BuildLayout();
+        // Đọc cờ Dừng khẩn cấp trước khi các scheduler/timer tự động được khởi tạo.
+        InitializeEmergencyStopState();
         InitializeProfileLifecycleDiagnostics();
         InitializeMonitorRelayoutHooks();
         ReloadCatalog();
@@ -1027,6 +1029,12 @@ public sealed partial class ManagerForm : Form
 
     async Task<string> SendCommandAsync(ProfileContext ctx, string command, TimeSpan? timeout = null)
     {
+        if (IsCommandBlockedByEmergencyStop(command))
+        {
+            _log.Warn($"[EMERGENCY_STOP_COMMAND_BLOCKED] profile={ctx.Profile.Name} command={command}");
+            return "emergency_stopped";
+        }
+
         await ctx.CommandGate.WaitAsync();
         try
         {
@@ -1364,9 +1372,9 @@ public sealed partial class ManagerForm : Form
         using var form = new Form
         {
             Text = $"Cấu hình mặc định — {AppVersionInfo.Display}",
-            Width = 680,
-            Height = 540,
-            MinimumSize = new Size(640, 500),
+            Width = 720,
+            Height = 650,
+            MinimumSize = new Size(660, 560),
             StartPosition = FormStartPosition.CenterParent,
             FormBorderStyle = FormBorderStyle.Sizable,
             MinimizeBox = false,
@@ -1377,12 +1385,12 @@ public sealed partial class ManagerForm : Form
         };
         ModernDialog.Apply(form);
 
-        // Footer luôn cố định để không bị khuất khi Windows dùng DPI/Scale lớn.
+        // Footer cố định để nút Đóng luôn dễ thấy.
         var footer = new Panel
         {
             Dock = DockStyle.Bottom,
-            Height = 62,
-            Padding = new Padding(18, 10, 18, 10),
+            Height = 58,
+            Padding = new Padding(18, 8, 18, 10),
             BackColor = UiTheme.Canvas
         };
         var footerFlow = new FlowLayoutPanel
@@ -1393,7 +1401,7 @@ public sealed partial class ManagerForm : Form
             Margin = Padding.Empty,
             Padding = Padding.Empty
         };
-        var close = new Button { Text = "Đóng", DialogResult = DialogResult.Cancel, Size = new Size(110, 40) };
+        var close = new Button { Text = "Đóng", DialogResult = DialogResult.Cancel, Size = new Size(100, 40) };
         ModernDialog.StyleSecondaryButton(close);
         footerFlow.Controls.Add(close);
         footer.Controls.Add(footerFlow);
@@ -1403,7 +1411,7 @@ public sealed partial class ManagerForm : Form
             Dock = DockStyle.Fill,
             AutoScroll = true,
             BackColor = UiTheme.Canvas,
-            Padding = new Padding(18, 16, 18, 12)
+            Padding = new Padding(18, 16, 18, 10)
         };
         var content = new TableLayoutPanel
         {
@@ -1411,7 +1419,7 @@ public sealed partial class ManagerForm : Form
             AutoSize = true,
             AutoSizeMode = AutoSizeMode.GrowAndShrink,
             ColumnCount = 1,
-            RowCount = 12,
+            RowCount = 11,
             BackColor = UiTheme.Canvas,
             Margin = Padding.Empty,
             Padding = Padding.Empty
@@ -1420,55 +1428,75 @@ public sealed partial class ManagerForm : Form
         for (var i = 0; i < content.RowCount; i++)
             content.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
-        var title = new Label
-        {
-            Text = "Cấu hình dùng cho profile tạo mới",
-            AutoSize = true,
-            Font = new Font("Segoe UI", 11F, FontStyle.Bold),
-            Margin = new Padding(0, 0, 0, 8)
-        };
-        ModernDialog.StylePrimaryLabel(title);
-
-        var note = new Label
-        {
-            Text = "Chỉ sao chép cấu hình Tool (auto_chrome.ini + nội dung dán), không sao chép tài khoản, mật khẩu, 2FA hay dữ liệu Chrome. Profile đã tồn tại không bị thay đổi.",
-            AutoSize = true,
-            MaximumSize = new Size(610, 0),
-            Margin = new Padding(0, 0, 0, 12)
-        };
-        var status = new Label
-        {
-            AutoSize = true,
-            MaximumSize = new Size(610, 0),
-            Margin = new Padding(0, 0, 0, 16)
-        };
-
-        // ZIP là cách nhập chính, luôn hiển thị ngay phía trên.
-        var zipTitle = new Label
-        {
-            Text = "Nhập cấu hình từ file ZIP",
-            AutoSize = true,
-            Font = new Font("Segoe UI", 10F, FontStyle.Bold),
-            Margin = new Padding(0, 0, 0, 4)
-        };
-        var zipNote = new Label
-        {
-            Text = "Chọn ZIP đã xuất từ Tool/profile. Tool tự tìm auto_chrome.ini và auto_chrome_noidung.txt dù chúng nằm trong thư mục con của ZIP.",
-            AutoSize = true,
-            MaximumSize = new Size(610, 0),
-            Margin = new Padding(0, 0, 0, 8)
-        };
-        var zipActions = new FlowLayoutPanel
+        // Chỉ giữ một dòng trạng thái cấu hình, tên cấu hình được nhấn mạnh riêng.
+        var statusLine = new FlowLayoutPanel
         {
             AutoSize = true,
             Dock = DockStyle.Top,
             FlowDirection = FlowDirection.LeftToRight,
-            WrapContents = true,
-            Margin = new Padding(0, 0, 0, 18)
+            WrapContents = false,
+            Margin = new Padding(0, 0, 0, 16),
+            Padding = Padding.Empty
         };
-        var importZip = new Button { Text = "Nhập từ ZIP...", Size = new Size(180, 42), Margin = new Padding(0, 0, 8, 4) };
-        ModernDialog.StylePrimaryButton(importZip);
-        zipActions.Controls.Add(importZip);
+        var statusCaption = new Label
+        {
+            Text = "Cấu hình đang dùng:",
+            AutoSize = true,
+            Margin = new Padding(0, 3, 6, 0),
+            Font = new Font("Segoe UI", 10F, FontStyle.Regular)
+        };
+        var statusName = new Label
+        {
+            AutoSize = true,
+            Margin = new Padding(0, 2, 0, 0),
+            Font = new Font("Segoe UI", 10.5F, FontStyle.Bold),
+            ForeColor = Color.FromArgb(35, 91, 152)
+        };
+        statusLine.Controls.Add(statusCaption);
+        statusLine.Controls.Add(statusName);
+
+        var directTitle = new Label
+        {
+            Text = "Nội dung dán mặc định",
+            AutoSize = true,
+            Font = new Font("Segoe UI", 10F, FontStyle.Bold),
+            Margin = new Padding(0, 0, 0, 6)
+        };
+        var contentEditor = new TextBox
+        {
+            Multiline = true,
+            AcceptsReturn = true,
+            AcceptsTab = false,
+            ScrollBars = ScrollBars.Vertical,
+            WordWrap = true,
+            Dock = DockStyle.Top,
+            Height = 220,
+            Font = new Font("Segoe UI", 10F),
+            Margin = new Padding(0, 0, 0, 6)
+        };
+        ModernDialog.StyleTextInput(contentEditor);
+
+        var contentInfo = new Label
+        {
+            AutoSize = true,
+            ForeColor = Color.DimGray,
+            Margin = new Padding(0, 0, 0, 8)
+        };
+        var directActions = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            Dock = DockStyle.Top,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Margin = new Padding(0, 0, 0, 18),
+            Padding = Padding.Empty
+        };
+        var saveContent = new Button { Text = "Lưu thay đổi", Size = new Size(140, 40), Margin = new Padding(0, 0, 8, 0) };
+        ModernDialog.StylePrimaryButton(saveContent);
+        directActions.Controls.Add(saveContent);
+        var reloadContent = new Button { Text = "Hoàn tác", Size = new Size(110, 40), Margin = new Padding(0, 0, 8, 0) };
+        ModernDialog.StyleSecondaryButton(reloadContent);
+        directActions.Controls.Add(reloadContent);
 
         var separator = new Label
         {
@@ -1476,12 +1504,32 @@ public sealed partial class ManagerForm : Form
             Height = 1,
             Dock = DockStyle.Top,
             BackColor = Color.FromArgb(210, 218, 228),
-            Margin = new Padding(0, 0, 0, 16)
+            Margin = new Padding(0, 0, 0, 14)
         };
+
+        var otherTitle = new Label
+        {
+            Text = "Cấu hình khác",
+            AutoSize = true,
+            Font = new Font("Segoe UI", 10F, FontStyle.Bold),
+            Margin = new Padding(0, 0, 0, 8)
+        };
+        var zipActions = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            Dock = DockStyle.Top,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Margin = new Padding(0, 0, 0, 12),
+            Padding = Padding.Empty
+        };
+        var importZip = new Button { Text = "Nhập ZIP...", Size = new Size(125, 40), Margin = new Padding(0, 0, 8, 0) };
+        ModernDialog.StyleSecondaryButton(importZip);
+        zipActions.Controls.Add(importZip);
 
         var sourceLabel = new Label
         {
-            Text = "Hoặc lấy cấu hình từ profile đã có",
+            Text = "Lấy cấu hình từ profile",
             AutoSize = true,
             Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
             Margin = new Padding(0, 0, 0, 5)
@@ -1510,33 +1558,146 @@ public sealed partial class ManagerForm : Form
             Dock = DockStyle.Top,
             FlowDirection = FlowDirection.LeftToRight,
             WrapContents = true,
-            Margin = new Padding(0, 0, 0, 16)
+            Margin = new Padding(0, 0, 0, 12),
+            Padding = Padding.Empty
         };
-        var useProfile = new Button { Text = "Dùng profile này làm mặc định", Size = new Size(230, 42), Margin = new Padding(0, 0, 8, 4) };
+        var useProfile = new Button { Text = "Dùng profile này", Size = new Size(160, 40), Margin = new Padding(0, 0, 8, 4) };
         ModernDialog.StyleSecondaryButton(useProfile);
         profileActions.Controls.Add(useProfile);
 
-        var clear = new Button { Text = "Bỏ cấu hình mặc định riêng", Size = new Size(220, 42), Margin = new Padding(0, 0, 8, 4) };
+        var clear = new Button { Text = "Về mặc định gốc", Size = new Size(155, 40), Margin = new Padding(0, 0, 8, 4) };
         ModernDialog.StyleSecondaryButton(clear);
         profileActions.Controls.Add(clear);
+
+        var loadingEditor = false;
+        var editorDirty = false;
+
+        int CountValidContentLines(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return 0;
+            return text
+                .Replace("\r\n", "\n", StringComparison.Ordinal)
+                .Replace("\r", "\n", StringComparison.Ordinal)
+                .Split('\n')
+                .Count(line => !string.IsNullOrWhiteSpace(line));
+        }
+
+        string NormalizeContentForSave(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return string.Empty;
+            var lines = text
+                .Replace("\r\n", "\n", StringComparison.Ordinal)
+                .Replace("\r", "\n", StringComparison.Ordinal)
+                .Split('\n')
+                .Select(line => line.TrimEnd())
+                .Where(line => !string.IsNullOrWhiteSpace(line));
+            return string.Join(Environment.NewLine, lines);
+        }
+
+        void UpdateContentInfo()
+        {
+            var count = CountValidContentLines(contentEditor.Text);
+            contentInfo.Text = $"{count} nội dung" + (editorDirty ? "  •  Chưa lưu" : "");
+            contentInfo.ForeColor = editorDirty ? Color.DarkOrange : Color.DimGray;
+        }
+
+        void LoadContentEditor()
+        {
+            loadingEditor = true;
+            try
+            {
+                if (File.Exists(ManagerDefaultIniPath))
+                {
+                    contentEditor.Text = File.Exists(ManagerDefaultContentPath)
+                        ? File.ReadAllText(ManagerDefaultContentPath, Encoding.UTF8)
+                        : string.Empty;
+                }
+                else
+                {
+                    var packagedContent = Path.Combine(_baseDir, "defaults", "auto_chrome_noidung.txt");
+                    contentEditor.Text = File.Exists(packagedContent)
+                        ? File.ReadAllText(packagedContent, Encoding.UTF8)
+                        : string.Empty;
+                }
+                editorDirty = false;
+                UpdateContentInfo();
+            }
+            finally
+            {
+                loadingEditor = false;
+            }
+        }
 
         void RefreshStatus()
         {
             if (File.Exists(ManagerDefaultIniPath))
             {
-                var contentState = File.Exists(ManagerDefaultContentPath) ? "có nội dung dán" : "không có nội dung dán";
-                var configName = GetManagerDefaultConfigDisplayName();
-                status.Text = $"Cấu hình đang dùng: {configName}\nĐang dùng cấu hình mặc định riêng ({contentState}). Profile tạo mới sẽ tự nhận cấu hình này.";
-                status.ForeColor = Color.DarkGreen;
+                statusName.Text = GetManagerDefaultConfigDisplayName();
                 clear.Enabled = true;
             }
             else
             {
-                status.Text = "Cấu hình đang dùng: Defaults gốc của Tool\nChưa đặt cấu hình mặc định riêng. Profile mới sẽ dùng defaults gốc đi kèm Tool.";
-                status.ForeColor = Color.DimGray;
+                statusName.Text = "Defaults gốc của Tool";
                 clear.Enabled = false;
             }
         }
+
+        contentEditor.TextChanged += (_, _) =>
+        {
+            if (!loadingEditor) editorDirty = true;
+            UpdateContentInfo();
+        };
+
+        saveContent.Click += (_, _) =>
+        {
+            try
+            {
+                BackupManagerDefaultConfig();
+                Directory.CreateDirectory(ManagerDefaultConfigRoot);
+
+                if (!File.Exists(ManagerDefaultIniPath))
+                {
+                    var packagedIni = Path.Combine(_baseDir, "defaults", "auto_chrome.ini");
+                    if (!File.Exists(packagedIni))
+                        throw new FileNotFoundException("Không tìm thấy defaults\\auto_chrome.ini để tạo cấu hình mặc định riêng.", packagedIni);
+                    File.Copy(packagedIni, ManagerDefaultIniPath, overwrite: true);
+                }
+
+                var normalized = NormalizeContentForSave(contentEditor.Text);
+                if (string.IsNullOrWhiteSpace(normalized))
+                {
+                    if (File.Exists(ManagerDefaultContentPath)) File.Delete(ManagerDefaultContentPath);
+                }
+                else
+                {
+                    File.WriteAllText(ManagerDefaultContentPath, normalized + Environment.NewLine, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+                }
+
+                SaveManagerDefaultConfigMetadata("Cấu hình chỉnh trực tiếp", "direct_edit", "auto_chrome_noidung.txt");
+                _log.Info($"[DEFAULT_CONFIG_CONTENT_EDITED] count={CountValidContentLines(normalized)}");
+                editorDirty = false;
+                RefreshStatus();
+                LoadContentEditor();
+                ModernDialog.ShowMessage(form,
+                    $"Đã lưu {CountValidContentLines(normalized)} nội dung mặc định.",
+                    "Cấu hình mặc định", MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                _log.Error("[DEFAULT_CONFIG_CONTENT_EDIT] " + ex);
+                ModernDialog.ShowMessage(form, ex.Message, "Không lưu được nội dung mặc định", MessageBoxIcon.Warning);
+            }
+        };
+
+        reloadContent.Click += (_, _) =>
+        {
+            if (editorDirty)
+            {
+                var confirm = ModernDialog.ShowConfirm(form, "Bỏ các thay đổi chưa lưu?", "Hoàn tác");
+                if (confirm != DialogResult.Yes) return;
+            }
+            LoadContentEditor();
+        };
 
         importZip.Click += (_, _) =>
         {
@@ -1556,8 +1717,9 @@ public sealed partial class ManagerForm : Form
                     "zip",
                     Path.GetFileName(picker.FileName));
                 RefreshStatus();
+                LoadContentEditor();
                 ModernDialog.ShowMessage(form,
-                    $"Đã nhập cấu hình mặc định từ:\n{Path.GetFileName(picker.FileName)}\n\nCác profile tạo mới sẽ tự nhận cấu hình này.",
+                    $"Đã nhập cấu hình từ {Path.GetFileName(picker.FileName)}.",
                     "Cấu hình mặc định", MessageBoxIcon.Information);
             }
             catch (Exception ex)
@@ -1590,7 +1752,8 @@ public sealed partial class ManagerForm : Form
                     profile.Name);
                 _log.Info($"[DEFAULT_CONFIG_SET_FROM_PROFILE] profile={profile.Name} source={sourceRoot}");
                 RefreshStatus();
-                ModernDialog.ShowMessage(form, $"Đã lấy cấu hình của {profile.Name} làm mặc định. Các profile tạo từ bây giờ sẽ tự nhận cấu hình này.", "Cấu hình mặc định", MessageBoxIcon.Information);
+                LoadContentEditor();
+                ModernDialog.ShowMessage(form, $"Đã dùng cấu hình của {profile.Name} làm mặc định.", "Cấu hình mặc định", MessageBoxIcon.Information);
             }
             catch (Exception ex)
             {
@@ -1602,7 +1765,7 @@ public sealed partial class ManagerForm : Form
         clear.Click += (_, _) =>
         {
             var confirm = ModernDialog.ShowConfirm(form,
-                "Bỏ cấu hình mặc định riêng? Profile mới sau đó sẽ quay về dùng defaults gốc đi kèm Tool. Các profile đã tạo không thay đổi.",
+                "Chuyển về defaults gốc của Tool?",
                 "Cấu hình mặc định");
             if (confirm != DialogResult.Yes) return;
             try
@@ -1611,6 +1774,7 @@ public sealed partial class ManagerForm : Form
                 if (Directory.Exists(ManagerDefaultConfigRoot)) Directory.Delete(ManagerDefaultConfigRoot, recursive: true);
                 _log.Info("[DEFAULT_CONFIG_CLEARED]");
                 RefreshStatus();
+                LoadContentEditor();
             }
             catch (Exception ex)
             {
@@ -1618,22 +1782,33 @@ public sealed partial class ManagerForm : Form
             }
         };
 
-        content.Controls.Add(title, 0, 0);
-        content.Controls.Add(note, 0, 1);
-        content.Controls.Add(status, 0, 2);
-        content.Controls.Add(zipTitle, 0, 3);
-        content.Controls.Add(zipNote, 0, 4);
-        content.Controls.Add(zipActions, 0, 5);
-        content.Controls.Add(separator, 0, 6);
-        content.Controls.Add(sourceLabel, 0, 7);
-        content.Controls.Add(profileBox, 0, 8);
-        content.Controls.Add(profileActions, 0, 9);
+        form.FormClosing += (_, e) =>
+        {
+            if (!editorDirty) return;
+            var confirm = ModernDialog.ShowConfirm(form,
+                "Nội dung có thay đổi chưa lưu. Đóng và bỏ thay đổi?",
+                "Nội dung chưa lưu");
+            if (confirm != DialogResult.Yes) e.Cancel = true;
+        };
+
+        content.Controls.Add(statusLine, 0, 0);
+        content.Controls.Add(directTitle, 0, 1);
+        content.Controls.Add(contentEditor, 0, 2);
+        content.Controls.Add(contentInfo, 0, 3);
+        content.Controls.Add(directActions, 0, 4);
+        content.Controls.Add(separator, 0, 5);
+        content.Controls.Add(otherTitle, 0, 6);
+        content.Controls.Add(zipActions, 0, 7);
+        content.Controls.Add(sourceLabel, 0, 8);
+        content.Controls.Add(profileBox, 0, 9);
+        content.Controls.Add(profileActions, 0, 10);
 
         viewport.Controls.Add(content);
         form.Controls.Add(viewport);
         form.Controls.Add(footer);
         form.CancelButton = close;
         RefreshStatus();
+        LoadContentEditor();
         form.ShowDialog(this);
     }
 

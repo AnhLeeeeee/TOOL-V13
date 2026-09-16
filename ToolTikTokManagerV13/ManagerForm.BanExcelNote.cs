@@ -29,7 +29,7 @@ public sealed partial class ManagerForm
 
     void CheckStoppedProfilesForBanNote()
     {
-        if (_closing || IsDisposed || Disposing) return;
+        if (IsAutomationHalted || _closing || IsDisposed || Disposing) return;
 
         foreach (var ctx in _contexts.Values.ToList())
         {

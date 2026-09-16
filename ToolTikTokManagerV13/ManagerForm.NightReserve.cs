@@ -339,7 +339,8 @@ public sealed partial class ManagerForm
 
     async Task CheckNightReserveAsync()
     {
-        if (!_nightReserveInitialized
+        if (IsAutomationHalted
+            || !_nightReserveInitialized
             || !_nightReserveSettings.Enabled
             || _nightReserveTickBusy
             || _closing

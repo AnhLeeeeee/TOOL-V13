@@ -1,195 +1,362 @@
-﻿namespace ToolTikTokManagerV13;
+﻿using System.Text;
+using System.Text.Json;
+using ToolTikTokV12.Controls;
+
+namespace ToolTikTokManagerV13;
 
 public sealed partial class ManagerForm
 {
+    sealed class EmergencyStopStateDocument
+    {
+        public int Version { get; set; } = 1;
+        public bool Halted { get; set; }
+        public DateTime UpdatedUtc { get; set; } = DateTime.UtcNow;
+    }
+
     Button? _autoReplacementManualControlButton;
     bool _autoReplacementManualControlInitialized;
+    bool _emergencyStopStateInitialized;
+    volatile bool _emergencyStopActive;
+    readonly object _emergencyStopLock = new();
+    CancellationTokenSource _emergencyAutomationCts = new();
+
+    string EmergencyStopStatePath => Path.Combine(_baseDir, "manager_emergency_stop.json");
+
+    bool IsAutomationHalted => _emergencyStopActive;
+
+    void InitializeEmergencyStopState()
+    {
+        if (_emergencyStopStateInitialized)
+            return;
+
+        _emergencyStopStateInitialized = true;
+
+        try
+        {
+            if (File.Exists(EmergencyStopStatePath))
+            {
+                var state = JsonSerializer.Deserialize<EmergencyStopStateDocument>(
+                    File.ReadAllText(EmergencyStopStatePath, Encoding.UTF8));
+                _emergencyStopActive = state?.Halted == true;
+            }
+        }
+        catch (Exception ex)
+        {
+            _emergencyStopActive = false;
+            try { _log.Warn($"[EMERGENCY_STOP_STATE_READ_WARN] error={ex.Message}"); } catch { }
+        }
+
+        if (_emergencyStopActive)
+        {
+            try { _emergencyAutomationCts.Cancel(); } catch { }
+            try { _log.Warn("[EMERGENCY_STOP_RESTORED] halted=true persisted=true"); } catch { }
+        }
+    }
+
+    CancellationToken GetEmergencyAutomationToken()
+    {
+        InitializeEmergencyStopState();
+        lock (_emergencyStopLock)
+            return _emergencyAutomationCts.Token;
+    }
+
+    CancellationTokenSource CreateEmergencyLinkedCancellationSource()
+        => CancellationTokenSource.CreateLinkedTokenSource(GetEmergencyAutomationToken());
+
+    void SaveEmergencyStopState()
+    {
+        try
+        {
+            var state = new EmergencyStopStateDocument
+            {
+                Halted = _emergencyStopActive,
+                UpdatedUtc = DateTime.UtcNow
+            };
+            var json = JsonSerializer.Serialize(
+                state,
+                new JsonSerializerOptions { WriteIndented = true });
+            var temp = EmergencyStopStatePath + ".tmp";
+            File.WriteAllText(temp, json, new UTF8Encoding(false));
+            File.Move(temp, EmergencyStopStatePath, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            try { _log.Warn($"[EMERGENCY_STOP_STATE_SAVE_WARN] error={ex.Message}"); } catch { }
+        }
+    }
+
+    bool IsCommandBlockedByEmergencyStop(string? command)
+    {
+        if (!IsAutomationHalted)
+            return false;
+
+        command = (command ?? "").Trim().ToLowerInvariant();
+
+        // Trong trạng thái khẩn cấp chỉ cho phép quan sát, dừng/đóng thủ công và xem Chrome.
+        // Các lệnh có thể bắt đầu/tiếp tục automation hoặc điều khiển TikTok bị chặn.
+        return command switch
+        {
+            "status" or "message_reply_status" or "message_reply_log"
+                or "message_reply_stop" or "stop" or "pause" or "show"
+                or "view_chrome" or "close_chrome" => false,
+            _ => true
+        };
+    }
+
+    bool EnsureAutomationAllowedFromUi(string operation)
+    {
+        if (!IsAutomationHalted)
+            return true;
+
+        try
+        {
+            ModernDialog.ShowMessage(
+                this,
+                $"Tool đang ở trạng thái Dừng khẩn cấp.\r\n\r\nKhông thể {operation}. Hãy bấm ‘Tiếp tục’ trước.",
+                "Đã dừng khẩn cấp",
+                MessageBoxIcon.Warning);
+        }
+        catch { }
+        return false;
+    }
 
     void InitializeAutoReplacementManualControl()
     {
-        if (_autoReplacementManualControlInitialized)
-            return;
+        InitializeEmergencyStopState();
 
-        _autoReplacementManualControlInitialized = true;
+        if (_autoReplacementManualControlInitialized)
+        {
+            UpdateEmergencyStopButton();
+            return;
+        }
 
         var toolbar =
             EnumerateAutoReplacementManualControls(this)
                 .OfType<FlowLayoutPanel>()
-                .FirstOrDefault(panel =>
-                    panel.Controls
-                        .OfType<Button>()
-                        .Any(button =>
-                            button.Text.Equals(
-                                "Dừng tất cả",
-                                StringComparison.OrdinalIgnoreCase)));
+                .FirstOrDefault(IsAutoReplacementManagerActionToolbar);
 
         if (toolbar is null)
         {
-            _log.Warn(
-                "[AUTO_REPLACE_MANUAL_UI] Không tìm thấy toolbar để thêm nút Dừng Tự bù.");
+            _log.Warn("[EMERGENCY_STOP_UI] Không tìm thấy toolbar để thêm nút Dừng khẩn cấp.");
             return;
         }
 
-        _autoReplacementManualControlButton =
-            new Button
-            {
-                AutoSize = true,
-                Height = 34,
-                MinimumSize = new Size(126, 34),
-                Margin = new Padding(5, 3, 5, 3),
-                FlatStyle = FlatStyle.Flat,
-                UseVisualStyleBackColor = false
-            };
+        _autoReplacementManualControlInitialized = true;
 
+        _autoReplacementManualControlButton = new Button
+        {
+            AutoSize = true,
+            Height = 34,
+            MinimumSize = new Size(132, 34),
+            Margin = new Padding(5, 3, 5, 3),
+            FlatStyle = FlatStyle.Flat,
+            UseVisualStyleBackColor = false
+        };
         _autoReplacementManualControlButton.FlatAppearance.BorderSize = 1;
+        _autoReplacementManualControlButton.Click += async (_, _) =>
+            await ToggleEmergencyStopFromUiAsync();
 
-        _autoReplacementManualControlButton.Click +=
-            (_, _) => ToggleAutoReplacementFromUi();
+        toolbar.Controls.Add(_autoReplacementManualControlButton);
 
-        toolbar.Controls.Add(
-            _autoReplacementManualControlButton);
-
-        // Đặt ngay sau nút "Tự động: BAN + ... + Bù" nếu tìm thấy.
-        // Nếu không tìm thấy thì giữ vị trí cuối toolbar, vẫn hoạt động bình thường.
         try
         {
             if (_autoCloseToolbarButton is not null
                 && !_autoCloseToolbarButton.IsDisposed
                 && _autoCloseToolbarButton.Parent == toolbar)
             {
-                var autoCloseIndex =
-                    toolbar.Controls.GetChildIndex(
-                        _autoCloseToolbarButton);
-
+                var autoCloseIndex = toolbar.Controls.GetChildIndex(_autoCloseToolbarButton);
                 toolbar.Controls.SetChildIndex(
                     _autoReplacementManualControlButton,
-                    Math.Min(
-                        toolbar.Controls.Count - 1,
-                        autoCloseIndex + 1));
+                    Math.Min(toolbar.Controls.Count - 1, autoCloseIndex + 1));
             }
         }
         catch { }
 
-        UpdateAutoReplacementManualControlButton();
+        UpdateEmergencyStopButton();
+        UpdateAutoCloseToolbarButtonText();
 
-        _log.Info(
-            $"[AUTO_REPLACE_MANUAL_UI_READY] enabled={_autoCloseSettings.OpenReplacementAfterAutoClose}");
+        _log.Info($"[EMERGENCY_STOP_UI_READY] halted={IsAutomationHalted}");
     }
 
-    static IEnumerable<Control>
-        EnumerateAutoReplacementManualControls(Control root)
+    static bool IsAutoReplacementManagerActionToolbar(FlowLayoutPanel panel)
+    {
+        var buttons = panel.Controls.OfType<Button>().ToList();
+
+        if (buttons.Any(button =>
+                button.Text.Equals("Stop All", StringComparison.OrdinalIgnoreCase)
+                || button.Text.Equals("Dừng tất cả", StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
+        var hasRun = buttons.Any(button =>
+            button.Text.Equals("Auto Run", StringComparison.OrdinalIgnoreCase)
+            || button.Text.Equals("Chạy tất cả", StringComparison.OrdinalIgnoreCase));
+        var hasDelete = buttons.Any(button =>
+            button.Text.Equals("Delete", StringComparison.OrdinalIgnoreCase)
+            || button.Text.Equals("Xóa profile", StringComparison.OrdinalIgnoreCase));
+
+        return hasRun && hasDelete;
+    }
+
+    static IEnumerable<Control> EnumerateAutoReplacementManualControls(Control root)
     {
         foreach (Control child in root.Controls)
         {
             yield return child;
-
-            foreach (var nested
-                     in EnumerateAutoReplacementManualControls(child))
-            {
+            foreach (var nested in EnumerateAutoReplacementManualControls(child))
                 yield return nested;
-            }
         }
     }
 
-    void ToggleAutoReplacementFromUi()
+    async Task ToggleEmergencyStopFromUiAsync()
     {
-        if (_autoCloseSettings.OpenReplacementAfterAutoClose)
-        {
-            StopAutoReplacementFromUi();
-        }
+        if (IsAutomationHalted)
+            ResumeAutomationFromEmergencyStop();
         else
-        {
-            StartAutoReplacementFromUi();
-        }
+            await EnterEmergencyStopAsync("manual_ui");
     }
 
-    void StopAutoReplacementFromUi()
+    async Task EnterEmergencyStopAsync(string source)
     {
-        var clearedPending = 0;
+        InitializeEmergencyStopState();
+        if (IsAutomationHalted)
+            return;
 
-        // HARD STOP: vô hiệu hóa session trước, sau đó hủy luôn execution token
-        // của lượt Tự bù đang chạy. Nhờ generation/token riêng, một request cũ
-        // không thể tiếp tục sang PRF/account kế tiếp sau khi người dùng bấm Dừng.
+        _emergencyStopActive = true;
+        SaveEmergencyStopState();
+
+        CancellationTokenSource? stopCts = null;
+        lock (_emergencyStopLock)
+        {
+            if (!_emergencyAutomationCts.IsCancellationRequested)
+                stopCts = _emergencyAutomationCts;
+        }
+        try { stopCts?.Cancel(); } catch { }
+
+        // Hủy mọi hàng đợi/phiên tự động có token riêng. Không đóng Chrome/PRF.
+        try { StopRunStrategySession("emergency_stop"); } catch { }
+        try { _nightReserveCts.Cancel(); } catch { }
+        try { InvalidateAutoReplacementExecution("emergency_stop"); } catch { }
         _autoReplacementSessionArmed = false;
-        var stopGeneration =
-            InvalidateAutoReplacementExecution("manual_ui_stop");
 
+        var clearedPending = 0;
         lock (_autoReplacementQueueLock)
         {
-            clearedPending =
-                _autoReplacementQueue.Count;
-
+            clearedPending = _autoReplacementQueue.Count;
             _autoReplacementQueue.Clear();
-
-            try
-            {
-                SaveAutoReplacementQueueUnsafe();
-            }
-            catch (Exception ex)
-            {
-                _log.Warn(
-                    $"[AUTO_REPLACE_MANUAL_STOP_SAVE_WARN] error={ex.Message}");
-            }
+            try { SaveAutoReplacementQueueUnsafe(); } catch { }
         }
 
-        _autoCloseSettings.OpenReplacementAfterAutoClose = false;
-
-        try
+        // Emergency Stop không giữ quota cũ. Sau khi Tiếp tục, người dùng Start thủ công
+        // hoặc Auto Run lại thì target được thiết lập lại từ hành động mới.
+        lock (_autoReplacementFixedSlotLock)
         {
-            // SaveAutoCloseSettings lưu trạng thái qua lần mở Tool sau
-            // và NotifyAutoReplacementSettingsChanged() sẽ làm queue dừng.
-            SaveAutoCloseSettings();
-        }
-        catch (Exception ex)
-        {
-            _log.Warn(
-                $"[AUTO_REPLACE_MANUAL_STOP_SETTINGS_WARN] error={ex.Message}");
+            _autoReplacementTargetSlots = 0;
+            _autoReplacementTargetInitialized = true;
         }
 
-        UpdateAutoReplacementManualControlButton();
+        _autoMessageReplyNextRunUtc.Clear();
+        _autoIdentityNextProbeUtc.Clear();
+
+        UpdateEmergencyStopButton();
+        UpdateAutoCloseToolbarButtonText();
 
         _log.Warn(
-            $"[AUTO_REPLACE_MANUAL_STOP] clearedPending={clearedPending} armed=false generation={stopGeneration} hardStop=true");
-
+            $"[EMERGENCY_STOP_ON] source={source} clearedReplacement={clearedPending} target=0 persisted=true");
         WriteAutoActivityLog(
-            action: "TỰ BÙ",
-            result: "ĐÃ DỪNG THỦ CÔNG",
-            detail:
-                $"Người dùng bấm Dừng Tự bù; đã xóa {clearedPending} suất bù đang chờ "
-                + $"và hủy execution generation cũ (generation={stopGeneration}). "
-                + "Không được chuyển sang PRF/account bù kế tiếp; các profile đã chạy trước đó giữ nguyên.");
+            action: "DỪNG KHẨN CẤP",
+            result: "ĐÃ DỪNG",
+            detail: $"Hủy automation đang chạy, xóa {clearedPending} suất bù tạm và đặt target=0. Chrome/PRF được giữ nguyên.");
+
+        await StopAllWorkerAutomationForEmergencyAsync();
     }
 
-    void StartAutoReplacementFromUi()
+    void ResumeAutomationFromEmergencyStop()
     {
-        _autoCloseSettings.OpenReplacementAfterAutoClose = true;
+        InitializeEmergencyStopState();
+        if (!IsAutomationHalted)
+            return;
 
+        CancellationTokenSource? previous;
+        lock (_emergencyStopLock)
+        {
+            previous = _emergencyAutomationCts;
+            _emergencyAutomationCts = new CancellationTokenSource();
+        }
+        try { previous.Dispose(); } catch { }
+
+        // Dự phòng đêm dùng CTS lâu sống; tạo token mới sau Emergency Stop.
         try
         {
-            // Chỉ bật quyền Tự bù.
-            // Không tự khôi phục queue cũ vì queue đã được xóa khi Dừng.
-            // Suất bù mới chỉ xuất hiện sau lần Tự đóng tiếp theo.
-            SaveAutoCloseSettings();
+            var oldNight = _nightReserveCts;
+            _nightReserveCts = new CancellationTokenSource();
+            try { oldNight.Dispose(); } catch { }
         }
-        catch (Exception ex)
-        {
-            _log.Warn(
-                $"[AUTO_REPLACE_MANUAL_START_SETTINGS_WARN] error={ex.Message}");
-        }
+        catch { }
 
-        UpdateAutoReplacementManualControlButton();
+        _emergencyStopActive = false;
+        SaveEmergencyStopState();
 
-        _log.Info(
-            "[AUTO_REPLACE_MANUAL_START] enabled=true pending=0 wait_for_next_auto_close");
+        // Không phục hồi queue/task cũ. Chỉ mở khóa để các hành động MỚI được chạy.
+        _autoReplacementSessionArmed = false;
+        _autoMessageReplyNextRunUtc.Clear();
+        _autoIdentityNextProbeUtc.Clear();
 
+        UpdateEmergencyStopButton();
+        UpdateAutoCloseToolbarButtonText();
+
+        _log.Info("[EMERGENCY_STOP_OFF] action=unlock_only old_tasks_not_resumed target=0");
         WriteAutoActivityLog(
-            action: "TỰ BÙ",
-            result: "ĐÃ BẬT THỦ CÔNG",
-            detail:
-                "Tự bù đã bật lại. Tool chỉ xử lý các suất bù phát sinh mới.");
+            action: "DỪNG KHẨN CẤP",
+            result: "TIẾP TỤC",
+            detail: "Đã mở khóa automation. Không chạy lại task/queue cũ; target vẫn 0 cho tới khi Start thủ công hoặc Auto Run mới.");
     }
 
-    void UpdateAutoReplacementManualControlButton()
+    async Task StopAllWorkerAutomationForEmergencyAsync()
+    {
+        var contexts = _contexts.Values
+            .Where(c => c.Worker is not null && !c.Worker.HasExited)
+            .ToList();
+
+        if (contexts.Count == 0)
+            return;
+
+        var tasks = contexts.Select(async ctx =>
+        {
+            try
+            {
+                // Tin nhắn có engine riêng, dừng trước.
+                try
+                {
+                    await SendPipeAsync(
+                        ctx.Profile.Name,
+                        "message_reply_stop",
+                        TimeSpan.FromSeconds(2));
+                }
+                catch { }
+
+                // Lệnh stop chỉ dừng AutomationEngine; không đóng Chrome và không shutdown Worker.
+                try
+                {
+                    await SendPipeAsync(
+                        ctx.Profile.Name,
+                        "stop",
+                        TimeSpan.FromSeconds(3));
+                }
+                catch (Exception ex)
+                {
+                    _log.Warn($"[EMERGENCY_STOP_WORKER_WARN] profile={ctx.Profile.Name} error={ex.Message}");
+                }
+            }
+            catch { }
+        }).ToArray();
+
+        try { await Task.WhenAll(tasks); } catch { }
+        _log.Warn($"[EMERGENCY_STOP_WORKERS_DONE] requested={contexts.Count}");
+    }
+
+    void UpdateEmergencyStopButton()
     {
         if (_autoReplacementManualControlButton is null
             || _autoReplacementManualControlButton.IsDisposed)
@@ -197,35 +364,19 @@ public sealed partial class ManagerForm
             return;
         }
 
-        if (_autoCloseSettings.OpenReplacementAfterAutoClose)
+        if (IsAutomationHalted)
         {
-            // Tự bù đang bật -> nút thể hiện hành động DỪNG.
-            _autoReplacementManualControlButton.Text =
-                "■ Dừng Tự bù";
-
-            _autoReplacementManualControlButton.BackColor =
-                Color.FromArgb(253, 236, 236);
-
-            _autoReplacementManualControlButton.ForeColor =
-                Color.FromArgb(185, 42, 42);
-
-            _autoReplacementManualControlButton.FlatAppearance.BorderColor =
-                Color.FromArgb(224, 112, 112);
+            _autoReplacementManualControlButton.Text = "▶ Tiếp tục";
+            _autoReplacementManualControlButton.BackColor = Color.FromArgb(232, 247, 236);
+            _autoReplacementManualControlButton.ForeColor = Color.FromArgb(32, 122, 60);
+            _autoReplacementManualControlButton.FlatAppearance.BorderColor = Color.FromArgb(112, 184, 128);
         }
         else
         {
-            // Tự bù đang dừng -> nút thể hiện hành động BẬT.
-            _autoReplacementManualControlButton.Text =
-                "▶ Bật Tự bù";
-
-            _autoReplacementManualControlButton.BackColor =
-                Color.FromArgb(232, 247, 236);
-
-            _autoReplacementManualControlButton.ForeColor =
-                Color.FromArgb(32, 122, 60);
-
-            _autoReplacementManualControlButton.FlatAppearance.BorderColor =
-                Color.FromArgb(112, 184, 128);
+            _autoReplacementManualControlButton.Text = "🛑 Dừng khẩn cấp";
+            _autoReplacementManualControlButton.BackColor = Color.FromArgb(255, 235, 235);
+            _autoReplacementManualControlButton.ForeColor = Color.FromArgb(175, 34, 34);
+            _autoReplacementManualControlButton.FlatAppearance.BorderColor = Color.FromArgb(221, 92, 92);
         }
     }
 }

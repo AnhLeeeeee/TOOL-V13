@@ -48,6 +48,7 @@ public sealed partial class MainForm
 
     async Task<string> StartManagedMessageReplyAsync(string commandPayload)
     {
+        if (IsManagerEmergencyStopActive()) return "emergency_stopped";
         if (IsMessageReplyRunning) return "already_running";
         // Chế độ tự động sẽ PAUSE automation LIVE trước khi xử lý tin nhắn.
         // Chỉ chặn khi engine vẫn đang chạy thực sự; engine đang Paused thì an toàn để điều hướng /messages.

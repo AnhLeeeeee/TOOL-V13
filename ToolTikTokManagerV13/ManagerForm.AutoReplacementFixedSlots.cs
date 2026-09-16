@@ -53,7 +53,8 @@ public sealed partial class ManagerForm
         string source = "periodic",
         bool force = false)
     {
-        if (_closing
+        if (IsAutomationHalted
+            || _closing
             || IsDisposed
             || Disposing
             || !_autoReplacementFeatureInitialized

@@ -1257,7 +1257,7 @@ public sealed partial class ManagerForm
 
     void ScheduleAutoMessageReplyForLiveProfiles()
     {
-        if (_closing) return;
+        if (IsAutomationHalted || _closing) return;
 
         var state = LoadMessageReplyToolState();
         if (!state.AutoEnabled)
@@ -1310,6 +1310,7 @@ public sealed partial class ManagerForm
 
     async Task RunAutoMessageReplyForProfileAsync(ProfileContext ctx)
     {
+        if (IsAutomationHalted) return;
         await _autoMessageReplyQueueGate.WaitAsync();
         var intervalMinutes = 60;
         var pauseAttempted = false;

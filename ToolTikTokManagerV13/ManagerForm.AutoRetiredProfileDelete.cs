@@ -28,6 +28,9 @@ public sealed partial class ManagerForm
         string profileName,
         string requestedReason)
     {
+        if (IsAutomationHalted)
+            return;
+
         if (!_autoCloseSettings.DeleteProfileAfterBanOrLifetime)
             return;
 
@@ -83,6 +86,9 @@ public sealed partial class ManagerForm
         {
             while (!_closing)
             {
+                if (IsAutomationHalted)
+                    return;
+
                 if (_autoRetiredProfileDeleted.Contains(profileName))
                     return;
 

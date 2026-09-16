@@ -336,6 +336,23 @@ public sealed partial class ManagerForm
         if (_autoCloseToolbarButton is null || _autoCloseToolbarButton.IsDisposed)
             return;
 
+        if (IsAutomationHalted)
+        {
+            _autoCloseToolbarDisplayText = "⛔ ĐÃ DỪNG KHẨN CẤP — MỌI TỰ ĐỘNG HÓA ĐÃ DỪNG";
+            _autoCloseToolbarButton.Text = "";
+            _autoCloseToolbarButton.AutoSize = false;
+            _autoCloseToolbarButton.Width = Math.Max(
+                390,
+                MeasureAutoCloseToolbarTextWidth(_autoCloseToolbarButton, _autoCloseToolbarDisplayText) + 30);
+            _autoCloseToolbarButton.BackColor = Color.FromArgb(255, 237, 237);
+            _autoCloseToolbarButton.ForeColor = Color.FromArgb(175, 34, 34);
+            _autoCloseToolbarButton.Invalidate();
+            return;
+        }
+
+        _autoCloseToolbarButton.BackColor = UiTheme.Card;
+        _autoCloseToolbarButton.ForeColor = Color.FromArgb(42, 57, 76);
+
         var parts = new List<string>();
         if (_autoCloseSettings.CloseOnBan) parts.Add("BAN");
         if (_autoCloseSettings.CloseOnRunTime) parts.Add($"{_autoCloseSettings.RunHours}h");
@@ -848,7 +865,8 @@ public sealed partial class ManagerForm
 
     async Task CheckAutoCloseRuntimeAsync()
     {
-        if (_autoCloseRuntimeCheckBusy
+        if (IsAutomationHalted
+            || _autoCloseRuntimeCheckBusy
             || _closing
             || IsDisposed
             || Disposing
@@ -1569,7 +1587,7 @@ public sealed partial class ManagerForm
 
     async Task AutoCloseProfileAsync(ProfileContext ctx, string reason, string detail, string source = "unknown")
     {
-        if (_closing || IsDisposed || Disposing)
+        if (IsAutomationHalted || _closing || IsDisposed || Disposing)
             return;
 
         var initialDecision = PromoteAutoCloseReason(
@@ -1630,6 +1648,12 @@ public sealed partial class ManagerForm
                 "TRIGGER",
                 $"decisionDetail={detail}");
 
+            if (IsAutomationHalted)
+            {
+                _log.Warn($"[AUTO_CLOSE_ABORT_EMERGENCY] profile={ctx.Profile.Name} phase=before_stop");
+                return;
+            }
+
             var worker = ctx.Worker;
 
             if (worker is not null && !worker.HasExited)
@@ -1660,6 +1684,12 @@ public sealed partial class ManagerForm
 
                     await Task.Delay(350);
                 }
+            }
+
+            if (IsAutomationHalted)
+            {
+                _log.Warn($"[AUTO_CLOSE_ABORT_EMERGENCY] profile={ctx.Profile.Name} phase=before_close_chrome");
+                return;
             }
 
             var chromeClosedByWorker = false;
@@ -1693,6 +1723,12 @@ public sealed partial class ManagerForm
             {
                 _log.Warn(
                     $"[AUTO_CLOSE_CHROME_NEEDS_FINAL_CLEANUP] profile={ctx.Profile.Name} workerCloseVerified=false");
+            }
+
+            if (IsAutomationHalted)
+            {
+                _log.Warn($"[AUTO_CLOSE_ABORT_EMERGENCY] profile={ctx.Profile.Name} phase=before_shutdown_worker");
+                return;
             }
 
             // Worker phải chết THẬT trước khi được phép giải phóng slot.

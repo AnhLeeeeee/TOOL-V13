@@ -964,7 +964,7 @@ public sealed partial class ManagerForm
 
     void ScheduleAutoIdentityForReadyProfiles()
     {
-        if (_closing) return;
+        if (IsAutomationHalted || _closing) return;
         var state = LoadIdentityToolState();
         if (!state.AutoOnReady) return;
         if (string.IsNullOrWhiteSpace(_accountPoolService.CurrentSourcePath)) return;
@@ -996,6 +996,7 @@ public sealed partial class ManagerForm
 
     async Task RunAutoIdentityForProfileAsync(ProfileContext ctx)
     {
+        if (IsAutomationHalted) return;
         await _autoIdentityQueueGate.WaitAsync();
         try
         {

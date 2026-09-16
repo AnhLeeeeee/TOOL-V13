@@ -136,6 +136,9 @@ public sealed partial class ManagerForm
 
     async Task ShowRunAllStrategyDialogAndStartAsync()
     {
+        if (!EnsureAutomationAllowedFromUi("chạy Auto Run"))
+            return;
+
         InitializeRunStrategyFeature();
 
         var openCount = _contexts.Values.Count(ctx =>
@@ -789,7 +792,8 @@ public sealed partial class ManagerForm
 
             // Nếu có request tự động phát sinh trong lúc bootstrap, trả gate xong
             // mới cho queue cũ chạy. Queue runner vốn tuần tự.
-            if (!_autoReplacementQueueRunning
+            if (!IsAutomationHalted
+                && !_autoReplacementQueueRunning
                 && GetAutoReplacementPendingCount() > 0
                 && !_closing
                 && _autoReplacementSessionArmed
@@ -1020,6 +1024,9 @@ public sealed partial class ManagerForm
         RunAllStrategySettings settings,
         int targetSlots)
     {
+        if (IsAutomationHalted)
+            return;
+
         settings = NormalizeRunStrategySettings(settings);
         targetSlots = Math.Max(0, targetSlots);
 
@@ -1096,7 +1103,8 @@ public sealed partial class ManagerForm
 
     async Task CheckRunStrategyAsync()
     {
-        if (!_runStrategyFeatureInitialized
+        if (IsAutomationHalted
+            || !_runStrategyFeatureInitialized
             || !_runStrategySessionActive
             || _runStrategyTickBusy
             || _runStrategyRotationRunning
@@ -1568,7 +1576,8 @@ public sealed partial class ManagerForm
             // Nếu trong lúc planned rotation một profile khác tự BAN/TIME/FAULT thì
             // request đã được xếp hàng nhưng bị gate chặn. Trả gate xong cho queue cũ
             // tiếp tục đúng tuần tự của nó.
-            if (GetAutoReplacementPendingCount() > 0
+            if (!IsAutomationHalted
+                && GetAutoReplacementPendingCount() > 0
                 && !_closing
                 && _autoReplacementSessionArmed
                 && _autoCloseSettings.OpenReplacementAfterAutoClose)
@@ -1578,7 +1587,8 @@ public sealed partial class ManagerForm
 
             // Nếu planned slot chưa fill được, dùng capacity reconcile hiện có làm
             // safety-net. Reconcile vẫn 2-pass, không mở hàng loạt do scheduler.
-            if (!filled
+            if (!IsAutomationHalted
+                && !filled
                 && !_closing
                 && _autoCloseSettings.OpenReplacementAfterAutoClose
                 && _autoReplacementSessionArmed)

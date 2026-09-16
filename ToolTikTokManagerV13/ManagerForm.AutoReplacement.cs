@@ -114,7 +114,8 @@ public sealed partial class ManagerForm
 
     bool IsAutoReplacementExecutionAllowed(int generation)
     {
-        if (_closing
+        if (IsAutomationHalted
+            || _closing
             || IsDisposed
             || Disposing
             || !_autoReplacementSessionArmed
@@ -243,7 +244,7 @@ public sealed partial class ManagerForm
 
     void ArmAutoReplacementSession(string source)
     {
-        if (_closing || IsDisposed || Disposing)
+        if (IsAutomationHalted || _closing || IsDisposed || Disposing)
             return;
 
         if (!_autoReplacementFeatureInitialized)
@@ -296,7 +297,7 @@ public sealed partial class ManagerForm
 
     void QueueAutoReplacementAfterAutoClose(string closedProfileName, string reason)
     {
-        if (_closing || IsDisposed || Disposing)
+        if (IsAutomationHalted || _closing || IsDisposed || Disposing)
             return;
 
         closedProfileName = (closedProfileName ?? "").Trim();
@@ -373,6 +374,9 @@ public sealed partial class ManagerForm
 
     async Task RunAutoReplacementQueueAsync()
     {
+        if (IsAutomationHalted)
+            return;
+
         if (!_autoReplacementSessionArmed)
         {
             if (GetAutoReplacementPendingCount() > 0)
@@ -389,6 +393,9 @@ public sealed partial class ManagerForm
         {
             while (!_closing && !IsDisposed && !Disposing)
             {
+                if (IsAutomationHalted)
+                    return;
+
                 if (!_autoReplacementSessionArmed)
                 {
                     _log.Info(
