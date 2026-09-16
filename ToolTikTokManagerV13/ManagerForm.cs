@@ -58,6 +58,26 @@ public sealed partial class ManagerForm : Form
     sealed record ProfileCreateRequest(string Name, string Username, string Password, string TotpSecret, bool AutoLogin, string? AccountPoolId);
     sealed record ManagerDefaultConfigMetadata(string DisplayName, string SourceType, string SourceValue, DateTime SavedAtUtc);
 
+    sealed class ManagerDefaultConfigSyncState
+    {
+        public bool Enabled { get; set; }
+        public long Revision { get; set; }
+        public DateTime UpdatedAtUtc { get; set; }
+    }
+
+    sealed class ManagerDefaultConfigAppliedMarker
+    {
+        public long Revision { get; set; }
+        public DateTime AppliedAtUtc { get; set; }
+        public string Source { get; set; } = "";
+    }
+
+    sealed record ProfileConfigFilesBackup(
+        bool IniExisted,
+        byte[]? IniBytes,
+        bool ContentExisted,
+        byte[]? ContentBytes);
+
     sealed class NaturalProfileNameComparer : IComparer<string>
     {
         public int Compare(string? left, string? right)
@@ -531,6 +551,14 @@ public sealed partial class ManagerForm : Form
     {
         if (_profileRenameInProgress)
             throw new InvalidOperationException("Đang đổi tên profile. Hãy chờ thao tác hoàn tất trước khi mở Worker/profile khác.");
+
+        if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+        {
+            _log.Warn(
+                $"[PROFILE_OPEN_BLOCK_RETIRE_DELETE] profile={ctx.Profile.Name} action=skip_open");
+            return false;
+        }
+
         if (ctx.Opening)
         {
             _log.Info($"[PROFILE_OPEN_SKIP] profile={ctx.Profile.Name} reason=already_opening");
@@ -544,6 +572,7 @@ public sealed partial class ManagerForm : Form
             if (ctx.Tab is not null) SelectTabPageSafely(ctx.Tab);
             if (!string.IsNullOrWhiteSpace(openingStatus)) SetStatus(ctx, openingStatus, Color.DarkOrange);
             LegacyDataMigration.TryImportLegacyProfileData(_baseDir, ctx.Profile.Name, _profileService.ResolveDataRoot(ctx.Profile));
+            await ApplyManagerDefaultConfigToExistingProfileOnOpenAsync(ctx, "open_profile");
             await EnsureWorkerAsync(ctx);
             await RefreshStatusAsync(ctx);
             await EmbedWorkerAsync(ctx);
@@ -1035,6 +1064,13 @@ public sealed partial class ManagerForm : Form
             return "emergency_stopped";
         }
 
+        // Fallback quan trọng cho PRF đã có Worker/tab sẵn: nếu cấu hình mặc định
+        // vừa đổi thì đồng bộ trước khi bắt đầu một phiên chạy mới. Không áp dụng
+        // khi resume vì resume là tiếp tục chính phiên đang chạy.
+        if (command.Equals("start", StringComparison.OrdinalIgnoreCase)
+            || command.Equals("start_auto", StringComparison.OrdinalIgnoreCase))
+            await ApplyManagerDefaultConfigToExistingProfileOnOpenAsync(ctx, "before_start");
+
         await ctx.CommandGate.WaitAsync();
         try
         {
@@ -1306,6 +1342,324 @@ public sealed partial class ManagerForm : Form
     string ManagerDefaultIniPath => Path.Combine(ManagerDefaultConfigRoot, "auto_chrome.ini");
     string ManagerDefaultContentPath => Path.Combine(ManagerDefaultConfigRoot, "auto_chrome_noidung.txt");
     string ManagerDefaultMetadataPath => Path.Combine(ManagerDefaultConfigRoot, "default_config_metadata.json");
+    string ManagerDefaultSyncStatePath => Path.Combine(_baseDir, "manager_default_config_sync.json");
+    const string ManagerDefaultAppliedMarkerFileName = "manager_default_config_applied.json";
+
+    ManagerDefaultConfigSyncState LoadManagerDefaultConfigSyncState()
+    {
+        try
+        {
+            if (!File.Exists(ManagerDefaultSyncStatePath))
+                return new ManagerDefaultConfigSyncState();
+
+            var json = File.ReadAllText(ManagerDefaultSyncStatePath, Encoding.UTF8);
+            var state = JsonSerializer.Deserialize<ManagerDefaultConfigSyncState>(json)
+                        ?? new ManagerDefaultConfigSyncState();
+            if (state.Revision < 0) state.Revision = 0;
+            return state;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"[DEFAULT_CONFIG_SYNC_STATE_READ] {ex.Message}");
+            return new ManagerDefaultConfigSyncState();
+        }
+    }
+
+    void SaveManagerDefaultConfigSyncState(ManagerDefaultConfigSyncState state)
+    {
+        try
+        {
+            state.Revision = Math.Max(0, state.Revision);
+            state.UpdatedAtUtc = DateTime.UtcNow;
+            var json = JsonSerializer.Serialize(state, new JsonSerializerOptions { WriteIndented = true });
+            var tempPath = ManagerDefaultSyncStatePath + ".tmp";
+            File.WriteAllText(tempPath, json, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            File.Move(tempPath, ManagerDefaultSyncStatePath, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"[DEFAULT_CONFIG_SYNC_STATE_WRITE] {ex.Message}");
+            throw;
+        }
+    }
+
+    static long NextManagerDefaultConfigRevision(long current)
+        => current >= long.MaxValue - 1 ? 1 : Math.Max(0, current) + 1;
+
+    ManagerDefaultConfigSyncState SetManagerDefaultConfigSyncEnabled(bool enabled)
+    {
+        var state = LoadManagerDefaultConfigSyncState();
+        if (state.Enabled == enabled) return state;
+
+        state.Enabled = enabled;
+        // Mỗi lần bật lại tạo một revision mới để mọi PRF hiện có đều được
+        // nhận lại đúng cấu hình mặc định ở lần mở/start an toàn kế tiếp.
+        if (enabled)
+            state.Revision = NextManagerDefaultConfigRevision(state.Revision);
+
+        SaveManagerDefaultConfigSyncState(state);
+        _log.Info($"[DEFAULT_CONFIG_SYNC_TOGGLE] enabled={enabled} revision={state.Revision}");
+        return state;
+    }
+
+    ManagerDefaultConfigSyncState MarkManagerDefaultConfigChanged(string source)
+    {
+        var state = LoadManagerDefaultConfigSyncState();
+        state.Revision = NextManagerDefaultConfigRevision(state.Revision);
+        SaveManagerDefaultConfigSyncState(state);
+        _log.Info($"[DEFAULT_CONFIG_REVISION] revision={state.Revision} enabled={state.Enabled} source={source}");
+        return state;
+    }
+
+    string ManagerDefaultAppliedMarkerPath(string dataRoot)
+        => Path.Combine(dataRoot, ManagerDefaultAppliedMarkerFileName);
+
+    long LoadManagerDefaultAppliedRevision(string dataRoot)
+    {
+        try
+        {
+            var path = ManagerDefaultAppliedMarkerPath(dataRoot);
+            if (!File.Exists(path)) return 0;
+            var json = File.ReadAllText(path, Encoding.UTF8);
+            var marker = JsonSerializer.Deserialize<ManagerDefaultConfigAppliedMarker>(json);
+            return Math.Max(0, marker?.Revision ?? 0);
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    void SaveManagerDefaultAppliedRevision(string dataRoot, long revision, string source)
+    {
+        Directory.CreateDirectory(dataRoot);
+        var marker = new ManagerDefaultConfigAppliedMarker
+        {
+            Revision = Math.Max(0, revision),
+            AppliedAtUtc = DateTime.UtcNow,
+            Source = source
+        };
+        var path = ManagerDefaultAppliedMarkerPath(dataRoot);
+        var tempPath = path + ".tmp";
+        var json = JsonSerializer.Serialize(marker, new JsonSerializerOptions { WriteIndented = true });
+        File.WriteAllText(tempPath, json, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        File.Move(tempPath, path, overwrite: true);
+    }
+
+    bool TryResolveManagerDefaultConfigSource(
+        bool allowPackagedDefaults,
+        out string sourceIni,
+        out string? sourceContent,
+        out string sourceLabel)
+    {
+        if (File.Exists(ManagerDefaultIniPath))
+        {
+            sourceIni = ManagerDefaultIniPath;
+            sourceContent = File.Exists(ManagerDefaultContentPath) ? ManagerDefaultContentPath : null;
+            sourceLabel = "manager_default";
+            return true;
+        }
+
+        if (allowPackagedDefaults)
+        {
+            var packagedIni = Path.Combine(_baseDir, "defaults", "auto_chrome.ini");
+            if (File.Exists(packagedIni))
+            {
+                var packagedContent = Path.Combine(_baseDir, "defaults", "auto_chrome_noidung.txt");
+                sourceIni = packagedIni;
+                sourceContent = File.Exists(packagedContent) ? packagedContent : null;
+                sourceLabel = "packaged_default";
+                return true;
+            }
+        }
+
+        sourceIni = "";
+        sourceContent = null;
+        sourceLabel = "";
+        return false;
+    }
+
+    static void ReplaceFileAtomically(string sourcePath, string targetPath)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(targetPath)!);
+        var tempPath = targetPath + ".manager-default-sync.tmp";
+        try
+        {
+            File.Copy(sourcePath, tempPath, overwrite: true);
+            File.Move(tempPath, targetPath, overwrite: true);
+        }
+        finally
+        {
+            try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+        }
+    }
+
+    string ApplyManagerDefaultConfigFiles(string dataRoot, bool allowPackagedDefaults)
+    {
+        if (!TryResolveManagerDefaultConfigSource(
+                allowPackagedDefaults,
+                out var sourceIni,
+                out var sourceContent,
+                out var sourceLabel))
+            return "";
+
+        Directory.CreateDirectory(dataRoot);
+        var targetIni = Path.Combine(dataRoot, "auto_chrome.ini");
+        var targetContent = Path.Combine(dataRoot, "auto_chrome_noidung.txt");
+        ReplaceFileAtomically(sourceIni, targetIni);
+
+        if (!string.IsNullOrWhiteSpace(sourceContent) && File.Exists(sourceContent))
+            ReplaceFileAtomically(sourceContent, targetContent);
+        else if (File.Exists(targetContent))
+            File.Delete(targetContent);
+
+        return sourceLabel;
+    }
+
+    static ProfileConfigFilesBackup CaptureProfileConfigFilesBackup(string dataRoot)
+    {
+        var iniPath = Path.Combine(dataRoot, "auto_chrome.ini");
+        var contentPath = Path.Combine(dataRoot, "auto_chrome_noidung.txt");
+        var iniExists = File.Exists(iniPath);
+        var contentExists = File.Exists(contentPath);
+        return new ProfileConfigFilesBackup(
+            iniExists,
+            iniExists ? File.ReadAllBytes(iniPath) : null,
+            contentExists,
+            contentExists ? File.ReadAllBytes(contentPath) : null);
+    }
+
+    static void RestoreProfileConfigFilesBackup(string dataRoot, ProfileConfigFilesBackup backup)
+    {
+        Directory.CreateDirectory(dataRoot);
+        var iniPath = Path.Combine(dataRoot, "auto_chrome.ini");
+        var contentPath = Path.Combine(dataRoot, "auto_chrome_noidung.txt");
+
+        if (backup.IniExisted)
+            File.WriteAllBytes(iniPath, backup.IniBytes ?? Array.Empty<byte>());
+        else if (File.Exists(iniPath))
+            File.Delete(iniPath);
+
+        if (backup.ContentExisted)
+            File.WriteAllBytes(contentPath, backup.ContentBytes ?? Array.Empty<byte>());
+        else if (File.Exists(contentPath))
+            File.Delete(contentPath);
+    }
+
+    int CountProfilesAppliedToManagerDefaultRevision(long revision)
+    {
+        if (revision <= 0) return 0;
+        try
+        {
+            var catalog = _profileService.Load();
+            return catalog.Profiles.Count(profile =>
+            {
+                try
+                {
+                    var dataRoot = _profileService.ResolveDataRoot(profile);
+                    return LoadManagerDefaultAppliedRevision(dataRoot) == revision;
+                }
+                catch
+                {
+                    return false;
+                }
+            });
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    async Task ApplyManagerDefaultConfigToExistingProfileOnOpenAsync(ProfileContext ctx, string reason)
+    {
+        var state = LoadManagerDefaultConfigSyncState();
+        if (!state.Enabled || state.Revision <= 0) return;
+
+        var dataRoot = _profileService.ResolveDataRoot(ctx.Profile);
+        if (LoadManagerDefaultAppliedRevision(dataRoot) == state.Revision) return;
+
+        await ctx.CommandGate.WaitAsync();
+        try
+        {
+            // Revision có thể thay đổi trong lúc chờ CommandGate.
+            state = LoadManagerDefaultConfigSyncState();
+            if (!state.Enabled || state.Revision <= 0) return;
+            if (LoadManagerDefaultAppliedRevision(dataRoot) == state.Revision) return;
+
+            var workerAlive = ctx.Worker is not null && !ctx.Worker.HasExited;
+            if (workerAlive)
+            {
+                try
+                {
+                    var raw = await SendPipeAsync(ctx.Profile.Name, "status", TimeSpan.FromSeconds(2));
+                    var snapshot = JsonSerializer.Deserialize<WorkerSnapshot>(raw, WorkerSnapshotJson)
+                                   ?? new WorkerSnapshot();
+                    var runState = NormalizeRuntimeState(snapshot.RunState);
+                    if (runState != RuntimeStateStopped || snapshot.MessageReplyRunning)
+                    {
+                        _log.Info(
+                            $"[DEFAULT_CONFIG_SYNC_DEFER] profile={ctx.Profile.Name} revision={state.Revision} reason={reason} runtime={runState} messageReply={snapshot.MessageReplyRunning}");
+                        return;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _log.Warn(
+                        $"[DEFAULT_CONFIG_SYNC_DEFER] profile={ctx.Profile.Name} revision={state.Revision} reason={reason} status_error={ex.Message}");
+                    return;
+                }
+            }
+
+            ProfileConfigFilesBackup? backup = null;
+            if (workerAlive)
+                backup = CaptureProfileConfigFilesBackup(dataRoot);
+
+            var sourceLabel = ApplyManagerDefaultConfigFiles(dataRoot, allowPackagedDefaults: true);
+            if (string.IsNullOrWhiteSpace(sourceLabel))
+            {
+                _log.Warn(
+                    $"[DEFAULT_CONFIG_SYNC_SKIP] profile={ctx.Profile.Name} revision={state.Revision} reason=no_default_source");
+                return;
+            }
+
+            if (workerAlive)
+            {
+                try
+                {
+                    // Worker STOPPED có thể đang còn sống để tái sử dụng. Bắt nó
+                    // reload UI/settings ngay; nếu không reload được thì rollback
+                    // file để không để runtime và file cấu hình lệch nhau.
+                    var reply = await SendPipeAsync(ctx.Profile.Name, "reload_config", TimeSpan.FromSeconds(8));
+                    if (!string.Equals(reply, "reloaded", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (backup is not null) RestoreProfileConfigFilesBackup(dataRoot, backup);
+                        _log.Warn(
+                            $"[DEFAULT_CONFIG_SYNC_DEFER] profile={ctx.Profile.Name} revision={state.Revision} reason={reason} reload={reply}");
+                        return;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (backup is not null)
+                    {
+                        try { RestoreProfileConfigFilesBackup(dataRoot, backup); } catch { }
+                    }
+                    _log.Warn(
+                        $"[DEFAULT_CONFIG_SYNC_DEFER] profile={ctx.Profile.Name} revision={state.Revision} reason={reason} reload_error={ex.Message}");
+                    return;
+                }
+            }
+
+            SaveManagerDefaultAppliedRevision(dataRoot, state.Revision, sourceLabel);
+            _log.Info(
+                $"[DEFAULT_CONFIG_SYNC_APPLIED] profile={ctx.Profile.Name} revision={state.Revision} source={sourceLabel} reason={reason} workerReload={workerAlive}");
+        }
+        finally
+        {
+            ctx.CommandGate.Release();
+        }
+    }
 
     ManagerDefaultConfigMetadata? LoadManagerDefaultConfigMetadata()
     {
@@ -1355,15 +1709,16 @@ public sealed partial class ManagerForm : Form
 
     void ApplyManagerDefaultConfigToNewProfile(string dataRoot)
     {
-        if (!File.Exists(ManagerDefaultIniPath)) return;
-        Directory.CreateDirectory(dataRoot);
-        File.Copy(ManagerDefaultIniPath, Path.Combine(dataRoot, "auto_chrome.ini"), overwrite: true);
-        var targetContent = Path.Combine(dataRoot, "auto_chrome_noidung.txt");
-        if (File.Exists(ManagerDefaultContentPath))
-            File.Copy(ManagerDefaultContentPath, targetContent, overwrite: true);
-        else if (File.Exists(targetContent))
-            File.Delete(targetContent);
-        _log.Info($"[DEFAULT_CONFIG_APPLIED] dataRoot={dataRoot}");
+        // Giữ đúng hành vi cũ cho PRF mới: chỉ chép cấu hình riêng của Manager.
+        // Defaults gốc vẫn do Worker dùng theo cơ chế hiện tại nếu Manager chưa có cấu hình riêng.
+        var sourceLabel = ApplyManagerDefaultConfigFiles(dataRoot, allowPackagedDefaults: false);
+        if (string.IsNullOrWhiteSpace(sourceLabel)) return;
+
+        var syncState = LoadManagerDefaultConfigSyncState();
+        if (syncState.Enabled && syncState.Revision > 0)
+            SaveManagerDefaultAppliedRevision(dataRoot, syncState.Revision, sourceLabel);
+
+        _log.Info($"[DEFAULT_CONFIG_APPLIED] dataRoot={dataRoot} source={sourceLabel} revision={(syncState.Enabled ? syncState.Revision : 0)}");
     }
 
     void ShowDefaultConfigDialog()
@@ -1419,7 +1774,7 @@ public sealed partial class ManagerForm : Form
             AutoSize = true,
             AutoSizeMode = AutoSizeMode.GrowAndShrink,
             ColumnCount = 1,
-            RowCount = 11,
+            RowCount = 12,
             BackColor = UiTheme.Canvas,
             Margin = Padding.Empty,
             Padding = Padding.Empty
@@ -1454,6 +1809,30 @@ public sealed partial class ManagerForm : Form
         };
         statusLine.Controls.Add(statusCaption);
         statusLine.Controls.Add(statusName);
+
+        var syncRow = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            Dock = DockStyle.Top,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Margin = new Padding(0, 0, 0, 14),
+            Padding = Padding.Empty
+        };
+        var syncExisting = new Button
+        {
+            Size = new Size(235, 38),
+            Margin = new Padding(0, 0, 10, 0)
+        };
+        ModernDialog.StyleSecondaryButton(syncExisting);
+        var syncInfo = new Label
+        {
+            AutoSize = true,
+            Margin = new Padding(0, 9, 0, 0),
+            ForeColor = Color.DimGray
+        };
+        syncRow.Controls.Add(syncExisting);
+        syncRow.Controls.Add(syncInfo);
 
         var directTitle = new Label
         {
@@ -1653,6 +2032,54 @@ public sealed partial class ManagerForm : Form
             }
         }
 
+        void RefreshSyncStatus()
+        {
+            var syncState = LoadManagerDefaultConfigSyncState();
+            var total = catalog.Profiles.Count;
+            var applied = syncState.Enabled
+                ? CountProfilesAppliedToManagerDefaultRevision(syncState.Revision)
+                : 0;
+
+            syncExisting.Text = syncState.Enabled
+                ? "Áp dụng PRF hiện có: BẬT"
+                : "Áp dụng PRF hiện có: TẮT";
+            syncInfo.Text = syncState.Enabled
+                ? $"Đã đồng bộ: {applied}/{total} · rev {syncState.Revision}"
+                : $"Chỉ PRF mới · rev {syncState.Revision}";
+            syncInfo.ForeColor = syncState.Enabled ? Color.DarkGreen : Color.DimGray;
+        }
+
+        syncExisting.Click += (_, _) =>
+        {
+            var syncState = LoadManagerDefaultConfigSyncState();
+            if (!syncState.Enabled)
+            {
+                if (editorDirty)
+                {
+                    ModernDialog.ShowMessage(
+                        form,
+                        "Nội dung mặc định đang có thay đổi chưa lưu. Hãy bấm “Lưu thay đổi” trước khi bật đồng bộ PRF hiện có.",
+                        "Cấu hình chưa lưu",
+                        MessageBoxIcon.Information);
+                    return;
+                }
+
+                var confirm = ModernDialog.ShowConfirm(
+                    form,
+                    "Bật chế độ này sẽ áp dụng cấu hình mặc định hiện tại cho từng PRF hiện có ở lần mở/start an toàn kế tiếp.\r\n\r\nPRF đang RUNNING/PAUSED sẽ không bị sửa nóng; Tool sẽ chờ lần mở/start sau. Chrome, cookie và phiên đăng nhập không bị đụng tới.\r\n\r\nTiếp tục?",
+                    "Áp dụng cho PRF hiện có");
+                if (confirm != DialogResult.Yes) return;
+
+                SetManagerDefaultConfigSyncEnabled(true);
+            }
+            else
+            {
+                SetManagerDefaultConfigSyncEnabled(false);
+            }
+
+            RefreshSyncStatus();
+        };
+
         contentEditor.TextChanged += (_, _) =>
         {
             if (!loadingEditor) editorDirty = true;
@@ -1685,9 +2112,11 @@ public sealed partial class ManagerForm : Form
                 }
 
                 SaveManagerDefaultConfigMetadata("Cấu hình chỉnh trực tiếp", "direct_edit", "auto_chrome_noidung.txt");
+                MarkManagerDefaultConfigChanged("direct_edit");
                 _log.Info($"[DEFAULT_CONFIG_CONTENT_EDITED] count={CountValidContentLines(normalized)}");
                 editorDirty = false;
                 RefreshStatus();
+                RefreshSyncStatus();
                 LoadContentEditor();
                 ModernDialog.ShowMessage(form,
                     $"Đã lưu {CountValidContentLines(normalized)} nội dung mặc định.",
@@ -1728,7 +2157,9 @@ public sealed partial class ManagerForm : Form
                     Path.GetFileNameWithoutExtension(picker.FileName),
                     "zip",
                     Path.GetFileName(picker.FileName));
+                MarkManagerDefaultConfigChanged("import_zip");
                 RefreshStatus();
+                RefreshSyncStatus();
                 LoadContentEditor();
                 ModernDialog.ShowMessage(form,
                     $"Đã nhập cấu hình từ {Path.GetFileName(picker.FileName)}.",
@@ -1763,8 +2194,10 @@ public sealed partial class ManagerForm : Form
                     $"Profile {profile.Name}",
                     "profile",
                     profile.Name);
+                MarkManagerDefaultConfigChanged($"profile:{profile.Name}");
                 _log.Info($"[DEFAULT_CONFIG_SET_FROM_PROFILE] profile={profile.Name} source={sourceRoot}");
                 RefreshStatus();
+                RefreshSyncStatus();
                 LoadContentEditor();
                 ModernDialog.ShowMessage(form, $"Đã dùng cấu hình của {profile.Name} làm mặc định.", "Cấu hình mặc định", MessageBoxIcon.Information);
             }
@@ -1788,8 +2221,10 @@ public sealed partial class ManagerForm : Form
             {
                 BackupManagerDefaultConfig();
                 if (Directory.Exists(ManagerDefaultConfigRoot)) Directory.Delete(ManagerDefaultConfigRoot, recursive: true);
+                MarkManagerDefaultConfigChanged("packaged_default");
                 _log.Info("[DEFAULT_CONFIG_CLEARED]");
                 RefreshStatus();
+                RefreshSyncStatus();
                 LoadContentEditor();
             }
             catch (Exception ex)
@@ -1808,22 +2243,24 @@ public sealed partial class ManagerForm : Form
         };
 
         content.Controls.Add(statusLine, 0, 0);
-        content.Controls.Add(directTitle, 0, 1);
-        content.Controls.Add(contentEditor, 0, 2);
-        content.Controls.Add(contentInfo, 0, 3);
-        content.Controls.Add(directActions, 0, 4);
-        content.Controls.Add(separator, 0, 5);
-        content.Controls.Add(otherTitle, 0, 6);
-        content.Controls.Add(zipActions, 0, 7);
-        content.Controls.Add(sourceLabel, 0, 8);
-        content.Controls.Add(profileBox, 0, 9);
-        content.Controls.Add(profileActions, 0, 10);
+        content.Controls.Add(syncRow, 0, 1);
+        content.Controls.Add(directTitle, 0, 2);
+        content.Controls.Add(contentEditor, 0, 3);
+        content.Controls.Add(contentInfo, 0, 4);
+        content.Controls.Add(directActions, 0, 5);
+        content.Controls.Add(separator, 0, 6);
+        content.Controls.Add(otherTitle, 0, 7);
+        content.Controls.Add(zipActions, 0, 8);
+        content.Controls.Add(sourceLabel, 0, 9);
+        content.Controls.Add(profileBox, 0, 10);
+        content.Controls.Add(profileActions, 0, 11);
 
         viewport.Controls.Add(content);
         form.Controls.Add(viewport);
         form.Controls.Add(footer);
         form.CancelButton = close;
         RefreshStatus();
+        RefreshSyncStatus();
         LoadContentEditor();
         form.ShowDialog(this);
     }

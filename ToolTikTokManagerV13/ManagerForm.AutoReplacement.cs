@@ -81,6 +81,14 @@ public sealed partial class ManagerForm
     const int AutoReplacementHealthyConfirmTimeoutSeconds = AutoCloseNotRunningMinutes * 60;
     const int AutoReplacementHealthyStableSeconds = 30;
     static readonly TimeSpan AutoReplacementStabilizationRecoveryInterval = TimeSpan.FromSeconds(30);
+
+    // PRF lấy từ Chờ dùng lại đã tồn tại + đã đăng nhập từ trước: không được
+    // giữ slot trong grace 10 phút như PRF vừa tạo/login. Chỉ cho một cửa sổ
+    // ngắn để Worker/Chrome khởi động và xác nhận RUNNING ổn định.
+    const int AutoReplacementReusableHealthyConfirmTimeoutSeconds = 45;
+    const int AutoReplacementReusableHealthyStableSeconds = 4;
+    const int AutoReplacementReusableStartCommandTimeoutSeconds = 20;
+    static readonly TimeSpan AutoReplacementReusableRecoveryInterval = TimeSpan.FromSeconds(8);
     static readonly TimeSpan AutoReplacementFailedProfileCooldown = TimeSpan.FromMinutes(5);
     static readonly TimeSpan AutoReplacementQueueWaitSlice = TimeSpan.FromSeconds(5);
     static readonly TimeSpan AutoReplacementReusableStateRetry = TimeSpan.FromSeconds(5);
@@ -1821,25 +1829,60 @@ public sealed partial class ManagerForm
         int executionGeneration,
         CancellationToken executionToken)
     {
-        var deadlineUtc = DateTime.UtcNow.AddSeconds(AutoReplacementHealthyConfirmTimeoutSeconds);
+        var isReusableProfileOpen = source.Equals(
+            "reuse_queue",
+            StringComparison.OrdinalIgnoreCase);
+
+        var healthyConfirmTimeoutSeconds = isReusableProfileOpen
+            ? AutoReplacementReusableHealthyConfirmTimeoutSeconds
+            : AutoReplacementHealthyConfirmTimeoutSeconds;
+        var healthyStableSeconds = isReusableProfileOpen
+            ? AutoReplacementReusableHealthyStableSeconds
+            : AutoReplacementHealthyStableSeconds;
+        var recoveryInterval = isReusableProfileOpen
+            ? AutoReplacementReusableRecoveryInterval
+            : AutoReplacementStabilizationRecoveryInterval;
+        var startCommandTimeout = TimeSpan.FromSeconds(
+            isReusableProfileOpen
+                ? AutoReplacementReusableStartCommandTimeoutSeconds
+                : 100);
+
+        var deadlineUtc = DateTime.UtcNow.AddSeconds(healthyConfirmTimeoutSeconds);
         var nextRecoveryUtc = DateTime.MinValue;
         DateTime? healthySinceUtc = null;
         string lastFault = "";
         var recoveryAttempt = 0;
 
-        // Candidate đang được đánh giá vẫn chiếm đúng 1 suất. 10 phút ở đây cùng
-        // triết lý với FAULT_10M: profile mới/VM chậm có thời gian ổn định trước khi
-        // bị kết luận lỗi và thay profile khác.
+        // PRF vừa tạo/login vẫn có grace dài như cũ. Riêng PRF Chờ dùng lại
+        // đã tồn tại từ trước chỉ được cửa sổ ngắn để mở Worker/Chrome + RUNNING;
+        // nếu không lên được thì nhả candidate và thử PRF khác.
         MarkAutoCloseExpectedRunning(
             ctx.Profile.Name,
             "auto_replace_stabilizing:" + source);
 
         _log.Info(
             $"[AUTO_REPLACE_STABILIZE_BEGIN] id={request.Id} profile={ctx.Profile.Name} source={source} " +
-            $"stable={AutoReplacementHealthyStableSeconds}s grace={AutoReplacementHealthyConfirmTimeoutSeconds}s");
+            $"policy={(isReusableProfileOpen ? "REUSE_FAST" : "CREATED_GRACE")} " +
+            $"stable={healthyStableSeconds}s grace={healthyConfirmTimeoutSeconds}s");
 
         while (!_closing && DateTime.UtcNow < deadlineUtc)
         {
+            // Candidate có thể bị BAN/TIME trong chính cửa sổ ổn định 10 phút.
+            // Không được recovery/reopen nó nữa, đặc biệt khi job xóa đã được arm.
+            if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+            {
+                ClearAutoCloseExpectedRunning(
+                    ctx.Profile.Name,
+                    "auto_replace_retire_delete_during_stabilize");
+
+                _log.Warn(
+                    $"[AUTO_REPLACE_STABILIZE_RETIRE_DELETE_ABORT] id={request.Id} profile={ctx.Profile.Name} source={source}");
+
+                return new AutoReplacementStabilizationResult(
+                    false, false, false,
+                    "RETIRE_DELETE_BLOCKED: profile đang Tự đóng/Tự xóa hoặc đã hard-retired.");
+            }
+
             if (IsManualCloseSuppressed(ctx.Profile.Name))
             {
                 ClearAutoCloseExpectedRunning(
@@ -1870,6 +1913,20 @@ public sealed partial class ManagerForm
                 lastFault = "status_poll:" + ex.Message;
             }
 
+            if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+            {
+                ClearAutoCloseExpectedRunning(
+                    ctx.Profile.Name,
+                    "auto_replace_retire_delete_after_poll");
+
+                _log.Warn(
+                    $"[AUTO_REPLACE_STABILIZE_RETIRE_DELETE_ABORT] id={request.Id} profile={ctx.Profile.Name} source={source} stage=after_poll");
+
+                return new AutoReplacementStabilizationResult(
+                    false, false, false,
+                    "RETIRE_DELETE_BLOCKED: profile chuyển sang Tự đóng/Tự xóa trong lúc kiểm tra trạng thái.");
+            }
+
             var nowUtc = DateTime.UtcNow;
             var state = GetEffectiveRuntimeState(ctx);
             var healthy = pollOk && IsAutoCloseHealthyRunning(ctx, state, nowUtc);
@@ -1878,7 +1935,7 @@ public sealed partial class ManagerForm
             {
                 healthySinceUtc ??= nowUtc;
                 var stableFor = nowUtc - healthySinceUtc.Value;
-                if (stableFor >= TimeSpan.FromSeconds(AutoReplacementHealthyStableSeconds))
+                if (stableFor >= TimeSpan.FromSeconds(healthyStableSeconds))
                 {
                     _log.Info(
                         $"[AUTO_REPLACE_STABILIZE_OK] id={request.Id} profile={ctx.Profile.Name} source={source} " +
@@ -1896,12 +1953,12 @@ public sealed partial class ManagerForm
                     lastFault = described;
             }
 
-            // Trong grace 10 phút chỉ cứu CHÍNH profile này; không tạo profile mới.
-            // Không spam START khi runtime đang RUNNING/RECOVERING, chỉ recovery khi
-            // Worker/Chrome/RunState chưa sẵn sàng và tối đa mỗi 30 giây.
+            // Chỉ recovery CHÍNH profile này; không tạo profile mới trong lúc claim.
+            // PRF reuse dùng nhịp recovery ngắn; PRF vừa tạo/login vẫn giữ nhịp dài
+            // như cũ. Không spam START khi runtime đang RUNNING/RECOVERING.
             if (!healthy && nowUtc >= nextRecoveryUtc)
             {
-                nextRecoveryUtc = nowUtc.Add(AutoReplacementStabilizationRecoveryInterval);
+                nextRecoveryUtc = nowUtc.Add(recoveryInterval);
                 recoveryAttempt++;
 
                 var workerAlive = IsNameGuardWorkerAlive(ctx);
@@ -1921,7 +1978,9 @@ public sealed partial class ManagerForm
                     {
                         await OpenProfileAsync(
                             ctx,
-                            $"Đang chờ profile {ctx.Profile.Name} ổn định (tối đa 10 phút)...");
+                            isReusableProfileOpen
+                                ? $"Đang mở lại profile chờ {ctx.Profile.Name}..."
+                                : $"Đang chờ profile {ctx.Profile.Name} ổn định (tối đa 10 phút)...");
                     }
                     catch (Exception ex)
                     {
@@ -1968,7 +2027,7 @@ public sealed partial class ManagerForm
                         var reply = await StartWithNameGuardAsync(
                             ctx,
                             "start_auto",
-                            TimeSpan.FromSeconds(100),
+                            startCommandTimeout,
                             suppressStatus: true);
 
                         if (IsNameGuardNameSyncPendingStartReply(reply))
@@ -2013,11 +2072,16 @@ public sealed partial class ManagerForm
 
         _log.Warn(
             $"[AUTO_REPLACE_STABILIZE_TIMEOUT] id={request.Id} profile={ctx.Profile.Name} source={source} " +
-            $"grace={AutoReplacementHealthyConfirmTimeoutSeconds}s fault={lastFault}");
+            $"policy={(isReusableProfileOpen ? "REUSE_FAST" : "CREATED_GRACE")} " +
+            $"grace={healthyConfirmTimeoutSeconds}s fault={lastFault}");
+
+        var timeoutText = isReusableProfileOpen
+            ? $"{healthyConfirmTimeoutSeconds} giây"
+            : $"{healthyConfirmTimeoutSeconds / 60} phút";
 
         return new AutoReplacementStabilizationResult(
             false, false, false,
-            $"Không RUNNING khỏe sau {AutoReplacementHealthyConfirmTimeoutSeconds / 60} phút. fault={lastFault}");
+            $"Không RUNNING khỏe sau {timeoutText}. fault={lastFault}");
     }
 
     async Task<bool> WaitForReplacementHealthyRunningAsync(

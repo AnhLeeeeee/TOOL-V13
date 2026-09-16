@@ -24,14 +24,42 @@ public sealed partial class ManagerForm
         _autoRetiredProfileDeleted =
             new(StringComparer.OrdinalIgnoreCase);
 
+    // Một profile đang Tự đóng/Tự xóa hoặc đã hard-retired tuyệt đối không được
+    // Auto Run/Tự bù mở lại. Đây là interlock 2 chiều với luồng xóa:
+    // - opener kiểm tra cờ này trước khi claim/mở/recovery;
+    // - deleter chờ mọi replacement claim cũ nhả ra rồi mới xóa folder/catalog.
+    bool IsProfileRetireDeleteBlockedForOpen(string? profileName)
+    {
+        profileName = (profileName ?? "").Trim();
+        if (profileName.Length == 0)
+            return false;
+
+        if (_autoRetiredProfileDeleteInProgress.Contains(profileName)
+            || _autoRetiredProfileDeleted.Contains(profileName)
+            || _autoCloseInProgressProfiles.Contains(profileName))
+        {
+            return true;
+        }
+
+        try
+        {
+            var supplyState = GetProfileSupplyState(profileName);
+            if (IsHardReusableProfileRetired(supplyState))
+                return true;
+        }
+        catch
+        {
+            // Không biến lỗi đọc state thành hard block vĩnh viễn; các gate khác vẫn bảo vệ.
+        }
+
+        return false;
+    }
+
     void QueueAutoDeleteRetiredProfileAfterExcelNote(
         string profileName,
         string requestedReason)
     {
         if (IsAutomationHalted)
-            return;
-
-        if (!_autoCloseSettings.DeleteProfileAfterBanOrLifetime)
             return;
 
         profileName =
@@ -43,6 +71,16 @@ public sealed partial class ManagerForm
 
         if (profileName.Length == 0)
             return;
+
+        // BAN là trạng thái không còn dùng lại được: sau khi Excel đã ghi + xác minh
+        // note=ban thì luôn xóa profile (miễn công tắc Tự đóng khi BAN đang bật).
+        // Checkbox DeleteProfileAfterBanOrLifetime từ đây chỉ còn quyết định auto-delete
+        // cho TIME_xH; không được làm profile BAN nằm lại trong kho.
+        if (requestedReason != "BAN"
+            && !_autoCloseSettings.DeleteProfileAfterBanOrLifetime)
+        {
+            return;
+        }
 
         if (requestedReason != "BAN"
             && !IsAutoCloseLifetimeReason(requestedReason))
@@ -71,6 +109,26 @@ public sealed partial class ManagerForm
             return;
         }
 
+        // Khóa nguồn ngay khi job xóa được arm. Không chờ tới lúc DeleteDirectory:
+        // nếu Auto Run đang scan queue đúng lúc BAN/TIME được xác minh, profile này
+        // không được trở thành candidate mới.
+        try
+        {
+            _autoReplacementRetiredProfiles.Add(profileName);
+            MarkProfileSupplyState(
+                profileName,
+                "retired",
+                "auto_close:" + requestedReason);
+            RemoveReusableProfileQueueEntry(
+                profileName,
+                "auto_retired_delete_queued:" + requestedReason);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn(
+                $"[AUTO_RETIRED_DELETE_ARM_GUARD_WARN] profile={profileName} reason={requestedReason} error={ex.Message}");
+        }
+
         _ = AutoDeleteRetiredProfileAfterExcelNoteAsync(
             profileName,
             requestedReason);
@@ -92,7 +150,8 @@ public sealed partial class ManagerForm
                 if (_autoRetiredProfileDeleted.Contains(profileName))
                     return;
 
-                if (!_autoCloseSettings.DeleteProfileAfterBanOrLifetime)
+                if (requestedReason != "BAN"
+                    && !_autoCloseSettings.DeleteProfileAfterBanOrLifetime)
                 {
                     _log.Info(
                         $"[AUTO_RETIRED_DELETE_CANCELLED] profile={profileName} reason=setting_disabled");
@@ -109,6 +168,28 @@ public sealed partial class ManagerForm
                         requestedReason,
                         retryAttempt,
                         "auto_close_in_progress");
+                    continue;
+                }
+
+                // Nếu profile đã bị Auto Run/Tự bù claim từ trước lúc BAN/TIME
+                // được xác minh, tuyệt đối không xóa folder/catalog song song với
+                // stabilization/recovery. Candidate mới đã bị chặn bởi
+                // _autoRetiredProfileDeleteInProgress; ở đây chỉ cần chờ claim cũ nhả.
+                var replacementClaimed =
+                    _autoReplacementClaimedProfiles.Contains(profileName);
+
+                var openingNow =
+                    _contexts.TryGetValue(profileName, out var openingCtx)
+                    && openingCtx.Opening;
+
+                if (replacementClaimed || openingNow)
+                {
+                    _log.Warn(
+                        $"[AUTO_RETIRED_DELETE_WAIT_OPEN_CLAIM] profile={profileName} replacementClaimed={replacementClaimed} opening={openingNow} action=wait_release");
+
+                    await Task.Delay(
+                        TimeSpan.FromMilliseconds(750));
+
                     continue;
                 }
 

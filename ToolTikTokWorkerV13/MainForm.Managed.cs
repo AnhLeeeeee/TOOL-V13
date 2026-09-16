@@ -8,16 +8,103 @@ public sealed partial class MainForm
     string _managedDetailSnapshot = "Bước: —";
     long _managedWindowHandleSnapshot;
 
+    // Guard BAN độc lập với AutomationEngine:
+    // Manager poll status mỗi giây, nhưng trước đây Worker chỉ dò trang BAN khi
+    // workflow automation đang RUNNING. Nếu engine vừa STOPPED/đang đứng ở một
+    // bước dài thì trang TikTok có thể hiện hard-ban mà Manager không nhận được
+    // marker để note Excel + đóng/xóa profile. Timer này chỉ đọc DOM qua CDP và
+    // latch một lần cho tới khi Worker bị đóng.
+    System.Windows.Forms.Timer? _managedFatalBanTimer;
+    bool _managedFatalBanProbeBusy;
+    bool _managedFatalBanLatched;
+    DateTime _managedFatalBanProbeErrorLogUtc = DateTime.MinValue;
+
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
         Interlocked.Exchange(ref _managedWindowHandleSnapshot, Handle.ToInt64());
+        InitializeManagedFatalBanWatcher();
     }
 
     protected override void OnHandleDestroyed(EventArgs e)
     {
+        DisposeManagedFatalBanWatcher();
         Interlocked.Exchange(ref _managedWindowHandleSnapshot, 0);
         base.OnHandleDestroyed(e);
+    }
+
+    void InitializeManagedFatalBanWatcher()
+    {
+        if (_managedFatalBanTimer is not null) return;
+
+        var timer = new System.Windows.Forms.Timer { Interval = 1500 };
+        timer.Tick += async (_, _) => await ProbeManagedFatalBanAsync();
+        _managedFatalBanTimer = timer;
+        timer.Start();
+    }
+
+    void DisposeManagedFatalBanWatcher()
+    {
+        var timer = _managedFatalBanTimer;
+        _managedFatalBanTimer = null;
+        if (timer is null) return;
+        try { timer.Stop(); } catch { }
+        try { timer.Dispose(); } catch { }
+    }
+
+    async Task ProbeManagedFatalBanAsync()
+    {
+        if (_managedFatalBanLatched
+            || _managedFatalBanProbeBusy
+            || IsDisposed
+            || Disposing
+            || !_chrome.Connected)
+        {
+            return;
+        }
+
+        _managedFatalBanProbeBusy = true;
+
+        try
+        {
+            var marker = await _chrome.DetectFatalFeatureRestrictionAsync();
+            if (string.IsNullOrWhiteSpace(marker)) return;
+
+            _managedFatalBanLatched = true;
+            _startupPreparationState = "ACCOUNT_BANNED";
+
+            const string reason =
+                "TikTok báo tài khoản đã vi phạm quy tắc và hiện không thể sử dụng tính năng này. Tool đã dừng để Manager ghi BAN và dọn profile.";
+
+            _log.Error(
+                $"[MANAGED_FATAL_BAN_DETECTED] marker={marker} running={_engine.Running} paused={_engine.Paused}");
+
+            if (_engine.Running)
+            {
+                _engine.Stop(reason);
+            }
+            else
+            {
+                // Khi Automation đã STOPPED, vẫn phải đẩy marker vào snapshot status
+                // để Manager Ban watcher nhìn thấy và chạy note/close/delete.
+                OnEngineStatus("ĐÃ DỪNG\n" + reason);
+            }
+        }
+        catch (Exception ex)
+        {
+            // Probe nền không được làm Worker lỗi vì CDP vừa reconnect/Chrome vừa đóng.
+            // Chỉ log tối đa một lần/phút để tránh spam trên VM chậm.
+            var now = DateTime.UtcNow;
+            if (now - _managedFatalBanProbeErrorLogUtc >= TimeSpan.FromMinutes(1))
+            {
+                _managedFatalBanProbeErrorLogUtc = now;
+                _log.Warn($"[MANAGED_FATAL_BAN_PROBE_ERROR] {ex.Message}");
+            }
+        }
+        finally
+        {
+            _managedFatalBanProbeBusy = false;
+        }
     }
 
     sealed class ManagedIdentityUpdateRequest
@@ -61,6 +148,15 @@ public sealed partial class MainForm
         {
             switch (command)
             {
+                case "reload_config":
+                    if (_engine.Running || IsMessageReplyRunning) return "busy_running";
+                    _settings = _settingsService.Load();
+                    ApplyManagedStartupOverrides();
+                    ApplySelectedProfileToSettings(logSelection: false);
+                    LoadToUi();
+                    ApplyVmOptimizationSettings();
+                    _log.Info("[MANAGED_CONFIG_RELOADED] source=manager_default_sync");
+                    return "reloaded";
                 case "start":
                     if (IsManagerEmergencyStopActive()) return "emergency_stopped";
                     if (IsMessageReplyRunning) return "message_reply_running";

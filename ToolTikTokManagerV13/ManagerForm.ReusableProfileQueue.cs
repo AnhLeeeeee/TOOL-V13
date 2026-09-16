@@ -1759,6 +1759,29 @@ public sealed partial class ManagerForm
                     return false;
                 }
 
+                // BAN/TIME có thể xuất hiện SAU khi candidate đã được claim/mở.
+                // Stabilizer sẽ thoát ngay; không đánh FAIL/cooldown và không cố mở lại.
+                // finally bên dưới nhả claim để job Tự xóa được tiếp tục an toàn.
+                if (IsProfileRetireDeleteBlockedForOpen(profileName)
+                    || (!stabilization.Healthy
+                        && (stabilization.Detail ?? "").StartsWith(
+                            "RETIRE_DELETE_BLOCKED:",
+                            StringComparison.OrdinalIgnoreCase)))
+                {
+                    ClearAutoCloseExpectedRunning(
+                        profileName,
+                        "reuse_retire_delete_abort");
+
+                    RemoveReusableProfileQueueEntry(
+                        profileName,
+                        "retire_delete_during_stabilize");
+
+                    _log.Warn(
+                        $"[REUSE_QUEUE_ABORT_RETIRE_DELETE] id={request.Id} profile={profileName} detail={stabilization.Detail}");
+
+                    continue;
+                }
+
                 if (stabilization.NameSyncPending)
                 {
                     await CleanupCreatedReplacementAttemptAsync(
@@ -1892,6 +1915,7 @@ public sealed partial class ManagerForm
             if (name.Length == 0
                 || name.Equals(request.ClosedProfileName, StringComparison.OrdinalIgnoreCase)
                 || _autoReplacementClaimedProfiles.Contains(name)
+                || IsProfileRetireDeleteBlockedForOpen(name)
                 || IsManualCloseSuppressed(name)
                 || HasAutoReplacementProfileBeenAttempted(request, name)
                 || IsNightReserveProfileProtected(name))
@@ -1997,8 +2021,14 @@ public sealed partial class ManagerForm
         }
 
         // Dự phòng đêm vẫn dùng CHÍNH queue cũ nhưng luôn xếp sau mọi PRF thường.
-        // Ban ngày/PREPARE còn bị hàng rào IsNightReserveProfileProtected chặn hẳn;
-        // OFFPEAK chỉ dùng reserve khi các candidate bình thường đã thử hết.
+        // Mặc định PREPARE/PRIME vẫn bảo vệ reserve. Ngoại lệ duy nhất là planned
+        // rotation của Giờ vàng đang thiếu quota FRESH: target chạy chính được quyền
+        // mượn reserve như một buffer mềm, sau đó Night Reserve sẽ tự bổ sung lại.
+        var allowNightReserveBorrowForFreshQuota =
+            (request.Reason ?? "").Contains(
+                "allow_night_reserve_borrow=fresh_quota",
+                StringComparison.OrdinalIgnoreCase);
+
         candidates = candidates
             .Select((entry, index) => new { entry, index })
             .OrderBy(x => IsNightReserveProfile(x.entry.ProfileName) ? 1 : 0)
@@ -2027,11 +2057,26 @@ public sealed partial class ManagerForm
             if (_autoReplacementClaimedProfiles.Contains(profileName))
                 continue;
 
-            if (IsNightReserveProfileProtected(profileName))
+            if (IsProfileRetireDeleteBlockedForOpen(profileName))
+            {
+                _log.Warn(
+                    $"[REUSE_QUEUE_SKIP_RETIRE_DELETE] id={request.Id} profile={profileName} action=skip_candidate");
+                continue;
+            }
+
+            if (IsNightReserveProfileProtected(profileName)
+                && !allowNightReserveBorrowForFreshQuota)
             {
                 _log.Info(
                     $"[REUSE_QUEUE_SKIP_NIGHT_RESERVE] id={request.Id} profile={profileName} reason={request.Reason}");
                 continue;
+            }
+
+            if (IsNightReserveProfile(profileName)
+                && allowNightReserveBorrowForFreshQuota)
+            {
+                _log.Info(
+                    $"[REUSE_QUEUE_BORROW_NIGHT_RESERVE] id={request.Id} profile={profileName} reason={request.Reason}");
             }
 
             if (IsManualCloseSuppressed(profileName))
@@ -2205,10 +2250,11 @@ public sealed partial class ManagerForm
                     return false;
                 }
 
-                // Profile mới mở/VM chậm có tối đa 10 phút để ổn định. Trong grace
-                // chỉ recovery CHÍNH profile này; slot vẫn bị claim nên không mở bù chồng.
+                // PRF trong Chờ dùng lại đã tồn tại + đăng nhập sẵn: chỉ xác nhận
+                // RUNNING trong cửa sổ ngắn. Grace dài 10 phút chỉ dành cho nhánh
+                // tạo mới/login, không áp vào reuse.
                 SetAutoReplacementUiPhase(
-                    "CHỜ PRF ỔN ĐỊNH",
+                    "XÁC NHẬN PRF CHỜ",
                     profileName,
                     request.Id);
 
@@ -2250,6 +2296,28 @@ public sealed partial class ManagerForm
                     return false;
                 }
 
+                if (IsProfileRetireDeleteBlockedForOpen(profileName)
+                    || (!stabilization.Healthy
+                        && (stabilization.Detail ?? "").StartsWith(
+                            "RETIRE_DELETE_BLOCKED:",
+                            StringComparison.OrdinalIgnoreCase)))
+                {
+                    ClearAutoCloseExpectedRunning(
+                        profileName,
+                        "reuse_retire_delete_abort");
+
+                    RemoveReusableProfileQueueEntry(
+                        profileName,
+                        "retire_delete_during_stabilize");
+
+                    _log.Warn(
+                        $"[REUSE_QUEUE_ABORT_RETIRE_DELETE] id={request.Id} profile={profileName} detail={stabilization.Detail}");
+
+                    // Không cleanup runtime ở đây: AutoClose/Tự xóa đang là owner của
+                    // lifecycle này. finally sẽ nhả claim để deleter tiếp tục.
+                    continue;
+                }
+
                 if (stabilization.NameSyncPending)
                 {
                     // Name Guard đã chủ động đóng vì TikTok chưa sync tên. Đây là DEFER,
@@ -2273,7 +2341,7 @@ public sealed partial class ManagerForm
                         candidate,
                         stabilization.HardFailed
                             ? "stabilize_hard_failed:" + stabilization.Detail
-                            : "stabilize_10m_timeout:" + stabilization.Detail);
+                            : "reuse_fast_timeout:" + stabilization.Detail);
 
                     // Đóng + xác minh sạch trước khi giải phóng claim và thử profile khác.
                     await CloseFailedReplacementRuntimeAsync(ctx);

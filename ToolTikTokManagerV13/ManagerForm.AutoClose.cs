@@ -23,8 +23,9 @@ public sealed partial class ManagerForm
         // tuyệt đối không tiêu account mới để tạo profile.
         public bool ReuseOnlyNoCreateProfile { get; set; }
 
-        // Chỉ xóa profile sau khi Excel đã ghi/xác minh:
-        // BAN -> note=ban; hết vòng đời -> note=TIME_xH.
+        // TIME_xH: tùy chọn có tự xóa sau khi Excel đã ghi/xác minh hay không.
+        // BAN luôn tự xóa sau khi note=ban đã được xác minh (nếu CloseOnBan bật).
+        // Giữ nguyên tên property để tương thích manager_auto_close.json cũ.
         public bool DeleteProfileAfterBanOrLifetime { get; set; }
     }
 
@@ -623,7 +624,7 @@ public sealed partial class ManagerForm
 
         var deleteRetiredProfile = new CheckBox
         {
-            Text = "Tự xóa profile sau khi đã ghi Excel (BAN + hết vòng đời TIME_xH)",
+            Text = "Tự xóa profile hết vòng đời TIME_xH (BAN luôn xóa sau khi đã ghi note=ban)",
             Checked = _autoCloseSettings.DeleteProfileAfterBanOrLifetime,
             AutoSize = true,
             Location = new Point(18, 234)

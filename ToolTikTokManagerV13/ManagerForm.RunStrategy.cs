@@ -68,6 +68,7 @@ public sealed partial class ManagerForm
     bool _runStrategyRotationRunning;
     int _runStrategyTargetSlots;
     DateTime _runStrategyNextRotationUtc = DateTime.MinValue;
+    string _runStrategyObservedPhase = "";
     CancellationTokenSource _runStrategyCts = new();
     CancellationTokenSource _runAllStartCts = new();
     RunAllStrategySettings _runStrategySettings = new();
@@ -86,6 +87,11 @@ public sealed partial class ManagerForm
         // các subsystem này đã được load trước khi dialog đọc trạng thái.
         InitializeAutoCloseFeature();
         _runStrategySettings = LoadRunStrategySettings();
+
+        // Theo dõi phase bằng một handler đồng bộ riêng. Nhờ vậy OFFPEAK/PREPARE/PRIME
+        // đổi ngay theo đồng hồ, kể cả khi tick async trước đó còn đang chờ pipeline.
+        // Handler này chỉ cập nhật state + reset cooldown, không đóng/mở profile.
+        _refreshTimer.Tick += (_, _) => ObserveRunStrategyPhaseClock();
 
         // Tick 1 giây chỉ làm nhiệm vụ đánh giá nhẹ. Mỗi lần xoay thật đều có
         // busy gate + khoảng nghỉ riêng nên tuyệt đối không đóng hàng loạt.
@@ -868,13 +874,15 @@ public sealed partial class ManagerForm
                     foreach (var candidate in GetRunStrategyReusableCandidates(
                                  settings,
                                  RunStrategyLane.Fresh,
-                                 preferLowerRuntime: true))
+                                 preferLowerRuntime: true,
+                                 allowProtectedNightReserve: true))
                     {
                         if (await TryUseSpecificRunStrategyReusableProfileAsync(
                                 candidate.ProfileName,
                                 "RUN_ALL_START",
                                 $"INITIAL_{phase}_FRESH_{slotNumber}",
-                                token))
+                                token,
+                                allowProtectedNightReserveBorrow: true))
                         {
                             return true;
                         }
@@ -1069,6 +1077,7 @@ public sealed partial class ManagerForm
             _runStrategySettings = settings;
             _runStrategyTargetSlots = targetSlots;
             _runStrategyNextRotationUtc = DateTime.MinValue;
+            _runStrategyObservedPhase = "";
             _runStrategySessionActive =
                 settings.Mode == RunAllStrategyMode.PrimeFresh
                 && targetSlots > 0;
@@ -1104,6 +1113,7 @@ public sealed partial class ManagerForm
             _runStrategySessionActive = false;
             _runStrategyTargetSlots = 0;
             _runStrategyNextRotationUtc = DateTime.MinValue;
+            _runStrategyObservedPhase = "";
 
             if (!_runStrategyCts.IsCancellationRequested)
                 oldCts = _runStrategyCts;
@@ -1262,6 +1272,64 @@ public sealed partial class ManagerForm
         StartRunStrategySession(settings, desiredTarget);
     }
 
+    void ObserveRunStrategyPhaseClock()
+    {
+        if (IsAutomationHalted
+            || !_runStrategyFeatureInitialized
+            || _closing
+            || IsDisposed
+            || Disposing)
+        {
+            return;
+        }
+
+        RunAllStrategySettings settings;
+        lock (_runStrategyLock)
+        {
+            if (!_runStrategySessionActive)
+                return;
+
+            settings = _runStrategySettings;
+        }
+
+        var currentPhase = GetRunStrategyPhase(GetToolNow(), settings);
+        string previousPhase;
+        var changed = false;
+        var initialized = false;
+
+        lock (_runStrategyLock)
+        {
+            if (!_runStrategySessionActive)
+                return;
+
+            previousPhase = _runStrategyObservedPhase;
+            if (string.IsNullOrWhiteSpace(previousPhase))
+            {
+                _runStrategyObservedPhase = currentPhase;
+                initialized = true;
+            }
+            else if (!string.Equals(previousPhase, currentPhase, StringComparison.Ordinal))
+            {
+                _runStrategyObservedPhase = currentPhase;
+
+                // Cooldown chỉ giới hạn hai lần xoay TRONG CÙNG phase. Khi đồng hồ
+                // đổi phase, hành vi mới được phép đánh giá ngay ở tick kế tiếp.
+                _runStrategyNextRotationUtc = DateTime.MinValue;
+                changed = true;
+            }
+        }
+
+        if (initialized)
+        {
+            _log.Info($"[RUN_STRATEGY_PHASE_INIT] phase={currentPhase}");
+        }
+        else if (changed)
+        {
+            _log.Info(
+                $"[RUN_STRATEGY_PHASE_CHANGE] from={previousPhase} to={currentPhase} action=RESET_ROTATION_COOLDOWN");
+        }
+    }
+
     async Task CheckRunStrategyAsync()
     {
         if (IsAutomationHalted
@@ -1282,6 +1350,10 @@ public sealed partial class ManagerForm
 
         if (!_runStrategySessionActive)
             return;
+
+        // Restore có thể vừa arm session trong chính tick này, nên quan sát phase ngay
+        // thay vì đợi tick Timer kế tiếp.
+        ObserveRunStrategyPhaseClock();
 
         _runStrategyTickBusy = true;
         try
@@ -1336,18 +1408,41 @@ public sealed partial class ManagerForm
             if (plan is null)
                 return;
 
+            // Build plan có thể phải refresh queue / kiểm tra account. Nếu đúng lúc đó
+            // đồng hồ qua phase khác, tuyệt đối không khởi động một rotation theo phase cũ.
+            var latestPhase = GetRunStrategyPhase(GetToolNow(), settings);
+            if (!string.Equals(plan.Phase, latestPhase, StringComparison.Ordinal))
+            {
+                ObserveRunStrategyPhaseClock();
+                _log.Info(
+                    $"[RUN_STRATEGY_STALE_PLAN_SKIP] planned={plan.Phase} current={latestPhase} victim={plan.Victim.Profile.Name}");
+                return;
+            }
+
             var rotated = await ExecuteRunStrategyRotationAsync(
                 plan,
                 settings,
                 token);
 
-            lock (_runStrategyLock)
+            // Rotation có thể kéo dài qua đúng mốc chuyển phase. Cooldown của phase cũ
+            // không được đè lên reset mà phase watcher vừa tạo.
+            var phaseAfterExecute = GetRunStrategyPhase(GetToolNow(), settings);
+            if (!string.Equals(phase, phaseAfterExecute, StringComparison.Ordinal))
             {
-                if (_runStrategySessionActive)
+                ObserveRunStrategyPhaseClock();
+                _log.Info(
+                    $"[RUN_STRATEGY_PHASE_CHANGED_DURING_ROTATION] from={phase} to={phaseAfterExecute} action=NO_OLD_COOLDOWN");
+            }
+            else
+            {
+                lock (_runStrategyLock)
                 {
-                    _runStrategyNextRotationUtc = rotated
-                        ? DateTime.UtcNow.AddMinutes(settings.RotationIntervalMinutes)
-                        : DateTime.UtcNow.AddMinutes(2);
+                    if (_runStrategySessionActive)
+                    {
+                        _runStrategyNextRotationUtc = rotated
+                            ? DateTime.UtcNow.AddMinutes(settings.RotationIntervalMinutes)
+                            : DateTime.UtcNow.AddMinutes(2);
+                    }
                 }
             }
         }
@@ -1470,7 +1565,8 @@ public sealed partial class ManagerForm
                         settings,
                         RunStrategyLane.Fresh,
                         excludeProfileName: victim.Profile.Name,
-                        preferLowerRuntime: true)
+                        preferLowerRuntime: true,
+                        allowProtectedNightReserve: true)
                     .Count > 0;
 
                 var canCreate = !_autoCloseSettings.ReuseOnlyNoCreateProfile;
@@ -1594,7 +1690,8 @@ public sealed partial class ManagerForm
         RunAllStrategySettings settings,
         RunStrategyLane lane,
         string? excludeProfileName = null,
-        bool? preferLowerRuntime = null)
+        bool? preferLowerRuntime = null,
+        bool allowProtectedNightReserve = false)
     {
         var freshLimit = TimeSpan.FromHours(settings.FreshHours).TotalSeconds;
         var oldLimit = TimeSpan.FromHours(settings.OldHours).TotalSeconds;
@@ -1607,7 +1704,8 @@ public sealed partial class ManagerForm
                 .Where(entry =>
                     !entry.NameSyncPending
                     && !string.IsNullOrWhiteSpace(entry.ProfileName)
-                    && !IsNightReserveProfileProtected(entry.ProfileName)
+                    && (allowProtectedNightReserve
+                        || !IsNightReserveProfileProtected(entry.ProfileName))
                     && !entry.ProfileName.Equals(
                         excludeProfileName ?? "",
                         StringComparison.OrdinalIgnoreCase))
@@ -1683,6 +1781,17 @@ public sealed partial class ManagerForm
     {
         if (_runStrategyRotationRunning || !CanRunStrategyRotateNow())
             return false;
+
+        // Chốt lại phase ngay trước khi bắt đầu thao tác vật lý. Timer phase watcher
+        // có thể đã đổi PRIME/OFFPEAK trong khoảng giữa build-plan và execute.
+        var executePhase = GetRunStrategyPhase(GetToolNow(), settings);
+        if (!string.Equals(plan.Phase, executePhase, StringComparison.Ordinal))
+        {
+            ObserveRunStrategyPhaseClock();
+            _log.Info(
+                $"[RUN_STRATEGY_STALE_EXECUTE_SKIP] planned={plan.Phase} current={executePhase} victim={plan.Victim.Profile.Name}");
+            return false;
+        }
 
         _runStrategyRotationRunning = true;
 
@@ -1855,11 +1964,16 @@ public sealed partial class ManagerForm
                 $"run_strategy_fill:{plan.Phase}:{lane}",
                 token);
 
+            var allowProtectedNightReserveBorrow =
+                lane == RunStrategyLane.Fresh
+                && plan.Phase is "PRIME" or "PREPARE";
+
             foreach (var candidate in GetRunStrategyReusableCandidates(
                          settings,
                          lane,
                          excludeProfileName: outgoingProfileName,
-                         preferLowerRuntime: preferLowerRuntime))
+                         preferLowerRuntime: preferLowerRuntime,
+                         allowProtectedNightReserve: allowProtectedNightReserveBorrow))
             {
                 if (!tried.Add(candidate.ProfileName))
                     continue;
@@ -1868,7 +1982,8 @@ public sealed partial class ManagerForm
                         candidate.ProfileName,
                         outgoingProfileName,
                         plan.Phase,
-                        token))
+                        token,
+                        allowProtectedNightReserveBorrow))
                 {
                     return true;
                 }
@@ -1951,7 +2066,8 @@ public sealed partial class ManagerForm
         string candidateProfileName,
         string outgoingProfileName,
         string reason,
-        CancellationToken token)
+        CancellationToken token,
+        bool allowProtectedNightReserveBorrow = false)
     {
         candidateProfileName = (candidateProfileName ?? "").Trim();
         if (candidateProfileName.Length == 0)
@@ -1979,7 +2095,11 @@ public sealed partial class ManagerForm
             // nên dùng marker slot ảo; candidate thật vẫn bị khóa chính xác bằng
             // AttemptedProfiles bên dưới.
             ClosedProfileName = "RUN_STRATEGY_SLOT_" + Guid.NewGuid().ToString("N")[..8],
-            Reason = "RUN_STRATEGY_" + reason + "; outgoing=" + outgoingProfileName,
+            Reason = "RUN_STRATEGY_" + reason
+                + "; outgoing=" + outgoingProfileName
+                + (allowProtectedNightReserveBorrow
+                    ? "; allow_night_reserve_borrow=fresh_quota"
+                    : ""),
             QueuedUtc = DateTime.UtcNow,
             NextAttemptUtc = DateTime.UtcNow,
             RequiresSourceCleanup = false,
