@@ -971,6 +971,70 @@ public sealed partial class ManagerForm
         }
     }
 
+    static Uri AddManifestCacheBuster(Uri uri)
+    {
+        var builder = new UriBuilder(uri);
+        var token = "_ttcb=" + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString();
+        var query = (builder.Query ?? "").TrimStart('?');
+        builder.Query = string.IsNullOrWhiteSpace(query) ? token : query + "&" + token;
+        return builder.Uri;
+    }
+
+    async Task<string> DownloadValidatedManifestJsonAsync(HttpClient client, Uri uri, string manifestName)
+    {
+        Exception? lastError = null;
+
+        for (var attempt = 1; attempt <= 2; attempt++)
+        {
+            try
+            {
+                var requestUri = AddManifestCacheBuster(uri);
+                using var request = new HttpRequestMessage(HttpMethod.Get, requestUri);
+                request.Headers.TryAddWithoutValidation("Cache-Control", "no-cache, no-store, max-age=0");
+                request.Headers.TryAddWithoutValidation("Pragma", "no-cache");
+
+                using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+                response.EnsureSuccessStatusCode();
+
+                var bytes = await response.Content.ReadAsByteArrayAsync();
+                if (bytes.Length == 0)
+                    throw new InvalidDataException($"{manifestName} rỗng.");
+
+                // 0x00 ở byte đầu là đúng lỗi manifest từng gặp trên GitHub.
+                // Không đưa thẳng vào JsonSerializer để tránh thông báo khó hiểu.
+                var probeLength = Math.Min(bytes.Length, 512);
+                var nulCount = 0;
+                for (var i = 0; i < probeLength; i++)
+                {
+                    if (bytes[i] == 0) nulCount++;
+                }
+
+                if (bytes[0] == 0 || nulCount >= Math.Max(8, probeLength / 2))
+                    throw new InvalidDataException($"{manifestName} bị hỏng (chứa dữ liệu NUL/0x00).");
+
+                var json = Encoding.UTF8.GetString(bytes).TrimStart('\uFEFF');
+                if (string.IsNullOrWhiteSpace(json))
+                    throw new InvalidDataException($"{manifestName} rỗng sau khi giải mã UTF-8.");
+                if (json.IndexOf('\0') >= 0)
+                    throw new InvalidDataException($"{manifestName} bị hỏng (có ký tự NUL/0x00).");
+
+                using (JsonDocument.Parse(json)) { }
+                return json;
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+                _log.Warn($"[UPDATE_MANIFEST_RETRY] name={manifestName} attempt={attempt}/2 url={uri} error={ex.Message}");
+                if (attempt < 2)
+                    await Task.Delay(700);
+            }
+        }
+
+        throw new InvalidDataException(
+            $"Không tải được {manifestName} hợp lệ sau 2 lần thử. {lastError?.Message}",
+            lastError);
+    }
+
     async Task CheckForUpdatesAsync(bool showWhenCurrent)
     {
         if (_updateCheckInProgress) return;
@@ -999,7 +1063,7 @@ public sealed partial class ManagerForm
             using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(18) };
             client.DefaultRequestHeaders.UserAgent.ParseAdd($"ToolTikTokManager/{AppVersionInfo.Current}");
 
-            var latestJson = await client.GetStringAsync(latestUri);
+            var latestJson = await DownloadValidatedManifestJsonAsync(client, latestUri, "version.json");
             var latest = JsonSerializer.Deserialize<UpdateManifest>(latestJson, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
             if (latest is null || string.IsNullOrWhiteSpace(latest.Version) || string.IsNullOrWhiteSpace(latest.SetupUrl))
                 throw new InvalidDataException("version.json thiếu version hoặc setupUrl.");
@@ -1011,7 +1075,7 @@ public sealed partial class ManagerForm
             {
                 try
                 {
-                    var historyJson = await client.GetStringAsync(historyUri);
+                    var historyJson = await DownloadValidatedManifestJsonAsync(client, historyUri, "versions.json");
                     history.AddRange(ParseVersionCatalog(historyJson));
                 }
                 catch (Exception ex)

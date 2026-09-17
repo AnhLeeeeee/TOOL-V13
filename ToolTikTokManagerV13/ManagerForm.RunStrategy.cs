@@ -1,4 +1,4 @@
-﻿using System.Text;
+using System.Text;
 using System.Text.Json;
 using ToolTikTokV12.Controls;
 using ToolTikTokV12.Utils;
@@ -20,9 +20,15 @@ public sealed partial class ManagerForm
         Old
     }
 
+    enum PrePrimeRefreshSourceMode
+    {
+        CurrentFresh = 0,
+        NeverRunOnly = 1
+    }
+
     sealed class RunAllStrategySettings
     {
-        public int Version { get; set; } = 3;
+        public int Version { get; set; } = 4;
         public RunAllStrategyMode Mode { get; set; } = RunAllStrategyMode.Time;
 
         // V3: khi user đã chọn Giờ vàng + Bắt đầu, giữ "ý định vận hành" này
@@ -47,6 +53,13 @@ public sealed partial class ManagerForm
         public int RotationIntervalMinutes { get; set; } = 10;
         public int PrepareMinutes { get; set; } = 30;
         public bool PreserveFreshOffPeak { get; set; } = true;
+
+        // V4: chế độ thay toàn bộ dàn đúng một lần trước giờ vàng. Khi bật,
+        // Run Strategy không còn xoay theo tuổi ở các phase khác; sau khi thay
+        // xong chỉ BAN/FAULT/manual mới làm thay slot cho tới kỳ PREPARE kế tiếp.
+        public bool RefreshAllBeforePrime { get; set; }
+        public PrePrimeRefreshSourceMode PrePrimeRefreshSource { get; set; } =
+            PrePrimeRefreshSourceMode.CurrentFresh;
     }
 
     sealed record RunStrategyReusableCandidate(
@@ -59,7 +72,11 @@ public sealed partial class ManagerForm
         ProfileContext Victim,
         IReadOnlyList<RunStrategyLane> PreferredLanes,
         bool AllowFreshEmergencyFallback,
-        bool AllowCreateFallback);
+        bool AllowCreateFallback)
+    {
+        public bool IsPrePrimeFullRefresh { get; init; }
+        public PrePrimeRefreshSourceMode? ForcedPrePrimeSource { get; init; }
+    }
 
     readonly object _runStrategyLock = new();
     bool _runStrategyFeatureInitialized;
@@ -72,6 +89,19 @@ public sealed partial class ManagerForm
     CancellationTokenSource _runStrategyCts = new();
     CancellationTokenSource _runAllStartCts = new();
     RunAllStrategySettings _runStrategySettings = new();
+
+    // State nhẹ của đợt làm mới trước giờ vàng. Chỉ giữ trong phiên Manager:
+    // profile nào đã được chính đợt refresh mở vào thì được ACCEPTED; mọi profile
+    // đã xuất hiện trước đó/được Tự bù chen vào khi refresh chưa xong đều phải thay.
+    readonly HashSet<string> _runStrategyPrePrimePendingProfiles =
+        new(StringComparer.OrdinalIgnoreCase);
+    readonly HashSet<string> _runStrategyPrePrimeAcceptedProfiles =
+        new(StringComparer.OrdinalIgnoreCase);
+    readonly HashSet<string> _runStrategyPrePrimeDisallowedCandidates =
+        new(StringComparer.OrdinalIgnoreCase);
+    string _runStrategyPrePrimeCycleKey = "";
+    bool _runStrategyPrePrimeCycleStarted;
+    bool _runStrategyPrePrimeCycleCompleted;
 
     string RunStrategySettingsPath
         => Path.Combine(_baseDir, "manager_run_strategy.json");
@@ -132,7 +162,7 @@ public sealed partial class ManagerForm
     static RunAllStrategySettings NormalizeRunStrategySettings(
         RunAllStrategySettings settings)
     {
-        settings.Version = 3;
+        settings.Version = 4;
         if (settings.Mode != RunAllStrategyMode.PrimeFresh)
         {
             settings.PrimeModeArmed = false;
@@ -150,6 +180,15 @@ public sealed partial class ManagerForm
         settings.OldHours = Math.Clamp(settings.OldHours, settings.FreshHours + 1, 24);
         settings.RotationIntervalMinutes = Math.Clamp(settings.RotationIntervalMinutes, 5, 60);
         settings.PrepareMinutes = Math.Clamp(settings.PrepareMinutes, 0, 180);
+
+        if (!Enum.IsDefined(typeof(PrePrimeRefreshSourceMode), settings.PrePrimeRefreshSource))
+            settings.PrePrimeRefreshSource = PrePrimeRefreshSourceMode.CurrentFresh;
+
+        // Full refresh cần một cửa sổ PREPARE thực sự. File config cũ không có
+        // field này nên RefreshAllBeforePrime mặc định false, không đổi hành vi cũ.
+        if (settings.RefreshAllBeforePrime && settings.PrepareMinutes <= 0)
+            settings.PrepareMinutes = 30;
+
         return settings;
     }
 
@@ -193,7 +232,9 @@ public sealed partial class ManagerForm
             OldHours = _runStrategySettings.OldHours,
             RotationIntervalMinutes = _runStrategySettings.RotationIntervalMinutes,
             PrepareMinutes = _runStrategySettings.PrepareMinutes,
-            PreserveFreshOffPeak = _runStrategySettings.PreserveFreshOffPeak
+            PreserveFreshOffPeak = _runStrategySettings.PreserveFreshOffPeak,
+            RefreshAllBeforePrime = _runStrategySettings.RefreshAllBeforePrime,
+            PrePrimeRefreshSource = _runStrategySettings.PrePrimeRefreshSource
         });
 
         using var form = new Form
@@ -204,7 +245,7 @@ public sealed partial class ManagerForm
             MaximizeBox = false,
             MinimizeBox = false,
             ShowInTaskbar = false,
-            ClientSize = new Size(800, 790),
+            ClientSize = new Size(980, 820),
             BackColor = UiTheme.Canvas,
             Font = new Font("Segoe UI", 9.5F),
             AutoScaleMode = AutoScaleMode.Dpi
@@ -215,21 +256,20 @@ public sealed partial class ManagerForm
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 6,
+            RowCount = 5,
             Padding = new Padding(18, 14, 18, 12),
             BackColor = ModernDialog.Canvas
         };
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 86));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 60));
 
         var title = new Label
         {
-            Text = "CHỌN CHIẾN LƯỢC CHẠY",
+            Text = "AUTO RUN",
             AutoSize = true,
             Font = new Font("Segoe UI", 13F, FontStyle.Bold),
             ForeColor = Color.FromArgb(37, 77, 122),
@@ -238,57 +278,188 @@ public sealed partial class ManagerForm
 
         var summary = new Label
         {
-            Text = $"PRF đang mở hiện tại: {openCount}. Có thể chạy các PRF đang mở hoặc để Tool tự bổ sung tuần tự đến target.",
+            Text = $"PRF đang mở: {openCount}",
             AutoSize = true,
-            MaximumSize = new Size(665, 0),
+            MaximumSize = new Size(900, 0),
             ForeColor = Color.DimGray,
-            Margin = new Padding(0, 0, 0, 12)
+            Margin = new Padding(0, 0, 0, 10)
         };
 
+        // Màu chọn dùng nền xanh rất nhạt + chữ tối để dễ đọc hơn nền xanh đặc.
+        var cardTextColor = Color.FromArgb(42, 57, 76);
+        var selectedCardBackColor = Color.FromArgb(232, 242, 255);
+        var selectedCardTextColor = Color.FromArgb(28, 67, 111);
+        var cardBorderColor = Color.FromArgb(205, 214, 224);
+
+        Button MainCard()
+        {
+            var card = new Button
+            {
+                AutoSize = false,
+                Size = new Size(292, 64),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = UiTheme.Card,
+                ForeColor = cardTextColor,
+                TextAlign = ContentAlignment.MiddleCenter,
+                Padding = new Padding(10, 6, 10, 6),
+                Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
+                Cursor = Cursors.Hand,
+                UseVisualStyleBackColor = false,
+                Margin = new Padding(0, 0, 12, 0)
+            };
+            card.FlatAppearance.BorderColor = cardBorderColor;
+            card.FlatAppearance.BorderSize = 1;
+            card.FlatAppearance.MouseOverBackColor = Color.FromArgb(239, 245, 252);
+            card.FlatAppearance.MouseDownBackColor = Color.FromArgb(225, 236, 248);
+            return card;
+        }
+
+        var cardsRow = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Padding = new Padding(0, 8, 0, 8),
+            Margin = Padding.Empty,
+            BackColor = ModernDialog.Canvas
+        };
+
+        var launchCard = MainCard();
+        var timeCard = MainCard();
+        var primeCard = MainCard();
+        cardsRow.Controls.Add(launchCard);
+        cardsRow.Controls.Add(timeCard);
+        cardsRow.Controls.Add(primeCard);
+
+        // Hai RadioButton này chỉ giữ trạng thái mode. Giao diện chọn mode chính là
+        // các thẻ phía trên, giống cách thẻ PRF đổi trạng thái khi được chọn.
+        var timeMode = new RadioButton
+        {
+            Checked = current.Mode == RunAllStrategyMode.Time,
+            Visible = false
+        };
+        var primeMode = new RadioButton
+        {
+            Checked = current.Mode == RunAllStrategyMode.PrimeFresh,
+            Visible = false
+        };
+
+        var detailsHost = new Panel
+        {
+            Dock = DockStyle.Fill,
+            Margin = new Padding(0),
+            Padding = new Padding(0),
+            BackColor = ModernDialog.Canvas
+        };
+
+        // ------------------------------------------------------------
+        // THẺ CHA 1: DÀN CHẠY
+        // ------------------------------------------------------------
         var launchBox = new GroupBox
         {
-            Text = "Cách khởi động / số PRF cần duy trì",
-            Dock = DockStyle.Top,
-            AutoSize = true,
-            Padding = new Padding(12, 10, 12, 10),
-            Margin = new Padding(0, 0, 0, 10),
+            Text = "SỐ LƯỢNG & NGUỒN PRF",
+            Dock = DockStyle.Fill,
+            Padding = new Padding(14, 12, 14, 12),
+            Margin = Padding.Empty,
             Font = new Font("Segoe UI", 9.5F, FontStyle.Bold)
         };
 
-        var launchGrid = new TableLayoutPanel
+        var launchRoot = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 5,
+            Padding = new Padding(4),
+            Margin = Padding.Empty
+        };
+        launchRoot.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        launchRoot.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        launchRoot.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        launchRoot.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        launchRoot.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        launchRoot.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+        var launchHint = new Label
+        {
+            Text = "Chọn cách Tool duy trì dàn PRF. Hai lựa chọn bên dưới loại trừ nhau.",
+            AutoSize = true,
+            ForeColor = Color.DimGray,
+            Font = new Font("Segoe UI", 9F),
+            Margin = new Padding(0, 0, 0, 10)
+        };
+
+        var launchChoiceRow = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Margin = new Padding(0, 0, 0, 12),
+            Padding = Padding.Empty
+        };
+
+        RadioButton ChildChoice(string text, bool isChecked, int width)
+        {
+            var choice = new RadioButton
+            {
+                Appearance = Appearance.Button,
+                AutoSize = false,
+                Size = new Size(width, 72),
+                Text = text,
+                Checked = isChecked,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Padding = new Padding(12, 6, 10, 6),
+                Font = new Font("Segoe UI", 9.2F, FontStyle.Bold),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = UiTheme.Card,
+                ForeColor = cardTextColor,
+                Cursor = Cursors.Hand,
+                Margin = new Padding(0, 0, 12, 0),
+                UseVisualStyleBackColor = false
+            };
+            choice.FlatAppearance.BorderColor = cardBorderColor;
+            choice.FlatAppearance.BorderSize = 1;
+            choice.FlatAppearance.CheckedBackColor = selectedCardBackColor;
+            choice.FlatAppearance.MouseOverBackColor = Color.FromArgb(239, 245, 252);
+            return choice;
+        }
+
+        var autoEnsureTarget = ChildChoice(
+            "TỰ DUY TRÌ ĐỦ TARGET\r\nPRF đang mở → Chờ dùng lại → cuối cùng mới tạo mới",
+            current.AutoEnsureTarget,
+            430);
+        var openedOnly = ChildChoice(
+            "CHỈ DÙNG PRF ĐANG MỞ\r\nKhông tự mở thêm PRF",
+            !current.AutoEnsureTarget,
+            430);
+        launchChoiceRow.Controls.Add(autoEnsureTarget);
+        launchChoiceRow.Controls.Add(openedOnly);
+
+        // Dùng chung đúng setting với hộp “Tự động” bên ngoài. Lưu ở Auto Run
+        // phải phản ánh ngay sang Tự động và engine Tự bù của phiên đang chạy.
+        var reuseOnlyNoCreate = new CheckBox
+        {
+            Text = "Chỉ dùng PRF chờ — không tạo PRF mới",
+            Checked = _autoCloseSettings.ReuseOnlyNoCreateProfile,
+            AutoSize = true,
+            Font = new Font("Segoe UI", 9.3F),
+            ForeColor = cardTextColor,
+            Margin = new Padding(4, 0, 0, 10),
+            Cursor = Cursors.Hand
+        };
+
+        var targetGrid = new TableLayoutPanel
         {
             Dock = DockStyle.Top,
             AutoSize = true,
             ColumnCount = 3,
-            RowCount = 3,
+            RowCount = 1,
             Margin = Padding.Empty,
             Padding = Padding.Empty
         };
-        launchGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 48));
-        launchGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));
-        launchGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 52));
-
-        var autoEnsureTarget = new RadioButton
-        {
-            Text = "Tự đảm bảo đủ số PRF — dùng PRF đang mở trước → Chờ dùng lại → cuối cùng mới tạo mới",
-            Checked = current.AutoEnsureTarget,
-            AutoSize = true,
-            Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
-            Margin = new Padding(0, 2, 0, 4)
-        };
-        launchGrid.SetColumnSpan(autoEnsureTarget, 3);
-        launchGrid.Controls.Add(autoEnsureTarget, 0, 0);
-
-        var openedOnly = new RadioButton
-        {
-            Text = "Chỉ chạy PRF đang mở — không tự mở thêm PRF",
-            Checked = !current.AutoEnsureTarget,
-            AutoSize = true,
-            Font = new Font("Segoe UI", 9.5F),
-            Margin = new Padding(0, 2, 0, 6)
-        };
-        launchGrid.SetColumnSpan(openedOnly, 3);
-        launchGrid.Controls.Add(openedOnly, 0, 1);
+        targetGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 190));
+        targetGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));
+        targetGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
 
         var targetLabel = new Label
         {
@@ -312,53 +483,82 @@ public sealed partial class ManagerForm
         var targetStatus = new Label
         {
             AutoSize = true,
+            MaximumSize = new Size(540, 0),
             ForeColor = Color.DimGray,
             Font = new Font("Segoe UI", 9F),
             Margin = new Padding(5, 8, 0, 4)
         };
+        targetGrid.Controls.Add(targetLabel, 0, 0);
+        targetGrid.Controls.Add(targetSlots, 1, 0);
+        targetGrid.Controls.Add(targetStatus, 2, 0);
 
-        launchGrid.Controls.Add(targetLabel, 0, 2);
-        launchGrid.Controls.Add(targetSlots, 1, 2);
-        launchGrid.Controls.Add(targetStatus, 2, 2);
-        launchBox.Controls.Add(launchGrid);
-
-        var modePanel = new FlowLayoutPanel
+        var launchFlowNote = new Label
         {
-            Dock = DockStyle.Top,
             AutoSize = true,
+            MaximumSize = new Size(860, 0),
+            ForeColor = Color.FromArgb(37, 77, 122),
+            Font = new Font("Segoe UI", 9F, FontStyle.Bold),
+            Text = "Tự bù luôn ưu tiên PRF có sẵn phù hợp trước; chỉ khi hết nguồn mới dùng Auto Profile để tạo mới (trừ khi bật CHỈ PRF CHỜ).",
+            Margin = new Padding(0, 12, 0, 0)
+        };
+
+        launchRoot.Controls.Add(launchHint, 0, 0);
+        launchRoot.Controls.Add(launchChoiceRow, 0, 1);
+        launchRoot.Controls.Add(reuseOnlyNoCreate, 0, 2);
+        launchRoot.Controls.Add(targetGrid, 0, 3);
+        launchRoot.Controls.Add(launchFlowNote, 0, 4);
+        launchBox.Controls.Add(launchRoot);
+
+        // ------------------------------------------------------------
+        // THẺ CHA 2: CHẠY THEO THỜI GIAN
+        // ------------------------------------------------------------
+        var timeBox = new GroupBox
+        {
+            Text = "Xoay theo runtime",
+            Dock = DockStyle.Fill,
+            Padding = new Padding(18, 16, 18, 16),
+            Margin = Padding.Empty,
+            Font = new Font("Segoe UI", 9.5F, FontStyle.Bold)
+        };
+
+        var timeInfo = new Label
+        {
+            AutoSize = true,
+            MaximumSize = new Size(860, 0),
+            ForeColor = Color.FromArgb(42, 57, 76),
+            Font = new Font("Segoe UI", 10F),
+            Margin = new Padding(0, 8, 0, 12)
+        };
+        var timeNote = new Label
+        {
+            AutoSize = true,
+            MaximumSize = new Size(860, 0),
+            ForeColor = Color.DimGray,
+            Font = new Font("Segoe UI", 9F),
+            Text = "Thẻ này chỉ chọn chiến lược Auto Run. Ngưỡng TIME/BAN/treo/Tự bù vẫn lấy nguyên cấu hình trong nút ‘Tự động’ hiện tại, không tạo logic mới.",
+            Margin = new Padding(0, 8, 0, 0)
+        };
+        var timeLayout = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.TopDown,
             WrapContents = false,
-            Margin = new Padding(0, 0, 0, 10)
+            Padding = new Padding(6),
+            Margin = Padding.Empty
         };
+        timeLayout.Controls.Add(timeInfo);
+        timeLayout.Controls.Add(timeNote);
+        timeBox.Controls.Add(timeLayout);
 
-        var timeMode = new RadioButton
-        {
-            Text = _autoCloseSettings.CloseOnRunTime
-                ? $"Theo thời gian — runtime ≥ {_autoCloseSettings.RunHours}h → thay (logic hiện tại)"
-                : "Theo thời gian — giữ logic hiện tại (TIME hiện đang tắt trong Tự động)",
-            AutoSize = true,
-            Checked = current.Mode == RunAllStrategyMode.Time,
-            Font = new Font("Segoe UI", 10F, FontStyle.Bold),
-            Margin = new Padding(0, 3, 0, 8)
-        };
-
-        var primeMode = new RadioButton
-        {
-            Text = "Giờ vàng / Giữ mục tiêu PRF MỚI",
-            AutoSize = true,
-            Checked = current.Mode == RunAllStrategyMode.PrimeFresh,
-            Font = new Font("Segoe UI", 10F, FontStyle.Bold),
-            Margin = new Padding(0, 3, 0, 0)
-        };
-        modePanel.Controls.Add(timeMode);
-        modePanel.Controls.Add(primeMode);
-
+        // ------------------------------------------------------------
+        // THẺ CHA 3: GIỜ VÀNG
+        // ------------------------------------------------------------
         var primeBox = new GroupBox
         {
-            Text = "Cấu hình giờ vàng",
+            Text = "Chiến lược giờ vàng",
             Dock = DockStyle.Fill,
             Padding = new Padding(14, 12, 14, 12),
-            Margin = new Padding(0),
+            Margin = Padding.Empty,
             Font = new Font("Segoe UI", 9.5F, FontStyle.Bold)
         };
 
@@ -366,13 +566,13 @@ public sealed partial class ManagerForm
         {
             Dock = DockStyle.Fill,
             ColumnCount = 3,
-            RowCount = 10,
+            RowCount = 13,
             Padding = new Padding(4),
             Margin = Padding.Empty
         };
-        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 48));
+        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 42));
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));
-        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 52));
+        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 58));
 
         NumericUpDown Num(decimal value, decimal min, decimal max)
             => new()
@@ -412,19 +612,78 @@ public sealed partial class ManagerForm
         var oldHours = Num(current.OldHours, 2, 24);
         var rotationMinutes = Num(current.RotationIntervalMinutes, 5, 60);
         var prepareMinutes = Num(current.PrepareMinutes, 0, 180);
-        var preserveFresh = new CheckBox
+        // Hai chiến lược con của Giờ vàng được trình bày như 2 thẻ chọn loại trừ nhau,
+        // giống phần DÀN PRF. Chọn THAY ACC thì dùng full-refresh trước giờ vàng;
+        // chọn CHẠY MỚI > TRUNG BÌNH thì dùng chiến lược PrimeFresh hiện tại.
+        var refreshAllBeforePrime = ChildChoice(
+            "THAY ACC TRƯỚC GIỜ VÀNG",
+            current.RefreshAllBeforePrime,
+            430);
+        var preserveFresh = ChildChoice(
+            "CHẠY MỚI > TRUNG BÌNH\r\nTRONG GIỜ VÀNG",
+            !current.RefreshAllBeforePrime,
+            430);
+
+        RadioButton SourceChoice(string text, bool isChecked)
+            => new()
+            {
+                Text = text,
+                Checked = isChecked,
+                AutoSize = true,
+                Appearance = Appearance.Normal,
+                Font = new Font("Segoe UI", 9.3F, FontStyle.Bold),
+                ForeColor = cardTextColor,
+                Margin = new Padding(0, 2, 24, 2),
+                Cursor = Cursors.Hand,
+                UseVisualStyleBackColor = true
+            };
+
+        var prePrimeCurrentFresh = SourceChoice(
+            "NEW HIỆN TẠI",
+            current.PrePrimeRefreshSource == PrePrimeRefreshSourceMode.CurrentFresh);
+        var prePrimeNeverRun = SourceChoice(
+            "MỚI HOÀN TOÀN",
+            current.PrePrimeRefreshSource == PrePrimeRefreshSourceMode.NeverRunOnly);
+
+        var prePrimeSourcePanel = new FlowLayoutPanel
         {
-            Text = "Ngoài giờ vàng: bảo lưu PRF MỚI; ưu tiên chạy CŨ → TRUNG BÌNH",
-            Checked = current.PreserveFreshOffPeak,
+            Dock = DockStyle.Fill,
             AutoSize = true,
-            Font = new Font("Segoe UI", 9.5F),
-            Margin = new Padding(0, 8, 0, 4)
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Margin = new Padding(18, 4, 0, 0),
+            Padding = Padding.Empty,
+            BackColor = UiTheme.Card
         };
+        prePrimeSourcePanel.Controls.Add(prePrimeCurrentFresh);
+        prePrimeSourcePanel.Controls.Add(prePrimeNeverRun);
+
+        // Hai thẻ chiến lược cùng một parent => RadioButton tự loại trừ nhau.
+        // Hàng dưới chỉ chứa lựa chọn nguồn cho thẻ THAY ACC.
+        var primeFeatureCards = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            ColumnCount = 2,
+            RowCount = 2,
+            Margin = new Padding(0, 8, 0, 8),
+            Padding = Padding.Empty,
+            BackColor = UiTheme.Card
+        };
+        primeFeatureCards.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
+        primeFeatureCards.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
+        primeFeatureCards.RowStyles.Add(new RowStyle(SizeType.Absolute, 74F));
+        primeFeatureCards.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        refreshAllBeforePrime.Margin = new Padding(0, 0, 7, 0);
+        preserveFresh.Margin = new Padding(7, 0, 0, 0);
+        primeFeatureCards.Controls.Add(refreshAllBeforePrime, 0, 0);
+        primeFeatureCards.Controls.Add(preserveFresh, 1, 0);
+        primeFeatureCards.Controls.Add(prePrimeSourcePanel, 0, 1);
 
         var ageLegend = new Label
         {
             AutoSize = true,
-            MaximumSize = new Size(680, 0),
+            MaximumSize = new Size(850, 0),
             ForeColor = Color.FromArgb(37, 77, 122),
             Font = new Font("Segoe UI", 9.2F, FontStyle.Bold),
             Margin = new Padding(0, 4, 0, 7)
@@ -436,10 +695,6 @@ public sealed partial class ManagerForm
                 $"Phân loại:  MỚI < {freshHours.Value:0}h   |   TRUNG BÌNH: {freshHours.Value:0}h ≤ runtime < {oldHours.Value:0}h   |   CŨ ≥ {oldHours.Value:0}h";
         }
 
-        freshHours.ValueChanged += (_, _) => UpdateAgeLegend();
-        oldHours.ValueChanged += (_, _) => UpdateAgeLegend();
-        UpdateAgeLegend();
-
         var row = 0;
         grid.Controls.Add(Field("Bắt đầu giờ vàng"), 0, row); grid.Controls.Add(startHour, 1, row); grid.Controls.Add(Unit("giờ"), 2, row++);
         grid.Controls.Add(Field("Kết thúc giờ vàng"), 0, row); grid.Controls.Add(endHour, 1, row); grid.Controls.Add(Unit("giờ  (24 = 00:00)"), 2, row++);
@@ -449,35 +704,23 @@ public sealed partial class ManagerForm
         grid.Controls.Add(Field("PRF CŨ: runtime ≥"), 0, row); grid.Controls.Add(oldHours, 1, row); grid.Controls.Add(Unit("giờ"), 2, row++);
         grid.SetColumnSpan(ageLegend, 3);
         grid.Controls.Add(ageLegend, 0, row++);
-        grid.Controls.Add(Field("Thay PRF tiếp theo sau ≥"), 0, row); grid.Controls.Add(rotationMinutes, 1, row); grid.Controls.Add(Unit("phút  ·  luôn chỉ 1 PRF/lần"), 2, row++);
-        grid.Controls.Add(Field("Chuẩn bị trước giờ vàng"), 0, row); grid.Controls.Add(prepareMinutes, 1, row); grid.Controls.Add(Unit("phút"), 2, row++);
-        grid.SetColumnSpan(preserveFresh, 3);
-        grid.Controls.Add(preserveFresh, 0, row++);
+        grid.Controls.Add(Field("Thay PRF tiếp theo sau ≥"), 0, row); grid.Controls.Add(rotationMinutes, 1, row); grid.Controls.Add(Unit("phút  ·  logic xoay giờ vàng cũ"), 2, row++);
+        grid.Controls.Add(Field("Chuẩn bị trước giờ vàng"), 0, row); grid.Controls.Add(prepareMinutes, 1, row); grid.Controls.Add(Unit("phút  ·  mốc bắt đầu làm mới toàn bộ"), 2, row++);
+        grid.SetColumnSpan(primeFeatureCards, 3);
+        grid.Controls.Add(primeFeatureCards, 0, row++);
 
         var reuseNote = new Label
         {
             AutoSize = true,
-            MaximumSize = new Size(620, 0),
+            MaximumSize = new Size(850, 0),
             ForeColor = Color.DimGray,
             Font = new Font("Segoe UI", 8.8F),
-            Text = _autoCloseSettings.ReuseOnlyNoCreateProfile
-                ? "Giờ vàng: giữ đúng mục tiêu MỚI khi có đủ TB/CŨ; slot còn lại lấy runtime thấp trước. Ngoài giờ: lấy runtime cao trước. Đang bật ‘CHỈ PRF CHỜ’ nên Tool không tạo PRF mới. Luôn chỉ 1 PRF/lần."
-                : "Giờ vàng: đạt mục tiêu MỚI trước; slot còn lại ưu tiên TB/CŨ runtime thấp → chỉ dùng thêm MỚI khi thiếu TB/CŨ. Ngoài giờ vàng: ưu tiên runtime cao để tận dụng PRF cũ. Luôn chỉ 1 PRF/lần.",
+            Text = "",
             Margin = new Padding(0, 6, 0, 0)
         };
         grid.SetColumnSpan(reuseNote, 3);
         grid.Controls.Add(reuseNote, 0, row);
-
         primeBox.Controls.Add(grid);
-
-        void UpdatePrimeEnabled()
-        {
-            foreach (Control control in grid.Controls)
-                control.Enabled = primeMode.Checked;
-        }
-        timeMode.CheckedChanged += (_, _) => UpdatePrimeEnabled();
-        primeMode.CheckedChanged += (_, _) => UpdatePrimeEnabled();
-        UpdatePrimeEnabled();
 
         var footer = new FlowLayoutPanel
         {
@@ -489,23 +732,248 @@ public sealed partial class ManagerForm
         };
         var cancel = new Button { Text = "Hủy", DialogResult = DialogResult.Cancel, Size = new Size(104, 40) };
         var start = new Button { Text = "Bắt đầu", DialogResult = DialogResult.OK, Size = new Size(122, 40) };
+        var save = new Button { Text = "Lưu", Size = new Size(104, 40) };
         ModernDialog.StyleSecondaryButton(cancel);
         ModernDialog.StylePrimaryButton(start);
+        ModernDialog.StyleSecondaryButton(save);
         footer.Controls.Add(cancel);
         footer.Controls.Add(start);
+        footer.Controls.Add(save);
+
+        detailsHost.Controls.Add(launchBox);
+        detailsHost.Controls.Add(timeBox);
+        detailsHost.Controls.Add(primeBox);
+
+        var activeSection = current.Mode == RunAllStrategyMode.PrimeFresh ? 2 : 1;
+
+        void StyleChildChoice(RadioButton choice)
+        {
+            choice.BackColor = choice.Checked ? selectedCardBackColor : UiTheme.Card;
+            choice.ForeColor = choice.Checked ? selectedCardTextColor : cardTextColor;
+            choice.FlatAppearance.CheckedBackColor = selectedCardBackColor;
+            choice.FlatAppearance.BorderColor = choice.Checked
+                ? ActiveProfileColor
+                : cardBorderColor;
+            choice.FlatAppearance.BorderSize = choice.Checked ? 2 : 1;
+        }
+
+        void UpdateReuseNote()
+        {
+            if (refreshAllBeforePrime.Checked)
+            {
+                var source = prePrimeNeverRun.Checked
+                    ? "chỉ PRF chưa hề chạy"
+                    : $"PRF MỚI < {freshHours.Value:0}h theo logic hiện tại";
+
+                reuseNote.Text =
+                    $"THAY ACC: đến PREPARE Tool thay tuần tự 1 PRF/lần bằng {source}; đóng sạch Worker/Chrome cũ rồi mới mở PRF tiếp theo. " +
+                    "Sau khi đủ dàn, không xoay theo tuổi/TIME nữa; BAN và watchdog lỗi kỹ thuật vẫn dùng Tự bù hiện tại." +
+                    (_autoCloseSettings.ReuseOnlyNoCreateProfile
+                        ? " Đang bật ‘CHỈ PRF CHỜ’ nên nếu hết nguồn phù hợp Tool sẽ chờ, không tạo PRF mới."
+                        : " Nếu hết PRF chờ phù hợp, Tool dùng Auto Profile/Tự bù hiện có để tạo mới theo cooldown.");
+            }
+            else
+            {
+                reuseNote.Text = _autoCloseSettings.ReuseOnlyNoCreateProfile
+                    ? "Giờ vàng: giữ đúng mục tiêu MỚI khi có đủ TB/CŨ; slot còn lại lấy runtime thấp trước. Ngoài giờ: lấy runtime cao trước. Đang bật ‘CHỈ PRF CHỜ’ nên Tool không tạo PRF mới. Luôn chỉ 1 PRF/lần."
+                    : "Giờ vàng: đạt mục tiêu MỚI trước; slot còn lại ưu tiên TB/CŨ runtime thấp → chỉ dùng thêm MỚI khi thiếu TB/CŨ. Ngoài giờ vàng: ưu tiên runtime cao để tận dụng PRF cũ. Luôn chỉ 1 PRF/lần.";
+            }
+        }
+
+        void UpdatePrimeEnabled()
+        {
+            foreach (Control control in grid.Controls)
+                control.Enabled = primeMode.Checked;
+
+            prePrimeSourcePanel.Enabled =
+                primeMode.Checked && refreshAllBeforePrime.Checked;
+
+            // Hai thẻ chiến lược luôn có thể chuyển qua lại khi đang ở mode Giờ vàng.
+            refreshAllBeforePrime.Enabled = primeMode.Checked;
+            preserveFresh.Enabled = primeMode.Checked;
+            StyleChildChoice(refreshAllBeforePrime);
+            StyleChildChoice(preserveFresh);
+
+            // Khi chọn THAY ACC, các setting xoay theo tuổi chỉ còn ý nghĩa cho
+            // chiến lược còn lại. Giữ giá trị để khi chuyển lại dùng ngay.
+            freshTarget.Enabled = primeMode.Checked && !refreshAllBeforePrime.Checked;
+            rotationMinutes.Enabled = primeMode.Checked && !refreshAllBeforePrime.Checked;
+
+            UpdateReuseNote();
+        }
+
+        void UpdateMainCards()
+        {
+            if (save.Text != "Lưu")
+                save.Text = "Lưu";
+
+            launchCard.Text = "DÀN PRF";
+            timeCard.Text = "XOAY THEO RUNTIME";
+            primeCard.Text = "CHIẾN LƯỢC GIỜ VÀNG";
+
+            var cards = new[] { launchCard, timeCard, primeCard };
+            for (var i = 0; i < cards.Length; i++)
+            {
+                var active = activeSection == i;
+                var card = cards[i];
+                card.BackColor = active ? selectedCardBackColor : UiTheme.Card;
+                card.ForeColor = active ? selectedCardTextColor : cardTextColor;
+                card.FlatAppearance.BorderColor = active
+                    ? ActiveProfileColor
+                    : cardBorderColor;
+                card.FlatAppearance.BorderSize = active ? 2 : 1;
+            }
+
+            // Mode đang chọn vẫn được đánh dấu bằng viền xanh khi user đang xem thẻ khác.
+            if (activeSection != 1 && timeMode.Checked)
+            {
+                timeCard.FlatAppearance.BorderColor = ActiveProfileColor;
+                timeCard.FlatAppearance.BorderSize = 2;
+            }
+            if (activeSection != 2 && primeMode.Checked)
+            {
+                primeCard.FlatAppearance.BorderColor = ActiveProfileColor;
+                primeCard.FlatAppearance.BorderSize = 2;
+            }
+        }
+
+        void ShowSection(int section)
+        {
+            activeSection = Math.Clamp(section, 0, 2);
+            launchBox.Visible = activeSection == 0;
+            timeBox.Visible = activeSection == 1;
+            primeBox.Visible = activeSection == 2;
+            if (launchBox.Visible) launchBox.BringToFront();
+            if (timeBox.Visible) timeBox.BringToFront();
+            if (primeBox.Visible) primeBox.BringToFront();
+            UpdateMainCards();
+        }
+
+        RunAllStrategySettings BuildSettingsFromDialog(bool startRequested)
+        {
+            // Nút Lưu chỉ lưu cấu hình, tuyệt đối không tự arm/bắt đầu một phiên
+            // Giờ vàng mới. Nếu phiên Giờ vàng hiện tại đã được arm thì giữ nguyên
+            // armed/suspended để chỉnh setting giữa lúc chạy có hiệu lực ngay.
+            var preserveExistingPrimeArm =
+                !startRequested
+                && primeMode.Checked
+                && _runStrategySettings.Mode == RunAllStrategyMode.PrimeFresh
+                && _runStrategySettings.PrimeModeArmed;
+
+            return NormalizeRunStrategySettings(new RunAllStrategySettings
+            {
+                Version = 4,
+                Mode = primeMode.Checked ? RunAllStrategyMode.PrimeFresh : RunAllStrategyMode.Time,
+                PrimeModeArmed = startRequested
+                    ? primeMode.Checked
+                    : preserveExistingPrimeArm,
+                PrimeModeSuspended = startRequested
+                    ? false
+                    : preserveExistingPrimeArm && _runStrategySettings.PrimeModeSuspended,
+                AutoEnsureTarget = autoEnsureTarget.Checked,
+                TargetSlots = (int)targetSlots.Value,
+                PrimeStartHour = (int)startHour.Value,
+                PrimeEndHour = (int)endHour.Value,
+                FreshTarget = (int)freshTarget.Value,
+                FreshHours = (int)freshHours.Value,
+                OldHours = (int)oldHours.Value,
+                RotationIntervalMinutes = (int)rotationMinutes.Value,
+                PrepareMinutes = (int)prepareMinutes.Value,
+                PreserveFreshOffPeak = preserveFresh.Checked,
+                RefreshAllBeforePrime = refreshAllBeforePrime.Checked,
+                PrePrimeRefreshSource = prePrimeNeverRun.Checked
+                    ? PrePrimeRefreshSourceMode.NeverRunOnly
+                    : PrePrimeRefreshSourceMode.CurrentFresh
+            });
+        }
+
+        bool ValidateSettingsForSave(RunAllStrategySettings settings, out string message)
+        {
+            if (settings.OldHours <= settings.FreshHours)
+            {
+                message = "Mốc PRF CŨ phải lớn hơn mốc PRF MỚI.";
+                return false;
+            }
+
+            if (settings.Mode == RunAllStrategyMode.PrimeFresh
+                && !settings.RefreshAllBeforePrime
+                && settings.AutoEnsureTarget
+                && settings.FreshTarget > settings.TargetSlots)
+            {
+                message = $"PRF MỚI mục tiêu ({settings.FreshTarget}) không được lớn hơn target ({settings.TargetSlots}).";
+                return false;
+            }
+
+            if (settings.Mode == RunAllStrategyMode.PrimeFresh
+                && settings.RefreshAllBeforePrime
+                && settings.PrepareMinutes <= 0)
+            {
+                message = "THAY ACC TRƯỚC GIỜ VÀNG cần ‘Chuẩn bị trước giờ vàng’ lớn hơn 0 phút.";
+                return false;
+            }
+
+            // Không chặn Lưu chỉ vì số PRF đang mở hiện tại chưa phù hợp target.
+            // Những điều kiện phụ thuộc runtime (0 PRF mở, open > target, FreshTarget
+            // > target động khi CHỈ PRF ĐANG MỞ...) chỉ được chặn khi Bắt đầu.
+            message = "";
+            return true;
+        }
+
+        void SyncSavedRunStrategyToOutsideAutomation(RunAllStrategySettings settings)
+        {
+            // Các mode tự duy trì/giờ vàng đều cần engine Tự bù bên ngoài. Đây chính
+            // là cùng rule trước đây chỉ được áp dụng khi bấm Bắt đầu; nay Lưu cũng
+            // đồng bộ ngay để nút “Tự động” bên ngoài phản ánh cấu hình đã chọn.
+            var requiresReplacement =
+                settings.AutoEnsureTarget
+                || settings.Mode == RunAllStrategyMode.PrimeFresh;
+
+            var changed = false;
+
+            if (_autoCloseSettings.ReuseOnlyNoCreateProfile != reuseOnlyNoCreate.Checked)
+            {
+                _autoCloseSettings.ReuseOnlyNoCreateProfile = reuseOnlyNoCreate.Checked;
+                changed = true;
+            }
+
+            if (requiresReplacement && !_autoCloseSettings.OpenReplacementAfterAutoClose)
+            {
+                _autoCloseSettings.OpenReplacementAfterAutoClose = true;
+                changed = true;
+            }
+
+            if (changed)
+            {
+                SaveAutoCloseSettings();
+                _log.Info(
+                    $"[RUN_STRATEGY_SAVE_SYNC_AUTO] replacement={_autoCloseSettings.OpenReplacementAfterAutoClose} " +
+                    $"reuseOnly={_autoCloseSettings.ReuseOnlyNoCreateProfile} mode={settings.Mode} autoEnsure={settings.AutoEnsureTarget}");
+            }
+            else
+            {
+                UpdateAutoCloseToolbarButtonText();
+            }
+        }
 
         void UpdateLaunchValidation()
         {
+            if (save.Text != "Lưu")
+                save.Text = "Lưu";
+
             var ensure = autoEnsureTarget.Checked;
             targetLabel.Enabled = ensure;
             targetSlots.Enabled = ensure;
+
+            StyleChildChoice(autoEnsureTarget);
+            StyleChildChoice(openedOnly);
 
             var effectiveTarget = ensure
                 ? (int)targetSlots.Value
                 : openCount;
 
-            freshTargetUnit.Text =
-                $"PRF mục tiêu  (≤ target: {Math.Max(0, effectiveTarget)} · chỉ vượt khi thiếu TB/CŨ)";
+            freshTargetUnit.Text = refreshAllBeforePrime.Checked
+                ? "không dùng khi chọn THAY ACC TRƯỚC GIỜ VÀNG"
+                : $"PRF mục tiêu  (≤ target: {Math.Max(0, effectiveTarget)} · chỉ vượt khi thiếu TB/CŨ)";
 
             var valid = true;
             if (ensure)
@@ -539,7 +1007,9 @@ public sealed partial class ManagerForm
                 valid = openCount > 0;
             }
 
-            if (primeMode.Checked && effectiveTarget > 0
+            if (primeMode.Checked
+                && !refreshAllBeforePrime.Checked
+                && effectiveTarget > 0
                 && freshTarget.Value > effectiveTarget)
             {
                 targetStatus.Text =
@@ -556,25 +1026,131 @@ public sealed partial class ManagerForm
                 valid = false;
             }
 
+            if (primeMode.Checked
+                && refreshAllBeforePrime.Checked
+                && prepareMinutes.Value <= 0)
+            {
+                targetStatus.Text =
+                    "THAY ACC TRƯỚC GIỜ VÀNG cần ‘Chuẩn bị trước giờ vàng’ lớn hơn 0 phút.";
+                targetStatus.ForeColor = Color.Firebrick;
+                valid = false;
+            }
+
+            timeInfo.Text = _autoCloseSettings.CloseOnRunTime
+                ? $"Đang dùng TIME hiện tại: đủ tổng runtime {_autoCloseSettings.RunHours} giờ thì đóng sạch PRF cũ và Tự bù theo engine hiện có."
+                : "TIME hiện đang TẮT trong cấu hình ‘Tự động’. Chọn chế độ Theo thời gian vẫn giữ nguyên cấu hình này; Tool không tự bật TIME.";
+
             start.Enabled = valid;
+            UpdateMainCards();
         }
+
+        launchCard.Click += (_, _) => ShowSection(0);
+        timeCard.Click += (_, _) =>
+        {
+            timeMode.Checked = true;
+            primeMode.Checked = false;
+            ShowSection(1);
+        };
+        primeCard.Click += (_, _) =>
+        {
+            primeMode.Checked = true;
+            timeMode.Checked = false;
+            ShowSection(2);
+        };
 
         autoEnsureTarget.CheckedChanged += (_, _) => UpdateLaunchValidation();
         openedOnly.CheckedChanged += (_, _) => UpdateLaunchValidation();
         targetSlots.ValueChanged += (_, _) => UpdateLaunchValidation();
         freshTarget.ValueChanged += (_, _) => UpdateLaunchValidation();
-        freshHours.ValueChanged += (_, _) => UpdateLaunchValidation();
-        oldHours.ValueChanged += (_, _) => UpdateLaunchValidation();
-        primeMode.CheckedChanged += (_, _) => UpdateLaunchValidation();
+        freshHours.ValueChanged += (_, _) =>
+        {
+            UpdateAgeLegend();
+            UpdateReuseNote();
+            UpdateLaunchValidation();
+        };
+        oldHours.ValueChanged += (_, _) =>
+        {
+            UpdateAgeLegend();
+            UpdateLaunchValidation();
+        };
+        startHour.ValueChanged += (_, _) => UpdateMainCards();
+        endHour.ValueChanged += (_, _) => UpdateMainCards();
+        rotationMinutes.ValueChanged += (_, _) => UpdateLaunchValidation();
+        prepareMinutes.ValueChanged += (_, _) => UpdateLaunchValidation();
+        refreshAllBeforePrime.CheckedChanged += (_, _) =>
+        {
+            UpdatePrimeEnabled();
+            UpdateLaunchValidation();
+        };
+        preserveFresh.CheckedChanged += (_, _) =>
+        {
+            UpdatePrimeEnabled();
+            UpdateLaunchValidation();
+        };
+        prePrimeCurrentFresh.CheckedChanged += (_, _) =>
+        {
+            UpdateReuseNote();
+            UpdateMainCards();
+        };
+        prePrimeNeverRun.CheckedChanged += (_, _) =>
+        {
+            UpdateReuseNote();
+            UpdateMainCards();
+        };
+        primeMode.CheckedChanged += (_, _) =>
+        {
+            UpdatePrimeEnabled();
+            UpdateLaunchValidation();
+        };
         timeMode.CheckedChanged += (_, _) => UpdateLaunchValidation();
+
+        save.Click += (_, _) =>
+        {
+            try
+            {
+                var saved = BuildSettingsFromDialog(startRequested: false);
+                if (!ValidateSettingsForSave(saved, out var saveError))
+                {
+                    ModernDialog.ShowMessage(
+                        form,
+                        saveError,
+                        "Auto Run",
+                        MessageBoxIcon.Warning);
+                    return;
+                }
+
+                SaveRunStrategySettings(saved);
+                SyncSavedRunStrategyToOutsideAutomation(saved);
+
+                // Cập nhật ngay note trong dialog theo trạng thái CHỈ PRF CHỜ vừa lưu.
+                // Engine Tự bù cũng đọc trực tiếp _autoCloseSettings nên phiên đang
+                // chạy sẽ áp dụng lựa chọn mới từ lần bù kế tiếp, không cần Start lại.
+                UpdateReuseNote();
+
+                save.Text = "Đã lưu ✓";
+                _log.Info(
+                    $"[RUN_STRATEGY_SETTINGS_SAVE_UI] mode={saved.Mode} autoEnsure={saved.AutoEnsureTarget} target={saved.TargetSlots} primeArmed={saved.PrimeModeArmed} fullRefresh={saved.RefreshAllBeforePrime} source={saved.PrePrimeRefreshSource}");
+            }
+            catch (Exception ex)
+            {
+                ModernDialog.ShowMessage(
+                    form,
+                    "Không lưu được cấu hình Auto Run.\r\n\r\n" + ex.Message,
+                    "Auto Run",
+                    MessageBoxIcon.Error);
+            }
+        };
+
+        UpdateAgeLegend();
+        UpdatePrimeEnabled();
         UpdateLaunchValidation();
+        ShowSection(activeSection);
 
         root.Controls.Add(title, 0, 0);
         root.Controls.Add(summary, 0, 1);
-        root.Controls.Add(launchBox, 0, 2);
-        root.Controls.Add(modePanel, 0, 3);
-        root.Controls.Add(primeBox, 0, 4);
-        root.Controls.Add(footer, 0, 5);
+        root.Controls.Add(cardsRow, 0, 2);
+        root.Controls.Add(detailsHost, 0, 3);
+        root.Controls.Add(footer, 0, 4);
         form.Controls.Add(root);
         form.AcceptButton = start;
         form.CancelButton = cancel;
@@ -583,23 +1159,7 @@ public sealed partial class ManagerForm
         if (form.ShowDialog(this) != DialogResult.OK)
             return;
 
-        var selected = NormalizeRunStrategySettings(new RunAllStrategySettings
-        {
-            Version = 3,
-            Mode = primeMode.Checked ? RunAllStrategyMode.PrimeFresh : RunAllStrategyMode.Time,
-            PrimeModeArmed = primeMode.Checked,
-            PrimeModeSuspended = false,
-            AutoEnsureTarget = autoEnsureTarget.Checked,
-            TargetSlots = (int)targetSlots.Value,
-            PrimeStartHour = (int)startHour.Value,
-            PrimeEndHour = (int)endHour.Value,
-            FreshTarget = (int)freshTarget.Value,
-            FreshHours = (int)freshHours.Value,
-            OldHours = (int)oldHours.Value,
-            RotationIntervalMinutes = (int)rotationMinutes.Value,
-            PrepareMinutes = (int)prepareMinutes.Value,
-            PreserveFreshOffPeak = preserveFresh.Checked
-        });
+        var selected = BuildSettingsFromDialog(startRequested: true);
 
         var target = selected.AutoEnsureTarget
             ? selected.TargetSlots
@@ -626,6 +1186,7 @@ public sealed partial class ManagerForm
         }
 
         if (selected.Mode == RunAllStrategyMode.PrimeFresh
+            && !selected.RefreshAllBeforePrime
             && selected.FreshTarget > target)
         {
             ModernDialog.ShowMessage(
@@ -648,17 +1209,11 @@ public sealed partial class ManagerForm
 
         SaveRunStrategySettings(selected);
         StopRunStrategySession("run_all_new_selection");
+        ResetRunStrategyPrePrimeRefreshState("run_all_new_selection");
 
-        // Prime Time luôn cần Tự bù để thay 1 slot. Chế độ tự bảo đảm target cũng
-        // cần cùng engine này để giữ target về sau. Không thay đổi lựa chọn
-        // CHỈ PRF CHỜ của user.
-        if ((selected.Mode == RunAllStrategyMode.PrimeFresh
-             || selected.AutoEnsureTarget)
-            && !_autoCloseSettings.OpenReplacementAfterAutoClose)
-        {
-            _autoCloseSettings.OpenReplacementAfterAutoClose = true;
-            SaveAutoCloseSettings();
-        }
+        // Đồng bộ cùng engine Tự động bên ngoài. Helper không tự tắt Tự bù nếu
+        // user đã bật riêng cho BAN/TIME.
+        SyncSavedRunStrategyToOutsideAutomation(selected);
 
         // Bước 1: tận dụng nguyên StartAll hiện có cho mọi PRF đang mở.
         // Không có PRF mở thì bỏ qua; target sẽ được fill ở bước 2.
@@ -1159,7 +1714,8 @@ public sealed partial class ManagerForm
         _log.Info(
             $"[RUN_STRATEGY_START] mode=PRIME armed={settings.PrimeModeArmed} target={targetSlots} prime={settings.PrimeStartHour:00}:00-{settings.PrimeEndHour:00}:00 " +
             $"freshTarget={Math.Min(settings.FreshTarget, targetSlots)} freshUnder={settings.FreshHours}h oldFrom={settings.OldHours}h " +
-            $"interval={settings.RotationIntervalMinutes}m prepare={settings.PrepareMinutes}m preserveOffPeak={settings.PreserveFreshOffPeak}");
+            $"interval={settings.RotationIntervalMinutes}m prepare={settings.PrepareMinutes}m preserveOffPeak={settings.PreserveFreshOffPeak} " +
+            $"prePrimeFullRefresh={settings.RefreshAllBeforePrime} prePrimeSource={settings.PrePrimeRefreshSource}");
     }
 
     void StopRunStrategySession(string source)
@@ -1505,8 +2061,15 @@ public sealed partial class ManagerForm
                     if (_runStrategySessionActive)
                     {
                         _runStrategyNextRotationUtc = rotated
-                            ? DateTime.UtcNow.AddMinutes(settings.RotationIntervalMinutes)
-                            : DateTime.UtcNow.AddMinutes(2);
+                            ? (plan.IsPrePrimeFullRefresh
+                                // Full refresh đã đóng sạch + mở khỏe từng slot; chuyển
+                                // slot kế tiếp ngay sau một nhịp ngắn, không áp interval
+                                // 5-60 phút của chiến lược xoay tuổi legacy.
+                                ? DateTime.UtcNow.AddSeconds(2)
+                                : DateTime.UtcNow.AddMinutes(settings.RotationIntervalMinutes))
+                            : (plan.IsPrePrimeFullRefresh
+                                ? DateTime.UtcNow.AddSeconds(15)
+                                : DateTime.UtcNow.AddMinutes(2));
                     }
                 }
             }
@@ -1561,6 +2124,349 @@ public sealed partial class ManagerForm
             .OrderBy(ctx => ctx.Profile.Name, NaturalProfileNameOrder)
             .ToList();
 
+    void ResetRunStrategyPrePrimeRefreshState(string source)
+    {
+        lock (_runStrategyLock)
+        {
+            _runStrategyPrePrimePendingProfiles.Clear();
+            _runStrategyPrePrimeAcceptedProfiles.Clear();
+            _runStrategyPrePrimeDisallowedCandidates.Clear();
+            _runStrategyPrePrimeCycleKey = "";
+            _runStrategyPrePrimeCycleStarted = false;
+            _runStrategyPrePrimeCycleCompleted = false;
+        }
+
+        _log.Info($"[PRE_GOLD_REFRESH_RESET] source={source}");
+    }
+
+    static string GetRunStrategyPrePrimeCycleKey(
+        DateTimeOffset now,
+        RunAllStrategySettings settings)
+        => $"{now:yyyy-MM-dd}|{settings.PrimeStartHour:00}:00";
+
+    bool IsRunStrategyPrePrimeCycleStartedFor(
+        DateTimeOffset now,
+        RunAllStrategySettings settings)
+    {
+        var key = GetRunStrategyPrePrimeCycleKey(now, settings);
+        lock (_runStrategyLock)
+        {
+            return _runStrategyPrePrimeCycleStarted
+                   && string.Equals(
+                       _runStrategyPrePrimeCycleKey,
+                       key,
+                       StringComparison.Ordinal);
+        }
+    }
+
+    bool IsRunStrategyPrePrimeCandidateDisallowed(string profileName)
+    {
+        lock (_runStrategyLock)
+        {
+            return _runStrategyPrePrimeDisallowedCandidates.Contains(
+                (profileName ?? "").Trim());
+        }
+    }
+
+    void EnsureRunStrategyPrePrimeCycleStarted(
+        DateTimeOffset now,
+        IReadOnlyList<ProfileContext> active,
+        RunAllStrategySettings settings,
+        int targetSlots)
+    {
+        var key = GetRunStrategyPrePrimeCycleKey(now, settings);
+        var activeNames = active
+            .Select(ctx => (ctx.Profile.Name ?? "").Trim())
+            .Where(name => name.Length > 0)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var startedNow = false;
+        var completedNow = false;
+        var pendingCount = 0;
+        var acceptedCount = 0;
+
+        lock (_runStrategyLock)
+        {
+            if (!string.Equals(
+                    _runStrategyPrePrimeCycleKey,
+                    key,
+                    StringComparison.Ordinal))
+            {
+                _runStrategyPrePrimePendingProfiles.Clear();
+                _runStrategyPrePrimeAcceptedProfiles.Clear();
+                _runStrategyPrePrimeDisallowedCandidates.Clear();
+                _runStrategyPrePrimeCycleKey = key;
+                _runStrategyPrePrimeCycleStarted = false;
+                _runStrategyPrePrimeCycleCompleted = false;
+            }
+
+            if (!_runStrategyPrePrimeCycleStarted)
+            {
+                _runStrategyPrePrimeCycleStarted = true;
+                _runStrategyPrePrimeCycleCompleted = false;
+                _runStrategyPrePrimeAcceptedProfiles.Clear();
+                _runStrategyPrePrimePendingProfiles.Clear();
+                _runStrategyPrePrimeDisallowedCandidates.Clear();
+
+                foreach (var name in activeNames)
+                {
+                    _runStrategyPrePrimePendingProfiles.Add(name);
+                    _runStrategyPrePrimeDisallowedCandidates.Add(name);
+                }
+
+                startedNow = true;
+            }
+            else if (!_runStrategyPrePrimeCycleCompleted)
+            {
+                // Accepted chỉ có hiệu lực khi profile đó vẫn là thành viên target.
+                // Nếu nó BAN trong lúc refresh, Tự bù có thể đưa profile khác vào;
+                // profile mới đó chưa được refresh chủ động nên phải vào pending.
+                _runStrategyPrePrimeAcceptedProfiles.RemoveWhere(
+                    name => !activeNames.Contains(name));
+                _runStrategyPrePrimePendingProfiles.RemoveWhere(
+                    name => !activeNames.Contains(name));
+
+                foreach (var name in activeNames)
+                {
+                    if (_runStrategyPrePrimeAcceptedProfiles.Contains(name))
+                        continue;
+
+                    _runStrategyPrePrimePendingProfiles.Add(name);
+                    _runStrategyPrePrimeDisallowedCandidates.Add(name);
+                }
+            }
+
+            if (!_runStrategyPrePrimeCycleCompleted
+                && targetSlots > 0
+                && activeNames.Count == targetSlots
+                && activeNames.All(name =>
+                    _runStrategyPrePrimeAcceptedProfiles.Contains(name)))
+            {
+                _runStrategyPrePrimeCycleCompleted = true;
+                _runStrategyPrePrimePendingProfiles.Clear();
+                completedNow = true;
+            }
+
+            pendingCount = _runStrategyPrePrimePendingProfiles.Count;
+            acceptedCount = _runStrategyPrePrimeAcceptedProfiles.Count;
+        }
+
+        if (startedNow)
+        {
+            _log.Info(
+                $"[PRE_GOLD_REFRESH_BEGIN] cycle={key} target={targetSlots} active={activeNames.Count} " +
+                $"source={settings.PrePrimeRefreshSource} prepare={settings.PrepareMinutes}m pending={pendingCount}");
+        }
+        else if (completedNow)
+        {
+            _log.Info(
+                $"[PRE_GOLD_REFRESH_DONE] cycle={key} target={targetSlots} accepted={acceptedCount} " +
+                "action=HOLD_UNTIL_BAN_OR_NEXT_PREPARE");
+        }
+    }
+
+    void RecordRunStrategyPrePrimeRotationResult(
+        string victimName,
+        IReadOnlyCollection<string> activeBefore,
+        bool filled,
+        RunAllStrategySettings settings)
+    {
+        var activeAfter = GetRunStrategyActiveContexts()
+            .Select(ctx => (ctx.Profile.Name ?? "").Trim())
+            .Where(name => name.Length > 0)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var added = activeAfter
+            .Where(name => !activeBefore.Contains(name, StringComparer.OrdinalIgnoreCase))
+            .ToList();
+
+        string acceptedProfile = "";
+        var completedNow = false;
+        int pendingCount;
+        int acceptedCount;
+        int targetSlots;
+        string cycleKey;
+
+        lock (_runStrategyLock)
+        {
+            targetSlots = _runStrategyTargetSlots;
+            cycleKey = _runStrategyPrePrimeCycleKey;
+
+            if (!_runStrategyPrePrimeCycleStarted
+                || _runStrategyPrePrimeCycleCompleted)
+            {
+                return;
+            }
+
+            if (!activeAfter.Contains(victimName))
+                _runStrategyPrePrimePendingProfiles.Remove(victimName);
+            else
+                _runStrategyPrePrimePendingProfiles.Add(victimName);
+
+            // Planned rotation giữ gate Tự bù nên một lần thành công bình thường chỉ
+            // có đúng một profile mới xuất hiện. Nếu có >1 thì không đoán: tick sau
+            // sẽ coi chúng là pending và xử lý lại an toàn.
+            if (filled && added.Count == 1)
+            {
+                var candidate = added[0];
+                if (!_runStrategyPrePrimeDisallowedCandidates.Contains(candidate))
+                {
+                    _runStrategyPrePrimeAcceptedProfiles.Add(candidate);
+                    _runStrategyPrePrimePendingProfiles.Remove(candidate);
+                    acceptedProfile = candidate;
+                }
+            }
+
+            if (targetSlots > 0
+                && activeAfter.Count == targetSlots
+                && activeAfter.All(name =>
+                    _runStrategyPrePrimeAcceptedProfiles.Contains(name)))
+            {
+                _runStrategyPrePrimeCycleCompleted = true;
+                _runStrategyPrePrimePendingProfiles.Clear();
+                completedNow = true;
+            }
+
+            pendingCount = _runStrategyPrePrimePendingProfiles.Count;
+            acceptedCount = _runStrategyPrePrimeAcceptedProfiles.Count;
+        }
+
+        _log.Info(
+            $"[PRE_GOLD_REFRESH_RESULT] cycle={cycleKey} victim={victimName} filled={filled} " +
+            $"accepted={(acceptedProfile.Length > 0 ? acceptedProfile : "-")} added={string.Join(",", added)} " +
+            $"acceptedCount={acceptedCount}/{targetSlots} pending={pendingCount} source={settings.PrePrimeRefreshSource}");
+
+        if (completedNow)
+        {
+            _log.Info(
+                $"[PRE_GOLD_REFRESH_DONE] cycle={cycleKey} target={targetSlots} accepted={acceptedCount} " +
+                "action=HOLD_UNTIL_BAN_OR_NEXT_PREPARE");
+        }
+    }
+
+    async Task<RunStrategyRotationPlan?> BuildRunStrategyPrePrimeFullRefreshPlanAsync(
+        string phase,
+        IReadOnlyList<ProfileContext> active,
+        RunAllStrategySettings settings,
+        CancellationToken token)
+    {
+        var now = GetToolNow();
+        int targetSlots;
+        lock (_runStrategyLock)
+            targetSlots = _runStrategyTargetSlots;
+
+        if (phase == "PREPARE")
+        {
+            EnsureRunStrategyPrePrimeCycleStarted(
+                now,
+                active,
+                settings,
+                targetSlots);
+        }
+        else if (phase == "PRIME")
+        {
+            // Nếu PREPARE đã bắt đầu nhưng chưa kịp thay hết thì tiếp tục tuần tự
+            // qua mốc giờ vàng. Nếu Manager/Auto Run chỉ được bật sau khi đã vào
+            // PRIME thì không khởi động một đợt refresh muộn ngoài yêu cầu.
+            if (!IsRunStrategyPrePrimeCycleStartedFor(now, settings))
+                return null;
+
+            EnsureRunStrategyPrePrimeCycleStarted(
+                now,
+                active,
+                settings,
+                targetSlots);
+        }
+        else
+        {
+            return null;
+        }
+
+        HashSet<string> pendingSnapshot;
+        lock (_runStrategyLock)
+        {
+            if (_runStrategyPrePrimeCycleCompleted)
+                return null;
+
+            pendingSnapshot = new HashSet<string>(
+                _runStrategyPrePrimePendingProfiles,
+                StringComparer.OrdinalIgnoreCase);
+        }
+
+        // Không giữ _runStrategyLock trong lúc đọc runtime_stats.json.
+        var victim = active
+            .Where(ctx => pendingSnapshot.Contains(ctx.Profile.Name))
+            .OrderByDescending(GetRunStrategyTotalSeconds)
+            .ThenBy(ctx => ctx.Profile.Name, NaturalProfileNameOrder)
+            .FirstOrDefault();
+
+        if (victim is null)
+            return null;
+
+        await RefreshReusableProfileQueueAsync(
+            $"pre_gold_refresh_supply:{settings.PrePrimeRefreshSource}",
+            token);
+
+        var neverRunOnly =
+            settings.PrePrimeRefreshSource == PrePrimeRefreshSourceMode.NeverRunOnly;
+
+        var available = GetRunStrategyReusableCandidates(
+                settings,
+                RunStrategyLane.Fresh,
+                excludeProfileName: victim.Profile.Name,
+                preferLowerRuntime: true,
+                allowProtectedNightReserve: true,
+                neverRunOnly: neverRunOnly)
+            .Any(candidate =>
+                !IsRunStrategyPrePrimeCandidateDisallowed(candidate.ProfileName));
+
+        var canCreate = !_autoCloseSettings.ReuseOnlyNoCreateProfile;
+        if (!available && canCreate)
+            canCreate = await HasRunStrategyNewAccountSupplyAsync(token);
+
+        if (!available && !canCreate)
+        {
+            lock (_runStrategyLock)
+            {
+                if (_runStrategySessionActive)
+                    _runStrategyNextRotationUtc = DateTime.UtcNow.AddSeconds(15);
+            }
+
+            _log.Info(
+                $"[PRE_GOLD_REFRESH_WAIT_SUPPLY] victim={victim.Profile.Name} source={settings.PrePrimeRefreshSource} " +
+                $"reuseOnly={_autoCloseSettings.ReuseOnlyNoCreateProfile} retry=15s action=KEEP_CURRENT");
+            return null;
+        }
+
+        return new RunStrategyRotationPlan(
+            phase,
+            victim,
+            new[] { RunStrategyLane.Fresh },
+            AllowFreshEmergencyFallback: false,
+            AllowCreateFallback: canCreate)
+        {
+            IsPrePrimeFullRefresh = true,
+            ForcedPrePrimeSource = settings.PrePrimeRefreshSource
+        };
+    }
+
+    // AutoClose TIME phải được tắt logic trong mode này: sau khi user chọn full
+    // refresh, profile được giữ tới BAN/FAULT/manual hoặc kỳ PREPARE ngày kế tiếp.
+    // BAN và watchdog lỗi kỹ thuật không bị ảnh hưởng.
+    bool ShouldSuppressAutoCloseTimeForPrePrimeRefresh()
+    {
+        if (!_runStrategyFeatureInitialized)
+            return false;
+
+        lock (_runStrategyLock)
+        {
+            return _runStrategySettings.Mode == RunAllStrategyMode.PrimeFresh
+                   && _runStrategySettings.PrimeModeArmed
+                   && !_runStrategySettings.PrimeModeSuspended
+                   && _runStrategySettings.RefreshAllBeforePrime;
+        }
+    }
+
     string GetRunStrategyPhase(
         DateTimeOffset now,
         RunAllStrategySettings settings)
@@ -1593,6 +2499,23 @@ public sealed partial class ManagerForm
             ctx => ctx.Profile.Name,
             GetRunStrategyTotalSeconds,
             StringComparer.OrdinalIgnoreCase);
+
+        // Chế độ mới là một chiến lược tách biệt: chỉ thay toàn bộ một lần ở PREPARE
+        // (có thể hoàn tất nốt trong PRIME), còn OFFPEAK/PRIME sau đó không xoay theo
+        // tuổi. BAN/FAULT vẫn do AutoClose/Tự bù hiện tại xử lý.
+        if (settings.RefreshAllBeforePrime)
+        {
+            if (phase is "PREPARE" or "PRIME")
+            {
+                return await BuildRunStrategyPrePrimeFullRefreshPlanAsync(
+                    phase,
+                    active,
+                    settings,
+                    token);
+            }
+
+            return null;
+        }
 
         var freshLimit = TimeSpan.FromHours(settings.FreshHours).TotalSeconds;
         var oldLimit = TimeSpan.FromHours(settings.OldHours).TotalSeconds;
@@ -1756,7 +2679,8 @@ public sealed partial class ManagerForm
         RunStrategyLane lane,
         string? excludeProfileName = null,
         bool? preferLowerRuntime = null,
-        bool allowProtectedNightReserve = false)
+        bool allowProtectedNightReserve = false,
+        bool neverRunOnly = false)
     {
         var freshLimit = TimeSpan.FromHours(settings.FreshHours).TotalSeconds;
         var oldLimit = TimeSpan.FromHours(settings.OldHours).TotalSeconds;
@@ -1789,6 +2713,13 @@ public sealed partial class ManagerForm
             RunStrategyLane.Old => snapshot.Where(x => x.TotalRunSeconds >= oldLimit),
             _ => Array.Empty<RunStrategyReusableCandidate>()
         };
+
+        if (neverRunOnly)
+        {
+            // Dùng đúng nguồn runtime_stats hiện có. Profile chưa từng Automation
+            // RUNNING có totalRunSeconds = 0; profile đã chạy dù rất ngắn bị loại.
+            filtered = filtered.Where(x => x.TotalRunSeconds <= 0.001);
+        }
 
         // Prime/PREPARE truyền preferLowerRuntime=true: runtime thấp trước.
         // OFFPEAK truyền false: runtime cao trước để tận dụng nốt vòng đời.
@@ -1866,6 +2797,12 @@ public sealed partial class ManagerForm
         _autoReplacementQueueRunning = true;
 
         var victimName = plan.Victim.Profile.Name;
+        var activeBefore = plan.IsPrePrimeFullRefresh
+            ? GetRunStrategyActiveContexts()
+                .Select(ctx => (ctx.Profile.Name ?? "").Trim())
+                .Where(name => name.Length > 0)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase)
+            : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var filled = false;
         try
         {
@@ -1873,7 +2810,8 @@ public sealed partial class ManagerForm
 
             _log.Info(
                 $"[RUN_STRATEGY_ROTATE_BEGIN] phase={plan.Phase} victim={victimName} runtime={TimeSpan.FromSeconds(GetRunStrategyTotalSeconds(plan.Victim)):c} " +
-                $"lanes={string.Join(",", plan.PreferredLanes)} oneAtATime=true");
+                $"lanes={string.Join(",", plan.PreferredLanes)} oneAtATime=true prePrimeFull={plan.IsPrePrimeFullRefresh} " +
+                $"prePrimeSource={(plan.ForcedPrePrimeSource?.ToString() ?? "-")}");
 
             // Planned close KHÔNG gọi RegisterManagerManualCloseIntent và KHÔNG mark
             // retired: target vẫn giữ nguyên, profile tốt được quét lại vào Chờ dùng lại.
@@ -1892,6 +2830,15 @@ public sealed partial class ManagerForm
                 plan,
                 settings,
                 token);
+
+            if (plan.IsPrePrimeFullRefresh)
+            {
+                RecordRunStrategyPrePrimeRotationResult(
+                    victimName,
+                    activeBefore,
+                    filled,
+                    settings);
+            }
 
             _log.Info(
                 $"[RUN_STRATEGY_ROTATE_END] phase={plan.Phase} victim={victimName} filled={filled} oneAtATime=true");
@@ -2032,13 +2979,24 @@ public sealed partial class ManagerForm
                 lane == RunStrategyLane.Fresh
                 && plan.Phase is "PRIME" or "PREPARE";
 
+            var neverRunOnly =
+                plan.IsPrePrimeFullRefresh
+                && plan.ForcedPrePrimeSource == PrePrimeRefreshSourceMode.NeverRunOnly;
+
             foreach (var candidate in GetRunStrategyReusableCandidates(
                          settings,
                          lane,
                          excludeProfileName: outgoingProfileName,
                          preferLowerRuntime: preferLowerRuntime,
-                         allowProtectedNightReserve: allowProtectedNightReserveBorrow))
+                         allowProtectedNightReserve: allowProtectedNightReserveBorrow,
+                         neverRunOnly: neverRunOnly))
             {
+                if (plan.IsPrePrimeFullRefresh
+                    && IsRunStrategyPrePrimeCandidateDisallowed(candidate.ProfileName))
+                {
+                    continue;
+                }
+
                 if (!tried.Add(candidate.ProfileName))
                     continue;
 
@@ -2064,8 +3022,16 @@ public sealed partial class ManagerForm
                          settings,
                          RunStrategyLane.Fresh,
                          excludeProfileName: outgoingProfileName,
-                         preferLowerRuntime: false))
+                         preferLowerRuntime: false,
+                         neverRunOnly: plan.IsPrePrimeFullRefresh
+                             && plan.ForcedPrePrimeSource == PrePrimeRefreshSourceMode.NeverRunOnly))
             {
+                if (plan.IsPrePrimeFullRefresh
+                    && IsRunStrategyPrePrimeCandidateDisallowed(candidate.ProfileName))
+                {
+                    continue;
+                }
+
                 if (!tried.Add(candidate.ProfileName))
                     continue;
 

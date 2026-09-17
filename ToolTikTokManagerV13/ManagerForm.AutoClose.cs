@@ -972,6 +972,9 @@ public sealed partial class ManagerForm
         {
             var timeThreshold = TimeSpan.FromHours(_autoCloseSettings.RunHours);
             var stuckThreshold = TimeSpan.FromMinutes(AutoCloseNotRunningMinutes);
+            var closeOnRunTime =
+                _autoCloseSettings.CloseOnRunTime
+                && !ShouldSuppressAutoCloseTimeForPrePrimeRefresh();
 
             // Không phụ thuộc tab Manager. Một profile có thể mất/tab bị detach nhưng
             // Worker/Chrome vẫn còn chạy và trang TikTok đã OOM. Nếu chỉ lọc theo Tab,
@@ -1027,7 +1030,7 @@ public sealed partial class ManagerForm
                         "healthy_running");
 
                     // Priority runtime: TIME luôn thắng FAULT_10M nếu cả hai cùng đến hạn.
-                    if (_autoCloseSettings.CloseOnRunTime)
+                    if (closeOnRunTime)
                     {
                         var total = ReadStatisticsRuntime(ctx).Total;
                         if (total >= timeThreshold)
@@ -1107,7 +1110,7 @@ public sealed partial class ManagerForm
                     || IsAutoCloseProfileExpectedToRun(ctx, state);
 
                 // TIME vẫn phải thắng FAULT_10M nếu profile vừa đủ giờ đúng lúc runtime lỗi.
-                if (_autoCloseSettings.CloseOnRunTime && expectedToRun)
+                if (closeOnRunTime && expectedToRun)
                 {
                     var total = ReadStatisticsRuntime(ctx).Total;
                     if (total >= timeThreshold)
