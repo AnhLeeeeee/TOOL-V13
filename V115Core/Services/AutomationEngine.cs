@@ -47,8 +47,12 @@ public sealed partial class AutomationEngine
     // ArrowDown CDP có thể mất hiệu lực sau nhiều lần reload dù session vẫn báo gửi key thành công.
     // Retry theo từng lần, reconnect/focus lại giống hiệu ứng người dùng dừng rồi chạy lại.
     const int ArrowDownAttemptWaitMs = 1600;
+    // Máy/VM chậm đôi khi đổi roomId sau cửa sổ 1.6s. Không bắn thêm phím ngay:
+    // giữ một cửa sổ xác nhận muộn cho lần đầu, rồi mới reconnect/retry.
+    const int ArrowDownLateConfirmWaitMs = 3400;
+    const int ArrowDownRecoveryAttemptWaitMs = 2600;
     const int ArrowDownRecoveryAttempts = 3;
-    const int ArrowDownPostResetAttemptWaitMs = 2600;
+    const int ArrowDownPostResetAttemptWaitMs = 3500;
     const int ArrowDownResetReloadWaitMs = 1000;
     const int ArrowDownRetryDelayMs = 300;
     const int PriorityPauseMs = 5000;
@@ -64,6 +68,13 @@ public sealed partial class AutomationEngine
     const int OldLiveScanRetryMs = 2500;
     const int ViewerReadRetryCount = 5;
     const int ViewerReadRetryDelayMs = 350;
+    // Cache cực ngắn, chỉ dùng khi cùng đúng roomId/url. Mục đích là chịu được một nhịp
+    // TikTok re-render làm XPath tạm mất/parse ra nhãn "Người xem", không giữ số qua LIVE khác.
+    const int ViewerRecentSnapshotTtlMs = 5000;
+    // Sau khi Viewer Gate vừa chọn/chuyển tới LIVE đủ ngưỡng, khóa chuyển LIVE trong thời gian
+    // ngắn để React/chat hydrate. Máy nhanh thoát lock ngay khi ô nhập + Viewer xác minh xong.
+    const int LiveTargetStabilizeMs = 10000;
+    const int LiveTargetStabilizePollMs = 650;
     const int ViewerGateRetryCooldownMs = 1000;
     const int ViewerLowStreakFeedResetThreshold = 5;
     // VM/chrome chậm: document.readyState có thể đã complete nhưng TikTok React/DOM LIVE
@@ -109,6 +120,14 @@ public sealed partial class AutomationEngine
     long _rounds;
     int _lastViewerValue = -1; // snapshot nhẹ cho Manager/Chrome Monitor
     int _consecutiveLowViewerLives; // reset nguồn đề xuất sau N LIVE liên tiếp <= ngưỡng
+
+    // Snapshot Viewer/lock ổn định chỉ sống rất ngắn và luôn ràng buộc theo identity của LIVE.
+    int _recentViewerValue = -1;
+    string _recentViewerLiveKey = "";
+    DateTime _recentViewerAtUtc = DateTime.MinValue;
+    string _liveTargetStabilizeKey = "";
+    int _liveTargetStabilizeViewer = -1;
+    DateTime _liveTargetStabilizeUntilUtc = DateTime.MinValue;
     System.Diagnostics.Stopwatch? _loopPerf;
     long _loopPerfTotalMs;
     long _loopPerfCount;
@@ -230,6 +249,12 @@ public sealed partial class AutomationEngine
         _rounds = 0;
         Volatile.Write(ref _lastViewerValue, -1);
         _consecutiveLowViewerLives = 0;
+        _recentViewerValue = -1;
+        _recentViewerLiveKey = "";
+        _recentViewerAtUtc = DateTime.MinValue;
+        _liveTargetStabilizeKey = "";
+        _liveTargetStabilizeViewer = -1;
+        _liveTargetStabilizeUntilUtc = DateTime.MinValue;
         _loopPerf = System.Diagnostics.Stopwatch.StartNew();
         _loopPerfTotalMs = 0;
         _loopPerfCount = 0;
@@ -1478,6 +1503,103 @@ public sealed partial class AutomationEngine
 
     static string GenerateOldLiveId(DateTime now) => $"old_live_{now:yyyyMMdd_HHmmss}_{Guid.NewGuid().ToString("N")[..6]}";
 
+    static string GetLiveStabilityKey(string identity)
+    {
+        var key = GetLivePageChangeKey(identity);
+        if (!string.IsNullOrWhiteSpace(key)) return key;
+
+        // Một số thời điểm TikTok chưa expose roomId/href nhưng broadcaster đã ổn định.
+        // Chỉ dùng fallback này cho lock/cache ngắn hạn, không dùng để xác nhận ArrowDown.
+        var broadcaster = ExtractLiveIdentityField(identity, "broadcaster");
+        return string.IsNullOrWhiteSpace(broadcaster) ? "" : "broadcaster=" + broadcaster;
+    }
+
+    void ClearLiveTargetStabilization(string reason)
+    {
+        var hadLock = _liveTargetStabilizeUntilUtc > DateTime.UtcNow
+            || !string.IsNullOrWhiteSpace(_liveTargetStabilizeKey);
+        if (hadLock)
+        {
+            _log.Info($"[LIVE_TARGET_STABILIZE_CLEAR] key={_liveTargetStabilizeKey} viewer={_liveTargetStabilizeViewer} reason={reason}");
+        }
+
+        _liveTargetStabilizeKey = "";
+        _liveTargetStabilizeViewer = -1;
+        _liveTargetStabilizeUntilUtc = DateTime.MinValue;
+    }
+
+    async Task ArmLiveTargetStabilizationAsync(string source, int viewer, CancellationToken ct)
+    {
+        var identity = await GetCurrentLiveIdentityAsync(ct);
+        var key = GetLiveStabilityKey(identity);
+        _liveTargetStabilizeKey = key;
+        _liveTargetStabilizeViewer = viewer;
+        _liveTargetStabilizeUntilUtc = DateTime.UtcNow.AddMilliseconds(LiveTargetStabilizeMs);
+
+        _log.Info(
+            $"[LIVE_TARGET_STABILIZE_ARM] source={source} key={(string.IsNullOrWhiteSpace(key) ? "(unknown)" : key)} " +
+            $"viewer={viewer} holdMs={LiveTargetStabilizeMs}");
+    }
+
+    async Task<(bool Active, int RemainingMs, int Viewer, string Key)> GetLiveTargetStabilizationAsync(CancellationToken ct)
+    {
+        var remaining = (int)Math.Ceiling((_liveTargetStabilizeUntilUtc - DateTime.UtcNow).TotalMilliseconds);
+        if (remaining <= 0)
+        {
+            if (!string.IsNullOrWhiteSpace(_liveTargetStabilizeKey))
+                ClearLiveTargetStabilization("hết thời gian ổn định");
+            return (false, 0, -1, "");
+        }
+
+        var identity = await GetCurrentLiveIdentityAsync(ct);
+        var currentKey = GetLiveStabilityKey(identity);
+        if (!string.IsNullOrWhiteSpace(_liveTargetStabilizeKey)
+            && !string.IsNullOrWhiteSpace(currentKey)
+            && !string.Equals(_liveTargetStabilizeKey, currentKey, StringComparison.OrdinalIgnoreCase))
+        {
+            ClearLiveTargetStabilization($"LIVE đã đổi sang {currentKey}");
+            return (false, 0, -1, currentKey);
+        }
+
+        return (true, remaining, _liveTargetStabilizeViewer, currentKey);
+    }
+
+    async Task RememberRecentViewerSnapshotAsync(int value, string source, CancellationToken ct)
+    {
+        if (value < 0) return;
+
+        var identity = await GetCurrentLiveIdentityAsync(ct);
+        var key = GetLiveStabilityKey(identity);
+        if (string.IsNullOrWhiteSpace(key)) return;
+
+        _recentViewerValue = value;
+        _recentViewerLiveKey = key;
+        _recentViewerAtUtc = DateTime.UtcNow;
+        _log.Info($"[VIEWER_RECENT_CACHE_SET] source={source} key={key} value={value} ttlMs={ViewerRecentSnapshotTtlMs}");
+    }
+
+    async Task<(bool Found, int Value, string Raw)> TryGetRecentViewerSnapshotAsync(string source, CancellationToken ct)
+    {
+        if (_recentViewerValue < 0 || string.IsNullOrWhiteSpace(_recentViewerLiveKey))
+            return (false, -1, "");
+
+        var ageMs = (int)Math.Max(0, (DateTime.UtcNow - _recentViewerAtUtc).TotalMilliseconds);
+        if (ageMs > ViewerRecentSnapshotTtlMs)
+            return (false, -1, "");
+
+        var identity = await GetCurrentLiveIdentityAsync(ct);
+        var key = GetLiveStabilityKey(identity);
+        if (string.IsNullOrWhiteSpace(key)
+            || !string.Equals(key, _recentViewerLiveKey, StringComparison.OrdinalIgnoreCase))
+        {
+            return (false, -1, "");
+        }
+
+        Volatile.Write(ref _lastViewerValue, _recentViewerValue);
+        _log.Warn($"[VIEWER_RECENT_CACHE_HIT] source={source} key={key} value={_recentViewerValue} ageMs={ageMs}");
+        return (true, _recentViewerValue, $"cache:{_recentViewerValue} ageMs={ageMs}");
+    }
+
     async Task<(int value, string raw)> ReadViewerWithRetryAsync(string source, CancellationToken ct, int attempts = ViewerReadRetryCount)
     {
         attempts = Math.Clamp(attempts, 1, ViewerReadRetryCount);
@@ -1491,6 +1613,7 @@ public sealed partial class AutomationEngine
             {
                 if (attempt > 1)
                     _log.Info($"[VIEWER_GATE_RENDERED] source={source} attempt={attempt}/{attempts} value={last.value} raw={last.raw}");
+                await RememberRecentViewerSnapshotAsync(last.value, source, ct);
                 return last;
             }
 
@@ -1500,6 +1623,10 @@ public sealed partial class AutomationEngine
                 await Task.Delay(ViewerReadRetryDelayMs, ct);
             }
         }
+
+        var cached = await TryGetRecentViewerSnapshotAsync(source, ct);
+        if (cached.Found)
+            return (cached.Value, cached.Raw);
 
         return last;
     }
@@ -1624,8 +1751,12 @@ public sealed partial class AutomationEngine
             ResetInputGuardConsecutive("sau chọn LIVE đề xuất");
             Volatile.Write(ref _lastViewerValue, best.Viewer);
             ResetLowViewerStreak($"đã chọn LIVE đề xuất {best.Viewer} người");
+            await ArmLiveTargetStabilizationAsync(
+                $"{source} / LIVE đề xuất {best.Candidate.Username}",
+                best.Viewer,
+                ct);
 
-            _log.Warn($"[VIEWER_RECOMMENDED_OPENED] source={source} user={best.Candidate.Username} sidebarViewer={best.Viewer} result=allow-workflow-without-enter-then-rescan");
+            _log.Warn($"[VIEWER_RECOMMENDED_OPENED] source={source} user={best.Candidate.Username} sidebarViewer={best.Viewer} result=stabilize-then-confirm-viewer-and-input");
             return true;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -1696,7 +1827,11 @@ public sealed partial class AutomationEngine
             if (value > _s.Viewer.Threshold)
             {
                 ResetLowViewerStreak($"đã tìm được LIVE đủ người ở vòng {i}/{max}");
-                _log.Info($"[VIEWER_GATE_RECOVERED] source={source} vòng={i}/{max} value={value} > threshold={_s.Viewer.Threshold}; cho phép workflow tiếp tục.");
+                await ArmLiveTargetStabilizationAsync(
+                    $"{source} / sau chuyển {i}/{max}",
+                    value,
+                    ct);
+                _log.Info($"[VIEWER_GATE_RECOVERED] source={source} vòng={i}/{max} value={value} > threshold={_s.Viewer.Threshold}; khóa ngắn để InputGuard ổn định rồi xác minh lại.");
                 return true;
             }
 
@@ -1770,7 +1905,11 @@ public sealed partial class AutomationEngine
             if (value > _s.Viewer.Threshold)
             {
                 ResetLowViewerStreak("LIVE đầu tiên sau reset /live đã đủ người");
-                _log.Warn($"[VIEWER_FEED_RESET_RECOVERED] source={source} value={value} > threshold={_s.Viewer.Threshold}; cho phép workflow tiếp tục.");
+                await ArmLiveTargetStabilizationAsync(
+                    $"{source} / LIVE đầu tiên sau reset /live",
+                    value,
+                    ct);
+                _log.Warn($"[VIEWER_FEED_RESET_RECOVERED] source={source} value={value} > threshold={_s.Viewer.Threshold}; khóa ngắn để InputGuard ổn định rồi xác minh lại.");
                 return true;
             }
 
@@ -2028,9 +2167,34 @@ public sealed partial class AutomationEngine
             await _chrome.PressArrowDownNavigationAsync(1, 0, recoveryMode, ct);
             _log.Info($"[LIVE_KEY_SENT] source={source} attempt={attempt}/{ArrowDownRecoveryAttempts} key=ArrowDown mode={(recoveryMode ? "recovery-keyDown" : "normal-rawKeyDown")}");
 
-            var changed = await WaitForPageChangeBeforeReloadAsync(source, beforeAttempt, ArrowDownAttemptWaitMs, attempt, ct);
+            var attemptWaitMs = attempt == 1
+                ? ArrowDownAttemptWaitMs
+                : ArrowDownRecoveryAttemptWaitMs;
+            var changed = await WaitForPageChangeBeforeReloadAsync(source, beforeAttempt, attemptWaitMs, attempt, ct);
             if (changed.Changed)
                 return await ReloadAfterConfirmedArrowDownAsync(source, changed, waitAfterReloadMs, ct);
+
+            // Máy chậm có thể nhận ArrowDown đúng nhưng React cập nhật roomId/url trễ hơn 1.6s.
+            // Ở lần đầu chỉ quan sát thêm, KHÔNG gửi phím thứ hai và KHÔNG reconnect vội.
+            if (attempt == 1)
+            {
+                _log.Warn(
+                    $"[LIVE_SWITCH_LATE_CONFIRM_BEGIN] source={source} attempt={attempt} " +
+                    $"extraWaitMs={ArrowDownLateConfirmWaitMs} action=OBSERVE_ONLY_NO_EXTRA_KEY");
+                var lateChanged = await WaitForPageChangeBeforeReloadAsync(
+                    source + " / xác nhận muộn",
+                    beforeAttempt,
+                    ArrowDownLateConfirmWaitMs,
+                    attempt,
+                    ct);
+                if (lateChanged.Changed)
+                {
+                    _log.Info(
+                        $"[LIVE_SWITCH_LATE_CONFIRMED] source={source} elapsedExtraMs={lateChanged.ElapsedMs} " +
+                        $"action=ACCEPT_ORIGINAL_ARROW_NO_RETRY");
+                    return await ReloadAfterConfirmedArrowDownAsync(source, lateChanged, waitAfterReloadMs, ct);
+                }
+            }
 
             // Tầng tự cứu nặng hơn: sau khi đã reconnect CDP mà ArrowDown vẫn không làm LIVE đổi,
             // kiểm tra renderer crash/OOM ngay thay vì tiếp tục kẹt trong chuỗi timeout.

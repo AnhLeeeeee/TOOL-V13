@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 
 namespace ToolTikTokManagerV13;
 
@@ -64,9 +64,24 @@ public sealed partial class ManagerForm
         // HasExited is itself an allowed, positive STOPPED confirmation. The
         // event/poll path also persists this through ConfirmRuntimeState.
         if (IsWorkerProcessExited(ctx)) return RuntimeStateStopped;
+
+        var confirmed = GetLastConfirmedRuntimeState(ctx);
+
+        // Một snapshot RECOVERING cũ không được phép sống lâu hơn lệnh STOP/cleanup
+        // đã được xác nhận sau snapshot đó. Trước đây SnapshotIndicatesRecovery()
+        // luôn thắng STOPPED nên sau AutoClose có thể còn state RECOVERING ảo dù
+        // Worker đã chết + tab đã gỡ; bộ đếm target vì thế tưởng vẫn đủ suất.
+        if (confirmed == RuntimeStateStopped
+            && ctx.LastConfirmedRuntimeStateUtc != DateTime.MinValue
+            && ctx.LastConfirmedRuntimeStateUtc >= ctx.LastStatusRefreshUtc)
+        {
+            return RuntimeStateStopped;
+        }
+
         if (ctx.RuntimeRecoveryInProgress || SnapshotIndicatesRecovery(ctx.LastSnapshot))
             return RuntimeStateRecovering;
-        return GetLastConfirmedRuntimeState(ctx);
+
+        return confirmed;
     }
 
     static Color GetRuntimeStateColor(string state)

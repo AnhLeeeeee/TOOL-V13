@@ -1891,6 +1891,13 @@ public sealed partial class ManagerForm
             if (ctx.Tab is not null && !ctx.Tab.IsDisposed && ctx.Tab.Parent == _tabs)
                 RemoveTab(ctx);
 
+            // Cleanup đã xác minh Worker chết + Chrome sạch + tab đã gỡ. Chốt STOPPED
+            // một lần nữa ở cuối để state cache RECOVERING cũ không thể giữ slot ảo.
+            ConfirmRuntimeState(
+                ctx,
+                RuntimeStateStopped,
+                "auto_close_cleanup_verified");
+
             // Reason có thể được nâng cấp trong lúc đang đóng (ví dụ FAULT -> BAN).
             var finalDecision = ResolveAutoCloseReasonDecision(
                 ctx.Profile.Name,

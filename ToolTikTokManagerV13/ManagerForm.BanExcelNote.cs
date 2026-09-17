@@ -37,13 +37,24 @@ public sealed partial class ManagerForm
 
             try
             {
+                var snapshot = ctx.LastSnapshot;
                 var state = GetEffectiveRuntimeState(ctx);
-                if (!string.Equals(state, RuntimeStateStopped, StringComparison.OrdinalIgnoreCase))
-                    continue;
+                var durableBanMarker = SnapshotHasDurableAccountBanMarker(snapshot);
+                var detailLooksBanned = LooksLikeAccountBanStop(snapshot?.Detail);
 
-                detail = ctx.LastSnapshot?.Detail ?? "";
-                if (!LooksLikeAccountBanStop(detail))
+                // Worker có marker TikTokStartupState=ACCOUNT_BANNED được latch độc lập
+                // với AutomationEngine. Marker này phải thắng RUNNING/RECOVERING và cả
+                // detail PAGE_RECOVERY có thể ghi đè sau đó. Với Worker cũ chưa có marker
+                // durable, vẫn giữ đường tương thích: STOPPED + detail nhận diện BAN.
+                if (!durableBanMarker
+                    && !(state == RuntimeStateStopped && detailLooksBanned))
+                {
                     continue;
+                }
+
+                detail = detailLooksBanned
+                    ? snapshot?.Detail ?? ""
+                    : "ACCOUNT_BANNED — Worker đã xác nhận tài khoản bị BAN/vi phạm; ưu tiên BAN hơn recovery/fault.";
             }
             catch (Exception ex)
             {
@@ -570,6 +581,16 @@ public sealed partial class ManagerForm
             $"[LIFETIME_EXCEL_NOTE_OK] profile={profileName} user={account.Username} row={account.SourceRow} note={verifiedNote} requested={reason} detail={detail}");
 
         return true;
+    }
+
+    static bool SnapshotHasDurableAccountBanMarker(WorkerSnapshot? snapshot)
+    {
+        if (snapshot is null) return false;
+
+        return string.Equals(
+            snapshot.TikTokStartupState?.Trim(),
+            "ACCOUNT_BANNED",
+            StringComparison.OrdinalIgnoreCase);
     }
 
     static bool LooksLikeAccountBanStop(string? detail)

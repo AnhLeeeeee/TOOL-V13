@@ -386,6 +386,27 @@ public sealed partial class ManagerForm
         return names.Count;
     }
 
+    bool HasAutoReplacementPhysicalRuntime(ProfileContext ctx)
+    {
+        var workerAlive = false;
+        try
+        {
+            workerAlive = ctx.Worker is not null && !ctx.Worker.HasExited;
+        }
+        catch
+        {
+            // Không đọc được HasExited thì fail-closed theo object Worker còn tồn tại.
+            workerAlive = ctx.Worker is not null;
+        }
+
+        var tabOpen =
+            ctx.Tab is not null
+            && !ctx.Tab.IsDisposed
+            && ctx.Tab.Parent == _tabs;
+
+        return workerAlive || tabOpen || ctx.Opening;
+    }
+
     int CountAutoReplacementFulfilledSlots()
     {
         var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -423,10 +444,16 @@ public sealed partial class ManagerForm
         foreach (var ctx in _contexts.Values)
         {
             var state = GetEffectiveRuntimeState(ctx);
+            var physicalRuntime = HasAutoReplacementPhysicalRuntime(ctx);
 
+            // RUNNING/PAUSED/RECOVERING chỉ là trạng thái logic. Sau cleanup có thể
+            // còn snapshot/cache RECOVERING cũ vài giây; nếu Worker/tab/Opening đã
+            // biến mất thì đây KHÔNG còn là một suất phục vụ target. Claim/Cleanup
+            // và ExpectedRunning đã được reserve riêng ở phía trên.
             if (state is RuntimeStateRunning or RuntimeStatePaused or RuntimeStateRecovering)
             {
-                names.Add(ctx.Profile.Name);
+                if (physicalRuntime)
+                    names.Add(ctx.Profile.Name);
                 continue;
             }
 
@@ -447,16 +474,7 @@ public sealed partial class ManagerForm
 
             // UNKNOWN + còn runtime vật lý: chưa đủ bằng chứng rằng slot đã mất, nên giữ
             // fail-closed cho tới khi status/probe xác minh rõ RUNNING hoặc STOPPED.
-            var workerAlive = false;
-            try { workerAlive = ctx.Worker is not null && !ctx.Worker.HasExited; }
-            catch { workerAlive = ctx.Worker is not null; }
-
-            var tabOpen =
-                ctx.Tab is not null
-                && !ctx.Tab.IsDisposed
-                && ctx.Tab.Parent == _tabs;
-
-            if (workerAlive || tabOpen)
+            if (physicalRuntime)
                 names.Add(ctx.Profile.Name);
         }
 
@@ -479,9 +497,12 @@ public sealed partial class ManagerForm
         foreach (var ctx in _contexts.Values)
         {
             var state = GetEffectiveRuntimeState(ctx);
+            var physicalRuntime = HasAutoReplacementPhysicalRuntime(ctx);
+
             if (state is RuntimeStateRunning or RuntimeStateRecovering)
             {
-                names.Add(ctx.Profile.Name);
+                if (physicalRuntime)
+                    names.Add(ctx.Profile.Name);
                 continue;
             }
 
@@ -494,16 +515,7 @@ public sealed partial class ManagerForm
             // Safety net: profile bù lỗi có thể đang STOPPED/DISCONNECTED nhưng
             // Worker/tab/Opening vẫn còn. Nếu không tính các runtime vật lý này,
             // slot gate tưởng còn chỗ trống và tiếp tục mở Chrome mới.
-            var workerAlive = false;
-            try { workerAlive = ctx.Worker is not null && !ctx.Worker.HasExited; }
-            catch { workerAlive = ctx.Worker is not null; }
-
-            var tabOpen =
-                ctx.Tab is not null
-                && !ctx.Tab.IsDisposed
-                && ctx.Tab.Parent == _tabs;
-
-            if (workerAlive || tabOpen || ctx.Opening)
+            if (physicalRuntime)
                 names.Add(ctx.Profile.Name);
         }
 
