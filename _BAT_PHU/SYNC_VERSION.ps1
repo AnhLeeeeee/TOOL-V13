@@ -39,7 +39,21 @@ function Read-JsonSafe([string]$path) {
         return ($raw | ConvertFrom-Json)
     }
     catch {
-        Write-Host "[VERSION] JSON loi tai $path; se tao lai file sach." -ForegroundColor Yellow
+        Write-Host "[VERSION] JSON loi tai $path; thu phuc hoi lastgood." -ForegroundColor Yellow
+        $backup = $path + '.lastgood'
+        if (Test-Path -LiteralPath $backup) {
+            try {
+                $backupRaw = [System.IO.File]::ReadAllText($backup, [System.Text.Encoding]::UTF8)
+                while ($backupRaw.Length -gt 0 -and $backupRaw[0] -eq [char]0xFEFF) {
+                    $backupRaw = $backupRaw.Substring(1)
+                }
+                if ($backupRaw.IndexOf([char]0) -lt 0 -and -not [string]::IsNullOrWhiteSpace($backupRaw)) {
+                    Write-Host "[VERSION] Da doc duoc ban lastgood: $backup" -ForegroundColor Yellow
+                    return ($backupRaw | ConvertFrom-Json)
+                }
+            }
+            catch { }
+        }
         return $null
     }
 }
@@ -50,10 +64,82 @@ function Ensure-JsonProperty($obj, [string]$name, $defaultValue) {
     }
 }
 
+function Test-JsonText([string]$jsonText, [string]$label) {
+    if ([string]::IsNullOrWhiteSpace($jsonText)) {
+        throw "$label rong; dung publish."
+    }
+    if ($jsonText.IndexOf([char]0) -ge 0) {
+        throw "$label chua byte NUL/0x00; dung publish."
+    }
+    try {
+        $null = $jsonText | ConvertFrom-Json
+    }
+    catch {
+        throw "$label khong parse duoc JSON: $($_.Exception.Message)"
+    }
+}
+
 function Write-JsonUtf8NoBom([string]$path, $obj) {
     $jsonText = $obj | ConvertTo-Json -Depth 20
+    Test-JsonText $jsonText ([System.IO.Path]::GetFileName($path))
+
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($path, $jsonText + [Environment]::NewLine, $utf8NoBom)
+    $dir = [System.IO.Path]::GetDirectoryName($path)
+    if ([string]::IsNullOrWhiteSpace($dir)) { $dir = (Get-Location).Path }
+    $tmp = Join-Path $dir ('.' + [System.IO.Path]::GetFileName($path) + '.tmp.' + [Guid]::NewGuid().ToString('N'))
+
+    try {
+        [System.IO.File]::WriteAllText($tmp, $jsonText + [Environment]::NewLine, $utf8NoBom)
+
+        # Doc lai file tam tu dia va parse lai truoc khi thay file chinh.
+        $verify = [System.IO.File]::ReadAllText($tmp, [System.Text.Encoding]::UTF8)
+        Test-JsonText $verify ([System.IO.Path]::GetFileName($path) + ' temp')
+
+        if ((Test-Path -LiteralPath $path) -and ((Get-Item -LiteralPath $path).Length -gt 0)) {
+            $backup = $path + '.lastgood'
+            try {
+                $current = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+                Test-JsonText $current ([System.IO.Path]::GetFileName($path) + ' current')
+                [System.IO.File]::Copy($path, $backup, $true)
+            }
+            catch {
+                Write-Host "[VERSION] File hien tai khong hop le, khong ghi de lastgood: $path" -ForegroundColor Yellow
+            }
+        }
+
+        # Khong dung File.Replace(..., $null, ...) tren Windows PowerShell 5.1:
+        # mot so may/.NET Framework nem ArgumentException "The path is not of a legal form"
+        # cho tham so backup null. File tam da duoc ghi + parse xong; copy de len file
+        # chinh, sau do doc/parse lai. Neu co loi thi phuc hoi tu .lastgood.
+        $fullPath = [System.IO.Path]::GetFullPath($path)
+        try {
+            [System.IO.File]::Copy($tmp, $fullPath, $true)
+
+            $final = [System.IO.File]::ReadAllText($fullPath, [System.Text.Encoding]::UTF8)
+            Test-JsonText $final ([System.IO.Path]::GetFileName($fullPath) + ' final')
+        }
+        catch {
+            $writeError = $_
+            $backup = $fullPath + '.lastgood'
+            if (Test-Path -LiteralPath $backup) {
+                try {
+                    $backupText = [System.IO.File]::ReadAllText($backup, [System.Text.Encoding]::UTF8)
+                    Test-JsonText $backupText ([System.IO.Path]::GetFileName($backup))
+                    [System.IO.File]::Copy($backup, $fullPath, $true)
+                    Write-Host "[VERSION] Ghi manifest loi; da phuc hoi lastgood: $fullPath" -ForegroundColor Yellow
+                }
+                catch {
+                    Write-Host "[VERSION] Khong phuc hoi duoc lastgood: $backup" -ForegroundColor Red
+                }
+            }
+            throw $writeError
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $tmp) {
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 function New-DefaultNotes([string]$value) {
