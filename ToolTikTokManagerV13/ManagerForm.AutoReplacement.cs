@@ -94,7 +94,6 @@ public sealed partial class ManagerForm
     static readonly TimeSpan AutoReplacementReusableStateRetry = TimeSpan.FromSeconds(5);
     static readonly TimeSpan AutoReplacementOperationalRetry = TimeSpan.FromSeconds(10);
     const int AutoReplacementCleanupBarrierRetrySeconds = 15;
-    const int AutoReplacementCleanupBarrierMaxAttempts = 4;
 
     // Profile NAME_SYNC_PENDING đã tồn tại phải được ưu tiên TRƯỚC khi tiêu account mới,
     // nhưng không mở lại ngay sau khi vừa đóng. Mỗi profile cần nghỉ tối thiểu 60 giây
@@ -104,8 +103,8 @@ public sealed partial class ManagerForm
     readonly List<AutoReplacementRequest> _autoReplacementQueue = new();
     readonly HashSet<string> _autoReplacementRetiredProfiles = new(StringComparer.OrdinalIgnoreCase);
     readonly HashSet<string> _autoReplacementClaimedProfiles = new(StringComparer.OrdinalIgnoreCase);
-    // Profile đang CLEANUP vẫn chiếm slot cho tới khi xác minh đóng sạch hoặc hết
-    // safety-valve. Capacity reconcile không được mở bù chồng lên runtime đang dọn.
+    // Profile đang CLEANUP luôn chiếm slot cho tới khi xác minh đóng sạch. Không còn
+    // safety-valve kiểu QUARANTINE_AND_CONTINUE vì có thể làm mở dư Chrome khi runtime cũ còn sống.
     readonly HashSet<string> _autoReplacementCleanupProfiles = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, DateTime> _autoReplacementFailedProfileRetryUtc = new(StringComparer.OrdinalIgnoreCase);
     readonly object _autoReplacementQueueLock = new();
@@ -1121,7 +1120,22 @@ public sealed partial class ManagerForm
                 {
                     var closeReply = await SendCloseChromeCommandAsync(ctx);
                     _log.Info(
-                        $"[AUTO_REPLACE_FAILED_CHROME] profile={ctx.Profile.Name} reply={closeReply}");
+                        $"[AUTO_REPLACE_FAILED_CHROME] profile={ctx.Profile.Name} attempt=1/2 reply={closeReply}");
+
+                    // Lệnh STOP của Worker chỉ signal engine và trả về ngay. Nếu vòng
+                    // Automation chưa unwind xong, close_chrome có thể trả
+                    // automation_running dù Manager đã gửi STOP. Cho engine một cửa
+                    // sổ ngắn rồi thử graceful close thêm đúng 1 lần trước khi chuyển
+                    // sang shutdown Worker + force cleanup theo PID/CDP.
+                    if (closeReply.Equals("automation_running", StringComparison.OrdinalIgnoreCase))
+                    {
+                        await Task.Delay(900);
+                        ThrowIfEmergencyStopRequested("before_close_chrome_retry");
+
+                        closeReply = await SendCloseChromeCommandAsync(ctx);
+                        _log.Info(
+                            $"[AUTO_REPLACE_FAILED_CHROME] profile={ctx.Profile.Name} attempt=2/2 reply={closeReply}");
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -1238,9 +1252,10 @@ public sealed partial class ManagerForm
                 }
 
                 _log.Warn($"[AUTO_REPLACE_FAILED_CLEANUP_BEGIN] profile={profileName} source={source}:path_only");
-                await EnsureAutoCloseChromeStoppedByPathAsync(
+                await EnsureAutoCloseChromeStoppedByPathAndPortAsync(
                     profileName,
                     profile.ProfilePath,
+                    profile.CdpPort,
                     respectEmergencyStop: true);
                 ClearAutoCloseExpectedRunning(
                     profileName,
@@ -1279,31 +1294,36 @@ public sealed partial class ManagerForm
         if (profileName.Length == 0)
             return;
 
+        // CLEANUP là GLOBAL BARRIER thật sự: khi profile bù lỗi còn bất kỳ dấu hiệu
+        // Worker/Chrome nào, tuyệt đối không nhường queue để mở profile khác. Bản cũ
+        // có safety-valve sau 4 lượt rồi QUARANTINE_AND_CONTINUE; đó là nguyên nhân
+        // tạo 6/5, 7/5 khi Chrome orphan vẫn giữ CDP. Từ đây chỉ có hai cách thoát:
+        // 1) cleanup được xác minh sạch; 2) cả phiên automation đang đóng/dừng khẩn cấp.
+        _autoReplacementCleanupProfiles.Add(profileName);
+
         SetAutoReplacementUiPhase(
             "DỌN PRF BÙ LỖI",
             profileName,
             request.Id);
 
-        // Không profile bù lỗi nào được phép khóa GLOBAL queue vô hạn. Thử cleanup
-        // tối đa 4 lượt (~60s chưa tính thời gian probe). Nếu vẫn UNKNOWN, cô lập
-        // profile lỗi bằng cooldown và trả quyền điều khiển cho queue để các suất bù
-        // khác còn được xử lý.
-        for (var attempt = 1;
-             attempt <= AutoReplacementCleanupBarrierMaxAttempts
-             && !_closing
-             && !IsDisposed
-             && !Disposing;
-             attempt++)
+        var attempt = 0;
+
+        while (!_closing
+               && !IsDisposed
+               && !Disposing)
         {
             if (IsAutomationHalted)
             {
-                _log.Warn($"[AUTO_REPLACE_CLEANUP_BARRIER_ABORT_EMERGENCY] profile={profileName} stage=before_wait");
+                _log.Warn(
+                    $"[AUTO_REPLACE_CLEANUP_BARRIER_ABORT_EMERGENCY] profile={profileName} stage=before_wait reservation=KEPT");
                 return;
             }
 
+            attempt++;
+
             _log.Warn(
                 $"[AUTO_REPLACE_CLEANUP_BARRIER_WAIT] blockedProfile={profileName} request={request.Id} " +
-                $"attempt={attempt}/{AutoReplacementCleanupBarrierMaxAttempts} retryIn={AutoReplacementCleanupBarrierRetrySeconds}s");
+                $"attempt={attempt} retryIn={AutoReplacementCleanupBarrierRetrySeconds}s mode=HARD_BLOCK_UNTIL_CLEAN");
 
             WriteAutoActivityLog(
                 action: "TỰ BÙ",
@@ -1312,14 +1332,16 @@ public sealed partial class ManagerForm
                 replacementProfile: profileName,
                 result: "CHỜ DỌN PROFILE BÙ LỖI",
                 detail:
-                    $"Profile bù {profileName} chưa đóng sạch; thử dọn lại " +
-                    $"{attempt}/{AutoReplacementCleanupBarrierMaxAttempts} sau {AutoReplacementCleanupBarrierRetrySeconds}s.");
+                    $"Profile bù {profileName} chưa đóng sạch; queue Tự bù bị khóa an toàn. " +
+                    $"Thử dọn lại lượt {attempt} sau {AutoReplacementCleanupBarrierRetrySeconds}s; " +
+                    "không mở profile khác cho tới khi xác minh Worker/Chrome đã tắt.");
 
             await Task.Delay(TimeSpan.FromSeconds(AutoReplacementCleanupBarrierRetrySeconds));
 
             if (IsAutomationHalted)
             {
-                _log.Warn($"[AUTO_REPLACE_CLEANUP_BARRIER_ABORT_EMERGENCY] profile={profileName} stage=after_wait");
+                _log.Warn(
+                    $"[AUTO_REPLACE_CLEANUP_BARRIER_ABORT_EMERGENCY] profile={profileName} stage=after_wait reservation=KEPT");
                 return;
             }
 
@@ -1329,7 +1351,7 @@ public sealed partial class ManagerForm
                 {
                     await CloseFailedReplacementRuntimeAsync(ctx);
                     _log.Info(
-                        $"[AUTO_REPLACE_CLEANUP_BARRIER_CLEARED] profile={profileName} source=context attempt={attempt}");
+                        $"[AUTO_REPLACE_CLEANUP_BARRIER_CLEARED] profile={profileName} source=context attempt={attempt} action=QUEUE_CAN_CONTINUE");
                     return;
                 }
 
@@ -1340,7 +1362,7 @@ public sealed partial class ManagerForm
                 {
                     await CloseFailedReplacementRuntimeAsync(refreshedCtx);
                     _log.Info(
-                        $"[AUTO_REPLACE_CLEANUP_BARRIER_CLEARED] profile={profileName} source=refreshed_context attempt={attempt}");
+                        $"[AUTO_REPLACE_CLEANUP_BARRIER_CLEARED] profile={profileName} source=refreshed_context attempt={attempt} action=QUEUE_CAN_CONTINUE");
                     return;
                 }
 
@@ -1349,31 +1371,42 @@ public sealed partial class ManagerForm
 
                 if (profile is null)
                 {
-                    _autoReplacementCleanupProfiles.Remove(profileName);
-                    _log.Info(
-                        $"[AUTO_REPLACE_CLEANUP_BARRIER_CLEARED] profile={profileName} source=profile_missing attempt={attempt}");
-                    return;
+                    // Không còn metadata ProfilePath/CDP thì KHÔNG được coi là sạch.
+                    // Giữ barrier thay vì tái diễn lỗi cũ "profile_missing => release".
+                    barrier = new AutoReplacementCleanupBarrierException(
+                        profileName,
+                        $"Không còn metadata profile {profileName} để xác minh cleanup; giữ barrier an toàn.",
+                        barrier);
+
+                    _log.Error(
+                        $"[AUTO_REPLACE_CLEANUP_BARRIER_PROFILE_MISSING] profile={profileName} request={request.Id} attempt={attempt} action=KEEP_BLOCKED");
+                    continue;
                 }
 
-                // Context không còn: chỉ còn khả năng Chrome mồ côi theo ProfilePath.
-                await EnsureAutoCloseChromeStoppedByPathAsync(
+                // Context không còn nhưng catalog vẫn có ProfilePath/CDP: cleanup trực
+                // tiếp theo identity profile. Khi CIM timeout, helper sẽ resolve PID
+                // listener từ CDP port bằng iphlpapi và kill đúng cây chrome.exe.
+                await EnsureAutoCloseChromeStoppedByPathAndPortAsync(
                     profileName,
                     profile.ProfilePath,
+                    profile.CdpPort,
                     respectEmergencyStop: true);
 
                 ClearAutoCloseExpectedRunning(
                     profileName,
-                    "auto_replacement_barrier_path_cleanup_done");
+                    "auto_replacement_barrier_path_port_cleanup_done");
                 _autoReplacementCleanupProfiles.Remove(profileName);
+
                 _log.Info(
-                    $"[AUTO_REPLACE_CLEANUP_BARRIER_CLEARED] profile={profileName} source=profile_path attempt={attempt}");
+                    $"[AUTO_REPLACE_CLEANUP_BARRIER_CLEARED] profile={profileName} source=profile_path_port attempt={attempt} action=QUEUE_CAN_CONTINUE");
                 return;
             }
             catch (OperationCanceledException ex)
                 when (IsAutomationHalted
                       || ex.Message.StartsWith("EMERGENCY_STOP_", StringComparison.Ordinal))
             {
-                _log.Warn($"[AUTO_REPLACE_CLEANUP_BARRIER_ABORT_EMERGENCY] profile={profileName} stage=cleanup detail={ex.Message}");
+                _log.Warn(
+                    $"[AUTO_REPLACE_CLEANUP_BARRIER_ABORT_EMERGENCY] profile={profileName} stage=cleanup detail={ex.Message} reservation=KEPT");
                 return;
             }
             catch (AutoReplacementCleanupBarrierException ex)
@@ -1394,37 +1427,14 @@ public sealed partial class ManagerForm
                     $"Profile bù {profileName} cleanup retry lỗi.",
                     ex);
             }
+
+            // Quan trọng: KHÔNG Remove cleanup reservation, KHÔNG ClearExpected,
+            // KHÔNG MarkFailed rồi tiếp tục queue. Lỗi cleanup phải fail-closed.
+            _log.Error(
+                $"[AUTO_REPLACE_CLEANUP_BARRIER_STILL_BLOCKED] blockedProfile={profileName} request={request.Id} " +
+                $"attempt={attempt} action=KEEP_BLOCKED error={barrier.Message}");
         }
-
-        if (_closing || IsDisposed || Disposing)
-            return;
-
-        // Safety valve: lỗi cleanup của MỘT profile không được làm chết cả hệ thống
-        // Tự bù. Profile đó vào cooldown; request hiện tại đã được ScheduleRetry ở
-        // caller nên queue sẽ quay lại sau, trong khi các request khác được tiếp tục.
-        // Chỉ tại đây mới giải phóng reservation CLEANUP sau khi đã thử đủ barrier.
-        _autoReplacementCleanupProfiles.Remove(profileName);
-        ClearAutoCloseExpectedRunning(profileName, "cleanup_barrier_exhausted_quarantine");
-        MarkReplacementProfileFailed(profileName, "cleanup_barrier_exhausted");
-
-        var finalDetail =
-            $"Profile bù {profileName} vẫn chưa xác minh cleanup sau " +
-            $"{AutoReplacementCleanupBarrierMaxAttempts} lượt. Đã cô lập profile này vào cooldown; " +
-            "không khóa hàng Tự bù vô hạn. Các suất bù khác tiếp tục được xử lý.";
-
-        _log.Error(
-            $"[AUTO_REPLACE_CLEANUP_BARRIER_RELEASED] blockedProfile={profileName} request={request.Id} " +
-            $"attempts={AutoReplacementCleanupBarrierMaxAttempts} action=QUARANTINE_AND_CONTINUE error={barrier.Message}");
-
-        WriteAutoActivityLog(
-            action: "TỰ BÙ",
-            profile: request.ClosedProfileName,
-            reason: request.Reason,
-            replacementProfile: profileName,
-            result: "CÔ LẬP PROFILE BÙ LỖI",
-            detail: finalDetail);
     }
-
 
 
     static bool IsNameSyncPendingOutcome(AutoProfileProcessOutcome outcome)

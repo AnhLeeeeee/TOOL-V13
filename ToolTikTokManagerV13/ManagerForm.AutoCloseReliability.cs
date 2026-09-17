@@ -1,9 +1,34 @@
-﻿using ToolTikTokV12.Services;
+﻿using System.Runtime.InteropServices;
+using ToolTikTokV12.Services;
 
 namespace ToolTikTokManagerV13;
 
 public sealed partial class ManagerForm
 {
+    [StructLayout(LayoutKind.Sequential)]
+    struct AutoCloseTcpRowOwnerPid
+    {
+        public uint State;
+        public uint LocalAddress;
+        public uint LocalPort;
+        public uint RemoteAddress;
+        public uint RemotePort;
+        public uint ProcessId;
+    }
+
+    const int AutoCloseAfInet = 2;
+    const int AutoCloseTcpTableOwnerPidListener = 3;
+    const int AutoCloseErrorInsufficientBuffer = 122;
+
+    [DllImport("iphlpapi.dll", SetLastError = true)]
+    static extern uint GetExtendedTcpTable(
+        IntPtr tcpTable,
+        ref int size,
+        bool order,
+        int ipVersion,
+        int tableClass,
+        uint reserved);
+
     sealed class AutoCloseCleanupPendingException : InvalidOperationException
     {
         public bool ProbeUnavailable { get; }
@@ -253,6 +278,281 @@ public sealed partial class ManagerForm
         }
     }
 
+    static int? TryGetAutoCloseCdpListenerPid(int port)
+    {
+        if (port <= 0 || port > 65535)
+            return null;
+
+        var size = 0;
+        var first = GetExtendedTcpTable(
+            IntPtr.Zero,
+            ref size,
+            false,
+            AutoCloseAfInet,
+            AutoCloseTcpTableOwnerPidListener,
+            0);
+
+        if (first != AutoCloseErrorInsufficientBuffer || size <= sizeof(int))
+            return null;
+
+        var table = Marshal.AllocHGlobal(size);
+        try
+        {
+            if (GetExtendedTcpTable(
+                    table,
+                    ref size,
+                    false,
+                    AutoCloseAfInet,
+                    AutoCloseTcpTableOwnerPidListener,
+                    0) != 0)
+            {
+                return null;
+            }
+
+            var count = Marshal.ReadInt32(table);
+            var rowSize = Marshal.SizeOf<AutoCloseTcpRowOwnerPid>();
+
+            for (var i = 0; i < count; i++)
+            {
+                var row = Marshal.PtrToStructure<AutoCloseTcpRowOwnerPid>(
+                    IntPtr.Add(table, sizeof(int) + i * rowSize));
+
+                var localPort = (ushort)(
+                    ((row.LocalPort & 0xFF) << 8)
+                    | ((row.LocalPort >> 8) & 0xFF));
+
+                if (localPort == port && row.ProcessId > 0)
+                    return unchecked((int)row.ProcessId);
+            }
+
+            return null;
+        }
+        catch
+        {
+            return null;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(table);
+        }
+    }
+
+    static bool IsAutoCloseProcessAlive(int pid)
+    {
+        if (pid <= 0)
+            return false;
+
+        try
+        {
+            using var process = System.Diagnostics.Process.GetProcessById(pid);
+            return !process.HasExited;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    static bool IsAutoCloseChromePid(int pid)
+    {
+        if (pid <= 0)
+            return false;
+
+        try
+        {
+            using var process = System.Diagnostics.Process.GetProcessById(pid);
+            return !process.HasExited
+                && process.ProcessName.Equals("chrome", StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    async Task<bool> TryForceKillAutoCloseChromeTreeAsync(
+        string profileName,
+        int pid,
+        string source,
+        bool respectEmergencyStop = false)
+    {
+        if (pid <= 0)
+            return true;
+
+        if (respectEmergencyStop && IsAutomationHalted)
+            throw new OperationCanceledException(
+                $"EMERGENCY_STOP_AUTOCLOSE: chrome_force_kill:{source}");
+
+        if (!IsAutoCloseProcessAlive(pid))
+            return true;
+
+        // Chỉ kill PID được xác minh là chrome.exe. PID từ CDP listener là ownership
+        // mạnh vì mỗi profile Manager có một CdpPort riêng, nhưng vẫn kiểm tra process
+        // name để không bao giờ kill nhầm một service khác nếu port bị tái sử dụng.
+        if (!IsAutoCloseChromePid(pid))
+        {
+            _log.Warn(
+                $"[AUTO_CLOSE_FORCE_PID_REJECTED] profile={profileName} pid={pid} source={source} reason=not_chrome");
+            return false;
+        }
+
+        try
+        {
+            using var process = System.Diagnostics.Process.GetProcessById(pid);
+            process.Kill(entireProcessTree: true);
+            _log.Warn(
+                $"[AUTO_CLOSE_FORCE_TREE_KILL] profile={profileName} pid={pid} source={source} method=Process.KillTree");
+        }
+        catch (Exception ex)
+        {
+            _log.Warn(
+                $"[AUTO_CLOSE_FORCE_TREE_KILL_WARN] profile={profileName} pid={pid} source={source} method=Process.KillTree error={ex.Message}");
+        }
+
+        var untilUtc = DateTime.UtcNow.AddSeconds(1.5);
+        while (DateTime.UtcNow < untilUtc)
+        {
+            if (!IsAutoCloseProcessAlive(pid))
+                return true;
+
+            await Task.Delay(120);
+
+            if (respectEmergencyStop && IsAutomationHalted)
+                throw new OperationCanceledException(
+                    $"EMERGENCY_STOP_AUTOCLOSE: chrome_force_kill_wait:{source}");
+        }
+
+        // Fallback Windows taskkill khi Process.Kill(entireProcessTree) không hạ được
+        // cây Chrome. Chỉ chạy với PID chrome.exe đã xác minh ở trên.
+        try
+        {
+            using var killer = new System.Diagnostics.Process
+            {
+                StartInfo = new System.Diagnostics.ProcessStartInfo(
+                    "taskkill.exe",
+                    $"/PID {pid} /T /F")
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                }
+            };
+
+            killer.Start();
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+            try
+            {
+                await killer.WaitForExitAsync(cts.Token);
+            }
+            catch (OperationCanceledException) when (cts.IsCancellationRequested)
+            {
+                try { killer.Kill(entireProcessTree: true); } catch { }
+            }
+
+            _log.Warn(
+                $"[AUTO_CLOSE_FORCE_TREE_KILL] profile={profileName} pid={pid} source={source} method=taskkill");
+        }
+        catch (Exception ex)
+        {
+            _log.Warn(
+                $"[AUTO_CLOSE_FORCE_TREE_KILL_WARN] profile={profileName} pid={pid} source={source} method=taskkill error={ex.Message}");
+        }
+
+        untilUtc = DateTime.UtcNow.AddSeconds(2);
+        while (DateTime.UtcNow < untilUtc)
+        {
+            if (!IsAutoCloseProcessAlive(pid))
+                return true;
+
+            await Task.Delay(150);
+
+            if (respectEmergencyStop && IsAutomationHalted)
+                throw new OperationCanceledException(
+                    $"EMERGENCY_STOP_AUTOCLOSE: chrome_taskkill_wait:{source}");
+        }
+
+        return !IsAutoCloseProcessAlive(pid);
+    }
+
+    async Task EnsureAutoCloseChromeStoppedByPathAndPortAsync(
+        string profileName,
+        string profilePath,
+        int cdpPort,
+        bool respectEmergencyStop = false)
+    {
+        try
+        {
+            for (var pass = 1; pass <= 2; pass++)
+            {
+                await EnsureAutoCloseChromeStoppedByPathAsync(
+                    profileName,
+                    profilePath,
+                    respectEmergencyStop);
+
+                if (pass == 1)
+                    await Task.Delay(Random.Shared.Next(900, 1401));
+            }
+
+            return;
+        }
+        catch (AutoCloseCleanupPendingException ex) when (ex.ProbeUnavailable)
+        {
+            _log.Warn(
+                $"[AUTO_CLOSE_PATH_PORT_FALLBACK_BEGIN] profile={profileName} port={cdpPort} probeError={ex.Message}");
+        }
+
+        if (cdpPort <= 0 || cdpPort > 65535)
+        {
+            throw new AutoCloseCleanupPendingException(
+                $"Không có CDP port hợp lệ để xác minh Chrome profile {profileName} sau khi CIM/probe lỗi. "
+                + "Giữ CLEANUP_PENDING; không được mở profile bù khác.",
+                probeUnavailable: true);
+        }
+
+        for (var pass = 1; pass <= 2; pass++)
+        {
+            if (respectEmergencyStop && IsAutomationHalted)
+                throw new OperationCanceledException(
+                    "EMERGENCY_STOP_AUTOCLOSE: chrome_path_port_fallback");
+
+            var listenerPid = TryGetAutoCloseCdpListenerPid(cdpPort);
+            if (listenerPid is > 0)
+            {
+                await TryForceKillAutoCloseChromeTreeAsync(
+                    profileName,
+                    listenerPid.Value,
+                    $"cdp_port_{cdpPort}_pass_{pass}",
+                    respectEmergencyStop);
+            }
+
+            await Task.Delay(pass == 1 ? 900 : 250);
+
+            var cdpListening = await IsAutoCloseCdpPortListeningAsync(cdpPort);
+            var latestPid = TryGetAutoCloseCdpListenerPid(cdpPort);
+            var pidAlive = latestPid is > 0 && IsAutoCloseProcessAlive(latestPid.Value);
+
+            _log.Warn(
+                $"[AUTO_CLOSE_PATH_PORT_FALLBACK_CHECK] profile={profileName} pass={pass}/2 port={cdpPort} cdpListening={cdpListening} listenerPid={(latestPid?.ToString() ?? "-")} pidAlive={pidAlive}");
+
+            if (cdpListening || pidAlive)
+            {
+                if (pass == 2)
+                {
+                    throw new AutoCloseCleanupPendingException(
+                        $"Chrome profile {profileName} vẫn còn CDP/PID trên port {cdpPort} sau force-kill. "
+                        + "Giữ CLEANUP_PENDING; không được mở profile bù khác.",
+                        probeUnavailable: true);
+                }
+
+                continue;
+            }
+        }
+
+        _log.Warn(
+            $"[AUTO_CLOSE_PATH_PORT_FALLBACK_CONFIRMED] profile={profileName} port={cdpPort} passes=2/2 action=ALLOW_CLEANUP_CONTINUE");
+    }
+
     async Task EnsureAutoCloseChromeStoppedByPathAsync(
         string profileName,
         string profilePath,
@@ -405,19 +705,6 @@ public sealed partial class ManagerForm
         }
 
         ThrowIfEmergencyStopRequested("begin");
-        static bool IsPidAlive(int pid)
-        {
-            if (pid <= 0) return false;
-            try
-            {
-                using var process = System.Diagnostics.Process.GetProcessById(pid);
-                return !process.HasExited;
-            }
-            catch
-            {
-                return false;
-            }
-        }
 
         var knownChromePid = 0;
         var hwndValue = ctx.LastSnapshot?.ChromeWindowHandle ?? 0;
@@ -432,28 +719,37 @@ public sealed partial class ManagerForm
             catch { }
         }
 
-        // Nếu PID top-level cũ còn sống, force-kill đúng cây process đó trước khi
-        // xác minh. Không quét/kill Chrome profile khác.
-        if (knownChromePid > 0 && IsPidAlive(knownChromePid))
+        // CIM/PowerShell có thể timeout khi máy đang tải cao. Lúc đó không chỉ
+        // "quan sát" CDP nữa: CdpPort là duy nhất theo profile, nên lấy PID owner
+        // trực tiếp từ bảng TCP của Windows (iphlpapi) rồi kill đúng cây chrome.exe.
+        // Đây là đường cứu chính cho tình huống Worker đã chết nhưng Chrome orphan
+        // vẫn giữ CDP khiến các bản trước QUARANTINE rồi mở dư 6/5, 7/5.
+        var firstListenerPid = TryGetAutoCloseCdpListenerPid(ctx.Profile.CdpPort);
+
+        if (knownChromePid > 0)
         {
             ThrowIfEmergencyStopRequested("before_known_pid_kill");
-            try
-            {
-                using var chrome = System.Diagnostics.Process.GetProcessById(knownChromePid);
-                chrome.Kill(entireProcessTree: true);
-                _log.Warn(
-                    $"[AUTO_CLOSE_FALLBACK_KILL_KNOWN_PID] profile={ctx.Profile.Name} pid={knownChromePid} probeError={probeError}");
-            }
-            catch (Exception ex)
-            {
-                _log.Warn(
-                    $"[AUTO_CLOSE_FALLBACK_KILL_WARN] profile={ctx.Profile.Name} pid={knownChromePid} error={ex.Message}");
-            }
+            await TryForceKillAutoCloseChromeTreeAsync(
+                ctx.Profile.Name,
+                knownChromePid,
+                "cached_window_pid",
+                respectEmergencyStop);
+        }
+
+        if (firstListenerPid is > 0 && firstListenerPid.Value != knownChromePid)
+        {
+            ThrowIfEmergencyStopRequested("before_listener_pid_kill");
+            await TryForceKillAutoCloseChromeTreeAsync(
+                ctx.Profile.Name,
+                firstListenerPid.Value,
+                $"cdp_listener_{ctx.Profile.CdpPort}",
+                respectEmergencyStop);
         }
 
         for (var pass = 1; pass <= 2; pass++)
         {
             ThrowIfEmergencyStopRequested($"before_pass_{pass}");
+
             var workerAlive = false;
             try
             {
@@ -464,18 +760,46 @@ public sealed partial class ManagerForm
                 workerAlive = ctx.Worker is not null;
             }
 
+            var opening = ctx.Opening;
             var windowAlive = HasAutoCloseCachedLiveChromeWindow(ctx);
             var cdpListening = await IsAutoCloseCdpPortListeningAsync(ctx.Profile.CdpPort);
-            var pidAlive = IsPidAlive(knownChromePid);
-            var opening = ctx.Opening;
+            var listenerPid = TryGetAutoCloseCdpListenerPid(ctx.Profile.CdpPort);
+
+            // Chrome có thể vừa spawn/re-parent nên listener PID có thể đổi sau lần
+            // kill đầu. Nếu port vẫn sống, resolve lại PID rồi kill thêm đúng cây đó.
+            if (cdpListening && listenerPid is > 0)
+            {
+                await TryForceKillAutoCloseChromeTreeAsync(
+                    ctx.Profile.Name,
+                    listenerPid.Value,
+                    $"cdp_listener_retry_pass_{pass}",
+                    respectEmergencyStop);
+
+                await Task.Delay(350);
+                cdpListening = await IsAutoCloseCdpPortListeningAsync(ctx.Profile.CdpPort);
+                listenerPid = TryGetAutoCloseCdpListenerPid(ctx.Profile.CdpPort);
+            }
+
+            var knownPidAlive = IsAutoCloseProcessAlive(knownChromePid);
+            var listenerPidAlive = listenerPid is > 0
+                && IsAutoCloseProcessAlive(listenerPid.Value);
 
             _log.Warn(
                 $"[AUTO_CLOSE_FALLBACK_CLOSE_CHECK] profile={ctx.Profile.Name} pass={pass}/2 " +
                 $"workerAlive={workerAlive} windowAlive={windowAlive} cdpListening={cdpListening} " +
-                $"knownPid={knownChromePid} pidAlive={pidAlive} opening={opening} probeError={probeError}");
+                $"knownPid={knownChromePid} knownPidAlive={knownPidAlive} " +
+                $"listenerPid={(listenerPid?.ToString() ?? "-")} listenerPidAlive={listenerPidAlive} " +
+                $"opening={opening} probeError={probeError}");
 
-            if (workerAlive || windowAlive || cdpListening || pidAlive || opening)
+            if (workerAlive
+                || windowAlive
+                || cdpListening
+                || knownPidAlive
+                || listenerPidAlive
+                || opening)
+            {
                 return false;
+            }
 
             if (pass == 1)
             {

@@ -1643,66 +1643,194 @@ public sealed partial class ManagerForm
                     continue;
                 }
 
-                var identityState = LoadIdentityToolState();
-                var names = SplitIdentityNames(identityState.NamesText);
-                if (names.Count == 0)
+                // Tên/ảnh=DONE trong Excel là override thủ công có chủ ý.
+                // Nếu người dùng đã sửa trạng thái này thành DONE thì recovery phải
+                // tin trạng thái đó giống Name Guard: không mở Hồ sơ, không probe tên
+                // và không được vì nickname hiện tại khác mẫu mà cleanup PRF.
+                // Nếu đọc Excel lỗi thì giữ hành vi cũ (probe/Name Guard) để tránh
+                // bỏ qua kiểm tra chỉ vì lỗi I/O tạm thời.
+                var excelIdentityDoneOverride = false;
+                try
                 {
-                    await CleanupCreatedReplacementAttemptAsync(
-                        profileName,
-                        "name_sync_recovery_names_empty");
-                    TouchReusableProfileNameSyncPending(profileName, "identity_names_empty");
-                    continue;
+                    excelIdentityDoneOverride = await RunAccountPoolIoAsync(
+                        () => _accountPoolService.IsIdentityDone(account.Username),
+                        executionToken);
                 }
-
-                // Chỉ PROBE tên. Không gọi ProcessNameGuardOnceAsync vì hàm đó sẽ
-                // đổi tên lại khi chưa match; recovery sweep theo yêu cầu chỉ kiểm tra.
-                var probe = await ProbeNameGuardFastAsync(
-                    ctx,
-                    account.Username,
-                    names);
-
-                if (!probe.Ok)
+                catch (OperationCanceledException)
+                    when (executionToken.IsCancellationRequested
+                          || !IsAutoReplacementExecutionAllowed(executionGeneration))
+                {
+                    throw;
+                }
+                catch (Exception ex)
                 {
                     _log.Warn(
-                        $"[NAME_SYNC_RECOVERY_PROBE_WAIT] profile={profileName} source={probe.Source} message={probe.Message}");
-
-                    await CleanupCreatedReplacementAttemptAsync(
-                        profileName,
-                        "name_sync_recovery_probe_transient");
-                    TouchReusableProfileNameSyncPending(profileName, "probe_transient");
-                    continue;
+                        $"[NAME_SYNC_RECOVERY_EXCEL_DONE_READ_WARN] profile={profileName} account={account.Username} error={ex.Message}");
                 }
 
-                if (!probe.Matched)
+                NameGuardProbeReply probe;
+                if (excelIdentityDoneOverride)
                 {
+                    probe = new NameGuardProbeReply
+                    {
+                        Ok = true,
+                        Matched = true,
+                        CurrentName = "EXCEL_DONE",
+                        Source = "excel_done_override",
+                        Message = "Tên/ảnh đã DONE trong Excel; bỏ qua kiểm tra tên theo override thủ công."
+                    };
+
+                    MarkNameGuardVerifiedForCurrentChromeSession(ctx, account.Username);
                     _log.Info(
-                        $"[NAME_SYNC_RECOVERY_NOT_YET] profile={profileName} currentName={probe.CurrentName}");
-
-                    await CleanupCreatedReplacementAttemptAsync(
-                        profileName,
-                        "name_sync_not_updated_yet");
-                    TouchReusableProfileNameSyncPending(profileName, "name_not_updated_yet");
-                    continue;
+                        $"[NAME_SYNC_RECOVERY_SKIP_EXCEL_DONE] profile={profileName} account={account.Username} action=SKIP_NAME_PROBE_AND_GUARD");
                 }
-
-                var identityDone = await MarkIdentityDoneVerifiedAsync(
-                    account.Username,
-                    profileName,
-                    executionToken);
-
-                if (!identityDone.Ok)
+                else
                 {
-                    _log.Warn(
-                        $"[NAME_SYNC_RECOVERY_EXCEL_WAIT] profile={profileName} error={identityDone.Error}");
+                    var identityState = LoadIdentityToolState();
+                    var names = SplitIdentityNames(identityState.NamesText);
+                    if (names.Count == 0)
+                    {
+                        await CleanupCreatedReplacementAttemptAsync(
+                            profileName,
+                            "name_sync_recovery_names_empty");
+                        TouchReusableProfileNameSyncPending(profileName, "identity_names_empty");
+                        continue;
+                    }
 
-                    await CleanupCreatedReplacementAttemptAsync(
+                    // Probe nhanh trước. Nếu tên đã đúng thì đi tiếp ngay; nếu vẫn sai thì
+                    // bên dưới mới giao cho Name Guard xử lý/đổi tên trước khi quyết định cleanup.
+                    probe = await ProbeNameGuardFastAsync(
+                        ctx,
+                        account.Username,
+                        names);
+
+                    if (!probe.Ok)
+                    {
+                        _log.Warn(
+                            $"[NAME_SYNC_RECOVERY_PROBE_WAIT] profile={profileName} source={probe.Source} message={probe.Message}");
+
+                        await CleanupCreatedReplacementAttemptAsync(
+                            profileName,
+                            "name_sync_recovery_probe_transient");
+                        TouchReusableProfileNameSyncPending(profileName, "probe_transient");
+                        continue;
+                    }
+
+                    if (!probe.Matched)
+                    {
+                        _log.Info(
+                            $"[NAME_SYNC_RECOVERY_NOT_YET] profile={profileName} currentName={probe.CurrentName} action=RUN_NAME_GUARD_BEFORE_CLEANUP");
+
+                        // PRF NAME_SYNC_PENDING có thể đang rơi đúng vào khoảng TikTok chưa
+                        // phản ánh nickname mới, hoặc AutoOnReady Name Guard vừa bắt đầu xử lý.
+                        // Không được đóng ngay khi probe đầu tiên còn thấy tên cũ: chờ/đi qua
+                        // Name Guard hiện có để nó có cơ hội xác nhận lại và đổi tên nếu cần.
+                        //
+                        // EnsureNameGuardBeforeStartAsync dùng chung _autoIdentityInFlight +
+                        // _autoIdentityQueueGate, nên nếu AutoOnReady đang đổi tên thì recovery
+                        // sẽ chờ lượt đó hoàn tất thay vì cleanup Chrome giữa chừng.
+                        _log.Info(
+                            $"[NAME_SYNC_RECOVERY_NAME_GUARD_BEGIN] profile={profileName} account={account.Username} currentName={probe.CurrentName}");
+
+                        var nameGuard = await EnsureNameGuardBeforeStartAsync(ctx);
+
+                        if (!IsAutoReplacementExecutionAllowed(executionGeneration))
+                        {
+                            try
+                            {
+                                await CleanupCreatedReplacementAttemptAsync(
+                                    profileName,
+                                    "name_sync_recovery_hard_stop_after_name_guard");
+                            }
+                            catch (Exception cleanupEx)
+                            {
+                                _log.Warn(
+                                    $"[NAME_SYNC_RECOVERY_HARD_STOP_CLEANUP_WARN] profile={profileName} error={cleanupEx.Message}");
+                            }
+
+                            return false;
+                        }
+
+                        executionToken.ThrowIfCancellationRequested();
+
+                        if (!nameGuard.Allowed)
+                        {
+                            _log.Warn(
+                                $"[NAME_SYNC_RECOVERY_NAME_GUARD_WAIT] profile={profileName} account={account.Username} " +
+                                $"transient={nameGuard.Transient} deferred={nameGuard.Deferred} reason={nameGuard.Message}");
+
+                            // Deferred nghĩa là chính Name Guard đã đưa PRF về NAME_SYNC_PENDING
+                            // và đóng sạch Chrome/Worker để chờ TikTok đồng bộ; không cleanup
+                            // lần hai. Các trường hợp khác giữ hành vi cũ: đóng lượt mở hiện tại,
+                            // touch lại pending rồi để cơ chế retry hiện có thử lại ở lượt sau.
+                            if (!nameGuard.Deferred)
+                            {
+                                await CleanupCreatedReplacementAttemptAsync(
+                                    profileName,
+                                    nameGuard.Transient
+                                        ? "name_sync_recovery_name_guard_transient"
+                                        : "name_sync_recovery_name_guard_blocked");
+                            }
+
+                            TouchReusableProfileNameSyncPending(
+                                profileName,
+                                nameGuard.Deferred
+                                    ? "name_guard_deferred_again"
+                                    : nameGuard.Transient
+                                        ? "name_guard_transient"
+                                        : "name_guard_blocked");
+                            continue;
+                        }
+
+                        // Name Guard chỉ cho phép đi tiếp khi nó đã có bằng chứng tên đúng
+                        // (hoặc một lượt song song vừa ghi DONE). Probe lại một lần để recovery
+                        // cũng có bằng chứng trực tiếp trước khi đánh dấu slot bù thành công.
+                        var verifiedAfterNameGuard = await ProbeNameGuardFastAsync(
+                            ctx,
+                            account.Username,
+                            names);
+
+                        if (!verifiedAfterNameGuard.Ok || !verifiedAfterNameGuard.Matched)
+                        {
+                            _log.Warn(
+                                $"[NAME_SYNC_RECOVERY_NAME_GUARD_NOT_VERIFIED] profile={profileName} " +
+                                $"ok={verifiedAfterNameGuard.Ok} matched={verifiedAfterNameGuard.Matched} " +
+                                $"currentName={verifiedAfterNameGuard.CurrentName} source={verifiedAfterNameGuard.Source} " +
+                                $"message={verifiedAfterNameGuard.Message}");
+
+                            await CleanupCreatedReplacementAttemptAsync(
+                                profileName,
+                                "name_sync_recovery_name_guard_post_probe_not_ready");
+                            TouchReusableProfileNameSyncPending(
+                                profileName,
+                                "name_guard_post_probe_not_ready");
+                            continue;
+                        }
+
+                        probe = verifiedAfterNameGuard;
+                        _log.Info(
+                            $"[NAME_SYNC_RECOVERY_NAME_GUARD_OK] profile={profileName} account={account.Username} currentName={probe.CurrentName}");
+                    }
+
+                    var identityDone = await MarkIdentityDoneVerifiedAsync(
+                        account.Username,
                         profileName,
-                        "name_sync_identity_done_write_failed");
-                    TouchReusableProfileNameSyncPending(profileName, "identity_done_write_failed");
-                    continue;
-                }
+                        executionToken);
 
-                MarkNameGuardVerifiedForCurrentChromeSession(ctx, account.Username);
+                    if (!identityDone.Ok)
+                    {
+                        _log.Warn(
+                            $"[NAME_SYNC_RECOVERY_EXCEL_WAIT] profile={profileName} error={identityDone.Error}");
+
+                        await CleanupCreatedReplacementAttemptAsync(
+                            profileName,
+                            "name_sync_identity_done_write_failed");
+                        TouchReusableProfileNameSyncPending(profileName, "identity_done_write_failed");
+                        continue;
+                    }
+
+                    MarkNameGuardVerifiedForCurrentChromeSession(ctx, account.Username);
+                }
 
                 if (!IsAutoReplacementExecutionAllowed(executionGeneration))
                 {
@@ -1822,8 +1950,12 @@ public sealed partial class ManagerForm
                     "used",
                     "name_sync_recovered_running_confirmed");
 
+                var usedExcelIdentityOverride =
+                    string.Equals(probe.Source, "excel_done_override", StringComparison.OrdinalIgnoreCase);
+
                 _log.Info(
-                    $"[NAME_SYNC_RECOVERY_OK] closed={request.ClosedProfileName} replacement={profileName} account={account.Username} currentName={probe.CurrentName}");
+                    $"[NAME_SYNC_RECOVERY_OK] closed={request.ClosedProfileName} replacement={profileName} account={account.Username} " +
+                    $"currentName={probe.CurrentName} excelDoneOverride={usedExcelIdentityOverride}");
 
                 WriteAutoActivityLog(
                     action: "KIỂM TRA TÊN CHỜ",
@@ -1832,7 +1964,9 @@ public sealed partial class ManagerForm
                     reason: request.Reason,
                     replacementProfile: profileName,
                     result: "THÀNH CÔNG",
-                    detail: $"Tên đã cập nhật thành '{probe.CurrentName}'. Đã xác minh DONE và profile RUNNING khỏe.");
+                    detail: usedExcelIdentityOverride
+                        ? "Tên/ảnh đã DONE trong Excel nên bỏ qua kiểm tra tên; profile RUNNING khỏe."
+                        : $"Tên đã cập nhật thành '{probe.CurrentName}'. Đã xác minh DONE và profile RUNNING khỏe.");
 
                 return true;
             }
