@@ -676,6 +676,31 @@ public sealed partial class ChromeController : IAsyncDisposable
         return pages;
     }
 
+    public async Task<CdpPage?> RefreshAttachedPageMetadataAsync()
+    {
+        // CdpPage is a snapshot returned by /json/list when we attach. Chrome keeps the same
+        // target id/websocket while the user navigates that tab, so Page.Url can become stale.
+        // Refresh the metadata for the SAME attached target without reconnecting or navigating.
+        if (_port <= 0 || Page is null) return Page;
+
+        var old = Page;
+        var pages = await GetPagesAsync(_port);
+        var fresh = pages.FirstOrDefault(p =>
+            p.Id.Equals(old.Id, StringComparison.Ordinal)
+            && IsUsablePageTarget(p));
+        if (fresh is null) return Page;
+
+        Page = fresh;
+        if (!string.Equals(old.Url, fresh.Url, StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(old.Title, fresh.Title, StringComparison.Ordinal))
+        {
+            _log.Info(
+                $"[CDP_PAGE_METADATA_REFRESH] id={fresh.Id} " +
+                $"oldUrl={TrimForLog(old.Url, 160)} newUrl={TrimForLog(fresh.Url, 160)}");
+        }
+        return fresh;
+    }
+
     public async Task<CdpVersionInfo> GetVersionAsync(int port)
     {
         var json = await _http.GetStringAsync($"http://127.0.0.1:{port}/json/version");

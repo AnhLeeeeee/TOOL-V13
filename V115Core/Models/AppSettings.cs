@@ -1,4 +1,4 @@
-namespace ToolTikTokV11.Models;
+﻿namespace ToolTikTokV11.Models;
 
 public sealed class AppSettings
 {
@@ -24,6 +24,7 @@ public sealed class AppSettings
     // V13.4: chế độ tiết kiệm tài nguyên cho máy ảo.
     public VmOptimizationSettings VmOptimization { get; set; } = new();
     public ViewerSettings Viewer { get; set; } = new();
+    public StartupLiveSearchSettings StartupLiveSearch { get; set; } = new();
     public OldLiveSettings OldLive { get; set; } = new();
 }
 
@@ -35,6 +36,15 @@ public sealed class ViewerSettings
     public int ConfirmLow { get; set; } = 2;
     public int WaitAfterF5Sec { get; set; } = 2;
     public int MaxF5 { get; set; } = 100;
+}
+
+public sealed class StartupLiveSearchSettings
+{
+    public bool Enabled { get; set; } = true;
+    public string Keywords { get; set; } = "live; liên quân";
+    public int KeywordTimeoutSec { get; set; } = 40;
+    public int TotalTimeoutSec { get; set; } = 90;
+    public int MaxCards { get; set; } = 12;
 }
 
 public sealed class OldLiveSettings

@@ -512,7 +512,7 @@ public sealed partial class MainForm : Form
             AutoSize = true,
             AutoSizeMode = AutoSizeMode.GrowAndShrink,
             ColumnCount = 1,
-            RowCount = 4,
+            RowCount = 5,
             Margin = new Padding(0)
         };
         contentLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -520,9 +520,11 @@ public sealed partial class MainForm : Form
         contentLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         contentLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         contentLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        contentLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         contentLayout.Controls.Add(BuildChromeGroup(), 0, 0);
         contentLayout.Controls.Add(BuildXPathGroup(), 0, 1);
-        contentLayout.Controls.Add(BuildTimingGroup(), 0, 2);
+        contentLayout.Controls.Add(BuildStartupLiveSearchGroup(), 0, 2);
+        contentLayout.Controls.Add(BuildTimingGroup(), 0, 3);
 
         var contentGroup = new GroupBox
         {
@@ -542,7 +544,7 @@ public sealed partial class MainForm : Form
         contentPanel.Controls.Add(_contentCount, 0, 0);
         contentPanel.Controls.Add(_contents, 0, 1);
         contentGroup.Controls.Add(contentPanel);
-        contentLayout.Controls.Add(contentGroup, 0, 3);
+        contentLayout.Controls.Add(contentGroup, 0, 4);
 
         scrollPanel.Controls.Add(contentLayout);
         BindScrollContentWidth(scrollPanel, contentLayout);
@@ -865,6 +867,7 @@ public sealed partial class MainForm : Form
         _viewerEnabled.Checked = _settings.Viewer.Enabled; _viewerXp.Text = _settings.Viewer.XPath; _viewerThreshold.Value = Clamp(_settings.Viewer.Threshold, _viewerThreshold);
         _viewerConfirm.Value = Clamp(_settings.Viewer.ConfirmLow, _viewerConfirm); _viewerWait.Value = Clamp(_settings.Viewer.WaitAfterF5Sec, _viewerWait);
         _viewerMaxF5.Value = Clamp(_settings.Viewer.MaxF5, _viewerMaxF5);
+        LoadStartupLiveSearchToUi();
         _oldEnabled.Checked = _settings.OldLive.Enabled; _oldIdentityXp.Text = _settings.OldLive.IdentityXPath; _oldActionXp.Text = _settings.OldLive.ActionXPath;
         SelectCombo(_oldKeep, _settings.OldLive.KeepMinutes.ToString());
         LoadProfilesToUi();
@@ -947,6 +950,7 @@ public sealed partial class MainForm : Form
             ApplyVmOptimizationSettings();
             _settings.Viewer.Enabled = _viewerEnabled.Checked; _settings.Viewer.XPath = _viewerXp.Text.Trim(); _settings.Viewer.Threshold = (int)_viewerThreshold.Value; _settings.Viewer.ConfirmLow = (int)_viewerConfirm.Value;
             _settings.Viewer.WaitAfterF5Sec = (int)_viewerWait.Value; _settings.Viewer.MaxF5 = (int)_viewerMaxF5.Value;
+            SaveStartupLiveSearchFromUi();
             _settings.OldLive.Enabled = _oldEnabled.Checked; _settings.OldLive.IdentityXPath = _oldIdentityXp.Text.Trim(); _settings.OldLive.ActionXPath = _oldActionXp.Text.Trim();
             _settings.OldLive.KeepMinutes = int.TryParse(_oldKeep.Text, out var km) ? km : 10;
             _settingsService.Save(_settings); _settingsService.SaveContents(_contents.Text); _log.Info($"Đã lưu cấu hình {AppVersionInfo.Display} + XPath/InputGuard/VM mode vào auto_chrome.ini.");
@@ -1770,10 +1774,12 @@ public sealed partial class MainForm : Form
             ThrowIfEmergencyStopRequested("after_ensure_chrome");
 
             // V13.5: giữ nguyên LIVE hiện tại nếu các XPath thao tác chính đã có.
-            // Trước đây mỗi lần bấm Bắt đầu đều chạy PrepareTikTokProfileStartupAsync(),
-            // khiến profile đang đứng trong một LIVE hợp lệ vẫn bị điều hướng về /live
-            // và TikTok chọn sang một LIVE ngẫu nhiên khác.
-            var liveUrlBeforeProbe = LooksLikeTikTokLiveUrl(_chrome.Page?.Url ?? "");
+            // CdpPage.Url là metadata được chụp tại lúc attach và KHÔNG tự cập nhật khi user
+            // điều hướng tab bằng tay. Vì vậy trước khi quyết định đang Home hay LIVE phải đọc
+            // location.href trực tiếp từ renderer hiện đang attach; nếu không, tab thật đang
+            // /@user/live vẫn có thể bị hiểu nhầm là https://www.tiktok.com/ và bị navigate lại.
+            var liveUrlBeforeProbe = LooksLikeTikTokLiveUrl(
+                await GetFreshStartupCurrentUrlAsync("before-live-probe"));
             var alreadyOnReadyLive = await IsCurrentLiveReadyForStartAsync();
             ThrowIfEmergencyStopRequested("after_live_ready_probe");
             if (alreadyOnReadyLive)
@@ -1797,28 +1803,55 @@ public sealed partial class MainForm : Form
                     return;
                 }
 
-                // Chỉ khi chưa ở URL LIVE mới thực hiện startup/login gate
-                // và điều hướng TikTok vào /live như logic cũ.
-                _log.Info("[TIKTOK_STARTUP_NEED_LIVE] currentUrlIsLive=false action=PREPARE_TIKTOK_LIVE");
-                await PrepareTikTokProfileStartupAsync();
-                ThrowIfEmergencyStopRequested("after_prepare_tiktok_startup");
-                if (!string.Equals(_startupPreparationState, "READY", StringComparison.OrdinalIgnoreCase))
+                // Chưa ở LIVE: nếu bật Search LIVE startup thì bảo đảm login nhưng giữ ở Home,
+                // thử Search đúng MỘT LẦN; chỉ khi Search thất bại/hết deadline mới quay về
+                // flow /live cũ. Nếu user đã đứng sẵn LIVE thì nhánh này không chạy.
+                var searchStartupSucceeded = false;
+                if (_settings.StartupLiveSearch.Enabled)
                 {
-                    var detail = _startupPreparationState switch
+                    _log.Info("[TIKTOK_STARTUP_NEED_LIVE] currentUrlIsLive=false action=SEARCH_LIVE_FIRST");
+                    await PrepareTikTokProfileStartupAsync(openLiveWhenReady: false);
+                    ThrowIfEmergencyStopRequested("after_prepare_tiktok_home_for_search");
+                    if (!string.Equals(_startupPreparationState, "READY", StringComparison.OrdinalIgnoreCase))
                     {
-                        "CAPTCHA_REQUIRED" => "TikTok vẫn đang yêu cầu CAPTCHA sau thời gian chờ. Hãy xử lý CAPTCHA trên Chrome rồi bấm Bắt đầu lại.",
-                        "TOTP_REQUIRED" => "TikTok đang yêu cầu 2FA nhưng profile chưa có secret TOTP.",
-                        "LOGIN_REQUIRED" => "Profile chưa đăng nhập và chưa cấu hình tài khoản/mật khẩu tự động.",
-                        _ => "TikTok chưa sẵn sàng: " + _startupPreparationState
-                    };
-                    AppendProblem("[TIKTOK_STARTUP_GATE] " + detail);
-                    if (!suppressDialogs) MessageBox.Show(detail, "TikTok chưa sẵn sàng", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    return;
+                        var detail = GetTikTokStartupGateDetail();
+                        AppendProblem("[TIKTOK_STARTUP_GATE] " + detail);
+                        if (!suppressDialogs) MessageBox.Show(detail, "TikTok chưa sẵn sàng", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        return;
+                    }
+
+                    searchStartupSucceeded = await TryStartupLiveSearchAsync();
+                    ThrowIfEmergencyStopRequested("after_startup_live_search");
+                }
+
+                if (!searchStartupSucceeded)
+                {
+                    _log.Info(_settings.StartupLiveSearch.Enabled
+                        ? "[STARTUP_LIVE_SEARCH_FALLBACK] result=failed action=PREPARE_TIKTOK_LIVE_OLD_FLOW"
+                        : "[TIKTOK_STARTUP_NEED_LIVE] currentUrlIsLive=false action=PREPARE_TIKTOK_LIVE");
+                    await PrepareTikTokProfileStartupAsync();
+                    ThrowIfEmergencyStopRequested("after_prepare_tiktok_startup");
+                    if (!string.Equals(_startupPreparationState, "READY", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var detail = GetTikTokStartupGateDetail();
+                        AppendProblem("[TIKTOK_STARTUP_GATE] " + detail);
+                        if (!suppressDialogs) MessageBox.Show(detail, "TikTok chưa sẵn sàng", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        return;
+                    }
                 }
             }
 
             if (!await ValidateCoreXpathsBeforeStartAsync(suppressDialogs)) return;
             ThrowIfEmergencyStopRequested("after_xpath_validation");
+
+            // ValidateCoreXpaths có thể mất một khoảng thời gian; refresh thêm lần cuối để
+            // AutomationEngine.Start nhận đúng URL hiện tại. Viewer Gate phía engine vẫn chạy
+            // nguyên logic: đủ view thì chạy, thấp/không đọc được thì tìm LIVE khác như cũ.
+            try { await _chrome.RefreshAttachedPageMetadataAsync(); }
+            catch (Exception ex)
+            {
+                _log.Warn($"[TIKTOK_STARTUP_FINAL_METADATA_REFRESH_WARN] reason={ShortText(ex.Message, 140)}");
+            }
             _engine.Start(_settings, GetAutomationContents());
         }
         catch (OperationCanceledException ex)
@@ -1863,6 +1896,61 @@ public sealed partial class MainForm : Form
            && (url.Contains("tiktok.com/live", StringComparison.OrdinalIgnoreCase)
                || (url.Contains("tiktok.com/@", StringComparison.OrdinalIgnoreCase)
                    && url.Contains("/live", StringComparison.OrdinalIgnoreCase)));
+
+    static string ExtractStartupRuntimeHref(string identity)
+    {
+        if (string.IsNullOrWhiteSpace(identity)) return "";
+        const string marker = "href=";
+        var start = identity.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+        if (start < 0) return "";
+        start += marker.Length;
+        var finish = identity.IndexOf(" | ", start, StringComparison.Ordinal);
+        if (finish < 0) finish = identity.Length;
+        return identity[start..finish].Trim();
+    }
+
+    async Task<string> GetFreshStartupCurrentUrlAsync(string source)
+    {
+        // Page.Url là snapshot của /json/list tại lúc CDP attach. Khi user tự gõ URL/click
+        // sang LIVE trong cùng tab, Id/WebSocket vẫn giữ nguyên nhưng Page.Url có thể còn Home.
+        // Refresh đúng target id trước, rồi đọc location.href trực tiếp từ renderer để có hai
+        // lớp xác minh mà không reconnect, không đổi tab và không navigate.
+        try
+        {
+            await _chrome.RefreshAttachedPageMetadataAsync();
+        }
+        catch (Exception ex)
+        {
+            _log.Warn(
+                $"[TIKTOK_STARTUP_METADATA_REFRESH_WARN] source={source} " +
+                $"reason={ShortText(ex.Message, 140)}");
+        }
+
+        var metadataUrl = _chrome.Page?.Url ?? "";
+        try
+        {
+            var identity = await _chrome.GetCurrentLiveIdentityAsync();
+            var runtimeUrl = ExtractStartupRuntimeHref(identity);
+            if (!string.IsNullOrWhiteSpace(runtimeUrl))
+            {
+                if (!string.Equals(runtimeUrl, metadataUrl, StringComparison.OrdinalIgnoreCase))
+                {
+                    _log.Info(
+                        $"[TIKTOK_STARTUP_URL_REFRESH] source={source} " +
+                        $"metadata={ShortText(metadataUrl, 140)} runtime={ShortText(runtimeUrl, 140)}");
+                }
+                return runtimeUrl;
+            }
+        }
+        catch (Exception ex) when (!_chrome.IsCdpSessionLost(ex))
+        {
+            _log.Warn(
+                $"[TIKTOK_STARTUP_URL_REFRESH_WARN] source={source} " +
+                $"reason={ShortText(ex.Message, 140)} fallback={ShortText(metadataUrl, 140)}");
+        }
+
+        return metadataUrl;
+    }
 
     static bool HasReliableStartupLiveIdentity(string identity)
     {
@@ -1964,9 +2052,10 @@ public sealed partial class MainForm : Form
 
     async Task<bool> IsCurrentLiveReadyForStartAsync()
     {
-        // Nếu đang ở trang chủ/login thì không tốn 25-50 giây chờ PAGE_READY; chạy startup
-        // navigation như cũ. Chỉ mở cửa sổ chờ dài khi URL hiện tại thực sự là LIVE.
-        var url = _chrome.Page?.Url ?? "";
+        // Không dùng _chrome.Page.Url trực tiếp ở đây: đó chỉ là metadata lúc attach và có thể
+        // stale sau khi user tự điều hướng tab. Viewer Gate phía AutomationEngine vẫn chạy
+        // bình thường; thay đổi này chỉ ngăn startup navigate đè lên LIVE user đang đứng sẵn.
+        var url = await GetFreshStartupCurrentUrlAsync("live-ready-probe");
         if (!LooksLikeTikTokLiveUrl(url))
         {
             _log.Info($"[TIKTOK_STARTUP_LIVE_PROBE] ready=false reason=not-live-url url={ShortText(url, 140)}");
@@ -1992,7 +2081,7 @@ public sealed partial class MainForm : Form
 
                 await _chrome.RecoverCurrentPageAsync(url);
 
-                url = _chrome.Page?.Url ?? url;
+                url = await GetFreshStartupCurrentUrlAsync("after-403-recovery");
 
                 _log.Warn(
                     $"[TIKTOK_STARTUP_403_RECOVERED] url={ShortText(url, 160)}");

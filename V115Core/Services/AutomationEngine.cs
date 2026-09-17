@@ -1,4 +1,4 @@
-﻿using ToolTikTokV12.Utils;
+using ToolTikTokV12.Utils;
 using System.Text.Json;
 using System.Xml.XPath;
 using ToolTikTokV11.Models;
@@ -75,6 +75,14 @@ public sealed partial class AutomationEngine
     // ngắn để React/chat hydrate. Máy nhanh thoát lock ngay khi ô nhập + Viewer xác minh xong.
     const int LiveTargetStabilizeMs = 10000;
     const int LiveTargetStabilizePollMs = 650;
+    // Khi START ngay trên một LIVE cụ thể, cho Viewer DOM tối đa 10 giây để render trước khi
+    // kết luận không đọc được và quay về flow recommendation. Máy nhanh thoát ngay khi đọc được.
+    const int StartupCurrentLiveViewerGraceMs = 10000;
+    const int StartupCurrentLiveViewerPollMs = 650;
+    // Sau khi rời một LIVE đề xuất vì comment bị khóa, đi theo chuỗi ArrowDown một thời gian
+    // hữu hạn trước khi quay lại recommendation để tránh bounce A -> low -> A vô hạn.
+    const int ViewerChainModeMaxTransitions = 10;
+    const int ViewerChainModeMaxSeconds = 60;
     const int ViewerGateRetryCooldownMs = 1000;
     const int ViewerLowStreakFeedResetThreshold = 5;
     // VM/chrome chậm: document.readyState có thể đã complete nhưng TikTok React/DOM LIVE
@@ -128,6 +136,11 @@ public sealed partial class AutomationEngine
     string _liveTargetStabilizeKey = "";
     int _liveTargetStabilizeViewer = -1;
     DateTime _liveTargetStabilizeUntilUtc = DateTime.MinValue;
+    bool _startupCurrentLivePending;
+    bool _currentLiveFromRecommended;
+    bool _viewerChainMode;
+    int _viewerChainTransitions;
+    DateTime _viewerChainModeUntilUtc = DateTime.MinValue;
     System.Diagnostics.Stopwatch? _loopPerf;
     long _loopPerfTotalMs;
     long _loopPerfCount;
@@ -255,6 +268,15 @@ public sealed partial class AutomationEngine
         _liveTargetStabilizeKey = "";
         _liveTargetStabilizeViewer = -1;
         _liveTargetStabilizeUntilUtc = DateTime.MinValue;
+        var startupUrl = _chrome.Page?.Url ?? "";
+        _startupCurrentLivePending = LooksLikeSpecificTikTokLiveUrl(startupUrl);
+        _currentLiveFromRecommended = false;
+        _viewerChainMode = false;
+        _viewerChainTransitions = 0;
+        _viewerChainModeUntilUtc = DateTime.MinValue;
+        _log.Info(_startupCurrentLivePending
+            ? $"[START_CURRENT_LIVE_ACCEPTED] url={startupUrl} action=KEEP_AND_VALIDATE_CURRENT_LIVE"
+            : $"[START_CURRENT_LIVE_REJECTED] url={startupUrl} reason=NOT_SPECIFIC_LIVE action=NORMAL_START_FLOW");
         _loopPerf = System.Diagnostics.Stopwatch.StartNew();
         _loopPerfTotalMs = 0;
         _loopPerfCount = 0;
@@ -1564,6 +1586,115 @@ public sealed partial class AutomationEngine
         return (true, remaining, _liveTargetStabilizeViewer, currentKey);
     }
 
+    static bool LooksLikeSpecificTikTokLiveUrl(string url)
+        => !string.IsNullOrWhiteSpace(url)
+           && url.Contains("tiktok.com/@", StringComparison.OrdinalIgnoreCase)
+           && url.Contains("/live", StringComparison.OrdinalIgnoreCase);
+
+    bool IsViewerChainModeActive()
+    {
+        if (!_viewerChainMode) return false;
+        if (DateTime.UtcNow >= _viewerChainModeUntilUtc
+            || _viewerChainTransitions >= ViewerChainModeMaxTransitions)
+        {
+            CompleteViewerChainMode("đã hết giới hạn chuỗi");
+            return false;
+        }
+        return true;
+    }
+
+    void ArmViewerChainMode(string reason)
+    {
+        if (!_viewerChainMode)
+        {
+            _viewerChainTransitions = 0;
+            _viewerChainModeUntilUtc = DateTime.UtcNow.AddSeconds(ViewerChainModeMaxSeconds);
+        }
+
+        // Nếu đã ở chain mode thì giữ nguyên deadline ban đầu; không gia hạn theo từng LIVE
+        // bị chặn để tổng thời gian luôn có giới hạn cứng.
+        _viewerChainMode = true;
+        _log.Warn(
+            $"[VIEWER_CHAIN_MODE_ARM] reason={reason} transitions={_viewerChainTransitions}/{ViewerChainModeMaxTransitions} " +
+            $"until={_viewerChainModeUntilUtc:HH:mm:ss.fff} action=ARROWDOWN_BEFORE_RECOMMENDATION");
+    }
+
+    void MaybeArmViewerChainModeForCommentRestriction(string reason)
+    {
+        if (_currentLiveFromRecommended || IsViewerChainModeActive())
+            ArmViewerChainMode(reason);
+    }
+
+    void NoteConfirmedLiveTransition(string source)
+    {
+        _currentLiveFromRecommended = false;
+        if (!IsViewerChainModeActive()) return;
+
+        _viewerChainTransitions++;
+        _log.Info(
+            $"[VIEWER_CHAIN_MODE_STEP] source={source} transitions={_viewerChainTransitions}/{ViewerChainModeMaxTransitions} " +
+            $"remainingSec={Math.Max(0, (_viewerChainModeUntilUtc - DateTime.UtcNow).TotalSeconds):F1}");
+
+        if (_viewerChainTransitions >= ViewerChainModeMaxTransitions)
+            CompleteViewerChainMode("đã đi đủ số LIVE trong chuỗi");
+    }
+
+    void CompleteViewerChainMode(string reason)
+    {
+        if (_viewerChainMode)
+            _log.Info($"[VIEWER_CHAIN_MODE_END] reason={reason} transitions={_viewerChainTransitions}");
+        _viewerChainMode = false;
+        _viewerChainTransitions = 0;
+        _viewerChainModeUntilUtc = DateTime.MinValue;
+    }
+
+    async Task<(bool Found, int Value, string Raw)> TryReadStartupCurrentLiveViewerAsync(string source, CancellationToken ct)
+    {
+        if (!_startupCurrentLivePending)
+            return (false, -1, "");
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        (int value, string raw) last = (-1, "");
+        _log.Info(
+            $"[START_CURRENT_LIVE_VIEWER_WAIT] source={source} graceMs={StartupCurrentLiveViewerGraceMs} " +
+            $"action=WAIT_CURRENT_LIVE_BEFORE_RECOMMENDATION");
+
+        while (_running && !ct.IsCancellationRequested && sw.ElapsedMilliseconds < StartupCurrentLiveViewerGraceMs)
+        {
+            await WaitIfPausedAsync(ct);
+
+            var identity = await GetCurrentLiveIdentityAsync(ct);
+            var currentUrl = _chrome.Page?.Url ?? "";
+            if (!HasReliableLiveIdentity(identity) && !LooksLikeSpecificTikTokLiveUrl(currentUrl))
+            {
+                _log.Warn(
+                    $"[START_CURRENT_LIVE_IDENTITY_LOST] source={source} identity={TrimIdentityForLog(identity)} url={currentUrl} " +
+                    $"action=FALLBACK_NORMAL_VIEWER_FLOW");
+                break;
+            }
+
+            last = await ReadViewerWithRetryAsync(source + " / START current LIVE", ct, attempts: 1);
+            if (last.value >= 0)
+            {
+                _startupCurrentLivePending = false;
+                _log.Info(
+                    $"[START_CURRENT_LIVE_VIEWER_READY] source={source} value={last.value} " +
+                    $"threshold={_s.Viewer.Threshold} elapsedMs={sw.ElapsedMilliseconds}");
+                return (true, last.value, last.raw);
+            }
+
+            var remaining = StartupCurrentLiveViewerGraceMs - (int)Math.Min(int.MaxValue, sw.ElapsedMilliseconds);
+            if (remaining <= 0) break;
+            await Task.Delay(Math.Min(StartupCurrentLiveViewerPollMs, remaining), ct);
+        }
+
+        _startupCurrentLivePending = false;
+        _log.Warn(
+            $"[START_CURRENT_LIVE_VIEWER_TIMEOUT] source={source} waitedMs={sw.ElapsedMilliseconds} " +
+            $"action=FALLBACK_NORMAL_VIEWER_FLOW");
+        return (false, last.value, last.raw);
+    }
+
     async Task RememberRecentViewerSnapshotAsync(int value, string source, CancellationToken ct)
     {
         if (value < 0) return;
@@ -1636,7 +1767,10 @@ public sealed partial class AutomationEngine
         if (!_s.Viewer.Enabled) return true;
 
         SetStatus("KIỂM TRA NGƯỜI XEM", $"{source} • bắt buộc đọc XPath trước khi thao tác");
-        var (value, raw) = await ReadViewerWithRetryAsync(source, ct);
+        var startupCurrent = await TryReadStartupCurrentLiveViewerAsync(source, ct);
+        var (value, raw) = startupCurrent.Found
+            ? (startupCurrent.Value, startupCurrent.Raw)
+            : await ReadViewerWithRetryAsync(source, ct);
 
         if (value < 0)
         {
@@ -1751,6 +1885,7 @@ public sealed partial class AutomationEngine
             ResetInputGuardConsecutive("sau chọn LIVE đề xuất");
             Volatile.Write(ref _lastViewerValue, best.Viewer);
             ResetLowViewerStreak($"đã chọn LIVE đề xuất {best.Viewer} người");
+            _currentLiveFromRecommended = true;
             await ArmLiveTargetStabilizationAsync(
                 $"{source} / LIVE đề xuất {best.Candidate.Username}",
                 best.Viewer,
@@ -1785,18 +1920,30 @@ public sealed partial class AutomationEngine
             _log.Warn($"[VIEWER_GATE_NO_VALUE] source={source}; tối đa {max} vòng ↓ + F5 để tìm LIVE có Viewer đọc được và > ngưỡng.");
         }
 
-        // Ưu tiên cột “Nhà sáng tạo LIVE đề xuất” trước mọi lần chuyển bằng ArrowDown.
-        // Viewer của recommendation được đọc ngay trên sidebar; không cần vào LIVE rồi mới quét lại.
-        if (await TryOpenBestRecommendedViewerLiveAsync(source + " / trước chuyển LIVE", ct))
-            return true;
+        // Bình thường ưu tiên cột “Nhà sáng tạo LIVE đề xuất”. Riêng khi vừa rời một LIVE
+        // đề xuất vì comment bị khóa, đi theo chuỗi ArrowDown hữu hạn trước để tránh bounce
+        // ngay về đúng LIVE neo vừa bị chặn.
+        if (!IsViewerChainModeActive())
+        {
+            if (await TryOpenBestRecommendedViewerLiveAsync(source + " / trước chuyển LIVE", ct))
+                return true;
+        }
+        else
+        {
+            _log.Info($"[VIEWER_CHAIN_MODE_SKIP_RECOMMENDATION] source={source} phase=before-first-switch transitions={_viewerChainTransitions}/{ViewerChainModeMaxTransitions}");
+        }
 
         for (int i = 1; i <= max && _running; i++)
         {
             await WaitIfPausedAsync(ct);
             SetStatus("TÌM LIVE ĐỦ NGƯỜI", $"{source} • vòng {i}/{max} • LIVE thấp {_consecutiveLowViewerLives}/{ViewerLowStreakFeedResetThreshold}");
 
-            if (i > 1 && await TryOpenBestRecommendedViewerLiveAsync($"{source} / trước ArrowDown vòng {i}/{max}", ct))
+            if (i > 1 && !IsViewerChainModeActive()
+                && await TryOpenBestRecommendedViewerLiveAsync($"{source} / trước ArrowDown vòng {i}/{max}", ct))
                 return true;
+
+            if (i > 1 && IsViewerChainModeActive())
+                _log.Info($"[VIEWER_CHAIN_MODE_SKIP_RECOMMENDATION] source={source} phase=loop loop={i}/{max} transitions={_viewerChainTransitions}/{ViewerChainModeMaxTransitions}");
 
             var transitioned = await TransitionAsync(
                 $"Viewer Gate {source} vòng {i}/{max}",
@@ -1866,6 +2013,17 @@ public sealed partial class AutomationEngine
             return null;
 
         var streak = _consecutiveLowViewerLives;
+
+        if (IsViewerChainModeActive())
+        {
+            // Chain mode có giới hạn riêng theo số lần chuyển/thời gian. Không để low-streak
+            // lén kéo profile quay lại recommendation hoặc /live trước khi chain kết thúc.
+            _consecutiveLowViewerLives = 0;
+            _log.Info(
+                $"[VIEWER_CHAIN_MODE_SKIP_FEED_RESET] source={source} streak={streak} " +
+                $"transitions={_viewerChainTransitions}/{ViewerChainModeMaxTransitions} action=KEEP_CHAIN");
+            return null;
+        }
 
         // Đủ 5 LIVE thấp: quét lại sidebar trước. Chỉ hard-reset /live khi sidebar
         // không có LIVE đề xuất nào > ngưỡng (và không thuộc Live cũ active).
@@ -2380,6 +2538,7 @@ public sealed partial class AutomationEngine
 
             ResetPeriodicDue(source + " da xac nhan sang LIVE moi va F5 xong", cancelCandidate: !scheduledPeriodic);
             ResetPageMaintenanceDue(source + " vừa F5 sau chuyển LIVE");
+            NoteConfirmedLiveTransition(source);
             completed = true;
             return true;
         }
@@ -2417,6 +2576,7 @@ public sealed partial class AutomationEngine
                 _log.Warn($"[RECOVERY_OK] transition={source} action=retry-after-cdp-reconnect");
                 ResetPeriodicDue(source + " da xac nhan sang LIVE moi sau retry reconnect", cancelCandidate: !scheduledPeriodic);
                 ResetPageMaintenanceDue(source + " vừa F5 sau retry chuyển LIVE");
+                NoteConfirmedLiveTransition(source + " / retry");
                 completed = true;
                 return true;
             }

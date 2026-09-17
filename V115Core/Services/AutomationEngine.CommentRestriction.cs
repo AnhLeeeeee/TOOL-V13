@@ -49,6 +49,7 @@ public sealed partial class AutomationEngine
                 _step = restartStep;
                 _postEnterCommentRestrictionPending = true;
                 _postEnterCommentRestrictionContext = pointName;
+                MaybeArmViewerChainModeForCommentRestriction($"toast cấm bình luận sau Enter tại {pointName}");
 
                 _log.Warn($"[COMMENT_RESTRICTION_DETECTED] point={pointName} marker={marker} action=SWITCH_LIVE restartStep={restartStep}");
                 ReportProblem("COMMENT_RESTRICTION_DETECTED", pointName,

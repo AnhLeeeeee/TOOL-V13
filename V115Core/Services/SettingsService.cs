@@ -68,6 +68,15 @@ public sealed class SettingsService
             MaxF5 = ini.GetInt("NguoiXem", "MaxF5", 100)
         };
 
+        s.StartupLiveSearch = new StartupLiveSearchSettings
+        {
+            Enabled = ini.GetBool("SearchLiveStartup", "Enabled", true),
+            Keywords = ini.Get("SearchLiveStartup", "Keywords", "live; liên quân"),
+            KeywordTimeoutSec = Math.Clamp(ini.GetInt("SearchLiveStartup", "KeywordTimeoutSec", 40), 10, 120),
+            TotalTimeoutSec = Math.Clamp(ini.GetInt("SearchLiveStartup", "TotalTimeoutSec", 90), 20, 300),
+            MaxCards = Math.Clamp(ini.GetInt("SearchLiveStartup", "MaxCards", 12), 3, 50)
+        };
+
         s.OldLive = new OldLiveSettings
         {
             Enabled = ini.GetBool("LiveCu", "Enabled"),
@@ -101,6 +110,11 @@ public sealed class SettingsService
         // Viewer Gate đọc trước mỗi Click 1/2; key chu kỳ cũ không còn dùng.
         ini.Remove("NguoiXem", "IntervalSec");
         ini.Set("NguoiXem", "MaxF5", s.Viewer.MaxF5);
+        ini.Set("SearchLiveStartup", "Enabled", s.StartupLiveSearch.Enabled ? 1 : 0);
+        ini.Set("SearchLiveStartup", "Keywords", s.StartupLiveSearch.Keywords ?? "");
+        ini.Set("SearchLiveStartup", "KeywordTimeoutSec", Math.Clamp(s.StartupLiveSearch.KeywordTimeoutSec, 10, 120));
+        ini.Set("SearchLiveStartup", "TotalTimeoutSec", Math.Clamp(s.StartupLiveSearch.TotalTimeoutSec, 20, 300));
+        ini.Set("SearchLiveStartup", "MaxCards", Math.Clamp(s.StartupLiveSearch.MaxCards, 3, 50));
         // V13.4.1 XPath-only: xóa hoàn toàn cấu hình OCR/toạ độ viewer legacy.
         foreach (var key in new[] { "OcrRetries", "RX1", "RY1", "RX2", "RY2", "X1", "Y1", "X2", "Y2" }) ini.Remove("NguoiXem", key);
         ini.Set("LiveCu", "Enabled", s.OldLive.Enabled ? 1 : 0); ini.Set("LiveCu", "IdentityXPath", s.OldLive.IdentityXPath);

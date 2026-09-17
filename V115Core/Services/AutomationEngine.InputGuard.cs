@@ -1,4 +1,4 @@
-﻿using ToolTikTokV11.Models;
+using ToolTikTokV11.Models;
 
 namespace ToolTikTokV11.Services;
 
@@ -18,6 +18,40 @@ public sealed partial class AutomationEngine
             || !snapshot.HasExpectedPlaceholder
             || snapshot.Reason.Contains("CDP", StringComparison.OrdinalIgnoreCase)
             || snapshot.Reason.Contains("placeholder", StringComparison.OrdinalIgnoreCase);
+    }
+
+    static bool IsHardCommentRestrictionSnapshot(ChatInputGuard.Snapshot snapshot)
+    {
+        var text = $"{snapshot.Placeholder} | {snapshot.Text} | {snapshot.Reason}";
+        return text.Contains("bị tắt tiếng", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("tính năng bình luận đang tắt", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("bình luận đang tắt", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("commenting is turned off", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("you are muted", StringComparison.OrdinalIgnoreCase);
+    }
+
+    bool QueueHardCommentRestrictionFromInputSnapshot(string pointName, ChatInputGuard.Snapshot snapshot)
+    {
+        if (!IsHardCommentRestrictionSnapshot(snapshot))
+            return false;
+
+        _step = CurrentRestartStep;
+        _postEnterCommentRestrictionPending = true;
+        _postEnterCommentRestrictionContext = pointName;
+        ClearLiveTargetStabilization("InputGuard xác nhận comment bị khóa");
+        MaybeArmViewerChainModeForCommentRestriction(
+            $"InputGuard hard restriction tại {pointName}: {snapshot.Placeholder} {snapshot.Reason}");
+
+        _log.Warn(
+            $"[COMMENT_RESTRICTION_INPUT_HARD] point={pointName} reason={snapshot.Reason} " +
+            $"placeholder=\"{snapshot.Placeholder}\" action=SWITCH_LIVE_NO_GRACE restartStep={_step}");
+        ReportProblem(
+            "COMMENT_RESTRICTION_DETECTED",
+            pointName,
+            "Ô bình luận xác nhận LIVE đang tắt/mute bình luận. Bỏ qua grace period và chuyển LIVE ngay.",
+            throttleSeconds: 5);
+        SetStatus("BỊ KHÓA BÌNH LUẬN", $"{pointName}: LIVE không cho bình luận → chuyển LIVE.");
+        return true;
     }
 
     async Task<bool> QueueVisibleCommentRestrictionBeforeInputAsync(string pointName, CancellationToken ct)
@@ -48,6 +82,7 @@ public sealed partial class AutomationEngine
         _postEnterCommentRestrictionPending = true;
         _postEnterCommentRestrictionContext = pointName;
         ClearLiveTargetStabilization("phát hiện cấm bình luận trước InputGuard");
+        MaybeArmViewerChainModeForCommentRestriction($"toast cấm bình luận trước InputGuard tại {pointName}");
 
         _log.Warn(
             $"[COMMENT_RESTRICTION_DETECTED_PRE_INPUT] point={pointName} marker={marker} " +
@@ -101,6 +136,8 @@ public sealed partial class AutomationEngine
         CancellationToken ct)
     {
         var stabilization = await GetLiveTargetStabilizationAsync(ct);
+        if (QueueHardCommentRestrictionFromInputSnapshot(pointName, initialSnapshot))
+            return (true, false, initialSnapshot);
         if (!stabilization.Active || !IsTransientInputDuringLiveStabilization(initialSnapshot))
             return (false, false, initialSnapshot);
 
@@ -131,6 +168,9 @@ public sealed partial class AutomationEngine
                 _s.InputGuard.NormalPlaceholderText,
                 ct);
 
+            if (QueueHardCommentRestrictionFromInputSnapshot(pointName, snapshot))
+                return (true, false, snapshot);
+
             if (snapshot.IsNormal)
             {
                 // Xác nhận lại theo đúng số lần đọc InputGuard cấu hình trước khi cho thao tác.
@@ -141,6 +181,8 @@ public sealed partial class AutomationEngine
                     var viewerOk = await ConfirmStabilizedLiveViewerAsync(pointName, ct);
                     if (viewerOk == true)
                     {
+                        if (IsViewerChainModeActive())
+                            CompleteViewerChainMode($"LIVE trong chuỗi đã ổn định tại {pointName}");
                         ResetInputGuardConsecutive("LIVE vừa chọn đã ổn định");
                         _log.Info(
                             $"[LIVE_TARGET_STABILIZE_READY] point={pointName} " +
@@ -252,10 +294,15 @@ public sealed partial class AutomationEngine
                     }
                 }
 
+                if (IsViewerChainModeActive())
+                    CompleteViewerChainMode($"đã tìm được LIVE trong chuỗi có Viewer + ô nhập hợp lệ tại {pointName}");
                 ResetInputGuardConsecutive("ô nhập bình thường");
                 _log.Info($"[INPUT_GUARD_OK] point={pointName} placeholder=\"{snapshot.Placeholder}\"");
                 return false;
             }
+
+            if (QueueHardCommentRestrictionFromInputSnapshot(pointName, snapshot))
+                return true;
 
             var stabilized = await TryStabilizeLiveInputAsync(
                 inputXPath,
@@ -312,6 +359,8 @@ public sealed partial class AutomationEngine
                 snapshot = verify.snapshot;
                 if (verify.normal)
                 {
+                    if (IsViewerChainModeActive())
+                        CompleteViewerChainMode($"InputGuard recovery đã gặp LIVE hợp lệ tại {pointName}");
                     ResetInputGuardConsecutive("LIVE mới có ô nhập bình thường");
                     _log.Info($"[INPUT_GUARD_RECOVERED] point={pointName} LIVE mới đã có ô nhập bình thường.");
 
