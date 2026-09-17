@@ -995,6 +995,11 @@ public sealed partial class ManagerForm
                 if (_autoCloseInProgressProfiles.Contains(profileName))
                     continue;
 
+                // Runtime-login recovery đang chủ động đóng/mở lại CHÍNH PRF. Không để
+                // TIME/FAULT watchdog chen vào cùng lúc và phát sinh cleanup/replacement thứ hai.
+                if (IsRuntimeLoginRecoveryInProgress(profileName))
+                    continue;
+
                 // Candidate đang thuộc một suất Tự bù (STABILIZING/CLEANUP) được chính
                 // luồng Tự bù quản lý grace 10 phút. Watchdog global không được tạo
                 // thêm FAULT_10M/suất bù thứ hai cho cùng profile.

@@ -28,7 +28,7 @@ public sealed partial class ManagerForm
 
     sealed class RunAllStrategySettings
     {
-        public int Version { get; set; } = 4;
+        public int Version { get; set; } = 5;
         public RunAllStrategyMode Mode { get; set; } = RunAllStrategyMode.Time;
 
         // V3: khi user đã chọn Giờ vàng + Bắt đầu, giữ "ý định vận hành" này
@@ -60,6 +60,15 @@ public sealed partial class ManagerForm
         public bool RefreshAllBeforePrime { get; set; }
         public PrePrimeRefreshSourceMode PrePrimeRefreshSource { get; set; } =
             PrePrimeRefreshSourceMode.CurrentFresh;
+
+        // V5: cầu chì chống CREATE runaway. Mặc định BẬT nhưng user có thể
+        // tắt hoặc chỉnh từng ngưỡng trong thẻ DÀN PRF. Chỉ đếm CREATE mới thật,
+        // không đếm mở lại PRF chờ / NAME_SYNC_PENDING.
+        public bool CreateLimitEnabled { get; set; } = true;
+        public int CreateLimitPerSlot { get; set; } = 3;
+        public int CreateLimitPerHour { get; set; } = 5;
+        public int CreateLimitPerSession { get; set; } = 10;
+        public int CreateLimitReuseRetryMinutes { get; set; } = 10;
     }
 
     sealed record RunStrategyReusableCandidate(
@@ -162,7 +171,7 @@ public sealed partial class ManagerForm
     static RunAllStrategySettings NormalizeRunStrategySettings(
         RunAllStrategySettings settings)
     {
-        settings.Version = 4;
+        settings.Version = 5;
         if (settings.Mode != RunAllStrategyMode.PrimeFresh)
         {
             settings.PrimeModeArmed = false;
@@ -180,6 +189,11 @@ public sealed partial class ManagerForm
         settings.OldHours = Math.Clamp(settings.OldHours, settings.FreshHours + 1, 24);
         settings.RotationIntervalMinutes = Math.Clamp(settings.RotationIntervalMinutes, 5, 60);
         settings.PrepareMinutes = Math.Clamp(settings.PrepareMinutes, 0, 180);
+
+        settings.CreateLimitPerSlot = Math.Clamp(settings.CreateLimitPerSlot, 1, 50);
+        settings.CreateLimitPerHour = Math.Clamp(settings.CreateLimitPerHour, 1, 200);
+        settings.CreateLimitPerSession = Math.Clamp(settings.CreateLimitPerSession, 1, 500);
+        settings.CreateLimitReuseRetryMinutes = Math.Clamp(settings.CreateLimitReuseRetryMinutes, 1, 120);
 
         if (!Enum.IsDefined(typeof(PrePrimeRefreshSourceMode), settings.PrePrimeRefreshSource))
             settings.PrePrimeRefreshSource = PrePrimeRefreshSourceMode.CurrentFresh;
@@ -234,7 +248,12 @@ public sealed partial class ManagerForm
             PrepareMinutes = _runStrategySettings.PrepareMinutes,
             PreserveFreshOffPeak = _runStrategySettings.PreserveFreshOffPeak,
             RefreshAllBeforePrime = _runStrategySettings.RefreshAllBeforePrime,
-            PrePrimeRefreshSource = _runStrategySettings.PrePrimeRefreshSource
+            PrePrimeRefreshSource = _runStrategySettings.PrePrimeRefreshSource,
+            CreateLimitEnabled = _runStrategySettings.CreateLimitEnabled,
+            CreateLimitPerSlot = _runStrategySettings.CreateLimitPerSlot,
+            CreateLimitPerHour = _runStrategySettings.CreateLimitPerHour,
+            CreateLimitPerSession = _runStrategySettings.CreateLimitPerSession,
+            CreateLimitReuseRetryMinutes = _runStrategySettings.CreateLimitReuseRetryMinutes
         });
 
         using var form = new Form
@@ -368,11 +387,12 @@ public sealed partial class ManagerForm
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 5,
+            RowCount = 6,
             Padding = new Padding(4),
             Margin = Padding.Empty
         };
         launchRoot.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        launchRoot.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         launchRoot.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         launchRoot.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         launchRoot.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -492,6 +512,92 @@ public sealed partial class ManagerForm
         targetGrid.Controls.Add(targetSlots, 1, 0);
         targetGrid.Controls.Add(targetStatus, 2, 0);
 
+        var createLimitBox = new GroupBox
+        {
+            Text = "GIỚI HẠN TẠO PRF",
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            Padding = new Padding(12, 10, 12, 10),
+            Margin = new Padding(0, 12, 0, 0),
+            Font = new Font("Segoe UI", 9.2F, FontStyle.Bold)
+        };
+
+        var createLimitRoot = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            ColumnCount = 8,
+            RowCount = 2,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty
+        };
+        createLimitRoot.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        createLimitRoot.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 72));
+        createLimitRoot.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        createLimitRoot.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 72));
+        createLimitRoot.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        createLimitRoot.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 72));
+        createLimitRoot.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        createLimitRoot.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 72));
+
+        var createLimitEnabled = new CheckBox
+        {
+            Text = "Bật giới hạn tạo PRF mới",
+            Checked = current.CreateLimitEnabled,
+            AutoSize = true,
+            Font = new Font("Segoe UI", 9.2F, FontStyle.Bold),
+            Margin = new Padding(0, 4, 16, 6)
+        };
+        createLimitRoot.SetColumnSpan(createLimitEnabled, 8);
+        createLimitRoot.Controls.Add(createLimitEnabled, 0, 0);
+
+        NumericUpDown CreateLimitNum(int value, int min, int max)
+            => new()
+            {
+                Value = Math.Clamp(value, min, max),
+                Minimum = min,
+                Maximum = max,
+                Width = 62,
+                Height = 28,
+                Font = new Font("Segoe UI", 9.5F),
+                Margin = new Padding(4, 2, 10, 2)
+            };
+
+        Label CreateLimitLabel(string text)
+            => new()
+            {
+                Text = text,
+                AutoSize = true,
+                Font = new Font("Segoe UI", 9F),
+                Margin = new Padding(0, 6, 0, 2)
+            };
+
+        var createLimitPerSlot = CreateLimitNum(current.CreateLimitPerSlot, 1, 50);
+        var createLimitPerHour = CreateLimitNum(current.CreateLimitPerHour, 1, 200);
+        var createLimitPerSession = CreateLimitNum(current.CreateLimitPerSession, 1, 500);
+        var createLimitRetryMinutes = CreateLimitNum(current.CreateLimitReuseRetryMinutes, 1, 120);
+
+        createLimitRoot.Controls.Add(CreateLimitLabel("Mỗi slot"), 0, 1);
+        createLimitRoot.Controls.Add(createLimitPerSlot, 1, 1);
+        createLimitRoot.Controls.Add(CreateLimitLabel("Trong 1 giờ"), 2, 1);
+        createLimitRoot.Controls.Add(createLimitPerHour, 3, 1);
+        createLimitRoot.Controls.Add(CreateLimitLabel("Trong 1 phiên"), 4, 1);
+        createLimitRoot.Controls.Add(createLimitPerSession, 5, 1);
+        createLimitRoot.Controls.Add(CreateLimitLabel("Retry PRF chờ (phút)"), 6, 1);
+        createLimitRoot.Controls.Add(createLimitRetryMinutes, 7, 1);
+        createLimitBox.Controls.Add(createLimitRoot);
+
+        void UpdateCreateLimitEnabled()
+        {
+            var enabled = createLimitEnabled.Checked;
+            createLimitPerSlot.Enabled = enabled;
+            createLimitPerHour.Enabled = enabled;
+            createLimitPerSession.Enabled = enabled;
+            createLimitRetryMinutes.Enabled = enabled;
+        }
+        createLimitEnabled.CheckedChanged += (_, _) => UpdateCreateLimitEnabled();
+        UpdateCreateLimitEnabled();
+
         var launchFlowNote = new Label
         {
             AutoSize = true,
@@ -506,7 +612,8 @@ public sealed partial class ManagerForm
         launchRoot.Controls.Add(launchChoiceRow, 0, 1);
         launchRoot.Controls.Add(reuseOnlyNoCreate, 0, 2);
         launchRoot.Controls.Add(targetGrid, 0, 3);
-        launchRoot.Controls.Add(launchFlowNote, 0, 4);
+        launchRoot.Controls.Add(createLimitBox, 0, 4);
+        launchRoot.Controls.Add(launchFlowNote, 0, 5);
         launchBox.Controls.Add(launchRoot);
 
         // ------------------------------------------------------------
@@ -862,7 +969,7 @@ public sealed partial class ManagerForm
 
             return NormalizeRunStrategySettings(new RunAllStrategySettings
             {
-                Version = 4,
+                Version = 5,
                 Mode = primeMode.Checked ? RunAllStrategyMode.PrimeFresh : RunAllStrategyMode.Time,
                 PrimeModeArmed = startRequested
                     ? primeMode.Checked
@@ -883,7 +990,12 @@ public sealed partial class ManagerForm
                 RefreshAllBeforePrime = refreshAllBeforePrime.Checked,
                 PrePrimeRefreshSource = prePrimeNeverRun.Checked
                     ? PrePrimeRefreshSourceMode.NeverRunOnly
-                    : PrePrimeRefreshSourceMode.CurrentFresh
+                    : PrePrimeRefreshSourceMode.CurrentFresh,
+                CreateLimitEnabled = createLimitEnabled.Checked,
+                CreateLimitPerSlot = (int)createLimitPerSlot.Value,
+                CreateLimitPerHour = (int)createLimitPerHour.Value,
+                CreateLimitPerSession = (int)createLimitPerSession.Value,
+                CreateLimitReuseRetryMinutes = (int)createLimitRetryMinutes.Value
             });
         }
 
@@ -953,6 +1065,11 @@ public sealed partial class ManagerForm
             {
                 UpdateAutoCloseToolbarButtonText();
             }
+
+            // Giới hạn CREATE đọc trực tiếp Run Strategy settings. Nếu user vừa tắt
+            // giới hạn hoặc nâng ngưỡng khiến request đang chờ không còn bị block,
+            // đánh thức request ngay thay vì bắt chờ hết timer cũ.
+            NotifyAutoReplacementCreateLimitSettingsChanged("run_strategy_save");
         }
 
         void UpdateLaunchValidation()
@@ -1129,7 +1246,10 @@ public sealed partial class ManagerForm
 
                 save.Text = "Đã lưu ✓";
                 _log.Info(
-                    $"[RUN_STRATEGY_SETTINGS_SAVE_UI] mode={saved.Mode} autoEnsure={saved.AutoEnsureTarget} target={saved.TargetSlots} primeArmed={saved.PrimeModeArmed} fullRefresh={saved.RefreshAllBeforePrime} source={saved.PrePrimeRefreshSource}");
+                    $"[RUN_STRATEGY_SETTINGS_SAVE_UI] mode={saved.Mode} autoEnsure={saved.AutoEnsureTarget} target={saved.TargetSlots} " +
+                    $"primeArmed={saved.PrimeModeArmed} fullRefresh={saved.RefreshAllBeforePrime} source={saved.PrePrimeRefreshSource} " +
+                    $"createLimit={saved.CreateLimitEnabled} perSlot={saved.CreateLimitPerSlot} perHour={saved.CreateLimitPerHour} " +
+                    $"perSession={saved.CreateLimitPerSession} retryMinutes={saved.CreateLimitReuseRetryMinutes}");
             }
             catch (Exception ex)
             {
@@ -1210,6 +1330,7 @@ public sealed partial class ManagerForm
         SaveRunStrategySettings(selected);
         StopRunStrategySession("run_all_new_selection");
         ResetRunStrategyPrePrimeRefreshState("run_all_new_selection");
+        ResetAutoReplacementCreateLimitSession("run_all_new_selection");
 
         // Đồng bộ cùng engine Tự động bên ngoài. Helper không tự tắt Tự bù nếu
         // user đã bật riêng cho BAN/TIME.

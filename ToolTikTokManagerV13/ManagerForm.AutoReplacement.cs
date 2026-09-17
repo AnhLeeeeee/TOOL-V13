@@ -33,6 +33,15 @@ public sealed partial class ManagerForm
         // vẫn có thể được đánh thức ngay nếu xuất hiện PRF Chờ dùng lại phù hợp.
         public DateTime? CreateNotBeforeUtc { get; set; }
 
+        // Số lần CREATE mới thật sự đã được bắt đầu cho chính slot/request này.
+        // Persist cùng queue để một request retry không thể tự reset cầu chì per-slot.
+        public int CreatedProfileCount { get; set; }
+
+        // Khi chạm giới hạn tạo, request chuyển sang vòng CHỜ -> vét lại toàn bộ PRF chờ.
+        // Trong khoảng chờ không được Wake sớm chỉ vì queue có thay đổi.
+        public bool CreateLimitReuseWaitActive { get; set; }
+        public string CreateLimitWaitReason { get; set; } = "";
+
         public string LastError { get; set; } = "";
 
         // Mỗi profile bù chỉ được mở/thử tối đa 1 lần trong cùng một suất bù.
@@ -47,9 +56,24 @@ public sealed partial class ManagerForm
 
     sealed class AutoReplacementQueueDocument
     {
-        public int Version { get; set; } = 3;
+        public int Version { get; set; } = 4;
         public List<AutoReplacementRequest> Pending { get; set; } = new();
     }
+
+    sealed class AutoReplacementCreateLimitStateDocument
+    {
+        public int Version { get; set; } = 1;
+        public string SessionId { get; set; } = "";
+        public int SessionCreatedCount { get; set; }
+        public List<DateTime> CreatedUtc { get; set; } = new();
+    }
+
+    sealed record AutoReplacementCreateLimitSnapshot(
+        bool Enabled,
+        int PerSlot,
+        int PerHour,
+        int PerSession,
+        int RetryMinutes);
 
     sealed record AutoReplacementCandidate(
         ProfileContext Context,
@@ -116,6 +140,8 @@ public sealed partial class ManagerForm
     // Deadline dùng chung cho mọi suất tạo mới để khi một suất vừa tạo xong/lỗi,
     // suất kế tiếp cũng phải tôn trọng đúng cấu hình ở cửa sổ "+ Auto Profile".
     readonly object _autoReplacementCreateCooldownLock = new();
+    readonly object _autoReplacementCreateLimitLock = new();
+    AutoReplacementCreateLimitStateDocument? _autoReplacementCreateLimitState;
     DateTime _autoReplacementCreateNotBeforeUtc = DateTime.MinValue;
     AutoProfileCooldownKind _autoReplacementCreateCooldownKind = AutoProfileCooldownKind.Normal;
     TimeSpan _autoReplacementCreateCooldownBase = TimeSpan.Zero;
@@ -135,6 +161,377 @@ public sealed partial class ManagerForm
     string _autoReplacementUiDetail = "";
     string _autoReplacementUiRequestId = "";
     DateTime _autoReplacementUiPhaseUtc = DateTime.MinValue;
+
+    string AutoReplacementCreateLimitStatePath
+        => Path.Combine(_baseDir, "manager_auto_create_limit_state.json");
+
+    AutoReplacementCreateLimitSnapshot GetAutoReplacementCreateLimitSnapshot()
+    {
+        // AutoReplacement có thể chạy từ Tự động ngay cả khi dialog Auto Run chưa
+        // từng mở trong phiên này. Khi đó đọc file Run Strategy để vẫn dùng đúng
+        // ngưỡng user đã Lưu; nếu đã init thì dùng snapshot đang sống để áp dụng ngay.
+        var settings = _runStrategyFeatureInitialized
+            ? NormalizeRunStrategySettings(_runStrategySettings)
+            : LoadRunStrategySettings();
+
+        return new AutoReplacementCreateLimitSnapshot(
+            settings.CreateLimitEnabled,
+            settings.CreateLimitPerSlot,
+            settings.CreateLimitPerHour,
+            settings.CreateLimitPerSession,
+            settings.CreateLimitReuseRetryMinutes);
+    }
+
+    AutoReplacementCreateLimitStateDocument EnsureAutoReplacementCreateLimitStateUnsafe()
+    {
+        if (_autoReplacementCreateLimitState is not null)
+            return _autoReplacementCreateLimitState;
+
+        AutoReplacementCreateLimitStateDocument state;
+        try
+        {
+            if (File.Exists(AutoReplacementCreateLimitStatePath))
+            {
+                state = JsonSerializer.Deserialize<AutoReplacementCreateLimitStateDocument>(
+                            File.ReadAllText(AutoReplacementCreateLimitStatePath),
+                            new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+                        ?? new AutoReplacementCreateLimitStateDocument();
+            }
+            else
+            {
+                state = new AutoReplacementCreateLimitStateDocument();
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"[AUTO_CREATE_LIMIT_STATE_READ_WARN] error={ex.Message}");
+            state = new AutoReplacementCreateLimitStateDocument();
+        }
+
+        state.Version = 1;
+        state.CreatedUtc ??= new List<DateTime>();
+        state.CreatedUtc = state.CreatedUtc
+            .Select(x => x.Kind == DateTimeKind.Utc ? x : x.ToUniversalTime())
+            .Where(x => x > DateTime.UtcNow.AddDays(-2) && x <= DateTime.UtcNow.AddMinutes(5))
+            .OrderBy(x => x)
+            .ToList();
+        state.SessionCreatedCount = Math.Max(0, state.SessionCreatedCount);
+        if (string.IsNullOrWhiteSpace(state.SessionId))
+            state.SessionId = Guid.NewGuid().ToString("N");
+
+        _autoReplacementCreateLimitState = state;
+        return state;
+    }
+
+    void SaveAutoReplacementCreateLimitStateUnsafe()
+    {
+        var temp = AutoReplacementCreateLimitStatePath + ".tmp";
+        try
+        {
+            var state = EnsureAutoReplacementCreateLimitStateUnsafe();
+            var json = JsonSerializer.Serialize(
+                state,
+                new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(temp, json, new UTF8Encoding(false));
+            File.Move(temp, AutoReplacementCreateLimitStatePath, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"[AUTO_CREATE_LIMIT_STATE_WRITE_WARN] error={ex.Message}");
+            try
+            {
+                if (File.Exists(temp))
+                    File.Delete(temp);
+            }
+            catch { }
+        }
+    }
+
+    int PruneAutoReplacementCreateHourWindowUnsafe(DateTime nowUtc)
+    {
+        var state = EnsureAutoReplacementCreateLimitStateUnsafe();
+        var cutoff = nowUtc.AddHours(-1);
+        var before = state.CreatedUtc.Count;
+        state.CreatedUtc.RemoveAll(x => x <= cutoff || x > nowUtc.AddMinutes(5));
+        return before - state.CreatedUtc.Count;
+    }
+
+    public void ResetAutoReplacementCreateLimitSession(string source)
+    {
+        var nowUtc = DateTime.UtcNow;
+        lock (_autoReplacementCreateLimitLock)
+        {
+            var state = EnsureAutoReplacementCreateLimitStateUnsafe();
+            PruneAutoReplacementCreateHourWindowUnsafe(nowUtc);
+            state.SessionId = Guid.NewGuid().ToString("N");
+            state.SessionCreatedCount = 0;
+            SaveAutoReplacementCreateLimitStateUnsafe();
+
+            _log.Info(
+                $"[AUTO_CREATE_LIMIT_SESSION_RESET] source={source} session={state.SessionId} " +
+                $"hourCreated={state.CreatedUtc.Count}");
+        }
+    }
+
+    int GetAutoReplacementRequestCreatedCount(AutoReplacementRequest request)
+    {
+        lock (_autoReplacementQueueLock)
+        {
+            var live = _autoReplacementQueue.FirstOrDefault(x =>
+                x.Id.Equals(request.Id, StringComparison.OrdinalIgnoreCase));
+            return Math.Max(0, live?.CreatedProfileCount ?? request.CreatedProfileCount);
+        }
+    }
+
+    bool TryGetAutoReplacementCreateLimitBlock(
+        AutoReplacementRequest request,
+        out string reason,
+        out int slotCreated,
+        out int hourCreated,
+        out int sessionCreated)
+    {
+        reason = "";
+        slotCreated = GetAutoReplacementRequestCreatedCount(request);
+        hourCreated = 0;
+        sessionCreated = 0;
+
+        var limit = GetAutoReplacementCreateLimitSnapshot();
+        if (!limit.Enabled)
+            return false;
+
+        lock (_autoReplacementCreateLimitLock)
+        {
+            var nowUtc = DateTime.UtcNow;
+            var state = EnsureAutoReplacementCreateLimitStateUnsafe();
+            var pruned = PruneAutoReplacementCreateHourWindowUnsafe(nowUtc);
+            if (pruned > 0)
+                SaveAutoReplacementCreateLimitStateUnsafe();
+
+            hourCreated = state.CreatedUtc.Count;
+            sessionCreated = state.SessionCreatedCount;
+        }
+
+        if (slotCreated >= limit.PerSlot)
+        {
+            reason = $"slot={slotCreated}/{limit.PerSlot}";
+            return true;
+        }
+
+        if (hourCreated >= limit.PerHour)
+        {
+            reason = $"hour={hourCreated}/{limit.PerHour}";
+            return true;
+        }
+
+        if (sessionCreated >= limit.PerSession)
+        {
+            reason = $"session={sessionCreated}/{limit.PerSession}";
+            return true;
+        }
+
+        return false;
+    }
+
+    bool TryReserveAutoReplacementCreateAttempt(
+        AutoReplacementRequest request,
+        string profileName,
+        out string blockReason)
+    {
+        blockReason = "";
+        var limit = GetAutoReplacementCreateLimitSnapshot();
+        var nowUtc = DateTime.UtcNow;
+
+        // Queue runner hiện chạy tuần tự, tuy nhiên vẫn re-check cả per-slot lẫn
+        // global ngay trước CREATE để setting vừa Lưu có hiệu lực ở lượt kế tiếp.
+        var slotCreated = GetAutoReplacementRequestCreatedCount(request);
+
+        lock (_autoReplacementCreateLimitLock)
+        {
+            var state = EnsureAutoReplacementCreateLimitStateUnsafe();
+            PruneAutoReplacementCreateHourWindowUnsafe(nowUtc);
+
+            if (limit.Enabled)
+            {
+                if (slotCreated >= limit.PerSlot)
+                    blockReason = $"slot={slotCreated}/{limit.PerSlot}";
+                else if (state.CreatedUtc.Count >= limit.PerHour)
+                    blockReason = $"hour={state.CreatedUtc.Count}/{limit.PerHour}";
+                else if (state.SessionCreatedCount >= limit.PerSession)
+                    blockReason = $"session={state.SessionCreatedCount}/{limit.PerSession}";
+
+                if (blockReason.Length > 0)
+                {
+                    SaveAutoReplacementCreateLimitStateUnsafe();
+                    return false;
+                }
+            }
+
+            // Luôn ghi nhận CREATE thật kể cả user tạm tắt giới hạn. Nếu bật lại giữa
+            // phiên, counter phản ánh đúng số PRF đã tiêu thụ trong phiên/60 phút.
+            state.CreatedUtc.Add(nowUtc);
+            state.SessionCreatedCount++;
+            SaveAutoReplacementCreateLimitStateUnsafe();
+        }
+
+        lock (_autoReplacementQueueLock)
+        {
+            var live = _autoReplacementQueue.FirstOrDefault(x =>
+                x.Id.Equals(request.Id, StringComparison.OrdinalIgnoreCase));
+            var target = live ?? request;
+            target.CreatedProfileCount = Math.Max(0, target.CreatedProfileCount) + 1;
+            target.CreateLimitReuseWaitActive = false;
+            target.CreateLimitWaitReason = "";
+
+            if (live is not null)
+                SaveAutoReplacementQueueUnsafe();
+
+            slotCreated = target.CreatedProfileCount;
+        }
+
+        int hourCreated;
+        int sessionCreated;
+        lock (_autoReplacementCreateLimitLock)
+        {
+            var state = EnsureAutoReplacementCreateLimitStateUnsafe();
+            hourCreated = state.CreatedUtc.Count;
+            sessionCreated = state.SessionCreatedCount;
+        }
+
+        _log.Info(
+            $"[AUTO_CREATE_LIMIT_COUNT] request={request.Id} profile={profileName} enabled={limit.Enabled} " +
+            $"slot={slotCreated}/{limit.PerSlot} hour={hourCreated}/{limit.PerHour} " +
+            $"session={sessionCreated}/{limit.PerSession}");
+
+        return true;
+    }
+
+    void ScheduleAutoReplacementCreateLimitReuseRetry(
+        string requestId,
+        string lastError)
+    {
+        var limit = GetAutoReplacementCreateLimitSnapshot();
+        var delay = TimeSpan.FromMinutes(limit.RetryMinutes);
+
+        lock (_autoReplacementQueueLock)
+        {
+            var request = _autoReplacementQueue.FirstOrDefault(x =>
+                x.Id.Equals(requestId, StringComparison.OrdinalIgnoreCase));
+            if (request is null)
+                return;
+
+            request.AttemptCount++;
+            request.LastError = (lastError ?? "").Trim();
+            request.AttemptedProfiles ??= new List<string>();
+            var previousAttempted = request.AttemptedProfiles.Count;
+            request.AttemptedProfiles.Clear();
+            request.CreateNotBeforeUtc = null;
+            request.CreateLimitReuseWaitActive = true;
+            request.CreateLimitWaitReason = request.LastError;
+            request.NextAttemptUtc = DateTime.UtcNow.Add(delay);
+            SaveAutoReplacementQueueUnsafe();
+
+            _log.Warn(
+                $"[AUTO_CREATE_LIMIT_WAIT_REUSE] id={request.Id} closed={request.ClosedProfileName} " +
+                $"retryIn={delay:c} clearedAttempted={previousAttempted} reason={request.CreateLimitWaitReason}");
+
+            WriteAutoActivityLog(
+                action: "TỰ BÙ",
+                profile: request.ClosedProfileName,
+                reason: request.Reason,
+                result: "TẠM DỪNG TẠO / CHỜ PRF",
+                detail: $"Tạm dừng nhánh tạo. Nghỉ {limit.RetryMinutes} phút rồi thử lại lần lượt toàn bộ PRF chờ; nếu vẫn chưa được sẽ tiếp tục chu kỳ chờ. {request.CreateLimitWaitReason}");
+        }
+    }
+
+    void MarkAutoReplacementCreateLimitReuseRoundDue(AutoReplacementRequest request)
+    {
+        var wasWaiting = false;
+        var reason = "";
+        lock (_autoReplacementQueueLock)
+        {
+            var live = _autoReplacementQueue.FirstOrDefault(x =>
+                x.Id.Equals(request.Id, StringComparison.OrdinalIgnoreCase));
+            var target = live ?? request;
+            if (!target.CreateLimitReuseWaitActive)
+                return;
+
+            wasWaiting = true;
+            reason = target.CreateLimitWaitReason;
+            target.CreateLimitReuseWaitActive = false;
+            target.CreateLimitWaitReason = "";
+            if (live is not null)
+                SaveAutoReplacementQueueUnsafe();
+        }
+
+        if (wasWaiting)
+        {
+            _log.Info(
+                $"[AUTO_CREATE_LIMIT_REUSE_ROUND_BEGIN] id={request.Id} closed={request.ClosedProfileName} " +
+                $"action=TRY_ALL_WAITING_PROFILES reason={reason}");
+        }
+    }
+
+    void NotifyAutoReplacementCreateLimitSettingsChanged(string source)
+    {
+        if (!_autoReplacementFeatureInitialized)
+            return;
+
+        List<AutoReplacementRequest> waiting;
+        lock (_autoReplacementQueueLock)
+        {
+            waiting = _autoReplacementQueue
+                .Where(x => x.CreateLimitReuseWaitActive)
+                .ToList();
+        }
+
+        if (waiting.Count == 0)
+            return;
+
+        var wakeIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var request in waiting)
+        {
+            if (!TryGetAutoReplacementCreateLimitBlock(
+                    request,
+                    out _,
+                    out _,
+                    out _,
+                    out _))
+            {
+                wakeIds.Add(request.Id);
+            }
+        }
+
+        if (wakeIds.Count == 0)
+        {
+            _log.Info(
+                $"[AUTO_CREATE_LIMIT_SETTINGS_APPLIED] source={source} waiting={waiting.Count} woke=0");
+            return;
+        }
+
+        lock (_autoReplacementQueueLock)
+        {
+            foreach (var request in _autoReplacementQueue)
+            {
+                if (!wakeIds.Contains(request.Id))
+                    continue;
+
+                request.CreateLimitReuseWaitActive = false;
+                request.CreateLimitWaitReason = "";
+                request.NextAttemptUtc = DateTime.UtcNow;
+            }
+            SaveAutoReplacementQueueUnsafe();
+        }
+
+        _log.Info(
+            $"[AUTO_CREATE_LIMIT_SETTINGS_APPLIED] source={source} waiting={waiting.Count} woke={wakeIds.Count}");
+
+        if (_autoReplacementSessionArmed
+            && _autoCloseSettings.OpenReplacementAfterAutoClose
+            && !_autoReplacementQueueRunning)
+        {
+            _ = RunAutoReplacementQueueAsync();
+        }
+    }
 
     void RegisterAutoReplacementCreateCooldown(
         AutoProfileProcessOutcome? outcome,
@@ -653,6 +1050,10 @@ public sealed partial class ManagerForm
                     continue;
                 }
 
+                // Nếu request vừa hết chu kỳ chờ do chạm giới hạn CREATE thì
+                // bắt đầu vòng mới bằng cách vét lại toàn bộ PRF chờ.
+                MarkAutoReplacementCreateLimitReuseRoundDue(request);
+
                 SetAutoReplacementUiPhase(
                     "XỬ LÝ SUẤT",
                     request.Reason,
@@ -780,6 +1181,7 @@ public sealed partial class ManagerForm
                 var lastError = "";
                 var reusableGuardBlocked = false;
                 var createDeferredByCooldown = false;
+                var createLimitBlocked = false;
                 var createAttempted = false;
                 AutoReplacementCleanupBarrierException? cleanupBarrier = null;
 
@@ -881,6 +1283,28 @@ public sealed partial class ManagerForm
                                 _log.Warn(
                                     $"[AUTO_REPLACE_REUSE_GUARD_BLOCK_NEW] id={request.Id} closed={request.ClosedProfileName} profile={untestedProfile} lane={untestedLane} detail={untestedDetail} attemptedProfiles={GetAutoReplacementAttemptedProfileCount(request)}");
                             }
+                            else if (TryGetAutoReplacementCreateLimitBlock(
+                                         request,
+                                         out var createLimitReason,
+                                         out var createLimitSlotCount,
+                                         out var createLimitHourCount,
+                                         out var createLimitSessionCount))
+                            {
+                                createLimitBlocked = true;
+                                var limit = GetAutoReplacementCreateLimitSnapshot();
+                                lastError =
+                                    $"Đã chạm giới hạn tạo PRF ({createLimitReason}); tạm dừng tạo và chuyển sang vòng retry PRF chờ.";
+
+                                _log.Warn(
+                                    $"[AUTO_CREATE_LIMIT_BLOCK] id={request.Id} closed={request.ClosedProfileName} " +
+                                    $"slot={createLimitSlotCount}/{limit.PerSlot} hour={createLimitHourCount}/{limit.PerHour} " +
+                                    $"session={createLimitSessionCount}/{limit.PerSession} retryMinutes={limit.RetryMinutes} reason={createLimitReason}");
+
+                                SetAutoReplacementUiPhase(
+                                    "TẠM DỪNG TẠO",
+                                    $"retry PRF chờ sau {limit.RetryMinutes} phút",
+                                    request.Id);
+                            }
                             else if (TryGetAutoReplacementCreateCooldown(
                                          request,
                                          out var createWait))
@@ -914,6 +1338,39 @@ public sealed partial class ManagerForm
                                     request,
                                     execution.Generation,
                                     execution.Token);
+
+                                if (!filled
+                                    && TryGetAutoReplacementCreateLimitBlock(
+                                        request,
+                                        out var postCreateLimitReason,
+                                        out var postCreateSlotCount,
+                                        out var postCreateHourCount,
+                                        out var postCreateSessionCount))
+                                {
+                                    createLimitBlocked = true;
+                                    var limit = GetAutoReplacementCreateLimitSnapshot();
+                                    lastError =
+                                        $"Đã chạm giới hạn tạo PRF ({postCreateLimitReason}); tạm dừng tạo và chuyển sang vòng retry PRF chờ.";
+
+                                    _log.Warn(
+                                        $"[AUTO_CREATE_LIMIT_REACHED_AFTER_CREATE] id={request.Id} closed={request.ClosedProfileName} " +
+                                        $"slot={postCreateSlotCount}/{limit.PerSlot} hour={postCreateHourCount}/{limit.PerHour} " +
+                                        $"session={postCreateSessionCount}/{limit.PerSession} retryMinutes={limit.RetryMinutes} reason={postCreateLimitReason}");
+                                }
+                                else if (!filled && GetAutoReplacementCreateLimitSnapshot().Enabled)
+                                {
+                                    // Không còn account/candidate để CREATE dù chưa chạm hard limit.
+                                    // Theo policy mới vẫn tạm ngưng nhánh tạo, chờ đủ chu kỳ rồi
+                                    // vét lại toàn bộ PRF chờ trước khi cân nhắc CREATE tiếp.
+                                    createLimitBlocked = true;
+                                    var limit = GetAutoReplacementCreateLimitSnapshot();
+                                    lastError =
+                                        $"Chưa tạo được PRF mới; tạm dừng tạo {limit.RetryMinutes} phút và thử lại toàn bộ PRF chờ.";
+
+                                    _log.Warn(
+                                        $"[AUTO_CREATE_LIMIT_CREATE_UNAVAILABLE] id={request.Id} closed={request.ClosedProfileName} " +
+                                        $"retryMinutes={limit.RetryMinutes} action=WAIT_THEN_RETRY_ALL_REUSE");
+                                }
                             }
                         }
                     }
@@ -993,6 +1450,10 @@ public sealed partial class ManagerForm
                         && lastError.StartsWith("Chế độ CHỈ PRF CHỜ", StringComparison.OrdinalIgnoreCase))
                     {
                         ScheduleAutoReplacementReuseOnlyRoundRetry(request.Id, lastError);
+                    }
+                    else if (createLimitBlocked)
+                    {
+                        ScheduleAutoReplacementCreateLimitReuseRetry(request.Id, lastError);
                     }
                     else if (cleanupBarrier is not null)
                     {
@@ -1499,7 +1960,7 @@ public sealed partial class ManagerForm
 
             executionToken.ThrowIfCancellationRequested();
             // Một suất Tự bù cần đạt đúng 1 profile RUNNING khỏe. BAN/lỗi/skip
-            // không được làm mất quota như logic cũ giới hạn 3 lần thử.
+            // vẫn được thử tiếp nhưng bị chặn bởi cầu chì CREATE user cấu hình (mặc định 3/slot).
             // Giữ danh sách account đã thử trong chính suất này để account vừa lỗi
             // nhưng được ReleaseAccount() không bị lấy lại ngay và gây vòng lặp.
             var attemptedAccountIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1569,6 +2030,19 @@ public sealed partial class ManagerForm
 
                 executionToken.ThrowIfCancellationRequested();
 
+                if (TryGetAutoReplacementCreateLimitBlock(
+                        request,
+                        out var preCreateLimitReason,
+                        out _,
+                        out _,
+                        out _))
+                {
+                    _log.Warn(
+                        $"[AUTO_CREATE_LIMIT_BLOCK_BEFORE_COOLDOWN] id={request.Id} closed={request.ClosedProfileName} " +
+                        $"profile={item.ProfileName} reason={preCreateLimitReason}");
+                    return false;
+                }
+
                 // Chỉ CREATE profile mới mới phải chờ cooldown. Các lane mở PRF đã có
                 // (TryUseReusableProfileQueueAsync / TryOpenNextExistingReplacementAsync)
                 // không đi qua đây nên không bị chậm bởi 4'/7'/15' của Auto Profile.
@@ -1580,6 +2054,19 @@ public sealed partial class ManagerForm
 
                 if (!createCooldownCompleted)
                     return false;
+
+                // Re-check + reserve quota ngay sát CREATE thật. Đây là chốt chống
+                // một lần gọi TryCreateReplacementAsync tự loop hàng chục account.
+                if (!TryReserveAutoReplacementCreateAttempt(
+                        request,
+                        item.ProfileName,
+                        out var createLimitBlockReason))
+                {
+                    _log.Warn(
+                        $"[AUTO_CREATE_LIMIT_BLOCK_INSIDE_CREATE] id={request.Id} closed={request.ClosedProfileName} " +
+                        $"profile={item.ProfileName} reason={createLimitBlockReason}");
+                    return false;
+                }
 
                 attemptedAccountIds.Add(item.Account.Id);
                 attempt++;
@@ -1596,7 +2083,7 @@ public sealed partial class ManagerForm
                 try
                 {
                     _log.Info(
-                        $"[AUTO_REPLACE_CREATE_BEGIN] closed={request.ClosedProfileName} profile={item.ProfileName} account={item.Account.Username} attempt={attempt} mode=until_success_or_exhausted");
+                        $"[AUTO_REPLACE_CREATE_BEGIN] closed={request.ClosedProfileName} profile={item.ProfileName} account={item.Account.Username} attempt={attempt} mode=until_success_or_limit");
 
                     WriteAutoActivityLog(
                         action: "MỞ PROFILE BÙ",
@@ -1605,7 +2092,7 @@ public sealed partial class ManagerForm
                         reason: request.Reason,
                         replacementProfile: item.ProfileName,
                         result: "BẮT ĐẦU",
-                        detail: $"Lần thử {attempt}; tiếp tục đến khi có 1 profile RUNNING khỏe hoặc hết kho.");
+                        detail: $"Lần thử {attempt}; tiếp tục đến khi có 1 profile RUNNING khỏe, hết kho hoặc chạm giới hạn tạo.");
 
                     SetAutoReplacementUiPhase(
                         "TẠO PRF MỚI",
@@ -2798,7 +3285,7 @@ public sealed partial class ManagerForm
     {
         var document = new AutoReplacementQueueDocument
         {
-            Version = 3,
+            Version = 4,
             Pending = _autoReplacementQueue
                 .OrderBy(x => x.QueuedUtc)
                 .ToList()

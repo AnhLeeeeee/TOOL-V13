@@ -17,13 +17,15 @@ public sealed partial class AutomationEngine
     }
 
     /// <summary>
-    /// Thay khoảng chờ thụ động 2 giây sau Enter bằng polling DOM nhẹ. Nếu TikTok chỉ hiện
-    /// toast “Bạn hiện bị cấm bình luận” nhưng ô nhập vẫn editable/placeholder bình thường,
-    /// đánh dấu bắt buộc chuyển LIVE và quay lại đúng điểm hiện tại để không làm mất nội dung.
+    /// Poll DOM nhẹ trong 2 giây sau Enter. Hai phản hồi được ưu tiên:
+    /// - popup “Đăng nhập vào TikTok”: cộng đúng một xác nhận cho lần Enter hiện tại;
+    /// - toast cấm bình luận: giữ nguyên flow chuyển LIVE hiện tại.
+    /// Popup login được xác nhận xuyên qua nhiều lần Click/Dán/Enter, không xác nhận bằng F5.
     /// </summary>
-    async Task<bool> WatchPostEnterCommentRestrictionAsync(string pointName, int restartStep, CancellationToken ct)
+    async Task<bool> WatchPostEnterReactionAsync(string pointName, int restartStep, CancellationToken ct)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
+        var successfulProbeCount = 0;
 
         while (_running && !ct.IsCancellationRequested && sw.ElapsedMilliseconds < EnterReactionScanMs)
         {
@@ -32,20 +34,34 @@ public sealed partial class AutomationEngine
             string marker;
             try
             {
-                marker = await DetectCommentRestrictionToastAsync(ct);
+                // Một Runtime.evaluate duy nhất kiểm tra cả popup login và toast cấm bình luận.
+                marker = await DetectPostEnterReactionAsync(ct);
+                successfulProbeCount++;
             }
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
                 // Guard bổ sung không được làm chết workflow nếu DOM thay đổi đúng lúc polling.
                 if (!IsLikelyCdpIssue(ex))
-                    ReportProblem("COMMENT_RESTRICTION_CHECK_FAILED", pointName,
-                        "Không kiểm tra được toast cấm bình luận: " + ex.Message, throttleSeconds: 60);
+                    ReportProblem("POST_ENTER_REACTION_CHECK_FAILED", pointName,
+                        "Không kiểm tra được phản hồi sau Enter: " + ex.Message, throttleSeconds: 60);
                 marker = "";
             }
 
-            if (!string.IsNullOrWhiteSpace(marker))
+            if (marker.StartsWith("LOGIN_MODAL|", StringComparison.Ordinal))
             {
+                // Không coi nội dung là đã gửi thành công. Mỗi Enter chỉ cộng 1 lần rồi thoát.
+                // Lần 1/3 và 2/3 sẽ chuyển LIVE; lần 3/3 latch LOGOUT_CONFIRMED để
+                // Manager gọi đúng luồng đóng sạch + launch_auto + start_auto đang có.
+                RegisterRuntimeLoginModalAfterEnter(pointName, restartStep, marker);
+                return true;
+            }
+
+            if (marker.StartsWith("COMMENT_BANNED|", StringComparison.Ordinal))
+            {
+                // Một phản hồi sau Enter không phải login-modal phá chuỗi xác nhận mất login.
+                ResetRuntimeLoginModalConfirmation($"{pointName}: phát hiện cấm bình luận thay vì popup login");
+
                 _step = restartStep;
                 _postEnterCommentRestrictionPending = true;
                 _postEnterCommentRestrictionContext = pointName;
@@ -63,6 +79,11 @@ public sealed partial class AutomationEngine
             if (remaining <= 0) break;
             await Task.Delay(Math.Min(CommentRestrictionPollMs, remaining), ct);
         }
+
+        // Chỉ reset khi đã có ít nhất một DOM probe thành công. Nếu toàn bộ probe lỗi CDP thì
+        // giữ streak cũ để không biến lỗi kỹ thuật thành bằng chứng “login đã hồi”.
+        if (successfulProbeCount > 0)
+            ResetRuntimeLoginModalConfirmation($"{pointName}: Enter kế tiếp không còn popup login");
 
         return false;
     }

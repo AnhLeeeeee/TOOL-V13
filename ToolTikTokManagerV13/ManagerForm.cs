@@ -1043,6 +1043,11 @@ public sealed partial class ManagerForm : Form
                 ctx.WorkerWindow = reported;
             }
         }
+
+        // Worker chỉ set marker này sau khi toast "Vui lòng đăng nhập trước"
+        // đã qua F5 và sidebar vẫn xác nhận Đăng nhập (không còn Nhận Xu).
+        // Coordinator chạy fire-and-forget để không giữ vòng refresh của toàn bộ PRF.
+        TryQueueRuntimeLoginRecovery(ctx, s);
     }
 
     async Task<WorkerSnapshot> ReadStatusAsync(ProfileContext ctx)
@@ -5490,6 +5495,8 @@ public sealed partial class ManagerForm : Form
         public bool F5Enabled { get; set; }
         public int F5RemainingSec { get; set; } = -1;
         public string TikTokStartupState { get; set; } = "";
+        public string RuntimeAuthState { get; set; } = "";
+        public string RuntimeAuthDetail { get; set; } = "";
         public bool MessageReplyRunning { get; set; }
     }
 

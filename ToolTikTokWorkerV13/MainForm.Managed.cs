@@ -1,5 +1,6 @@
 ﻿using System.Text;
 using System.Text.Json;
+using System.Threading;
 
 namespace ToolTikTokV11;
 
@@ -198,6 +199,89 @@ public sealed partial class MainForm
                     await LaunchChromeAsync(stopOnCaptcha: true, suppressDialogs: true);
                     if (!_chrome.Connected) return "not_opened";
                     return MapManagedLaunchState();
+                case "runtime_relogin_auto":
+                    if (IsManagerEmergencyStopActive()) return "emergency_stopped";
+                    if (IsMessageReplyRunning) return "message_reply_running";
+
+                    // runtime_login_lost đã được Worker xác nhận bằng popup đăng nhập
+                    // lặp 3/3 sau Enter. Ở recovery này KHÔNG được tin lại cookie/session
+                    // cũ ngay sau khi reopen, vì chính cookie stale làm launch_auto báo
+                    // "opened" rồi Start lại automation -> popup login -> loop.
+                    //
+                    // Vẫn gọi nguyên flow đăng nhập hiện có: chỉ xóa cookie của phiên
+                    // Chrome vừa reopen rồi gọi PrepareTikTokProfileStartupAsync().
+                    // Flow đó tiếp tục giữ toàn bộ xử lý sẵn có: form login, CAPTCHA,
+                    // TOTP/2FA, login failure, hard BAN và trạng thái startup.
+                    await LaunchChromeAsync(stopOnCaptcha: true, suppressDialogs: true);
+                    if (!_chrome.Connected) return "not_opened";
+
+                    try
+                    {
+                        _log.Warn(
+                            "[RUNTIME_RELOGIN_FORCE_BEGIN] reason=runtime_login_lost action=CLEAR_STALE_BROWSER_COOKIES_THEN_EXISTING_LOGIN_FLOW");
+
+                        // Chỉ xóa cookie thuộc TikTok, không đụng cookie website khác
+                        // trong cùng Chrome profile. Mục đích là buộc
+                        // IsTikTokSessionActiveAsync không thể kết luận nhầm từ cookie
+                        // TikTok stale sau khi runtime đã xác nhận logout.
+                        var allCookies = await CallChromeCdpForRuntimeReloginAsync(
+                            "Network.getAllCookies",
+                            null);
+
+                        var deletedTikTokCookies = 0;
+                        if (allCookies.ValueKind == JsonValueKind.Object
+                            && allCookies.TryGetProperty("cookies", out var cookies)
+                            && cookies.ValueKind == JsonValueKind.Array)
+                        {
+                            foreach (var cookie in cookies.EnumerateArray())
+                            {
+                                var name = cookie.TryGetProperty("name", out var nameValue)
+                                    ? nameValue.GetString() ?? ""
+                                    : "";
+                                var domain = cookie.TryGetProperty("domain", out var domainValue)
+                                    ? domainValue.GetString() ?? ""
+                                    : "";
+                                var path = cookie.TryGetProperty("path", out var pathValue)
+                                    ? pathValue.GetString() ?? "/"
+                                    : "/";
+
+                                if (string.IsNullOrWhiteSpace(name)
+                                    || domain.IndexOf("tiktok.com", StringComparison.OrdinalIgnoreCase) < 0)
+                                {
+                                    continue;
+                                }
+
+                                await CallChromeCdpForRuntimeReloginAsync(
+                                    "Network.deleteCookies",
+                                    new { name, domain, path });
+                                deletedTikTokCookies++;
+                            }
+                        }
+
+                        _log.Warn(
+                            $"[RUNTIME_RELOGIN_TIKTOK_COOKIES_CLEARED] count={deletedTikTokCookies}");
+
+                        _startupPreparationState = "";
+
+                        // openLiveWhenReady=false: chỉ hoàn tất đăng nhập ở đây.
+                        // Manager sẽ gọi start_auto sau khi reply=opened; StartAsync sẽ
+                        // đi tiếp workflow LIVE theo logic hiện tại.
+                        await PrepareTikTokProfileStartupAsync(
+                            openLiveWhenReady: false,
+                            stopOnCaptcha: true);
+
+                        var reloginState = MapManagedLaunchState();
+                        _log.Warn(
+                            $"[RUNTIME_RELOGIN_FORCE_RESULT] state={_startupPreparationState} reply={reloginState}");
+                        return reloginState;
+                    }
+                    catch (Exception ex)
+                    {
+                        _startupPreparationState = "ERROR";
+                        _log.Error(
+                            $"[RUNTIME_RELOGIN_FORCE_ERROR] {ex}");
+                        return "startup_error";
+                    }
                 case "captcha_check":
                     if (!_chrome.Connected) return "not_connected";
                     try { return await _chrome.IsCaptchaVisibleAsync() ? "captcha" : "clear"; }
@@ -354,6 +438,93 @@ public sealed partial class MainForm
         });
     }
 
+    async Task<JsonElement> CallChromeCdpForRuntimeReloginAsync(string method, object? parameters)
+    {
+        // ChromeController.Cdp khong public, nen MainForm khong duoc truy cap truc tiep
+        // (CS0122). Dung reflection chi o recovery nay de goi CHINH CdpClient dang duoc
+        // ChromeController quan ly; khong tao them ket noi CDP va khong thay doi flow cu.
+        const System.Reflection.BindingFlags flags =
+            System.Reflection.BindingFlags.Instance
+            | System.Reflection.BindingFlags.Public
+            | System.Reflection.BindingFlags.NonPublic;
+
+        object? cdp = null;
+        var chromeType = _chrome.GetType();
+
+        try
+        {
+            var cdpProperty = chromeType.GetProperty("Cdp", flags);
+            if (cdpProperty is not null)
+                cdp = cdpProperty.GetValue(_chrome);
+        }
+        catch { }
+
+        if (cdp is null)
+        {
+            // Fallback neu Cdp duoc luu bang field thay vi property o mot build khac.
+            var cdpField = chromeType.GetField("Cdp", flags)
+                ?? chromeType.GetField("_cdp", flags);
+            if (cdpField is not null)
+                cdp = cdpField.GetValue(_chrome);
+        }
+
+        if (cdp is null)
+            throw new InvalidOperationException(
+                "Khong lay duoc CdpClient hien tai tu ChromeController de runtime relogin.");
+
+        System.Reflection.MethodInfo? callAsync = null;
+        foreach (var candidate in cdp.GetType().GetMethods(flags))
+        {
+            if (!string.Equals(candidate.Name, "CallAsync", StringComparison.Ordinal))
+                continue;
+
+            var ps = candidate.GetParameters();
+            if (ps.Length != 3)
+                continue;
+
+            if (ps[0].ParameterType != typeof(string))
+                continue;
+
+            if (ps[2].ParameterType != typeof(CancellationToken))
+                continue;
+
+            callAsync = candidate;
+            break;
+        }
+
+        if (callAsync is null)
+            throw new MissingMethodException(
+                cdp.GetType().FullName,
+                "CallAsync(string, ..., CancellationToken)");
+
+        object? pending;
+        try
+        {
+            pending = callAsync.Invoke(
+                cdp,
+                new object?[] { method, parameters, CancellationToken.None });
+        }
+        catch (System.Reflection.TargetInvocationException ex) when (ex.InnerException is not null)
+        {
+            throw ex.InnerException!;
+        }
+
+        if (pending is Task<JsonElement> jsonTask)
+            return await jsonTask;
+
+        if (pending is Task task)
+        {
+            await task;
+            var resultProperty = task.GetType().GetProperty("Result", flags);
+            var result = resultProperty?.GetValue(task);
+            if (result is JsonElement json)
+                return json;
+        }
+
+        throw new InvalidOperationException(
+            $"CDP CallAsync tra ve kieu khong ho tro: {pending?.GetType().FullName ?? "null"}.");
+    }
+
     string MapManagedLaunchState()
         => _startupPreparationState switch
         {
@@ -397,6 +568,8 @@ public sealed partial class MainForm
             F5Enabled = periodic.Enabled,
             F5RemainingSec = f5RemainingSec
             ,TikTokStartupState = _startupPreparationState
+            ,RuntimeAuthState = _engine.RuntimeLoginLostConfirmed ? "LOGOUT_CONFIRMED" : "NORMAL"
+            ,RuntimeAuthDetail = _engine.RuntimeLoginLostDetail
             ,MessageReplyRunning = IsMessageReplyRunning
         });
     }

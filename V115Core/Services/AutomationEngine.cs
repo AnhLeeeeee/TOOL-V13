@@ -121,6 +121,15 @@ public sealed partial class AutomationEngine
     volatile bool _running;
     bool _transitioning;
 
+    // Runtime auth-loss latch: set only after the post-comment login-required
+    // signal survives a real reload and the LIVE sidebar is still logged out.
+    // Manager reads this through Worker status and owns the clean close/reopen/login flow.
+    volatile bool _runtimeLoginLostConfirmed;
+    string _runtimeLoginLostDetail = "";
+
+    public bool RuntimeLoginLostConfirmed => _runtimeLoginLostConfirmed;
+    public string RuntimeLoginLostDetail => _runtimeLoginLostDetail;
+
     AppSettings _s = new();
     List<string> _contents = [];
     int _contentIndex;
@@ -283,6 +292,9 @@ public sealed partial class AutomationEngine
         _paused = false;
         _running = true;
         _transitioning = false;
+        _runtimeLoginLostConfirmed = false;
+        _runtimeLoginLostDetail = "";
+        ResetRuntimeLoginModalState("khởi động");
         ResetPostEnterCommentRestrictionState();
         ResetInputGuardConsecutive("khởi động");
 
@@ -371,6 +383,11 @@ public sealed partial class AutomationEngine
                     // Stop guard DOM: trạng thái vi phạm/tính năng bị khóa là lỗi cấp tài khoản,
                     // không được coi như ô nhập bất thường rồi tiếp tục đổi LIVE.
                     await StopIfFatalTikTokRestrictionAsync("ranh giới vòng chính", ct);
+
+                    // Nếu Enter vừa hiện popup “Đăng nhập vào TikTok” ở lần xác minh 1/3 hoặc 2/3,
+                    // khóa workflow và chuyển LIVE trước. Streak không bị reset chỉ vì popup biến mất
+                    // sau chuyển LIVE/F5; chỉ Enter thành công kế tiếp mới reset.
+                    if (await HandlePendingRuntimeLoginSuspectTransitionAsync(ct)) continue;
 
                     // Nếu Enter vừa bị TikTok từ chối bằng toast “Bạn hiện bị cấm bình luận”,
                     // khóa workflow tại đây cho đến khi đã thực hiện xong một lần chuyển LIVE.
@@ -986,9 +1003,9 @@ public sealed partial class AutomationEngine
 
                 case 3:
                 {
-                    SetStatus("BƯỚC 3/8", "Enter ô 1 • theo dõi phản hồi cấm bình luận");
+                    SetStatus("BƯỚC 3/8", "Enter ô 1 • theo dõi popup đăng nhập / cấm bình luận");
                     await _chrome.PressKeyAsync("Enter", ct: ct);
-                    if (await WatchPostEnterCommentRestrictionAsync("điểm 1", restartStep: 1, ct)) return;
+                    if (await WatchPostEnterReactionAsync("điểm 1", restartStep: 1, ct)) return;
                     AdvanceContentAfterSuccessfulSend("điểm 1");
                     _step = 4;
                     break;
@@ -1019,9 +1036,9 @@ public sealed partial class AutomationEngine
 
                 case 7:
                 {
-                    SetStatus("BƯỚC 7/8", "Enter ô 2 • theo dõi phản hồi cấm bình luận");
+                    SetStatus("BƯỚC 7/8", "Enter ô 2 • theo dõi popup đăng nhập / cấm bình luận");
                     await _chrome.PressKeyAsync("Enter", ct: ct);
-                    if (await WatchPostEnterCommentRestrictionAsync("điểm 2", restartStep: 5, ct)) return;
+                    if (await WatchPostEnterReactionAsync("điểm 2", restartStep: 5, ct)) return;
                     AdvanceContentAfterSuccessfulSend("điểm 2");
                     _step = 8;
                     break;
