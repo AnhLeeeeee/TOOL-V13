@@ -34,16 +34,8 @@ public sealed partial class ManagerForm
         RemoveLegacyStatisticsTab();
         ApplyDashboardCompactPaste();
 
-        // Handler được gắn sau handler RefreshDashboard có sẵn, nên mỗi tick
-        // Dashboard được cập nhật trước rồi mới bổ sung Session/Total/Vòng giờ/Progress.
-        _refreshTimer.Tick += (_, _) =>
-        {
-            RemoveLegacyStatisticsTab();
-            ApplyDashboardCompactPaste();
-        };
-
-        if (_dashboardTab is not null && !_dashboardTab.IsDisposed)
-            _dashboardTab.Enter += (_, _) => ApplyDashboardCompactPaste();
+        // Không đăng ký thêm Timer/Enter handler ở đây. RefreshDashboard() là lane UI duy nhất
+        // và sẽ gọi ApplyDashboardCompactPaste() sau khi cập nhật LastSnapshot lên grid.
     }
 
     void RemoveLegacyStatisticsTab()
@@ -127,7 +119,7 @@ public sealed partial class ManagerForm
             if (row.DataGridView?.Columns.Contains("RoundsPerHour") == true)
             {
                 var rateCell = row.Cells["RoundsPerHour"];
-                rateCell.Style.Font = new Font("Segoe UI", 9F, FontStyle.Bold);
+                rateCell.Style.Font = DashboardCellFont9Bold;
                 rateCell.Style.Alignment = DataGridViewContentAlignment.MiddleCenter;
 
                 // Reset trước khi ApplyPerformanceStyle để màu luôn phản ánh dữ liệu hiện tại.
@@ -319,7 +311,7 @@ public sealed partial class ManagerForm
         {
             var session = row.Cells["SessionRuntime"];
             session.Style.Alignment = DataGridViewContentAlignment.MiddleCenter;
-            session.Style.Font = new Font("Segoe UI", 9F, FontStyle.Regular);
+            session.Style.Font = DashboardCellFont9Regular;
             session.Style.ForeColor = Color.FromArgb(76, 88, 104);
             session.Style.BackColor = Color.FromArgb(248, 249, 251);
         }
@@ -328,7 +320,7 @@ public sealed partial class ManagerForm
         {
             var total = row.Cells["TotalRuntime"];
             total.Style.Alignment = DataGridViewContentAlignment.MiddleCenter;
-            total.Style.Font = new Font("Segoe UI", 9.5F, FontStyle.Bold);
+            total.Style.Font = DashboardCellFont95Bold;
             total.Style.ForeColor = Color.FromArgb(31, 78, 146);
             total.Style.BackColor = Color.FromArgb(232, 241, 252);
             total.Style.SelectionBackColor = Color.FromArgb(65, 112, 173);
@@ -431,7 +423,7 @@ public sealed partial class ManagerForm
     {
         if (row.DataGridView?.Columns.Contains("Profile") != true) return;
         var profileCell = row.Cells["Profile"];
-        profileCell.Style.Font = new Font("Segoe UI", 9F, FontStyle.Bold);
+        profileCell.Style.Font = DashboardCellFont9Bold;
         profileCell.Style.ForeColor = Color.FromArgb(25, 67, 112);
         profileCell.Style.SelectionForeColor = Color.FromArgb(18, 55, 95);
     }
@@ -473,7 +465,7 @@ public sealed partial class ManagerForm
         if (row.DataGridView?.Columns.Contains("RunState") == true)
         {
             var stateCell = row.Cells["RunState"];
-            stateCell.Style.Font = new Font("Segoe UI", 9F, FontStyle.Bold);
+            stateCell.Style.Font = DashboardCellFont9Bold;
             stateCell.Style.ForeColor = chromeDisconnected || hasError
                 ? Color.FromArgb(176, 45, 45)
                 : GetRuntimeStateColor(runState);

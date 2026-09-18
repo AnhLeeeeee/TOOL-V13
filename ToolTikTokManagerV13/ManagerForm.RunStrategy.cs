@@ -942,12 +942,23 @@ public sealed partial class ManagerForm
         var cancel = new Button { Text = "Hủy", DialogResult = DialogResult.Cancel, Size = new Size(104, 40) };
         var start = new Button { Text = "Bắt đầu", DialogResult = DialogResult.OK, Size = new Size(122, 40) };
         var save = new Button { Text = "Lưu", Size = new Size(104, 40) };
+        var launchWarning = new Label
+        {
+            AutoSize = true,
+            MaximumSize = new Size(480, 42),
+            ForeColor = Color.Firebrick,
+            Font = new Font("Segoe UI", 9F, FontStyle.Bold),
+            TextAlign = ContentAlignment.MiddleLeft,
+            Margin = new Padding(16, 9, 10, 0),
+            Visible = false
+        };
         ModernDialog.StyleSecondaryButton(cancel);
         ModernDialog.StylePrimaryButton(start);
         ModernDialog.StyleSecondaryButton(save);
         footer.Controls.Add(cancel);
         footer.Controls.Add(start);
         footer.Controls.Add(save);
+        footer.Controls.Add(launchWarning);
 
         detailsHost.Controls.Add(launchBox);
         detailsHost.Controls.Add(timeBox);
@@ -1292,6 +1303,13 @@ public sealed partial class ManagerForm
                 ? $"Đang dùng TIME hiện tại: đủ tổng runtime {_autoCloseSettings.RunHours} giờ thì đóng sạch PRF cũ và Tự bù theo engine hiện có."
                 : "TIME hiện đang TẮT trong cấu hình ‘Tự động’. Chọn chế độ Theo thời gian vẫn giữ nguyên cấu hình này; Tool không tự bật TIME.";
 
+            var overTargetBlocked = ensure && openCount > effectiveTarget;
+            launchWarning.Visible = overTargetBlocked;
+            launchWarning.Text = overTargetBlocked
+                ? $"⚠ Không thể Bắt đầu: đang mở {openCount} PRF > target {effectiveTarget}. Hãy tăng target hoặc đóng bớt PRF."
+                : string.Empty;
+            start.Text = overTargetBlocked ? "Bị chặn" : "Bắt đầu";
+
             start.Enabled = valid;
             UpdateMainCards();
         }
@@ -1411,7 +1429,22 @@ public sealed partial class ManagerForm
         form.Controls.Add(root);
         form.AcceptButton = start;
         form.CancelButton = cancel;
-        form.Shown += (_, _) => ModernDialog.FitToWorkingArea(form);
+        form.Shown += (_, _) =>
+        {
+            ModernDialog.FitToWorkingArea(form);
+
+            // Cảnh báo một lần ngay khi mở Auto Run nếu nút Bắt đầu đang bị khóa
+            // chỉ vì số PRF đang mở lớn hơn target. Không đổi validation/engine hiện có.
+            if (autoEnsureTarget.Checked && openCount > (int)targetSlots.Value)
+            {
+                ModernDialog.ShowMessage(
+                    form,
+                    $"Đang mở {openCount} PRF nhưng target chỉ là {(int)targetSlots.Value}.\r\n\r\n" +
+                    "Tool không tự đóng PRF dư khi Bắt đầu. Hãy tăng target hoặc đóng bớt PRF.",
+                    "Auto Run — chưa thể bắt đầu",
+                    MessageBoxIcon.Warning);
+            }
+        };
 
         if (form.ShowDialog(this) != DialogResult.OK)
             return;

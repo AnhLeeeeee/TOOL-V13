@@ -59,6 +59,9 @@ public sealed partial class AutomationEngine
     // Chỉ khi DOM LIVE không hydrate đủ nhanh mới fallback F5 đúng một lần.
     const int ArrowDownFastReadyTimeoutMs = 2200;
     const int ArrowDownFastReadyPollMs = 200;
+    // Fast-path chỉ pass sau khi DOM thao tác của LIVE mới ổn định ở 2 mẫu liên tiếp.
+    // Không thay fallback: nếu chưa đủ chắc chắn thì vẫn F5 đúng một lần như trước.
+    const int ArrowDownFastReadyStableSamples = 2;
     const int PriorityPauseMs = 5000;
     // Bộ F5 cứu trang độc lập: không đổi LIVE. Bình thường reload trang hiện tại mỗi 30 phút;
     // nếu renderer/tab crash (Aw, Snap!/Out of Memory/CDP target crashed) thì xử lý ngay.
@@ -2273,40 +2276,93 @@ public sealed partial class AutomationEngine
         return new LiveSwitchVerification(false, beforeIdentity, latestIdentity, attempt, sw.ElapsedMilliseconds);
     }
 
+    async Task<(bool Ready, string Signal)> ProbeArrowDownFastReadyDomAsync(CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        // Fast-path không dùng old-live-identity làm tín hiệu ready vì node định danh cũ có thể
+        // còn tồn tại trong DOM trong lúc TikTok đang thay room. Chỉ dùng DOM mà workflow sẽ
+        // thực sự cần ngay sau transition: Viewer hoặc ô nhập hiện tại.
+        var probes = new List<(string Name, string XPath)>();
+        if (_s.Viewer.Enabled && !string.IsNullOrWhiteSpace(_s.Viewer.XPath))
+            probes.Add(("viewer", _s.Viewer.XPath));
+        if (!string.IsNullOrWhiteSpace(CurrentInputXPath))
+            probes.Add((CurrentPointName + "-input", CurrentInputXPath));
+
+        foreach (var probe in probes
+            .Where(x => !string.IsNullOrWhiteSpace(x.XPath))
+            .GroupBy(x => x.XPath.Trim(), StringComparer.Ordinal)
+            .Select(g => g.First()))
+        {
+            try
+            {
+                if (await _chrome.XPathExistsAsync(probe.XPath, ct))
+                    return (true, "xpath:" + probe.Name);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) when (!_chrome.IsCdpSessionLost(ex))
+            {
+                _log.Warn($"[LIVE_SWITCH_FAST_READY_PROBE_WARN] signal={probe.Name} reason={ex.Message}");
+            }
+        }
+
+        return (false, "none");
+    }
+
     async Task<(bool Ready, string Signal, long ElapsedMs)> WaitForArrowDownFastReadyAsync(
         string source,
-        string beforeIdentity,
+        LiveSwitchVerification changed,
         CancellationToken ct)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var lastSignal = "none";
-        var beforeKey = GetLivePageChangeKey(beforeIdentity);
+        var beforeKey = GetLivePageChangeKey(changed.BeforeIdentity);
+        var detectedKey = GetLivePageChangeKey(changed.AfterIdentity);
+
+        // Điểm quan trọng: dùng key đã được ghi nhận NGAY lúc WaitForPageChangeBeforeReloadAsync
+        // xác nhận trang đổi. Không bắt key phải còn đọc lại được ở từng poll sau đó vì DOM TikTok
+        // có thể giữ roomId cũ trong outerHTML trong vài giây dù LIVE mới đã render xong.
+        var stableNewKeyDetected = !string.IsNullOrWhiteSpace(detectedKey)
+            && (string.IsNullOrWhiteSpace(beforeKey)
+                || !string.Equals(beforeKey, detectedKey, StringComparison.OrdinalIgnoreCase));
+
+        // Nếu lần xác nhận trước chỉ dựa vào title (không có roomId/url/canonical mới), không nới
+        // điều kiện và không tốn thêm 2.2s probe: đi thẳng fallback F5 cũ.
+        if (!stableNewKeyDetected)
+        {
+            _log.Info(
+                $"[LIVE_SWITCH_FAST_READY_BYPASS] source={source} beforeKey={beforeKey} detectedKey={detectedKey} " +
+                "reason=no-stable-new-live-key action=F5_FALLBACK_ONCE");
+            return (false, "no-stable-new-live-key", sw.ElapsedMilliseconds);
+        }
+
+        var stableReadySamples = 0;
         _log.Info(
             $"[LIVE_SWITCH_FAST_READY_WAIT] source={source} timeoutMs={ArrowDownFastReadyTimeoutMs} " +
-            $"pollMs={ArrowDownFastReadyPollMs} requirement=new-live-key+xpath-signal beforeKey={beforeKey}");
+            $"pollMs={ArrowDownFastReadyPollMs} requirement=detected-new-key+action-dom-x{ArrowDownFastReadyStableSamples} " +
+            $"beforeKey={beforeKey} detectedKey={detectedKey}");
 
         while (sw.ElapsedMilliseconds < ArrowDownFastReadyTimeoutMs)
         {
             await WaitIfPausedAsync(ct);
-            var probe = await ProbeLivePageReadyAsync(ct);
+            var probe = await ProbeArrowDownFastReadyDomAsync(ct);
             lastSignal = probe.Signal;
 
-            var currentIdentity = await GetCurrentLiveIdentityAsync(ct);
-            var currentKey = GetLivePageChangeKey(currentIdentity);
-            var confirmedNewLive = !string.IsNullOrWhiteSpace(currentKey)
-                && (string.IsNullOrWhiteSpace(beforeKey)
-                    || !string.Equals(beforeKey, currentKey, StringComparison.OrdinalIgnoreCase));
-
-            // Chỉ bỏ F5 khi đồng thời: key LIVE mới đã thực sự khác và đã có tín hiệu DOM/XPath.
-            // Identity-only hoặc chỉ đổi title chưa đủ để đi fast path.
-            if (confirmedNewLive
-                && probe.Ready
-                && probe.Signal.StartsWith("xpath:", StringComparison.OrdinalIgnoreCase))
+            if (probe.Ready)
             {
-                _log.Info(
-                    $"[LIVE_SWITCH_FAST_READY] source={source} elapsedMs={sw.ElapsedMilliseconds} " +
-                    $"signal={probe.Signal} beforeKey={beforeKey} currentKey={currentKey} action=SKIP_F5");
-                return (true, probe.Signal, sw.ElapsedMilliseconds);
+                stableReadySamples++;
+                if (stableReadySamples >= ArrowDownFastReadyStableSamples)
+                {
+                    _log.Info(
+                        $"[LIVE_SWITCH_FAST_READY] source={source} elapsedMs={sw.ElapsedMilliseconds} " +
+                        $"signal={probe.Signal} samples={stableReadySamples}/{ArrowDownFastReadyStableSamples} " +
+                        $"beforeKey={beforeKey} detectedKey={detectedKey} action=SKIP_F5");
+                    return (true, probe.Signal, sw.ElapsedMilliseconds);
+                }
+            }
+            else
+            {
+                stableReadySamples = 0;
             }
 
             var remaining = ArrowDownFastReadyTimeoutMs - (int)Math.Min(int.MaxValue, sw.ElapsedMilliseconds);
@@ -2316,7 +2372,8 @@ public sealed partial class AutomationEngine
 
         _log.Warn(
             $"[LIVE_SWITCH_FAST_READY_TIMEOUT] source={source} waitedMs={sw.ElapsedMilliseconds} " +
-            $"lastSignal={lastSignal} beforeKey={beforeKey} action=F5_FALLBACK_ONCE");
+            $"lastSignal={lastSignal} samples={stableReadySamples}/{ArrowDownFastReadyStableSamples} " +
+            $"beforeKey={beforeKey} detectedKey={detectedKey} action=F5_FALLBACK_ONCE");
         return (false, lastSignal, sw.ElapsedMilliseconds);
     }
 
@@ -2326,7 +2383,7 @@ public sealed partial class AutomationEngine
         int waitAfterReloadMs,
         CancellationToken ct)
     {
-        var fastReady = await WaitForArrowDownFastReadyAsync(source, changed.BeforeIdentity, ct);
+        var fastReady = await WaitForArrowDownFastReadyAsync(source, changed, ct);
         if (fastReady.Ready)
         {
             await StopIfFatalTikTokRestrictionAsync($"sau chuyển LIVE không F5: {source}", ct);

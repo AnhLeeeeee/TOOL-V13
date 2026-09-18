@@ -97,6 +97,13 @@ public sealed partial class ManagerForm
     bool _updateCheckInProgress;
     bool _updateDownloadInProgress;
     bool _updatingHoldToggle;
+    DateTime _dashboardNextPeriodicRefreshUtc = DateTime.MinValue;
+    static readonly TimeSpan DashboardPeriodicRefreshInterval = TimeSpan.FromSeconds(5);
+
+    // Font dùng chung cho các cell được style lại nhiều lần. Không tạo GDI Font mới theo mỗi tick/hàng.
+    static readonly Font DashboardCellFont9Regular = new("Segoe UI", 9F, FontStyle.Regular);
+    static readonly Font DashboardCellFont9Bold = new("Segoe UI", 9F, FontStyle.Bold);
+    static readonly Font DashboardCellFont95Bold = new("Segoe UI", 9.5F, FontStyle.Bold);
 
     string UpdateSettingsPath => Path.Combine(_baseDir, UpdateSettingsFileName);
 
@@ -104,10 +111,11 @@ public sealed partial class ManagerForm
     {
         EnsureDashboardTab();
         RefreshDashboard();
+        _dashboardNextPeriodicRefreshUtc = DateTime.UtcNow.Add(DashboardPeriodicRefreshInterval);
 
-        // Dashboard chỉ đọc LastSnapshot vốn đã được Manager refresh định kỳ,
-        // không tạo thêm một vòng status IPC riêng cho từng Worker.
-        _refreshTimer.Tick += (_, _) => RefreshDashboard();
+        // Dashboard chỉ là phần HIỂN THỊ. LastSnapshot vẫn được Manager cập nhật theo nhịp cũ;
+        // giảm riêng repaint/đọc thống kê của Dashboard xuống 5 giây để không đụng workflow.
+        _refreshTimer.Tick += (_, _) => RefreshDashboardPeriodic();
 
         Shown += async (_, _) =>
         {
@@ -120,6 +128,14 @@ public sealed partial class ManagerForm
                 await CheckForUpdatesAsync(showWhenCurrent: false);
             }
         };
+    }
+
+    void RefreshDashboardPeriodic()
+    {
+        var nowUtc = DateTime.UtcNow;
+        if (nowUtc < _dashboardNextPeriodicRefreshUtc) return;
+        _dashboardNextPeriodicRefreshUtc = nowUtc.Add(DashboardPeriodicRefreshInterval);
+        RefreshDashboard();
     }
 
     void EnsureDashboardTab()
@@ -536,12 +552,12 @@ public sealed partial class ManagerForm
 
         // Chỉ nhấn thị giác, không thay đổi dữ liệu/logic trạng thái.
         var profileCell = row.Cells["Profile"];
-        profileCell.Style.Font = new Font("Segoe UI", 9F, FontStyle.Bold);
+        profileCell.Style.Font = DashboardCellFont9Bold;
         profileCell.Style.ForeColor = Color.FromArgb(25, 67, 112);
         profileCell.Style.SelectionForeColor = Color.FromArgb(18, 55, 95);
 
         var stateCell = row.Cells["RunState"];
-        stateCell.Style.Font = new Font("Segoe UI", 9F, FontStyle.Bold);
+        stateCell.Style.Font = DashboardCellFont9Bold;
         stateCell.Style.ForeColor = GetRuntimeStateColor(runState);
     }
 
@@ -578,6 +594,10 @@ public sealed partial class ManagerForm
         var unknown = 0;
         long viewerTotal = 0;
         var viewerCount = 0;
+        // Cột RAM đang bị Dashboard gộp ẩn. Không gọi Process.WorkingSet64/GetProcessById
+        // khi dữ liệu đó không được hiển thị; nếu sau này bật lại cột, phép đo cũ tự hoạt động.
+        var shouldMeasureRam = _dashboardGrid.Columns.Contains("Ram")
+            && _dashboardGrid.Columns["Ram"].Visible;
 
         _dashboardGrid.SuspendLayout();
         try
@@ -638,7 +658,6 @@ public sealed partial class ManagerForm
                 var roundsText = snapshot is null ? "—" : snapshot.Rounds.ToString();
                 var chrome = snapshot?.Chrome ?? "—";
                 var runTime = FormatDashboardRuntime(snapshot?.TotalRunSeconds ?? -1);
-                var ram = GetDashboardPrimaryRamMb(ctx, snapshot);
                 var previousRunState = Convert.ToString(row.Cells["RunState"].Value) ?? "";
 
                 SetDashboardCellIfChanged(row, "Profile", ctx.Profile.Name);
@@ -648,7 +667,11 @@ public sealed partial class ManagerForm
                 SetDashboardCellIfChanged(row, "RunTime", runTime);
                 SetDashboardCellIfChanged(row, "Step", stepText);
                 SetDashboardCellIfChanged(row, "Rounds", roundsText);
-                SetDashboardCellIfChanged(row, "Ram", ram < 0 ? "—" : $"{ram:N0} MB");
+                if (shouldMeasureRam)
+                {
+                    var ram = GetDashboardPrimaryRamMb(ctx, snapshot);
+                    SetDashboardCellIfChanged(row, "Ram", ram < 0 ? "—" : $"{ram:N0} MB");
+                }
                 SetDashboardCellIfChanged(row, "Detail", detail);
 
                 if (needsRowRebuild || !string.Equals(previousRunState, runState, StringComparison.Ordinal))
@@ -669,6 +692,11 @@ public sealed partial class ManagerForm
                 : $"Profiles đang mở: {contexts.Count}/{allContexts.Count}";
             _dashboardSummary.Text = $"{profileCountText}   |   🟢 Running: {running}   |   🟠 Paused: {paused}   |   🟡 Recovering: {recovering}   |   ⚪ Stopped: {stopped}   |   ❔ Unknown: {unknown}   |   Viewer TB: {avg}";
         }
+
+        // V14.1.8 dùng Dashboard gộp: bổ sung Session/Total/Vòng giờ ngay trong cùng một
+        // lượt refresh, không chạy thêm một handler Timer thứ hai.
+        if (_dashboardCompactPasteInstalled)
+            ApplyDashboardCompactPaste();
     }
 
     string GetDashboardAccount(ProfileContext ctx)

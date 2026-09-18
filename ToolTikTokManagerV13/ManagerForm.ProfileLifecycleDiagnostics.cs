@@ -300,7 +300,25 @@ public sealed partial class ManagerForm
             }
 
             var archivePath = Path.GetFullPath(saveDialog.FileName);
-            var result = await Task.Run(() => CreateDiagnosticLogArchive(archivePath));
+
+            // Bảo đảm các event AutoClose/Tự bù vừa phát sinh đã xuống file trước
+            // khi đóng gói Diagnostic. Không đổi nội dung log, chỉ tránh thiếu vài
+            // dòng cuối đang còn trong hàng đợi writer.
+            await FlushAutoActivityLogAsync(TimeSpan.FromSeconds(5));
+
+            (int Included, List<string> Skipped) result;
+            await _autoActivityLogGate.WaitAsync();
+            try
+            {
+                // Giữ riêng gate của auto_close_replace.jsonl trong lúc đóng ZIP để
+                // snapshot phần log này nhất quán. Event mới vẫn xếp hàng FIFO và sẽ
+                // được writer ghi tiếp ngay sau khi export xong.
+                result = await Task.Run(() => CreateDiagnosticLogArchive(archivePath));
+            }
+            finally
+            {
+                _autoActivityLogGate.Release();
+            }
 
             try
             {

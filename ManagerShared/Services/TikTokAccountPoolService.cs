@@ -98,7 +98,19 @@ public sealed class TikTokAccountPoolService
     static readonly byte[] Entropy =
         Encoding.UTF8.GetBytes("ToolTikTok-V13.5-AccountPool-v1");
 
+    // Các luồng Manager (UI / scheduler / Auto Profile) có thể cùng đọc-ghi kho.
+    // Khóa trong process để không có reader tự "cứu" .tmp khi writer còn đang ghi.
+    static readonly object CatalogIoGate = new();
+
     readonly string _path;
+
+    // Cache CHỈ cho snapshot JSON catalog đã parse. Mọi bước xác minh Excel trước
+    // hành động vẫn giữ nguyên như cũ; cache này không thay thế Excel.
+    // Stamp file chính được kiểm tra ở mỗi lần gọi để thay đổi từ bên ngoài vẫn
+    // được nhận ra trước khi trả snapshot cache.
+    StoredCatalog? _catalogCache;
+    long _catalogCacheLength = -1;
+    DateTime _catalogCacheLastWriteUtc = DateTime.MinValue;
 
     public TikTokAccountPoolService(string baseDir)
     {
@@ -312,6 +324,85 @@ public sealed class TikTokAccountPoolService
         }
 
         return result;
+    }
+
+    public (
+        List<TikTokAccountPoolItem> Accounts,
+        Dictionary<string, string> AutoProfileResults,
+        Dictionary<string, string> IdentityResults)
+        LoadReusableQueueScanSnapshot()
+    {
+        // Queue Chờ chỉ cần một snapshot nhất quán cho đúng MỘT lượt quét.
+        // Đọc file nguồn đúng một lần rồi dựng cả +Auto và Tên/ảnh từ cùng rows.
+        // Các API fresh-read trước thao tác quan trọng vẫn giữ nguyên và không đi qua đây.
+        var accounts = Load();
+        var autoProfileResults =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var identityResults =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        var path = CurrentSourcePath;
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        {
+            return (accounts, autoProfileResults, identityResults);
+        }
+
+        var rows = ReadSourceRows(path);
+        var sourceColumns = ResolveSourceColumns(
+            rows,
+            allocateManagedColumns: false);
+        var autoColumns = ResolveAutoColumns(
+            rows,
+            allocateManagedColumns: false);
+
+        // Giữ đúng semantics của LoadAutoProfileResults()/LoadAutoStates():
+        // map theo AccountId + SourceRow từ catalog, không suy đoán theo thứ tự khác.
+        if (autoColumns.HeaderRow >= 0 && autoColumns.Result >= 0)
+        {
+            foreach (var account in accounts)
+            {
+                if (string.IsNullOrWhiteSpace(account.Id)
+                    || account.SourceRow <= 0)
+                {
+                    continue;
+                }
+
+                var rowIndex = account.SourceRow - 1;
+                if (rowIndex < 0 || rowIndex >= rows.Count)
+                    continue;
+
+                var finalResult =
+                    NormalizeAutoProfileResult(
+                        GetCell(
+                            rows[rowIndex],
+                            autoColumns.Result));
+
+                if (finalResult.Length > 0)
+                    autoProfileResults[account.Id] = finalResult;
+            }
+        }
+
+        // Giữ đúng semantics của GetIdentityResults(): map theo username trong Excel.
+        if (sourceColumns.HeaderRow >= 0 && sourceColumns.IdentityDone >= 0)
+        {
+            for (var i = sourceColumns.HeaderRow + 1; i < rows.Count; i++)
+            {
+                var row = rows[i];
+                var user = GetCell(row, sourceColumns.User).Trim();
+
+                if (user.Length == 0)
+                    continue;
+
+                var value =
+                    NormalizeDoneFailValue(
+                        GetCell(row, sourceColumns.IdentityDone));
+
+                if (value.Length > 0)
+                    identityResults[user] = value;
+            }
+        }
+
+        return (accounts, autoProfileResults, identityResults);
     }
 
     public HashSet<string> GetIdentityDoneUsernames()
@@ -693,12 +784,305 @@ public sealed class TikTokAccountPoolService
 
     StoredCatalog LoadStoredCatalog()
     {
-        if (!File.Exists(_path))
-            return new StoredCatalog();
+        lock (CatalogIoGate)
+        {
+            // Fast path: tránh ReadAllText + JsonSerializer.Deserialize lặp lại
+            // khi catalog không hề thay đổi. Chỉ dùng cache khi file chính vẫn
+            // tồn tại và cả LastWriteTimeUtc + Length còn đúng như lần parse trước.
+            if (_catalogCache is not null
+                && TryGetPrimaryCatalogStamp(out var length, out var lastWriteUtc)
+                && length == _catalogCacheLength
+                && lastWriteUtc == _catalogCacheLastWriteUtc)
+            {
+                return _catalogCache;
+            }
 
-        return JsonSerializer.Deserialize<StoredCatalog>(
-                   File.ReadAllText(_path))
-               ?? new StoredCatalog();
+            var loaded = LoadStoredCatalogCore();
+            RefreshCatalogCacheFromPrimary(loaded);
+            return loaded;
+        }
+    }
+
+    bool TryGetPrimaryCatalogStamp(
+        out long length,
+        out DateTime lastWriteUtc)
+    {
+        length = -1;
+        lastWriteUtc = DateTime.MinValue;
+
+        try
+        {
+            var info = new FileInfo(_path);
+            if (!info.Exists)
+                return false;
+
+            length = info.Length;
+            lastWriteUtc = info.LastWriteTimeUtc;
+            return true;
+        }
+        catch (IOException)
+        {
+            // Không dùng cache nếu metadata file đang không đọc được.
+            // LoadStoredCatalogCore vẫn giữ nguyên hành vi retry/throw hiện tại.
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    void RefreshCatalogCacheFromPrimary(StoredCatalog catalog)
+    {
+        if (TryGetPrimaryCatalogStamp(out var length, out var lastWriteUtc))
+        {
+            _catalogCache = catalog;
+            _catalogCacheLength = length;
+            _catalogCacheLastWriteUtc = lastWriteUtc;
+            return;
+        }
+
+        // Không cache trạng thái "file đang thiếu" để .tmp/.bak xuất hiện sau đó
+        // vẫn được cơ chế self-heal hiện tại phát hiện ngay ở lần đọc kế tiếp.
+        _catalogCache = null;
+        _catalogCacheLength = -1;
+        _catalogCacheLastWriteUtc = DateTime.MinValue;
+    }
+
+    StoredCatalog LoadStoredCatalogCore()
+    {
+        // V14.1.7+: catalog phải tự phục hồi thay vì để JsonException
+        // thoát ra UI thread và làm Manager hiện hộp thoại Unhandled exception.
+        //
+        // Thứ tự phục hồi:
+        // 1) file chính hợp lệ -> dùng ngay;
+        // 2) file chính hỏng -> thử .tmp rồi .bak;
+        // 3) nếu có bản phụ hợp lệ -> cách ly file hỏng và khôi phục;
+        // 4) nếu không còn bản hợp lệ -> cách ly file hỏng, trả kho trống
+        //    để người dùng có thể Import lại Excel mà Manager không crash.
+        var primaryState = TryLoadStoredCatalogFile(
+            _path,
+            out var primary);
+
+        if (primaryState == CatalogReadState.Valid)
+            return primary;
+
+        if (primaryState == CatalogReadState.Missing)
+        {
+            // Có thể tiến trình trước đã ghi xong .tmp nhưng bị tắt trước
+            // bước replace. Thử cứu .tmp/.bak ngay cả khi file chính mất.
+            if (TryRecoverStoredCatalogFromSidecar(out var recovered))
+            {
+                TryPromoteRecoveredCatalog(recovered.SourcePath);
+                return recovered.Catalog;
+            }
+
+            return new StoredCatalog();
+        }
+
+        // Chỉ tới đây khi file chính tồn tại nhưng nội dung không còn là JSON
+        // hợp lệ (ví dụ zero-filled toàn bộ bằng 0x00). Không coi lỗi I/O /
+        // quyền truy cập là corruption; các lỗi đó vẫn được throw ở helper.
+        if (TryRecoverStoredCatalogFromSidecar(out var sidecar))
+        {
+            QuarantineCorruptCatalogFile(_path);
+            TryPromoteRecoveredCatalog(sidecar.SourcePath);
+            return sidecar.Catalog;
+        }
+
+        QuarantineCorruptCatalogFile(_path);
+        QuarantineCorruptCatalogFile(_path + ".tmp");
+        QuarantineCorruptCatalogFile(_path + ".bak");
+
+        return new StoredCatalog();
+    }
+
+    enum CatalogReadState
+    {
+        Missing,
+        Valid,
+        Corrupt
+    }
+
+    sealed record RecoveredCatalog(
+        StoredCatalog Catalog,
+        string SourcePath);
+
+    static CatalogReadState TryLoadStoredCatalogFile(
+        string path,
+        out StoredCatalog catalog)
+    {
+        catalog = new StoredCatalog();
+
+        if (!File.Exists(path))
+            return CatalogReadState.Missing;
+
+        // Retry ngắn để tránh kết luận hỏng chỉ vì antivirus / tiến trình khác
+        // vừa thay file đúng thời điểm đọc. JSON thực sự hỏng vẫn fail rất nhanh.
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            try
+            {
+                var json = File.ReadAllText(path);
+
+                if (string.IsNullOrWhiteSpace(json)
+                    || json.IndexOf('\0') >= 0)
+                {
+                    return CatalogReadState.Corrupt;
+                }
+
+                var parsed =
+                    JsonSerializer.Deserialize<StoredCatalog>(json);
+
+                if (parsed is null)
+                    return CatalogReadState.Corrupt;
+
+                parsed.SourceFilePath ??= "";
+                parsed.Accounts ??= new List<StoredItem>();
+                catalog = parsed;
+                return CatalogReadState.Valid;
+            }
+            catch (JsonException)
+            {
+                return CatalogReadState.Corrupt;
+            }
+            catch (IOException) when (attempt < 2)
+            {
+                Thread.Sleep(40 * (attempt + 1));
+            }
+        }
+
+        // Lần đọc cuối nếu vẫn lỗi I/O thì để lỗi thật đi lên caller.
+        // Không được tự coi file bị khóa/quyền đọc lỗi là file corrupt.
+        var finalJson = File.ReadAllText(path);
+
+        if (string.IsNullOrWhiteSpace(finalJson)
+            || finalJson.IndexOf('\0') >= 0)
+        {
+            return CatalogReadState.Corrupt;
+        }
+
+        try
+        {
+            var parsed =
+                JsonSerializer.Deserialize<StoredCatalog>(finalJson);
+
+            if (parsed is null)
+                return CatalogReadState.Corrupt;
+
+            parsed.SourceFilePath ??= "";
+            parsed.Accounts ??= new List<StoredItem>();
+            catalog = parsed;
+            return CatalogReadState.Valid;
+        }
+        catch (JsonException)
+        {
+            return CatalogReadState.Corrupt;
+        }
+    }
+
+    bool TryRecoverStoredCatalogFromSidecar(
+        out RecoveredCatalog recovered)
+    {
+        foreach (var candidate in new[]
+        {
+            _path + ".tmp",
+            _path + ".bak"
+        })
+        {
+            if (TryLoadStoredCatalogFile(
+                    candidate,
+                    out var catalog) == CatalogReadState.Valid)
+            {
+                recovered = new RecoveredCatalog(
+                    catalog,
+                    candidate);
+                return true;
+            }
+        }
+
+        recovered = new RecoveredCatalog(
+            new StoredCatalog(),
+            "");
+        return false;
+    }
+
+    void TryPromoteRecoveredCatalog(string sourcePath)
+    {
+        if (string.IsNullOrWhiteSpace(sourcePath)
+            || !File.Exists(sourcePath))
+        {
+            return;
+        }
+
+        try
+        {
+            Directory.CreateDirectory(
+                Path.GetDirectoryName(_path)!);
+
+            // Copy sang một recovery temp riêng rồi dùng cùng cơ chế replace an toàn.
+            // Không ghi đè trực tiếp file đích để tránh tái tạo lỗi zero-filled.
+            var recoveryTemp =
+                _path + ".recovery.tmp";
+
+            File.Copy(
+                sourcePath,
+                recoveryTemp,
+                true);
+
+            ReplaceCatalogFileFromTemp(
+                recoveryTemp,
+                _path);
+
+            try
+            {
+                if (File.Exists(sourcePath)
+                    && !SamePath(sourcePath, _path))
+                {
+                    File.Delete(sourcePath);
+                }
+            }
+            catch
+            {
+            }
+        }
+        catch
+        {
+            // Bản sidecar đã parse hợp lệ vẫn được dùng cho lượt hiện tại.
+            // Nếu không promote được do file lock/quyền ghi, không làm Manager crash.
+        }
+    }
+
+    static void QuarantineCorruptCatalogFile(string path)
+    {
+        if (!File.Exists(path))
+            return;
+
+        try
+        {
+            var directory =
+                Path.GetDirectoryName(path) ?? "";
+            var fileName =
+                Path.GetFileName(path);
+            var stamp =
+                DateTime.Now.ToString(
+                    "yyyyMMdd_HHmmss_fff",
+                    CultureInfo.InvariantCulture);
+            var quarantine =
+                Path.Combine(
+                    directory,
+                    fileName + ".corrupt_" + stamp);
+
+            File.Move(
+                path,
+                quarantine,
+                false);
+        }
+        catch
+        {
+            // Quarantine là best-effort. Quan trọng nhất là JSON lỗi không được
+            // làm scheduler/UI thread văng Unhandled exception.
+        }
     }
 
     static List<TikTokAccountPoolItem> ToItems(
@@ -775,11 +1159,21 @@ public sealed class TikTokAccountPoolService
         Directory.CreateDirectory(
             Path.GetDirectoryName(_path)!);
 
-        AtomicWrite(
-            _path,
+        var json =
             JsonSerializer.Serialize(
                 catalog,
-                JsonOptions));
+                JsonOptions);
+
+        lock (CatalogIoGate)
+        {
+            AtomicWriteCatalog(
+                _path,
+                json);
+
+            // Writer đã có object catalog chính xác trong RAM. Cập nhật cache ngay
+            // sau atomic replace để lần đọc kế tiếp không phải parse lại JSON.
+            RefreshCatalogCacheFromPrimary(catalog);
+        }
     }
 
     static int NextSourceRow(
@@ -3826,6 +4220,119 @@ public sealed class TikTokAccountPoolService
                 raw,
                 Entropy,
                 DataProtectionScope.CurrentUser));
+    }
+
+    static void AtomicWriteCatalog(
+        string path,
+        string content)
+    {
+        var temp =
+            path + ".tmp";
+
+        Directory.CreateDirectory(
+            Path.GetDirectoryName(path)!);
+
+        // Ghi xong + flush xuống disk trước khi đụng tới file catalog chính.
+        using (var stream = new FileStream(
+                   temp,
+                   FileMode.Create,
+                   FileAccess.Write,
+                   FileShare.Read))
+        {
+            using (var writer = new StreamWriter(
+                       stream,
+                       new UTF8Encoding(false),
+                       4096,
+                       leaveOpen: true))
+            {
+                writer.Write(content);
+                writer.Flush();
+            }
+
+            stream.Flush(true);
+        }
+
+        ReplaceCatalogFileFromTemp(
+            temp,
+            path);
+    }
+
+    static void ReplaceCatalogFileFromTemp(
+        string temp,
+        string path)
+    {
+        // Chỉ dành cho tiktok_accounts_pool.json. Không dùng fallback kiểu
+        // FileMode.Create + CopyTo vì nó truncate file chính trước khi copy;
+        // nếu VM/app tắt đúng lúc đó catalog có thể biến thành toàn 0x00.
+        try
+        {
+            if (!File.Exists(path))
+            {
+                File.Move(
+                    temp,
+                    path);
+                return;
+            }
+
+            var backup =
+                path + ".bak";
+
+            try
+            {
+                if (File.Exists(backup))
+                    File.Delete(backup);
+            }
+            catch
+            {
+                // Nếu backup cũ đang bị khóa, nhánh File.Move bên dưới
+                // vẫn có cơ hội replace mà không truncate destination.
+            }
+
+            try
+            {
+                File.Replace(
+                    temp,
+                    path,
+                    backup,
+                    true);
+
+                try
+                {
+                    if (File.Exists(backup))
+                        File.Delete(backup);
+                }
+                catch
+                {
+                    // Cố tình giữ .bak nếu không xóa được; loader có thể dùng
+                    // nó làm nguồn phục hồi ở lần khởi động sau.
+                }
+
+                return;
+            }
+            catch (Exception ex)
+                when (ex is IOException
+                      or UnauthorizedAccessException
+                      or PlatformNotSupportedException)
+            {
+                File.Move(
+                    temp,
+                    path,
+                    true);
+                return;
+            }
+        }
+        catch (Exception writeEx)
+            when (writeEx is IOException
+                  or UnauthorizedAccessException
+                  or PlatformNotSupportedException)
+        {
+            // Giữ nguyên .tmp hợp lệ để lần sau loader có thể tự phục hồi.
+            // Quan trọng: file chính không bị truncate/copy trực tiếp.
+            throw new IOException(
+                "Không thể thay an toàn tiktok_accounts_pool.json. "
+                + "Bản .tmp đã được giữ lại để phục hồi và file catalog cũ không bị truncate.",
+                writeEx);
+        }
     }
 
     static void AtomicWrite(

@@ -14,7 +14,7 @@ public enum VmOptimizationMode
 /// </summary>
 public sealed class VmOptimizationSettings
 {
-    public VmOptimizationMode Mode { get; set; } = VmOptimizationMode.VmSafe;
+    public VmOptimizationMode Mode { get; set; } = VmOptimizationMode.VmMax;
 
     public bool Enabled => Mode != VmOptimizationMode.Normal;
     public bool PauseVideo => Mode != VmOptimizationMode.Normal;
@@ -36,8 +36,9 @@ public sealed class VmOptimizationSettings
 
     public int WorkerLogUiRefreshMs => Mode switch
     {
-        VmOptimizationMode.VmSafe => 250,
-        VmOptimizationMode.VmMax => 750,
+        // Chỉ giảm nhịp repaint TextBox log; Logger/Automation vẫn ghi và chạy như cũ.
+        VmOptimizationMode.VmSafe => 1000,
+        VmOptimizationMode.VmMax => 2000,
         _ => 100
     };
 

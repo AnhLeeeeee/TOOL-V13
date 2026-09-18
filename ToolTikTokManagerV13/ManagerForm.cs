@@ -993,8 +993,10 @@ public sealed partial class ManagerForm : Form
 
                 // V13.5: profile đang xem vẫn refresh 1 giây như cũ. Các tab nền
                 // chỉ refresh 5 giây/lần để giảm pipe/JSON/UI work khi chạy nhiều VM profile.
-                var monitorVisible = _chromeMonitor is not null && !_chromeMonitor.IsDisposed && _chromeMonitor.Visible;
-                var interval = ReferenceEquals(ctx.Tab, selectedTab) || monitorVisible
+                // Chrome Monitor chỉ đọc LastSnapshot đã có trong RAM; việc mở Monitor
+                // không còn ép TẤT CẢ Worker poll status 1 giây/lần. Thứ tự xử lý
+                // RefreshStatus -> embed recovery của mỗi lượt poll vẫn giữ nguyên.
+                var interval = ReferenceEquals(ctx.Tab, selectedTab)
                     ? TimeSpan.FromSeconds(1)
                     : TimeSpan.FromSeconds(5);
                 if (now - ctx.LastStatusPollAttemptUtc < interval) continue;
@@ -1294,6 +1296,11 @@ public sealed partial class ManagerForm : Form
             try { await SendPipeAsync(ctx.Profile.Name, "shutdown", TimeSpan.FromSeconds(5)); } catch { }
             try { if (worker is not null && !await WaitForProcessExitAsync(worker, TimeSpan.FromSeconds(7))) worker.Kill(true); } catch { }
         }
+
+        // Best-effort flush sau khi shutdown Worker để các event cuối của chu trình
+        // được ghi đủ. Timeout ngắn để không làm Manager treo khi ổ đĩa có vấn đề.
+        try { await FlushAutoActivityLogAsync(TimeSpan.FromSeconds(5)); } catch { }
+
         FormClosing -= OnClosing;
         Close();
     }

@@ -1,4 +1,5 @@
-﻿using System.Text;
+﻿using System.Collections.Concurrent;
+using System.Text;
 using System.Text.Json;
 using ToolTikTokV12.Controls;
 using ToolTikTokV12.Utils;
@@ -20,6 +21,12 @@ public sealed partial class ManagerForm
     }
 
     readonly SemaphoreSlim _autoActivityLogGate = new(1, 1);
+    readonly ConcurrentQueue<AutoActivityLogEntry> _autoActivityLogQueue = new();
+    readonly SemaphoreSlim _autoActivityLogSignal = new(0, 1);
+    readonly object _autoActivityLogWriterLock = new();
+    Task? _autoActivityLogWriterTask;
+    long _autoActivityLogEnqueuedCount;
+    long _autoActivityLogWrittenCount;
 
     string AutoActivityLogPath
         => Path.Combine(_baseDir, "logs", "auto_close_replace.jsonl");
@@ -65,31 +72,123 @@ public sealed partial class ManagerForm
             Detail = CompactAutoActivityText(detail, 600)
         };
 
-        // Ghi file ở background để không giữ UI Manager.
-        _ = Task.Run(async () =>
+        // Một writer duy nhất giữ đúng thứ tự FIFO. Không tạo Task.Run mới cho từng
+        // event nữa, tránh task backlog khi AutoClose/Tự bù chạy lâu.
+        _autoActivityLogQueue.Enqueue(entry);
+        Interlocked.Increment(ref _autoActivityLogEnqueuedCount);
+        EnsureAutoActivityLogWriterStarted();
+
+        try { _autoActivityLogSignal.Release(); }
+        catch (SemaphoreFullException) { }
+        catch (ObjectDisposedException) { }
+    }
+
+    void EnsureAutoActivityLogWriterStarted()
+    {
+        lock (_autoActivityLogWriterLock)
         {
-            await _autoActivityLogGate.WaitAsync();
+            if (_autoActivityLogWriterTask is not null
+                && !_autoActivityLogWriterTask.IsCompleted)
+            {
+                return;
+            }
+
+            _autoActivityLogWriterTask =
+                Task.Run(AutoActivityLogWriterLoopAsync);
+        }
+    }
+
+    async Task AutoActivityLogWriterLoopAsync()
+    {
+        while (true)
+        {
             try
             {
-                var dir = Path.GetDirectoryName(AutoActivityLogPath);
-                if (!string.IsNullOrWhiteSpace(dir))
-                    Directory.CreateDirectory(dir);
+                await _autoActivityLogSignal.WaitAsync();
+            }
+            catch (ObjectDisposedException)
+            {
+                return;
+            }
 
-                var json = JsonSerializer.Serialize(entry);
-                await File.AppendAllTextAsync(
-                    AutoActivityLogPath,
-                    json + Environment.NewLine,
-                    new UTF8Encoding(false));
-            }
-            catch (Exception ex)
+            // Một wake-up có thể phục vụ toàn bộ backlog hiện có. Ghi theo batch
+            // nhỏ để giảm số lần mở/append file nhưng không đổi thứ tự event.
+            while (!_autoActivityLogQueue.IsEmpty)
             {
-                try { _log.Warn("[AUTO_ACTIVITY_LOG_WRITE] " + ex.Message); } catch { }
+                var batch = new List<AutoActivityLogEntry>(64);
+                while (batch.Count < 64
+                       && _autoActivityLogQueue.TryDequeue(out var entry))
+                {
+                    batch.Add(entry);
+                }
+
+                if (batch.Count == 0)
+                    break;
+
+                await _autoActivityLogGate.WaitAsync();
+                try
+                {
+                    var dir = Path.GetDirectoryName(AutoActivityLogPath);
+                    if (!string.IsNullOrWhiteSpace(dir))
+                        Directory.CreateDirectory(dir);
+
+                    var builder = new StringBuilder(batch.Count * 220);
+                    foreach (var entry in batch)
+                    {
+                        builder.Append(JsonSerializer.Serialize(entry));
+                        builder.Append(Environment.NewLine);
+                    }
+
+                    await File.AppendAllTextAsync(
+                        AutoActivityLogPath,
+                        builder.ToString(),
+                        new UTF8Encoding(false));
+                }
+                catch (Exception ex)
+                {
+                    try { _log.Warn("[AUTO_ACTIVITY_LOG_WRITE] " + ex.Message); } catch { }
+                }
+                finally
+                {
+                    Interlocked.Add(ref _autoActivityLogWrittenCount, batch.Count);
+                    _autoActivityLogGate.Release();
+                }
             }
-            finally
-            {
-                _autoActivityLogGate.Release();
-            }
-        });
+        }
+    }
+
+    async Task FlushAutoActivityLogAsync(
+        TimeSpan? timeout = null)
+    {
+        var target =
+            Interlocked.Read(ref _autoActivityLogEnqueuedCount);
+
+        if (Interlocked.Read(ref _autoActivityLogWrittenCount) >= target)
+            return;
+
+        EnsureAutoActivityLogWriterStarted();
+        try { _autoActivityLogSignal.Release(); }
+        catch (SemaphoreFullException) { }
+        catch (ObjectDisposedException) { return; }
+
+        var waitFor = timeout ?? TimeSpan.FromSeconds(5);
+        var deadline = DateTime.UtcNow + waitFor;
+
+        while (Interlocked.Read(ref _autoActivityLogWrittenCount) < target
+               && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(25);
+        }
+
+        // Nếu writer vừa lấy batch nhưng chưa nhả file gate, chờ gate một nhịp để
+        // Export Diagnostic không chụp đúng giữa lúc append. Đây là best-effort;
+        // timeout không được phép làm treo UI/đóng Manager.
+        var remaining = deadline - DateTime.UtcNow;
+        if (remaining <= TimeSpan.Zero)
+            return;
+
+        if (await _autoActivityLogGate.WaitAsync(remaining))
+            _autoActivityLogGate.Release();
     }
 
     static string CompactAutoActivityText(string? value, int maxLength)
@@ -107,6 +206,8 @@ public sealed partial class ManagerForm
 
     async Task<List<AutoActivityLogEntry>> ReadAutoActivityLogAsync()
     {
+        await FlushAutoActivityLogAsync(TimeSpan.FromSeconds(5));
+
         return await Task.Run(async () =>
         {
             await _autoActivityLogGate.WaitAsync();
@@ -155,6 +256,10 @@ public sealed partial class ManagerForm
 
     async Task ClearAutoActivityLogAsync()
     {
+        // Ghi hết event cũ trước rồi mới clear để không có event cũ append trở lại
+        // sau khi người dùng vừa bấm Xóa log.
+        await FlushAutoActivityLogAsync(TimeSpan.FromSeconds(5));
+
         await Task.Run(async () =>
         {
             await _autoActivityLogGate.WaitAsync();

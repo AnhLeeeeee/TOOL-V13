@@ -55,7 +55,7 @@ public sealed class SettingsService
 
         s.VmOptimization = new VmOptimizationSettings
         {
-            Mode = ParseVmOptimizationMode(ini.Get("VM", "Mode", "VmSafe"))
+            Mode = ParseVmOptimizationMode(ini.Get("VM", "Mode", "VmMax"))
         };
 
         s.Viewer = new ViewerSettings

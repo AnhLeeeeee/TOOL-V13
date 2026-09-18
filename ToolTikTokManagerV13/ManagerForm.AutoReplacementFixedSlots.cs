@@ -641,21 +641,43 @@ public sealed partial class ManagerForm
             return 0;
 
         var staleCandidates = new List<string>();
+        var checkedPass1 = 0;
+        var presentPass1 = 0;
+        var workerAlivePass1 = 0;
+        var windowAlivePass1 = 0;
+        var cdpListeningPass1 = 0;
+        var openingPass1 = 0;
 
         // PASS 1: chỉ đánh dấu ứng viên stale, chưa xóa ngay.
+        // Vẫn probe TẤT CẢ profile với đúng tần suất cũ; chỉ giảm ghi log chi tiết khi profile
+        // đang hiện diện bình thường để tránh hàng nghìn dòng I/O không cần thiết.
         foreach (var profileName in expectedNames)
         {
             if (!_autoCloseExpectedRunningProfiles.Contains(profileName))
                 continue;
 
             var probe = await ProbeAutoReplacementExpectedRuntimeAsync(profileName);
+            checkedPass1++;
+            if (probe.Present) presentPass1++;
+            if (probe.WorkerAlive) workerAlivePass1++;
+            if (probe.WindowAlive) windowAlivePass1++;
+            if (probe.CdpListening) cdpListeningPass1++;
+            if (probe.Opening) openingPass1++;
 
-            _log.Info(
-                $"[AUTO_REPLACE_EXPECTED_SLOT_PROBE] request={request.Id} profile={profileName} pass=1/2 present={probe.Present} workerAlive={probe.WorkerAlive} windowAlive={probe.WindowAlive} cdpListening={probe.CdpListening} opening={probe.Opening} source={probe.Source}");
-
+            // Chỉ log detail ngay khi thật sự có ứng viên stale. Các cảnh báo probe exception
+            // vẫn được ProbeAutoReplacementExpectedRuntimeAsync log riêng như trước.
             if (!probe.Present)
+            {
+                _log.Info(
+                    $"[AUTO_REPLACE_EXPECTED_SLOT_PROBE] request={request.Id} profile={profileName} pass=1/2 present={probe.Present} workerAlive={probe.WorkerAlive} windowAlive={probe.WindowAlive} cdpListening={probe.CdpListening} opening={probe.Opening} source={probe.Source}");
                 staleCandidates.Add(profileName);
+            }
         }
+
+        _log.Info(
+            $"[AUTO_REPLACE_EXPECTED_SLOT_PROBE_SUMMARY] request={request.Id} pass=1/2 checked={checkedPass1} " +
+            $"present={presentPass1} staleCandidates={staleCandidates.Count} workerAlive={workerAlivePass1} " +
+            $"windowAlive={windowAlivePass1} cdpListening={cdpListeningPass1} opening={openingPass1}");
 
         if (staleCandidates.Count == 0)
             return 0;

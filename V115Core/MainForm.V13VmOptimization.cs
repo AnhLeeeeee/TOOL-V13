@@ -117,8 +117,8 @@ public sealed partial class MainForm
         };
         _vmModeSummary.Text = mode switch
         {
-            VmOptimizationMode.VmSafe => "VM Safe: UI nền 2s, log UI 250ms, pause video, block video/segment phổ biến; giữ Chrome nền hoạt động để automation tiếp tục tăng vòng.",
-            VmOptimizationMode.VmMax => "VM Max: như VM Safe, thêm tắt animation và giảm tần suất UI/log mạnh hơn; Chrome nền vẫn không bị throttle.",
+            VmOptimizationMode.VmSafe => "VM Safe: UI nền 2s, log UI 1s, pause video, block video/segment phổ biến; giữ Chrome nền hoạt động để automation tiếp tục tăng vòng.",
+            VmOptimizationMode.VmMax => "VM Max: như VM Safe, thêm tắt animation; UI nền 5s, log UI 2s; Chrome nền vẫn không bị throttle.",
             _ => "Bình thường: giữ hành vi Chrome/UI đầy đủ như chế độ thường và ghi đầy đủ log chẩn đoán."
         };
     }

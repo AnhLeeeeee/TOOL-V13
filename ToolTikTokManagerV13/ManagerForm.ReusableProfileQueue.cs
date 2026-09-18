@@ -49,8 +49,23 @@ public sealed partial class ManagerForm
         TimeSpan TotalRuntime,
         bool IsManual);
 
+    sealed class ReusableRuntimeStatsCacheEntry
+    {
+        public long Length { get; init; }
+        public DateTime LastWriteUtc { get; init; }
+        public double TotalRunSeconds { get; init; }
+    }
+
     readonly object _reusableProfileQueueLock = new();
     readonly SemaphoreSlim _reusableProfileRefreshGate = new(1, 1);
+
+    // runtime_stats.json chỉ thay đổi khi Worker checkpoint. Mỗi lượt quét queue vẫn
+    // stat file để phát hiện thay đổi, nhưng không đọc + parse JSON lại nếu stamp y hệt.
+    // Đây chỉ là cache I/O; điều kiện eligibility và thứ tự xử lý không thay đổi.
+    readonly object _reusableRuntimeStatsCacheLock = new();
+    readonly Dictionary<string, ReusableRuntimeStatsCacheEntry>
+        _reusableRuntimeStatsCache = new(StringComparer.OrdinalIgnoreCase);
+
     ReusableProfileQueueDocument _reusableProfileQueueCache = new();
     Dictionary<string, string> _reusableProfileReasonCache =
         new(StringComparer.OrdinalIgnoreCase);
@@ -98,10 +113,7 @@ public sealed partial class ManagerForm
             // +auto không cần DONE nữa; chỉ +auto=FAIL mới tiếp tục chặn để tránh
             // tự hồi sinh profile đã có lỗi cứng/đã được đánh dấu không nên retry.
             var accountPoolSnapshot = await RunAccountPoolIoAsync(
-                () => (
-                    Accounts: _accountPoolService.Load(),
-                    AutoProfileResults: _accountPoolService.LoadAutoProfileResults(),
-                    IdentityResults: _accountPoolService.GetIdentityResults()),
+                () => _accountPoolService.LoadReusableQueueScanSnapshot(),
                 ct);
 
             var accounts = accountPoolSnapshot.Accounts;
@@ -126,6 +138,11 @@ public sealed partial class ManagerForm
                         result[profile.Name] =
                             ReadReusableProfileTotalSeconds(profile);
                     }
+
+                    // Chỉ dọn cache I/O của profile đã biến mất khỏi catalog thật sự.
+                    // Profile còn trong Chờ/NAME_SYNC_PENDING vẫn nằm trong catalog nên
+                    // tuyệt đối không bị dọn ở đây.
+                    PruneReusableRuntimeStatsCache(catalog.Profiles);
 
                     return result;
                 },
@@ -2757,8 +2774,27 @@ public sealed partial class ManagerForm
                     dataRoot,
                     "runtime_stats.json");
 
-            if (!File.Exists(path))
+            var info = new FileInfo(path);
+            if (!info.Exists)
+            {
+                lock (_reusableRuntimeStatsCacheLock)
+                    _reusableRuntimeStatsCache.Remove(path);
+
                 return 0;
+            }
+
+            var length = info.Length;
+            var lastWriteUtc = info.LastWriteTimeUtc;
+
+            lock (_reusableRuntimeStatsCacheLock)
+            {
+                if (_reusableRuntimeStatsCache.TryGetValue(path, out var cached)
+                    && cached.Length == length
+                    && cached.LastWriteUtc == lastWriteUtc)
+                {
+                    return cached.TotalRunSeconds;
+                }
+            }
 
             using var document =
                 JsonDocument.Parse(
@@ -2773,13 +2809,61 @@ public sealed partial class ManagerForm
                 return 0;
             }
 
-            return Math.Max(
-                0,
-                seconds);
+            var normalized = Math.Max(0, seconds);
+
+            lock (_reusableRuntimeStatsCacheLock)
+            {
+                _reusableRuntimeStatsCache[path] =
+                    new ReusableRuntimeStatsCacheEntry
+                    {
+                        Length = length,
+                        LastWriteUtc = lastWriteUtc,
+                        TotalRunSeconds = normalized
+                    };
+            }
+
+            return normalized;
         }
         catch
         {
+            // Giữ nguyên semantics cũ: file đang ghi dở/không đọc được thì lượt này = 0.
+            // Không ghi đè cache bằng 0 để lần quét sau vẫn thử đọc lại ngay.
             return 0;
+        }
+    }
+
+    void PruneReusableRuntimeStatsCache(
+        IEnumerable<TikTokProfileEntry> profiles)
+    {
+        var keep =
+            new HashSet<string>(
+                StringComparer.OrdinalIgnoreCase);
+
+        foreach (var profile in profiles)
+        {
+            try
+            {
+                var dataRoot =
+                    _profileService.ResolveDataRoot(profile);
+
+                keep.Add(
+                    Path.Combine(
+                        dataRoot,
+                        "runtime_stats.json"));
+            }
+            catch
+            {
+                // ResolveDataRoot lỗi ở một profile không được phép làm hỏng cả lượt quét.
+            }
+        }
+
+        lock (_reusableRuntimeStatsCacheLock)
+        {
+            foreach (var path in _reusableRuntimeStatsCache.Keys.ToList())
+            {
+                if (!keep.Contains(path))
+                    _reusableRuntimeStatsCache.Remove(path);
+            }
         }
     }
 

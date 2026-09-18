@@ -40,16 +40,67 @@ public sealed partial class ManagerForm
     readonly HashSet<string> _autoIdentityInFlight = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, DateTime> _autoIdentityNextProbeUtc = new(StringComparer.OrdinalIgnoreCase);
     readonly SemaphoreSlim _autoIdentityQueueGate = new(1, 1);
+    readonly object _identityToolStateCacheLock = new();
+    IdentityToolState? _identityToolStateCache;
+    DateTime _identityToolStateCacheWriteUtc = DateTime.MinValue;
+    long _identityToolStateCacheLength = -1;
+
+    static IdentityToolState CloneIdentityToolState(IdentityToolState state)
+        => new()
+        {
+            NamesText = state.NamesText,
+            ImageFolder = state.ImageFolder,
+            BioText = state.BioText,
+            UpdateName = state.UpdateName,
+            UpdateAvatar = state.UpdateAvatar,
+            UpdateBio = state.UpdateBio,
+            AutoOnReady = state.AutoOnReady,
+            RandomNames = state.RandomNames,
+            AvoidLastAvatar = state.AvoidLastAvatar,
+            LastAvatarByProfile = new Dictionary<string, string>(
+                state.LastAvatarByProfile ?? new(),
+                StringComparer.OrdinalIgnoreCase)
+        };
 
     IdentityToolState LoadIdentityToolState()
     {
         try
         {
-            if (!File.Exists(IdentityToolStatePath)) return new IdentityToolState();
+            if (!File.Exists(IdentityToolStatePath))
+            {
+                lock (_identityToolStateCacheLock)
+                {
+                    _identityToolStateCache = null;
+                    _identityToolStateCacheWriteUtc = DateTime.MinValue;
+                    _identityToolStateCacheLength = -1;
+                }
+                return new IdentityToolState();
+            }
+
+            var info = new FileInfo(IdentityToolStatePath);
+            var writeUtc = info.LastWriteTimeUtc;
+            var length = info.Length;
+            lock (_identityToolStateCacheLock)
+            {
+                if (_identityToolStateCache is not null
+                    && _identityToolStateCacheWriteUtc == writeUtc
+                    && _identityToolStateCacheLength == length)
+                {
+                    return CloneIdentityToolState(_identityToolStateCache);
+                }
+            }
+
             var state = JsonSerializer.Deserialize<IdentityToolState>(File.ReadAllText(IdentityToolStatePath));
             if (state is null) return new IdentityToolState();
             state.LastAvatarByProfile = new Dictionary<string, string>(state.LastAvatarByProfile ?? new(), StringComparer.OrdinalIgnoreCase);
-            return state;
+
+            lock (_identityToolStateCacheLock)
+            {
+                _identityToolStateCache = CloneIdentityToolState(state);
+                _identityToolStateCacheWriteUtc = writeUtc;
+                _identityToolStateCacheLength = length;
+            }
+            return CloneIdentityToolState(state);
         }
         catch (Exception ex)
         {
@@ -63,6 +114,15 @@ public sealed partial class ManagerForm
         try
         {
             File.WriteAllText(IdentityToolStatePath, JsonSerializer.Serialize(state, new JsonSerializerOptions { WriteIndented = true }));
+
+            // Đồng bộ cache ngay sau Save để scheduler/tính năng khác không cần parse lại file.
+            var info = new FileInfo(IdentityToolStatePath);
+            lock (_identityToolStateCacheLock)
+            {
+                _identityToolStateCache = CloneIdentityToolState(state);
+                _identityToolStateCacheWriteUtc = info.LastWriteTimeUtc;
+                _identityToolStateCacheLength = info.Length;
+            }
         }
         catch (Exception ex) { _log.Warn("[IDENTITY_TOOL_STATE_SAVE] " + ex.Message); }
     }

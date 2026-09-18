@@ -6,13 +6,13 @@ namespace ToolTikTokV11.Utils;
 /// <summary>
 /// Logger Worker tối ưu cho VM.
 /// - Mỗi profile chỉ giữ tối đa 500 dòng log gần nhất trên ổ đĩa.
-/// - Chia log thành các segment tối đa 50 dòng để tránh rewrite file sau mỗi dòng mới.
+/// - Chia log thành các segment tối đa 250 dòng để giảm rotate/scan I/O trên VM.
 /// - Ghi theo buffer để tránh I/O đồng bộ trên hot path.
 /// - WARN/ERROR luôn được ghi; PERF/CDP chi tiết có thể tắt bằng VerboseDiagnosticsEnabled.
 /// </summary>
 public sealed class Logger : IDisposable
 {
-    const int MaxSegmentLines = 50;
+    const int MaxSegmentLines = 250;
     const int MaxSavedLines = 500;
     const long MaxActiveLogBytes = 1L * 1024 * 1024;
     const long MaxTotalLogBytes = 2L * 1024 * 1024;
@@ -132,7 +132,7 @@ public sealed class Logger : IDisposable
             var archive = Path.Combine(directory, $"{baseName}-{DateTime.Now:HHmmss_fff}.log");
             File.Move(activePath, archive);
 
-            // Giữ tối đa 450 dòng cũ; segment đang bắt đầu có thể thêm tối đa 50 dòng.
+            // Giữ phần log cũ vừa đủ; segment mới có thể thêm tối đa MaxSegmentLines dòng.
             TrimDirectoryToLatestLines(_dir, MaxSavedLines - MaxSegmentLines);
             CleanupLogs(_dir);
         }
