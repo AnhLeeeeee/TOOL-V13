@@ -46,15 +46,19 @@ public sealed partial class AutomationEngine
     const int LiveVerifyTimeoutMs = 5000;
     // ArrowDown CDP có thể mất hiệu lực sau nhiều lần reload dù session vẫn báo gửi key thành công.
     // Retry theo từng lần, reconnect/focus lại giống hiệu ứng người dùng dừng rồi chạy lại.
-    const int ArrowDownAttemptWaitMs = 1600;
-    // Máy/VM chậm đôi khi đổi roomId sau cửa sổ 1.6s. Không bắn thêm phím ngay:
-    // giữ một cửa sổ xác nhận muộn cho lần đầu, rồi mới reconnect/retry.
-    const int ArrowDownLateConfirmWaitMs = 3400;
-    const int ArrowDownRecoveryAttemptWaitMs = 2600;
+    const int ArrowDownAttemptWaitMs = 1200;
+    // Fast path: lần đầu chỉ quan sát thêm ngắn để bắt VM chậm vừa phải; nếu vẫn không đổi
+    // mới reconnect/focus và retry. Giảm tổng thời gian chờ nhưng vẫn không bắn phím dồn dập.
+    const int ArrowDownLateConfirmWaitMs = 1400;
+    const int ArrowDownRecoveryAttemptWaitMs = 1900;
     const int ArrowDownRecoveryAttempts = 3;
-    const int ArrowDownPostResetAttemptWaitMs = 3500;
+    const int ArrowDownPostResetAttemptWaitMs = 2500;
     const int ArrowDownResetReloadWaitMs = 1000;
-    const int ArrowDownRetryDelayMs = 300;
+    const int ArrowDownRetryDelayMs = 200;
+    // Sau khi roomId/url đã đổi, ưu tiên dùng DOM hiện tại thay vì F5 bắt buộc.
+    // Chỉ khi DOM LIVE không hydrate đủ nhanh mới fallback F5 đúng một lần.
+    const int ArrowDownFastReadyTimeoutMs = 2200;
+    const int ArrowDownFastReadyPollMs = 200;
     const int PriorityPauseMs = 5000;
     // Bộ F5 cứu trang độc lập: không đổi LIVE. Bình thường reload trang hiện tại mỗi 30 phút;
     // nếu renderer/tab crash (Aw, Snap!/Out of Memory/CDP target crashed) thì xử lý ngay.
@@ -66,15 +70,17 @@ public sealed partial class AutomationEngine
     const int PageRecoveryReloadWaitMs = 1200;
     const int OldLiveScanIntervalMs = 1500;
     const int OldLiveScanRetryMs = 2500;
-    const int ViewerReadRetryCount = 5;
-    const int ViewerReadRetryDelayMs = 350;
+    const int ViewerReadRetryCount = 3;
+    const int ViewerReadRetryDelayMs = 250;
+    const int ViewerGateFastPassTtlMs = 2500;
+    const int ViewerLowConfirmDelayMs = 800;
     // Cache cực ngắn, chỉ dùng khi cùng đúng roomId/url. Mục đích là chịu được một nhịp
     // TikTok re-render làm XPath tạm mất/parse ra nhãn "Người xem", không giữ số qua LIVE khác.
     const int ViewerRecentSnapshotTtlMs = 5000;
     // Sau khi Viewer Gate vừa chọn/chuyển tới LIVE đủ ngưỡng, khóa chuyển LIVE trong thời gian
     // ngắn để React/chat hydrate. Máy nhanh thoát lock ngay khi ô nhập + Viewer xác minh xong.
-    const int LiveTargetStabilizeMs = 10000;
-    const int LiveTargetStabilizePollMs = 650;
+    const int LiveTargetStabilizeMs = 5000;
+    const int LiveTargetStabilizePollMs = 350;
     // Khi START ngay trên một LIVE cụ thể, cho Viewer DOM tối đa 10 giây để render trước khi
     // kết luận không đọc được và quay về flow recommendation. Máy nhanh thoát ngay khi đọc được.
     const int StartupCurrentLiveViewerGraceMs = 10000;
@@ -1726,13 +1732,17 @@ public sealed partial class AutomationEngine
         _log.Info($"[VIEWER_RECENT_CACHE_SET] source={source} key={key} value={value} ttlMs={ViewerRecentSnapshotTtlMs}");
     }
 
-    async Task<(bool Found, int Value, string Raw)> TryGetRecentViewerSnapshotAsync(string source, CancellationToken ct)
+    async Task<(bool Found, int Value, string Raw)> TryGetRecentViewerSnapshotAsync(
+        string source,
+        CancellationToken ct,
+        int maxAgeMs = ViewerRecentSnapshotTtlMs)
     {
         if (_recentViewerValue < 0 || string.IsNullOrWhiteSpace(_recentViewerLiveKey))
             return (false, -1, "");
 
+        maxAgeMs = Math.Clamp(maxAgeMs, 1, ViewerRecentSnapshotTtlMs);
         var ageMs = (int)Math.Max(0, (DateTime.UtcNow - _recentViewerAtUtc).TotalMilliseconds);
-        if (ageMs > ViewerRecentSnapshotTtlMs)
+        if (ageMs > maxAgeMs)
             return (false, -1, "");
 
         var identity = await GetCurrentLiveIdentityAsync(ct);
@@ -1744,7 +1754,7 @@ public sealed partial class AutomationEngine
         }
 
         Volatile.Write(ref _lastViewerValue, _recentViewerValue);
-        _log.Warn($"[VIEWER_RECENT_CACHE_HIT] source={source} key={key} value={_recentViewerValue} ageMs={ageMs}");
+        _log.Warn($"[VIEWER_RECENT_CACHE_HIT] source={source} key={key} value={_recentViewerValue} ageMs={ageMs} maxAgeMs={maxAgeMs}");
         return (true, _recentViewerValue, $"cache:{_recentViewerValue} ageMs={ageMs}");
     }
 
@@ -1783,6 +1793,21 @@ public sealed partial class AutomationEngine
     {
         if (!_s.Viewer.Enabled) return true;
 
+        // Nếu cùng đúng roomId/url vừa PASS Viewer trong 2.5 giây gần nhất, dùng lại snapshot.
+        // Cache luôn ràng buộc theo LIVE identity nên không thể mang Viewer của LIVE cũ sang LIVE mới.
+        var fastPass = await TryGetRecentViewerSnapshotAsync(
+            source + " / fast-pass",
+            ct,
+            ViewerGateFastPassTtlMs);
+        if (fastPass.Found && fastPass.Value > _s.Viewer.Threshold)
+        {
+            ResetLowViewerStreak($"Viewer fast-pass cùng LIVE tại {source}");
+            _log.Info(
+                $"[VIEWER_GATE_FAST_PASS] source={source} value={fastPass.Value} " +
+                $"threshold={_s.Viewer.Threshold} ttlMs={ViewerGateFastPassTtlMs}");
+            return true;
+        }
+
         SetStatus("KIỂM TRA NGƯỜI XEM", $"{source} • bắt buộc đọc XPath trước khi thao tác");
         var startupCurrent = await TryReadStartupCurrentLiveViewerAsync(source, ct);
         var (value, raw) = startupCurrent.Found
@@ -1807,7 +1832,7 @@ public sealed partial class AutomationEngine
         var lowCount = 1;
         while (lowCount < Math.Max(1, _s.Viewer.ConfirmLow))
         {
-            await Task.Delay(2000, ct);
+            await Task.Delay(ViewerLowConfirmDelayMs, ct);
             await WaitIfPausedAsync(ct);
             var (confirm, rawConfirm) = await ReadViewerWithRetryAsync(source + " / xác nhận thấp", ct);
             if (confirm < 0)
@@ -1927,14 +1952,14 @@ public sealed partial class AutomationEngine
         var max = Math.Max(1, _s.Viewer.MaxF5);
         if (initialLow.HasValue)
         {
-            _log.Warn($"[VIEWER_GATE_LOW] source={source} value={initialLow.Value} <= threshold={_s.Viewer.Threshold}; tối đa {max} vòng ↓ + F5 để tìm LIVE đủ người.");
+            _log.Warn($"[VIEWER_GATE_LOW] source={source} value={initialLow.Value} <= threshold={_s.Viewer.Threshold}; tối đa {max} vòng chuyển LIVE để tìm LIVE đủ người (F5 chỉ fallback khi DOM không sẵn sàng).");
             RecordLowViewerLive(source + " / LIVE hiện tại", initialLow.Value);
             var resetResult = await MaybeResetLowViewerRecommendationFeedAsync(source + " / LIVE hiện tại", ct);
             if (resetResult == true) return true;
         }
         else
         {
-            _log.Warn($"[VIEWER_GATE_NO_VALUE] source={source}; tối đa {max} vòng ↓ + F5 để tìm LIVE có Viewer đọc được và > ngưỡng.");
+            _log.Warn($"[VIEWER_GATE_NO_VALUE] source={source}; tối đa {max} vòng chuyển LIVE để tìm LIVE có Viewer đọc được và > ngưỡng (F5 chỉ fallback khi cần).");
         }
 
         // Bình thường ưu tiên cột “Nhà sáng tạo LIVE đề xuất”. Riêng khi vừa rời một LIVE
@@ -2140,7 +2165,14 @@ public sealed partial class AutomationEngine
     }
 
     enum TransitionAction { ArrowDown, ClickXPath }
-    sealed record LiveSwitchVerification(bool Changed, string BeforeIdentity, string AfterIdentity, int Attempt, long ElapsedMs, bool PageRecovered = false);
+    sealed record LiveSwitchVerification(
+        bool Changed,
+        string BeforeIdentity,
+        string AfterIdentity,
+        int Attempt,
+        long ElapsedMs,
+        bool PageRecovered = false,
+        bool PageReadyConfirmed = false);
 
     static string TrimIdentityForLog(string identity, int max = 220)
     {
@@ -2241,14 +2273,92 @@ public sealed partial class AutomationEngine
         return new LiveSwitchVerification(false, beforeIdentity, latestIdentity, attempt, sw.ElapsedMilliseconds);
     }
 
-    async Task<LiveSwitchVerification> ReloadAfterConfirmedArrowDownAsync(string source, LiveSwitchVerification changed, int waitAfterReloadMs, CancellationToken ct)
+    async Task<(bool Ready, string Signal, long ElapsedMs)> WaitForArrowDownFastReadyAsync(
+        string source,
+        string beforeIdentity,
+        CancellationToken ct)
     {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var lastSignal = "none";
+        var beforeKey = GetLivePageChangeKey(beforeIdentity);
+        _log.Info(
+            $"[LIVE_SWITCH_FAST_READY_WAIT] source={source} timeoutMs={ArrowDownFastReadyTimeoutMs} " +
+            $"pollMs={ArrowDownFastReadyPollMs} requirement=new-live-key+xpath-signal beforeKey={beforeKey}");
+
+        while (sw.ElapsedMilliseconds < ArrowDownFastReadyTimeoutMs)
+        {
+            await WaitIfPausedAsync(ct);
+            var probe = await ProbeLivePageReadyAsync(ct);
+            lastSignal = probe.Signal;
+
+            var currentIdentity = await GetCurrentLiveIdentityAsync(ct);
+            var currentKey = GetLivePageChangeKey(currentIdentity);
+            var confirmedNewLive = !string.IsNullOrWhiteSpace(currentKey)
+                && (string.IsNullOrWhiteSpace(beforeKey)
+                    || !string.Equals(beforeKey, currentKey, StringComparison.OrdinalIgnoreCase));
+
+            // Chỉ bỏ F5 khi đồng thời: key LIVE mới đã thực sự khác và đã có tín hiệu DOM/XPath.
+            // Identity-only hoặc chỉ đổi title chưa đủ để đi fast path.
+            if (confirmedNewLive
+                && probe.Ready
+                && probe.Signal.StartsWith("xpath:", StringComparison.OrdinalIgnoreCase))
+            {
+                _log.Info(
+                    $"[LIVE_SWITCH_FAST_READY] source={source} elapsedMs={sw.ElapsedMilliseconds} " +
+                    $"signal={probe.Signal} beforeKey={beforeKey} currentKey={currentKey} action=SKIP_F5");
+                return (true, probe.Signal, sw.ElapsedMilliseconds);
+            }
+
+            var remaining = ArrowDownFastReadyTimeoutMs - (int)Math.Min(int.MaxValue, sw.ElapsedMilliseconds);
+            if (remaining <= 0) break;
+            await Task.Delay(Math.Min(ArrowDownFastReadyPollMs, remaining), ct);
+        }
+
+        _log.Warn(
+            $"[LIVE_SWITCH_FAST_READY_TIMEOUT] source={source} waitedMs={sw.ElapsedMilliseconds} " +
+            $"lastSignal={lastSignal} beforeKey={beforeKey} action=F5_FALLBACK_ONCE");
+        return (false, lastSignal, sw.ElapsedMilliseconds);
+    }
+
+    async Task<LiveSwitchVerification> FinalizeConfirmedArrowDownAsync(
+        string source,
+        LiveSwitchVerification changed,
+        int waitAfterReloadMs,
+        CancellationToken ct)
+    {
+        var fastReady = await WaitForArrowDownFastReadyAsync(source, changed.BeforeIdentity, ct);
+        if (fastReady.Ready)
+        {
+            await StopIfFatalTikTokRestrictionAsync($"sau chuyển LIVE không F5: {source}", ct);
+            var afterIdentity = await GetCurrentLiveIdentityAsync(ct);
+            _log.Info(
+                $"[LIVE_SWITCH_CONFIRMED] source={source} attempt={changed.Attempt} " +
+                $"before={TrimIdentityForLog(changed.BeforeIdentity)} after={TrimIdentityForLog(afterIdentity)} " +
+                $"action=SKIP_F5 pageReadySignal={fastReady.Signal}");
+            return new LiveSwitchVerification(
+                true,
+                changed.BeforeIdentity,
+                afterIdentity,
+                changed.Attempt,
+                changed.ElapsedMs,
+                PageReadyConfirmed: true);
+        }
+
+        // Chỉ fallback F5 khi LIVE đã đổi nhưng DOM/XPath chưa hydrate đủ nhanh.
         await _chrome.ReloadAndWaitAsync(Math.Max(0, waitAfterReloadMs), 15000, ct);
-        _log.Info($"[LIVE_SWITCH_DOM_READY] source={source} preReloadChanged=True attempt={changed.Attempt}");
-        await StopIfFatalTikTokRestrictionAsync($"sau chuyển LIVE: {source}", ct);
-        var afterIdentity = await GetCurrentLiveIdentityAsync(ct);
-        _log.Info($"[LIVE_SWITCH_CONFIRMED] source={source} attempt={changed.Attempt} before={TrimIdentityForLog(changed.BeforeIdentity)} after={TrimIdentityForLog(afterIdentity)}");
-        return new LiveSwitchVerification(true, changed.BeforeIdentity, afterIdentity, changed.Attempt, changed.ElapsedMs);
+        _log.Info($"[LIVE_SWITCH_DOM_READY] source={source} preReloadChanged=True attempt={changed.Attempt} action=F5_FALLBACK");
+        await StopIfFatalTikTokRestrictionAsync($"sau chuyển LIVE + F5 fallback: {source}", ct);
+        var afterReloadIdentity = await GetCurrentLiveIdentityAsync(ct);
+        _log.Info(
+            $"[LIVE_SWITCH_CONFIRMED] source={source} attempt={changed.Attempt} " +
+            $"before={TrimIdentityForLog(changed.BeforeIdentity)} after={TrimIdentityForLog(afterReloadIdentity)} " +
+            $"action=F5_FALLBACK");
+        return new LiveSwitchVerification(
+            true,
+            changed.BeforeIdentity,
+            afterReloadIdentity,
+            changed.Attempt,
+            changed.ElapsedMs);
     }
 
     async Task<bool> TryRecoverRendererCrashAfterArrowDownNoChangeAsync(string source, int resumeStep, CancellationToken ct)
@@ -2347,9 +2457,9 @@ public sealed partial class AutomationEngine
                 : ArrowDownRecoveryAttemptWaitMs;
             var changed = await WaitForPageChangeBeforeReloadAsync(source, beforeAttempt, attemptWaitMs, attempt, ct);
             if (changed.Changed)
-                return await ReloadAfterConfirmedArrowDownAsync(source, changed, waitAfterReloadMs, ct);
+                return await FinalizeConfirmedArrowDownAsync(source, changed, waitAfterReloadMs, ct);
 
-            // Máy chậm có thể nhận ArrowDown đúng nhưng React cập nhật roomId/url trễ hơn 1.6s.
+            // Máy chậm có thể nhận ArrowDown đúng nhưng React cập nhật roomId/url trễ hơn cửa sổ nhanh đầu tiên.
             // Ở lần đầu chỉ quan sát thêm, KHÔNG gửi phím thứ hai và KHÔNG reconnect vội.
             if (attempt == 1)
             {
@@ -2367,7 +2477,7 @@ public sealed partial class AutomationEngine
                     _log.Info(
                         $"[LIVE_SWITCH_LATE_CONFIRMED] source={source} elapsedExtraMs={lateChanged.ElapsedMs} " +
                         $"action=ACCEPT_ORIGINAL_ARROW_NO_RETRY");
-                    return await ReloadAfterConfirmedArrowDownAsync(source, lateChanged, waitAfterReloadMs, ct);
+                    return await FinalizeConfirmedArrowDownAsync(source, lateChanged, waitAfterReloadMs, ct);
                 }
             }
 
@@ -2402,7 +2512,7 @@ public sealed partial class AutomationEngine
         _log.Info($"[LIVE_KEY_SENT] source={source} attempt=post-reset key=ArrowDown mode=recovery-keyDown");
         var finalChanged = await WaitForPageChangeBeforeReloadAsync(source, beforeFinal, ArrowDownPostResetAttemptWaitMs, ArrowDownRecoveryAttempts + 1, ct);
         if (finalChanged.Changed)
-            return await ReloadAfterConfirmedArrowDownAsync(source, finalChanged, waitAfterReloadMs, ct);
+            return await FinalizeConfirmedArrowDownAsync(source, finalChanged, waitAfterReloadMs, ct);
 
         ReportProblem("LIVE_SWITCH_KEY_UNRESPONSIVE", source,
             "ArrowDown CDP vẫn không làm LIVE đổi sau reconnect + focus + F5 reset. Không F5 lặp cùng LIVE; Viewer/InputGuard vẫn khóa workflow và vòng sau sẽ thử lại.",
@@ -2547,14 +2657,19 @@ public sealed partial class AutomationEngine
                 return false;
             }
 
-            if (!await WaitForLivePageReadyAsync($"sau chuyển LIVE: {source}", ct))
+            if (!verify.PageReadyConfirmed
+                && !await WaitForLivePageReadyAsync($"sau chuyển LIVE: {source}", ct))
             {
                 _log.Warn($"[LIVE_SWITCH_PAGE_NOT_READY] source={source} changed=true action=RETURN_TO_MAIN_LOOP_NO_EXTRA_F5");
                 return false;
             }
+            if (verify.PageReadyConfirmed)
+            {
+                _log.Info($"[LIVE_SWITCH_PAGE_READY_REUSE] source={source} action=SKIP_DUPLICATE_PAGE_READY_WAIT");
+            }
 
-            ResetPeriodicDue(source + " da xac nhan sang LIVE moi va F5 xong", cancelCandidate: !scheduledPeriodic);
-            ResetPageMaintenanceDue(source + " vừa F5 sau chuyển LIVE");
+            ResetPeriodicDue(source + " da xac nhan sang LIVE moi", cancelCandidate: !scheduledPeriodic);
+            ResetPageMaintenanceDue(source + " vừa chuyển LIVE");
             NoteConfirmedLiveTransition(source);
             completed = true;
             return true;
@@ -2584,15 +2699,20 @@ public sealed partial class AutomationEngine
                     return false;
                 }
 
-                if (!await WaitForLivePageReadyAsync($"sau retry chuyển LIVE: {source}", ct))
+                if (!verify.PageReadyConfirmed
+                    && !await WaitForLivePageReadyAsync($"sau retry chuyển LIVE: {source}", ct))
                 {
                     _log.Warn($"[LIVE_SWITCH_PAGE_NOT_READY] source={source} retry=true changed=true action=RETURN_TO_MAIN_LOOP_NO_EXTRA_F5");
                     return false;
                 }
+                if (verify.PageReadyConfirmed)
+                {
+                    _log.Info($"[LIVE_SWITCH_PAGE_READY_REUSE] source={source} retry=true action=SKIP_DUPLICATE_PAGE_READY_WAIT");
+                }
 
                 _log.Warn($"[RECOVERY_OK] transition={source} action=retry-after-cdp-reconnect");
                 ResetPeriodicDue(source + " da xac nhan sang LIVE moi sau retry reconnect", cancelCandidate: !scheduledPeriodic);
-                ResetPageMaintenanceDue(source + " vừa F5 sau retry chuyển LIVE");
+                ResetPageMaintenanceDue(source + " vừa chuyển LIVE sau retry");
                 NoteConfirmedLiveTransition(source + " / retry");
                 completed = true;
                 return true;
