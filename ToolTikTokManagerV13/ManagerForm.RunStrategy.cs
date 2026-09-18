@@ -1,6 +1,7 @@
-using System.Text;
+﻿using System.Text;
 using System.Text.Json;
 using ToolTikTokV12.Controls;
+using ToolTikTokV12.Services;
 using ToolTikTokV12.Utils;
 
 namespace ToolTikTokManagerV13;
@@ -28,7 +29,7 @@ public sealed partial class ManagerForm
 
     sealed class RunAllStrategySettings
     {
-        public int Version { get; set; } = 5;
+        public int Version { get; set; } = 6;
         public RunAllStrategyMode Mode { get; set; } = RunAllStrategyMode.Time;
 
         // V3: khi user đã chọn Giờ vàng + Bắt đầu, giữ "ý định vận hành" này
@@ -69,6 +70,14 @@ public sealed partial class ManagerForm
         public int CreateLimitPerHour { get; set; } = 5;
         public int CreateLimitPerSession { get; set; } = 10;
         public int CreateLimitReuseRetryMinutes { get; set; } = 10;
+
+        // V6: khung giờ cấm CREATE tự động. Hai setting này độc lập hoàn toàn
+        // với “Chỉ dùng PRF chờ”: chỉ khi CẢ HAI cùng cho phép thì Tool mới
+        // được lấy account chưa gán để tạo PRF mới. Dùng phút trong ngày để
+        // hỗ trợ cả khung qua đêm, ví dụ 23:00 -> 07:00.
+        public bool NoCreateScheduleEnabled { get; set; }
+        public int NoCreateStartMinute { get; set; } = 23 * 60;
+        public int NoCreateEndMinute { get; set; } = 7 * 60;
     }
 
     sealed record RunStrategyReusableCandidate(
@@ -171,7 +180,7 @@ public sealed partial class ManagerForm
     static RunAllStrategySettings NormalizeRunStrategySettings(
         RunAllStrategySettings settings)
     {
-        settings.Version = 5;
+        settings.Version = 6;
         if (settings.Mode != RunAllStrategyMode.PrimeFresh)
         {
             settings.PrimeModeArmed = false;
@@ -194,6 +203,8 @@ public sealed partial class ManagerForm
         settings.CreateLimitPerHour = Math.Clamp(settings.CreateLimitPerHour, 1, 200);
         settings.CreateLimitPerSession = Math.Clamp(settings.CreateLimitPerSession, 1, 500);
         settings.CreateLimitReuseRetryMinutes = Math.Clamp(settings.CreateLimitReuseRetryMinutes, 1, 120);
+        settings.NoCreateStartMinute = Math.Clamp(settings.NoCreateStartMinute, 0, (24 * 60) - 1);
+        settings.NoCreateEndMinute = Math.Clamp(settings.NoCreateEndMinute, 0, (24 * 60) - 1);
 
         if (!Enum.IsDefined(typeof(PrePrimeRefreshSourceMode), settings.PrePrimeRefreshSource))
             settings.PrePrimeRefreshSource = PrePrimeRefreshSourceMode.CurrentFresh;
@@ -253,7 +264,10 @@ public sealed partial class ManagerForm
             CreateLimitPerSlot = _runStrategySettings.CreateLimitPerSlot,
             CreateLimitPerHour = _runStrategySettings.CreateLimitPerHour,
             CreateLimitPerSession = _runStrategySettings.CreateLimitPerSession,
-            CreateLimitReuseRetryMinutes = _runStrategySettings.CreateLimitReuseRetryMinutes
+            CreateLimitReuseRetryMinutes = _runStrategySettings.CreateLimitReuseRetryMinutes,
+            NoCreateScheduleEnabled = _runStrategySettings.NoCreateScheduleEnabled,
+            NoCreateStartMinute = _runStrategySettings.NoCreateStartMinute,
+            NoCreateEndMinute = _runStrategySettings.NoCreateEndMinute
         });
 
         using var form = new Form
@@ -387,11 +401,12 @@ public sealed partial class ManagerForm
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 6,
+            RowCount = 7,
             Padding = new Padding(4),
             Margin = Padding.Empty
         };
         launchRoot.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        launchRoot.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         launchRoot.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         launchRoot.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         launchRoot.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -587,6 +602,92 @@ public sealed partial class ManagerForm
         createLimitRoot.Controls.Add(createLimitRetryMinutes, 7, 1);
         createLimitBox.Controls.Add(createLimitRoot);
 
+        var noCreateScheduleBox = new GroupBox
+        {
+            Text = "KHUNG GIỜ KHÔNG TẠO PRF MỚI",
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            Padding = new Padding(12, 10, 12, 10),
+            Margin = new Padding(0, 12, 0, 0),
+            Font = new Font("Segoe UI", 9.2F, FontStyle.Bold)
+        };
+
+        var noCreateScheduleRoot = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = true,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty
+        };
+
+        var noCreateScheduleEnabled = new CheckBox
+        {
+            Text = "Không tạo PRF mới trong khung giờ",
+            Checked = current.NoCreateScheduleEnabled,
+            AutoSize = true,
+            Font = new Font("Segoe UI", 9.2F, FontStyle.Bold),
+            Margin = new Padding(0, 5, 16, 4)
+        };
+
+        DateTime MinuteOfDayToPickerValue(int minute)
+        {
+            minute = Math.Clamp(minute, 0, (24 * 60) - 1);
+            return DateTime.Today.AddMinutes(minute);
+        }
+
+        DateTimePicker CreateNoCreateTimePicker(int minute)
+            => new()
+            {
+                Format = DateTimePickerFormat.Custom,
+                CustomFormat = "HH:mm",
+                ShowUpDown = true,
+                Width = 78,
+                Value = MinuteOfDayToPickerValue(minute),
+                Font = new Font("Segoe UI", 9.5F),
+                Margin = new Padding(4, 2, 8, 2)
+            };
+
+        var noCreateStart = CreateNoCreateTimePicker(current.NoCreateStartMinute);
+        var noCreateEnd = CreateNoCreateTimePicker(current.NoCreateEndMinute);
+
+        Label ScheduleLabel(string text)
+            => new()
+            {
+                Text = text,
+                AutoSize = true,
+                Font = new Font("Segoe UI", 9F),
+                Margin = new Padding(0, 6, 0, 2)
+            };
+
+        var noCreateScheduleNote = new Label
+        {
+            AutoSize = true,
+            MaximumSize = new Size(420, 0),
+            ForeColor = Color.DimGray,
+            Font = new Font("Segoe UI", 8.8F),
+            Text = "Trong giờ cấm vẫn dùng PRF chờ; chỉ CREATE tự động bị chặn. Khung qua đêm như 23:00 → 07:00 được hỗ trợ.",
+            Margin = new Padding(12, 6, 0, 2)
+        };
+
+        noCreateScheduleRoot.Controls.Add(noCreateScheduleEnabled);
+        noCreateScheduleRoot.Controls.Add(ScheduleLabel("Từ"));
+        noCreateScheduleRoot.Controls.Add(noCreateStart);
+        noCreateScheduleRoot.Controls.Add(ScheduleLabel("đến"));
+        noCreateScheduleRoot.Controls.Add(noCreateEnd);
+        noCreateScheduleRoot.Controls.Add(noCreateScheduleNote);
+        noCreateScheduleBox.Controls.Add(noCreateScheduleRoot);
+
+        void UpdateNoCreateScheduleEnabled()
+        {
+            var enabled = noCreateScheduleEnabled.Checked;
+            noCreateStart.Enabled = enabled;
+            noCreateEnd.Enabled = enabled;
+        }
+        noCreateScheduleEnabled.CheckedChanged += (_, _) => UpdateNoCreateScheduleEnabled();
+        UpdateNoCreateScheduleEnabled();
+
         void UpdateCreateLimitEnabled()
         {
             var enabled = createLimitEnabled.Checked;
@@ -604,7 +705,7 @@ public sealed partial class ManagerForm
             MaximumSize = new Size(860, 0),
             ForeColor = Color.FromArgb(37, 77, 122),
             Font = new Font("Segoe UI", 9F, FontStyle.Bold),
-            Text = "Tự bù luôn ưu tiên PRF có sẵn phù hợp trước; chỉ khi hết nguồn mới dùng Auto Profile để tạo mới (trừ khi bật CHỈ PRF CHỜ).",
+            Text = "Tự bù luôn ưu tiên PRF có sẵn phù hợp trước; chỉ khi hết nguồn mới dùng Auto Profile để tạo mới (trừ khi bật CHỈ PRF CHỜ hoặc đang trong khung giờ cấm CREATE).",
             Margin = new Padding(0, 12, 0, 0)
         };
 
@@ -613,7 +714,8 @@ public sealed partial class ManagerForm
         launchRoot.Controls.Add(reuseOnlyNoCreate, 0, 2);
         launchRoot.Controls.Add(targetGrid, 0, 3);
         launchRoot.Controls.Add(createLimitBox, 0, 4);
-        launchRoot.Controls.Add(launchFlowNote, 0, 5);
+        launchRoot.Controls.Add(noCreateScheduleBox, 0, 5);
+        launchRoot.Controls.Add(launchFlowNote, 0, 6);
         launchBox.Controls.Add(launchRoot);
 
         // ------------------------------------------------------------
@@ -969,7 +1071,7 @@ public sealed partial class ManagerForm
 
             return NormalizeRunStrategySettings(new RunAllStrategySettings
             {
-                Version = 5,
+                Version = 6,
                 Mode = primeMode.Checked ? RunAllStrategyMode.PrimeFresh : RunAllStrategyMode.Time,
                 PrimeModeArmed = startRequested
                     ? primeMode.Checked
@@ -995,7 +1097,10 @@ public sealed partial class ManagerForm
                 CreateLimitPerSlot = (int)createLimitPerSlot.Value,
                 CreateLimitPerHour = (int)createLimitPerHour.Value,
                 CreateLimitPerSession = (int)createLimitPerSession.Value,
-                CreateLimitReuseRetryMinutes = (int)createLimitRetryMinutes.Value
+                CreateLimitReuseRetryMinutes = (int)createLimitRetryMinutes.Value,
+                NoCreateScheduleEnabled = noCreateScheduleEnabled.Checked,
+                NoCreateStartMinute = (noCreateStart.Value.Hour * 60) + noCreateStart.Value.Minute,
+                NoCreateEndMinute = (noCreateEnd.Value.Hour * 60) + noCreateEnd.Value.Minute
             });
         }
 
@@ -1024,6 +1129,13 @@ public sealed partial class ManagerForm
                 return false;
             }
 
+            if (settings.NoCreateScheduleEnabled
+                && settings.NoCreateStartMinute == settings.NoCreateEndMinute)
+            {
+                message = "Khung giờ không tạo PRF phải có giờ bắt đầu khác giờ kết thúc.";
+                return false;
+            }
+
             // Không chặn Lưu chỉ vì số PRF đang mở hiện tại chưa phù hợp target.
             // Những điều kiện phụ thuộc runtime (0 PRF mở, open > target, FreshTarget
             // > target động khi CHỈ PRF ĐANG MỞ...) chỉ được chặn khi Bắt đầu.
@@ -1041,11 +1153,21 @@ public sealed partial class ManagerForm
                 || settings.Mode == RunAllStrategyMode.PrimeFresh;
 
             var changed = false;
+            bool previousReuseOnly;
+            bool currentReuseOnly;
 
-            if (_autoCloseSettings.ReuseOnlyNoCreateProfile != reuseOnlyNoCreate.Checked)
+            // Serialize toggle với đúng điểm BuildAutoProfileQueue ASSIGN account.
+            // Không giữ lock qua Save/await nên UI không bị treo bởi một vòng login/create.
+            lock (_autoReplacementCreateModeGate)
             {
-                _autoCloseSettings.ReuseOnlyNoCreateProfile = reuseOnlyNoCreate.Checked;
-                changed = true;
+                previousReuseOnly = _autoCloseSettings.ReuseOnlyNoCreateProfile;
+                currentReuseOnly = reuseOnlyNoCreate.Checked;
+
+                if (previousReuseOnly != currentReuseOnly)
+                {
+                    _autoCloseSettings.ReuseOnlyNoCreateProfile = currentReuseOnly;
+                    changed = true;
+                }
             }
 
             if (requiresReplacement && !_autoCloseSettings.OpenReplacementAfterAutoClose)
@@ -1066,10 +1188,23 @@ public sealed partial class ManagerForm
                 UpdateAutoCloseToolbarButtonText();
             }
 
+            // Bật/tắt CHỈ PRF CHỜ phải có hiệu lực hai chiều ngay lập tức:
+            // bật => các hard-gate live chặn CREATE chưa commit;
+            // tắt => wake request đang ngủ 5 phút vì reuse-only để CREATE fallback lại được phép.
+            NotifyAutoReplacementReuseOnlySettingChanged(
+                previousReuseOnly,
+                currentReuseOnly,
+                "run_strategy_save");
+
             // Giới hạn CREATE đọc trực tiếp Run Strategy settings. Nếu user vừa tắt
             // giới hạn hoặc nâng ngưỡng khiến request đang chờ không còn bị block,
             // đánh thức request ngay thay vì bắt chờ hết timer cũ.
             NotifyAutoReplacementCreateLimitSettingsChanged("run_strategy_save");
+
+            // Khung giờ cấm CREATE cũng phải áp dụng live. Nếu user vừa tắt hoặc
+            // đổi sang một khung không còn bao phủ hiện tại, đánh thức request
+            // đang chờ ngay; nếu vẫn đang trong giờ cấm thì cập nhật deadline mới.
+            NotifyAutoReplacementNoCreateScheduleSettingsChanged("run_strategy_save");
         }
 
         void UpdateLaunchValidation()
@@ -1249,7 +1384,9 @@ public sealed partial class ManagerForm
                     $"[RUN_STRATEGY_SETTINGS_SAVE_UI] mode={saved.Mode} autoEnsure={saved.AutoEnsureTarget} target={saved.TargetSlots} " +
                     $"primeArmed={saved.PrimeModeArmed} fullRefresh={saved.RefreshAllBeforePrime} source={saved.PrePrimeRefreshSource} " +
                     $"createLimit={saved.CreateLimitEnabled} perSlot={saved.CreateLimitPerSlot} perHour={saved.CreateLimitPerHour} " +
-                    $"perSession={saved.CreateLimitPerSession} retryMinutes={saved.CreateLimitReuseRetryMinutes}");
+                    $"perSession={saved.CreateLimitPerSession} retryMinutes={saved.CreateLimitReuseRetryMinutes} " +
+                    $"noCreateSchedule={saved.NoCreateScheduleEnabled} window={saved.NoCreateStartMinute / 60:00}:{saved.NoCreateStartMinute % 60:00}-" +
+                    $"{saved.NoCreateEndMinute / 60:00}:{saved.NoCreateEndMinute % 60:00}");
             }
             catch (Exception ex)
             {
@@ -1280,6 +1417,16 @@ public sealed partial class ManagerForm
             return;
 
         var selected = BuildSettingsFromDialog(startRequested: true);
+
+        if (!ValidateSettingsForSave(selected, out var startSettingsError))
+        {
+            ModernDialog.ShowMessage(
+                this,
+                startSettingsError,
+                "Auto Run",
+                MessageBoxIcon.Warning);
+            return;
+        }
 
         var target = selected.AutoEnsureTarget
             ? selected.TargetSlots
@@ -1565,7 +1712,7 @@ public sealed partial class ManagerForm
                     }
 
                     // Thiếu quota MỚI thật sự: chỉ lúc này mới được tạo đúng 1 PRF mới.
-                    if (!_autoCloseSettings.ReuseOnlyNoCreateProfile
+                    if (IsAutomaticNewProfileCreationAllowedNow()
                         && await TryCreateRunStrategyReplacementAsync(
                             "RUN_ALL_START",
                             $"INITIAL_{phase}_FRESH_{slotNumber}",
@@ -1635,7 +1782,7 @@ public sealed partial class ManagerForm
                 }
 
                 // Không còn reusable phù hợp: lúc này mới tạo mới để giữ đủ target.
-                if (_autoCloseSettings.ReuseOnlyNoCreateProfile)
+                if (!IsAutomaticNewProfileCreationAllowedNow())
                     return false;
 
                 return await TryCreateRunStrategyReplacementAsync(
@@ -1670,7 +1817,7 @@ public sealed partial class ManagerForm
                 }
             }
 
-            if (_autoCloseSettings.ReuseOnlyNoCreateProfile)
+            if (!IsAutomaticNewProfileCreationAllowedNow())
                 return false;
 
             return await TryCreateRunStrategyReplacementAsync(
@@ -1688,7 +1835,7 @@ public sealed partial class ManagerForm
             return true;
         }
 
-        if (_autoCloseSettings.ReuseOnlyNoCreateProfile)
+        if (!IsAutomaticNewProfileCreationAllowedNow())
             return false;
 
         return await TryCreateRunStrategyReplacementAsync(
@@ -2541,7 +2688,7 @@ public sealed partial class ManagerForm
             .Any(candidate =>
                 !IsRunStrategyPrePrimeCandidateDisallowed(candidate.ProfileName));
 
-        var canCreate = !_autoCloseSettings.ReuseOnlyNoCreateProfile;
+        var canCreate = IsAutomaticNewProfileCreationAllowedNow();
         if (!available && canCreate)
             canCreate = await HasRunStrategyNewAccountSupplyAsync(token);
 
@@ -2678,7 +2825,7 @@ public sealed partial class ManagerForm
                         allowProtectedNightReserve: true)
                     .Count > 0;
 
-                var canCreate = !_autoCloseSettings.ReuseOnlyNoCreateProfile;
+                var canCreate = IsAutomaticNewProfileCreationAllowedNow();
                 if (!hasFreshReusable && canCreate)
                     canCreate = await HasRunStrategyNewAccountSupplyAsync(token);
 
@@ -2778,7 +2925,7 @@ public sealed partial class ManagerForm
             freshVictim,
             new[] { RunStrategyLane.Old, RunStrategyLane.Medium },
             AllowFreshEmergencyFallback: true,
-            AllowCreateFallback: !_autoCloseSettings.ReuseOnlyNoCreateProfile);
+            AllowCreateFallback: IsAutomaticNewProfileCreationAllowedNow());
     }
 
     double GetRunStrategyTotalSeconds(ProfileContext ctx)
@@ -2861,7 +3008,7 @@ public sealed partial class ManagerForm
 
     async Task<bool> HasRunStrategyNewAccountSupplyAsync(CancellationToken token)
     {
-        if (_autoCloseSettings.ReuseOnlyNoCreateProfile)
+        if (!IsAutomaticNewProfileCreationAllowedNow())
             return false;
 
         try
@@ -2873,11 +3020,25 @@ public sealed partial class ManagerForm
                     if (!string.IsNullOrWhiteSpace(_accountPoolService.CurrentSourcePath))
                         _accountPoolService.ReloadCurrentExcel();
                     _accountPoolService.EnsureAutoColumns();
-                    return BuildAutoProfileQueue(
-                        requestedNew: 1,
-                        requestedStartName: startName,
-                        resumeIncomplete: false,
-                        retryPaused: false);
+
+                    // Probe này gọi BuildAutoProfileQueue (có điểm COMMIT account),
+                    // nên phải re-check chính sách ngay sát Build, không chỉ ở đầu hàm.
+                    lock (_autoReplacementCreateModeGate)
+                    {
+                        if (_autoCloseSettings.ReuseOnlyNoCreateProfile
+                            || TryGetAutoReplacementNoCreateScheduleBlock(
+                                out _,
+                                out _))
+                        {
+                            return new List<AutoProfileQueueItem>();
+                        }
+
+                        return BuildAutoProfileQueue(
+                            requestedNew: 1,
+                            requestedStartName: startName,
+                            resumeIncomplete: false,
+                            retryPaused: false);
+                    }
                 },
                 token);
 
@@ -3172,7 +3333,7 @@ public sealed partial class ManagerForm
         // slot thật sự không thể phục hồi mới tiêu account mới ở nhánh cuối.
         if (plan.Phase != "OFFPEAK"
             && plan.AllowCreateFallback
-            && !_autoCloseSettings.ReuseOnlyNoCreateProfile
+            && IsAutomaticNewProfileCreationAllowedNow()
             && await TryCreateRunStrategyReplacementAsync(
                 outgoingProfileName,
                 plan.Phase,
@@ -3202,7 +3363,7 @@ public sealed partial class ManagerForm
         // mới dùng account mới, đúng yêu cầu “thiếu thì mới tạo PRF mới”.
         if (plan.Phase == "OFFPEAK"
             && plan.AllowCreateFallback
-            && !_autoCloseSettings.ReuseOnlyNoCreateProfile)
+            && IsAutomaticNewProfileCreationAllowedNow())
         {
             return await TryCreateRunStrategyReplacementAsync(
                 outgoingProfileName,
@@ -3324,7 +3485,7 @@ public sealed partial class ManagerForm
         string phase,
         CancellationToken token)
     {
-        if (_autoCloseSettings.ReuseOnlyNoCreateProfile)
+        if (!IsAutomaticNewProfileCreationAllowedNow())
             return false;
 
         token.ThrowIfCancellationRequested();

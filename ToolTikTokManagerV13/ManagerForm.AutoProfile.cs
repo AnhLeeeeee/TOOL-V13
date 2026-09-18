@@ -58,10 +58,13 @@ public sealed partial class ManagerForm
 
     sealed class AutoProfileCooldownSettings
     {
-        public int Version { get; set; } = 1;
+        // Version 2: nhóm cooldown giữa = lỗi LOGIN hoặc đúng trường hợp TikTok đã nhận
+        // thao tác cập nhật Tên/ảnh nhưng probe sau đó vẫn chưa thấy tên mới.
+        // Giữ tên property LoginErrorSeconds để tương thích manager_auto_profile_cooldown.json cũ.
+        public int Version { get; set; } = 2;
         public int BetweenProfilesSeconds { get; set; } = 120;
-        public int LoginErrorSeconds { get; set; } = 300;
-        public int ProtectionSeconds { get; set; } = 600;
+        public int LoginErrorSeconds { get; set; } = 600;
+        public int ProtectionSeconds { get; set; } = 3600;
         public int JitterSeconds { get; set; } = 30;
     }
 
@@ -93,11 +96,31 @@ public sealed partial class ManagerForm
 
             var json = File.ReadAllText(AutoProfileCooldownSettingsPath, Encoding.UTF8);
             var loaded = JsonSerializer.Deserialize<AutoProfileCooldownSettings>(json) ?? fallback;
+
+            // Migration an toàn từ cấu hình mặc định cũ: 2' / 5' / 10' hoặc 30'.
+            // Chỉ đổi khi cả bộ vẫn đúng mẫu mặc định cũ; cấu hình người dùng đã chỉnh
+            // sang giá trị khác được giữ nguyên.
+            var oldVersion = loaded.Version;
+            var migrateKnownOldDefaults = oldVersion < 2
+                && loaded.BetweenProfilesSeconds == 120
+                && loaded.LoginErrorSeconds == 300
+                && (loaded.ProtectionSeconds == 600 || loaded.ProtectionSeconds == 1800);
+
+            if (migrateKnownOldDefaults)
+            {
+                loaded.LoginErrorSeconds = 600;
+                loaded.ProtectionSeconds = 3600;
+            }
+
             loaded.BetweenProfilesSeconds = Math.Clamp(loaded.BetweenProfilesSeconds, 0, 3600);
             loaded.LoginErrorSeconds = Math.Clamp(loaded.LoginErrorSeconds, 0, 7200);
             loaded.ProtectionSeconds = Math.Clamp(loaded.ProtectionSeconds, 0, 14400);
             loaded.JitterSeconds = Math.Clamp(loaded.JitterSeconds, 0, 300);
-            loaded.Version = 1;
+            loaded.Version = 2;
+
+            if (oldVersion < 2)
+                SaveAutoProfileCooldownSettings(loaded);
+
             return loaded;
         }
         catch (Exception ex)
@@ -111,7 +134,7 @@ public sealed partial class ManagerForm
     {
         try
         {
-            settings.Version = 1;
+            settings.Version = 2;
             settings.BetweenProfilesSeconds = Math.Clamp(settings.BetweenProfilesSeconds, 0, 3600);
             settings.LoginErrorSeconds = Math.Clamp(settings.LoginErrorSeconds, 0, 7200);
             settings.ProtectionSeconds = Math.Clamp(settings.ProtectionSeconds, 0, 14400);
@@ -137,6 +160,19 @@ public sealed partial class ManagerForm
                || outcome.Status.StartsWith("PAUSED_CAPTCHA_LOGIN", StringComparison.OrdinalIgnoreCase);
     }
 
+    static bool IsAutoProfileIdentityNotUpdatedCooldownOutcome(AutoProfileProcessOutcome? outcome)
+    {
+        if (outcome is null) return false;
+
+        // CHỈ tính chung với lỗi LOGIN khi thao tác cập nhật Tên/ảnh đã thành công
+        // (RenameSucceeded=true) nhưng probe sau đó vẫn chưa thấy tên mới.
+        // Các lỗi RENAME khác như CAPTCHA, config, lỗi thao tác, lỗi Excel...
+        // vẫn chỉ dùng cooldown Giữa PRF bình thường.
+        return outcome.Step.Equals("READY_PENDING_NAME", StringComparison.OrdinalIgnoreCase)
+               && outcome.RenameSucceeded
+               && !outcome.IdentityVerified;
+    }
+
     static AutoProfileCooldownKind ResolveAutoProfileCooldownKind(
         AutoProfileProcessOutcome? outcome,
         ref int consecutiveLoginErrors)
@@ -148,7 +184,12 @@ public sealed partial class ManagerForm
             return AutoProfileCooldownKind.Protection;
         }
 
-        if (IsAutoProfileLoginCooldownOutcome(outcome))
+        // Cùng một bộ đếm cho LOGIN lỗi và duy nhất trường hợp Save Tên/ảnh đã thành công
+        // nhưng tên mới chưa xuất hiện khi probe. Các lỗi RENAME khác không vào nhóm này.
+        // Vì Auto Replacement cũng gọi chung resolver này nên +Auto Profile và Tự bù
+        // luôn dùng cùng một chính sách cooldown.
+        if (IsAutoProfileLoginCooldownOutcome(outcome)
+            || IsAutoProfileIdentityNotUpdatedCooldownOutcome(outcome))
         {
             consecutiveLoginErrors++;
             if (consecutiveLoginErrors >= AutoProfileLoginErrorProtectionThreshold)
@@ -177,8 +218,8 @@ public sealed partial class ManagerForm
     static string DescribeAutoProfileCooldownKind(AutoProfileCooldownKind kind)
         => kind switch
         {
-            AutoProfileCooldownKind.LoginError => "LOGIN lỗi",
-            AutoProfileCooldownKind.Protection => "BẢO VỆ BAN/lỗi liên tiếp",
+            AutoProfileCooldownKind.LoginError => "LOGIN / cập nhật Tên-ảnh xong nhưng tên chưa đổi",
+            AutoProfileCooldownKind.Protection => "BẢO VỆ BAN / 3 lỗi liên tiếp",
             _ => "nghỉ giữa PRF"
         };
 
@@ -500,10 +541,10 @@ public sealed partial class ManagerForm
         cooldownPanel.Controls.Add(new Label { Text = "Giữa PRF", AutoSize = true, Margin = new Padding(0, 7, 0, 0) });
         cooldownPanel.Controls.Add(normalCooldownMinutes);
         cooldownPanel.Controls.Add(new Label { Text = "phút", AutoSize = true, Margin = new Padding(0, 7, 12, 0) });
-        cooldownPanel.Controls.Add(new Label { Text = "Login lỗi", AutoSize = true, Margin = new Padding(0, 7, 0, 0) });
+        cooldownPanel.Controls.Add(new Label { Text = "Login / tên chưa đổi", AutoSize = true, Margin = new Padding(0, 7, 0, 0) });
         cooldownPanel.Controls.Add(loginCooldownMinutes);
         cooldownPanel.Controls.Add(new Label { Text = "phút", AutoSize = true, Margin = new Padding(0, 7, 12, 0) });
-        cooldownPanel.Controls.Add(new Label { Text = "BAN / 3 lỗi login", AutoSize = true, Margin = new Padding(0, 7, 0, 0) });
+        cooldownPanel.Controls.Add(new Label { Text = "BAN / 3 lỗi liên tiếp", AutoSize = true, Margin = new Padding(0, 7, 0, 0) });
         cooldownPanel.Controls.Add(protectionCooldownMinutes);
         cooldownPanel.Controls.Add(new Label { Text = "phút", AutoSize = true, Margin = new Padding(0, 7, 12, 0) });
         cooldownPanel.Controls.Add(new Label { Text = "Dao động ±", AutoSize = true, Margin = new Padding(0, 7, 0, 0) });
@@ -886,7 +927,7 @@ public sealed partial class ManagerForm
 
             var detailLabel = new Label
             {
-                Text = $"Sẵn sàng. Cooldown dùng chung: giữa PRF {cooldownSettings.BetweenProfilesSeconds / 60}' · login lỗi {cooldownSettings.LoginErrorSeconds / 60}' · bảo vệ {cooldownSettings.ProtectionSeconds / 60}' ± {cooldownSettings.JitterSeconds}s. PRF hiện tại phải đóng sạch mới chuyển sang PRF tiếp theo.",
+                Text = $"Sẵn sàng. Cooldown dùng chung: giữa PRF {cooldownSettings.BetweenProfilesSeconds / 60}' · login/tên chưa đổi {cooldownSettings.LoginErrorSeconds / 60}' · bảo vệ {cooldownSettings.ProtectionSeconds / 60}' ± {cooldownSettings.JitterSeconds}s. PRF hiện tại phải đóng sạch mới chuyển sang PRF tiếp theo.",
                 Dock = DockStyle.Fill,
                 AutoEllipsis = true,
                 ForeColor = Color.DimGray,
@@ -1410,7 +1451,14 @@ public sealed partial class ManagerForm
                                 autoStart.Checked,
                                 () => paused,
                                 runCts.Token,
-                                (stepText, resultText, color) => UpdateGridRow(item, stepText, resultText, color));
+                                (stepText, resultText, color) => UpdateGridRow(item, stepText, resultText, color),
+                                // +Auto Profile chính: sau khi Save Tên/ảnh thành công phải probe tên thật.
+                                // Nếu tên vẫn chưa đổi/khớp sau 3 lần thì KHÔNG tính thành công,
+                                // KHÔNG Start tool; giữ PROCESSING để có thể xử lý lại.
+                                verifyIdentityAfterRename: autoRename.Checked,
+                                writeIdentityDoneToExcel: true,
+                                tolerateIdentityValidationFailure: true,
+                                requireIdentityMatchForSuccess: autoRename.Checked);
                         }
                         catch (OperationCanceledException)
                         {
@@ -1435,6 +1483,130 @@ public sealed partial class ManagerForm
                             // profile mới thành công.
                             if (!item.ResumeExisting)
                                 newNotSuccessful++;
+                        }
+
+                        // HARD CLEANUP BARRIER cho lane TẠO MỚI:
+                        // Nếu lượt tạo mới đã thực sự được xử lý nhưng kết quả chưa thành công,
+                        // phải đóng sạch Worker + Chrome của đúng PRF trước khi cooldown / tạo PRF kế tiếp.
+                        // ResumeExisting giữ hành vi cũ để không tự đóng profile người dùng đang xử lý lại.
+                        // Outcome Skipped thường dừng trước khi tạo/mở runtime nên không cần cleanup.
+                        if (!item.ResumeExisting && !outcome.Success && !outcome.Skipped)
+                        {
+                            var originalResult = $"{outcome.Status} — {outcome.Note}";
+                            status.Text = $"PRF {item.ProfileName} chưa thành công — đang đóng sạch Chrome/Worker trước PRF tiếp theo...";
+                            UpdateGridRow(
+                                item,
+                                "CLOSING",
+                                originalResult + " | Đang đóng sạch Chrome/Worker...",
+                                Color.RoyalBlue);
+
+                            _autoReplacementCleanupProfiles.Add(item.ProfileName);
+                            try
+                            {
+                                _log.Warn(
+                                    $"[AUTO_PROFILE_FAILED_NEW_CLEAN_BEGIN] profile={item.ProfileName} account={item.Account.Username} "
+                                    + $"status={outcome.Status} step={outcome.Step}");
+
+                                await ClosePreparedProfileRuntimeAsync(
+                                    item.ProfileName,
+                                    item.Account.Username);
+
+                                // Sau khi đã đóng sạch, giữ lại PRF lỗi CÓ THỂ RETRY trong
+                                // Chờ dùng lại để lượt sau xử lý tiếp thay vì bỏ phí profile
+                                // đã tạo. BAN/account không còn hợp lệ là terminal và tuyệt đối
+                                // không được đưa vào Chờ.
+                                var queuedForRetry = false;
+                                var retryQueueMessage = "";
+                                if (!outcome.Status.Equals(
+                                        "LOGIN_BANNED",
+                                        StringComparison.OrdinalIgnoreCase)
+                                    && !(item.Account.Note ?? "").Trim().Equals(
+                                        "ban",
+                                        StringComparison.OrdinalIgnoreCase))
+                                {
+                                    try
+                                    {
+                                        if (IsAutoProfileIdentityNotUpdatedCooldownOutcome(outcome))
+                                        {
+                                            // Save Tên/ảnh đã thành công nhưng tên chưa đổi:
+                                            // dùng đúng lane NAME_SYNC_PENDING để recovery sweep
+                                            // xác minh lại tên ở lần dùng sau.
+                                            QueueReusableProfileNameSyncPending(
+                                                item,
+                                                $"auto_profile_failed_new:{outcome.Status}:{outcome.Step}");
+                                            queuedForRetry = true;
+                                            retryQueueMessage = "Đã vào Chờ dùng lại (chờ đồng bộ tên).";
+                                        }
+                                        else
+                                        {
+                                            // Các lỗi tạm thời khác (CAPTCHA/login/rename/start/healthy...)
+                                            // giữ PRF trong Chờ để có thể mở lại xử lý. Dùng API queue
+                                            // hiện có để đảm bảo profile đã tạo thật và đang đóng sạch.
+                                            queuedForRetry = TryAddReusableProfileManual(
+                                                item.Account.Id,
+                                                item.Account.Username,
+                                                item.ProfileName,
+                                                item.Account.Note,
+                                                out retryQueueMessage);
+                                        }
+
+                                        if (queuedForRetry)
+                                        {
+                                            _log.Info(
+                                                $"[AUTO_PROFILE_FAILED_NEW_WAITING_ADDED] profile={item.ProfileName} account={item.Account.Username} "
+                                                + $"status={outcome.Status} step={outcome.Step} message={retryQueueMessage}");
+                                        }
+                                        else
+                                        {
+                                            _log.Warn(
+                                                $"[AUTO_PROFILE_FAILED_NEW_WAITING_SKIP] profile={item.ProfileName} account={item.Account.Username} "
+                                                + $"status={outcome.Status} step={outcome.Step} message={retryQueueMessage}");
+                                        }
+                                    }
+                                    catch (Exception queueEx)
+                                    {
+                                        retryQueueMessage = "Không thêm được vào Chờ: " + queueEx.Message;
+                                        _log.Warn(
+                                            $"[AUTO_PROFILE_FAILED_NEW_WAITING_WARN] profile={item.ProfileName} account={item.Account.Username} "
+                                            + $"status={outcome.Status} step={outcome.Step} error={queueEx.Message}");
+                                    }
+                                }
+                                else
+                                {
+                                    retryQueueMessage = "BAN/account không còn hợp lệ — không đưa vào Chờ.";
+                                }
+
+                                _log.Info(
+                                    $"[AUTO_PROFILE_FAILED_NEW_CLEAN_CONFIRMED] profile={item.ProfileName} account={item.Account.Username} "
+                                    + $"chrome=0 worker=closed queuedForRetry={queuedForRetry} action=ALLOW_COOLDOWN_AND_NEXT_CREATE");
+
+                                UpdateGridRow(
+                                    item,
+                                    queuedForRetry ? "CHỜ DÙNG LẠI" : outcome.Step,
+                                    originalResult + " | Đã đóng sạch Chrome/Worker. " + retryQueueMessage,
+                                    queuedForRetry ? Color.DarkOrange : (outcome.Paused ? Color.DarkOrange : Color.Firebrick));
+                            }
+                            catch (Exception cleanupEx)
+                            {
+                                _log.Error(
+                                    $"[AUTO_PROFILE_FAILED_NEW_CLEAN_BLOCK] profile={item.ProfileName} account={item.Account.Username} "
+                                    + $"status={outcome.Status} step={outcome.Step} error={cleanupEx}");
+
+                                UpdateGridRow(
+                                    item,
+                                    "CLEANUP_BLOCKED",
+                                    originalResult + " | CHƯA đóng sạch Chrome/Worker — dừng hàng đợi, không tạo PRF mới.",
+                                    Color.Firebrick);
+
+                                throw new InvalidOperationException(
+                                    $"PRF {item.ProfileName} chưa thành công nhưng chưa đóng sạch Chrome/Worker. "
+                                    + "Đã chặn tạo PRF mới để tránh chạy chồng. Hãy kiểm tra/đóng PRF này rồi chạy lại.",
+                                    cleanupEx);
+                            }
+                            finally
+                            {
+                                _autoReplacementCleanupProfiles.Remove(item.ProfileName);
+                            }
                         }
 
                         var hasMoreRequiredWork =
@@ -1828,7 +2000,8 @@ public sealed partial class ManagerForm
         Action<string, string, Color> ui,
         bool verifyIdentityAfterRename = false,
         bool writeIdentityDoneToExcel = true,
-        bool tolerateIdentityValidationFailure = false)
+        bool tolerateIdentityValidationFailure = false,
+        bool requireIdentityMatchForSuccess = false)
     {
         var stopwatch = Stopwatch.StartNew();
         var step = "RESERVE";
@@ -2102,6 +2275,47 @@ public sealed partial class ManagerForm
                         resultText,
                         identityVerified || !verifyIdentityAfterRename ? Color.DarkGreen : Color.DarkOrange);
                 }
+            }
+
+            // +Auto Profile chính: thao tác Save Tên/ảnh đã thành công nhưng sau
+            // 3 lần probe tên thực tế vẫn chưa khớp danh sách cấu hình. Đây KHÔNG
+            // phải lỗi RENAME chung: giữ profile ở PROCESSING để có thể resume, không
+            // ghi Auto Profile=DONE và tuyệt đối không Start tool. Outcome riêng này
+            // được cooldown resolver tính chung với LOGIN lỗi (10' mặc định; lần 3 -> 60').
+            // "Tạo trước PRF chờ" không bật requireIdentityMatchForSuccess nên giữ
+            // nguyên hành vi cũ: vẫn đóng và đưa PRF đã Save tên thành công vào CHỜ.
+            if (requireIdentityMatchForSuccess
+                && autoRename
+                && renameSucceeded
+                && !identityVerified)
+            {
+                const string pendingStatus = "PAUSED_NAME_NOT_CHANGED";
+                const string pendingStep = "READY_PENDING_NAME";
+                var pendingNote =
+                    "TikTok/Worker đã xác nhận thao tác cập nhật Tên/ảnh thành công nhưng sau 3 lần kiểm tra tên thực tế vẫn chưa đổi/khớp danh sách cấu hình. "
+                    + "Không tính PRF này vào mục tiêu và không Bắt đầu tool; giữ PROCESSING để xử lý lại.";
+
+                await TryWriteAutoPauseCheckpointAsync(
+                    item.Account.Id,
+                    pendingStatus,
+                    pendingStep,
+                    pendingNote,
+                    ct);
+
+                ui(pendingStep, pendingStatus + " — " + pendingNote, Color.DarkOrange);
+                _log.Warn(
+                    $"[AUTO_PROFILE_NAME_NOT_CHANGED_AFTER_SAVE] profile={item.ProfileName} account={item.Account.Username} "
+                    + $"renameSucceeded={renameSucceeded} verified={identityVerified} excelDone={identityExcelDone} action=NO_DONE_NO_START_KEEP_PROCESSING");
+
+                return new AutoProfileProcessOutcome(
+                    false,
+                    true,
+                    pendingStatus,
+                    pendingStep,
+                    pendingNote,
+                    RenameSucceeded: true,
+                    IdentityVerified: false,
+                    IdentityExcelDone: identityExcelDone);
             }
 
             if (autoStart)
@@ -2444,9 +2658,9 @@ public sealed partial class ManagerForm
             throw new AutoProfilePauseException("PAUSED_RENAME", "RENAME", string.IsNullOrWhiteSpace(reply.Message) ? "TikTok bỏ qua thao tác đổi tên." : reply.Message);
 
         // Từ đây thao tác đổi tên đã được TikTok/Worker xác nhận thành công.
-        // Với "Tạo trước PRF chờ", kể cả tên chưa kịp hiện đúng khi probe,
-        // profile vẫn phải được đóng và đưa vào CHỜ. Probe chỉ quyết định
-        // profile có được tính vào quota DONE hay không.
+        // Probe phía dưới được dùng cho cả +Auto Profile chính và Tạo trước PRF chờ.
+        // Tạo trước vẫn có thể đưa PRF đã Save thành công vào CHỜ khi tên chưa kịp khớp;
+        // +Auto Profile chính sẽ chặn DONE/Start ở caller nếu requireIdentityMatchForSuccess.
         var verifiedOk = false;
         var verificationError = "";
 

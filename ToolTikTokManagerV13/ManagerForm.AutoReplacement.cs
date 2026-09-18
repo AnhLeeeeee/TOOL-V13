@@ -75,6 +75,11 @@ public sealed partial class ManagerForm
         int PerSession,
         int RetryMinutes);
 
+    sealed record AutoReplacementNoCreateScheduleSnapshot(
+        bool Enabled,
+        int StartMinute,
+        int EndMinute);
+
     sealed record AutoReplacementCandidate(
         ProfileContext Context,
         TikTokAccountPoolItem Account,
@@ -141,6 +146,12 @@ public sealed partial class ManagerForm
     // suất kế tiếp cũng phải tôn trọng đúng cấu hình ở cửa sổ "+ Auto Profile".
     readonly object _autoReplacementCreateCooldownLock = new();
     readonly object _autoReplacementCreateLimitLock = new();
+
+    // Đồng bộ điểm COMMIT của CREATE với checkbox "Chỉ dùng PRF chờ".
+    // Không cache trạng thái: mọi chốt CREATE luôn đọc live setting hiện tại.
+    // Lock chỉ bao quanh bước chọn/ASSIGN account (rất ngắn), không giữ qua await.
+    readonly object _autoReplacementCreateModeGate = new();
+
     AutoReplacementCreateLimitStateDocument? _autoReplacementCreateLimitState;
     DateTime _autoReplacementCreateNotBeforeUtc = DateTime.MinValue;
     AutoProfileCooldownKind _autoReplacementCreateCooldownKind = AutoProfileCooldownKind.Normal;
@@ -180,6 +191,70 @@ public sealed partial class ManagerForm
             settings.CreateLimitPerHour,
             settings.CreateLimitPerSession,
             settings.CreateLimitReuseRetryMinutes);
+    }
+
+    AutoReplacementNoCreateScheduleSnapshot GetAutoReplacementNoCreateScheduleSnapshot()
+    {
+        // Giống create-limit: Tự bù có thể chạy trước khi dialog Auto Run được mở.
+        // Vì vậy luôn đọc file đã Lưu khi Run Strategy chưa init trong phiên.
+        var settings = _runStrategyFeatureInitialized
+            ? NormalizeRunStrategySettings(_runStrategySettings)
+            : LoadRunStrategySettings();
+
+        return new AutoReplacementNoCreateScheduleSnapshot(
+            settings.NoCreateScheduleEnabled,
+            settings.NoCreateStartMinute,
+            settings.NoCreateEndMinute);
+    }
+
+    bool TryGetAutoReplacementNoCreateScheduleBlock(
+        out DateTime nextAllowedLocal,
+        out string windowText)
+    {
+        nextAllowedLocal = DateTime.MinValue;
+        windowText = "";
+
+        var schedule = GetAutoReplacementNoCreateScheduleSnapshot();
+        if (!schedule.Enabled)
+            return false;
+
+        var start = Math.Clamp(schedule.StartMinute, 0, (24 * 60) - 1);
+        var end = Math.Clamp(schedule.EndMinute, 0, (24 * 60) - 1);
+
+        // UI không cho lưu start == end. Nếu file bị sửa tay/cũ lỗi thì fail-open
+        // để tránh khóa CREATE 24/7 ngoài ý muốn.
+        if (start == end)
+            return false;
+
+        var now = DateTime.Now;
+        var minute = (now.Hour * 60) + now.Minute;
+        var blocked = start < end
+            ? minute >= start && minute < end
+            : minute >= start || minute < end;
+
+        if (!blocked)
+            return false;
+
+        var endToday = now.Date.AddMinutes(end);
+        nextAllowedLocal = start < end
+            ? endToday
+            : minute >= start
+                ? endToday.AddDays(1)
+                : endToday;
+
+        windowText =
+            $"{start / 60:00}:{start % 60:00}-{end / 60:00}:{end % 60:00}";
+        return true;
+    }
+
+    bool IsAutomaticNewProfileCreationAllowedNow()
+    {
+        if (_autoCloseSettings.ReuseOnlyNoCreateProfile)
+            return false;
+
+        return !TryGetAutoReplacementNoCreateScheduleBlock(
+            out _,
+            out _);
     }
 
     AutoReplacementCreateLimitStateDocument EnsureAutoReplacementCreateLimitStateUnsafe()
@@ -1183,6 +1258,8 @@ public sealed partial class ManagerForm
                 var createDeferredByCooldown = false;
                 var createLimitBlocked = false;
                 var createAttempted = false;
+                var reuseOnlyCreateBlocked = false;
+                var scheduleCreateBlocked = false;
                 AutoReplacementCleanupBarrierException? cleanupBarrier = null;
 
                 try
@@ -1283,6 +1360,23 @@ public sealed partial class ManagerForm
                                 _log.Warn(
                                     $"[AUTO_REPLACE_REUSE_GUARD_BLOCK_NEW] id={request.Id} closed={request.ClosedProfileName} profile={untestedProfile} lane={untestedLane} detail={untestedDetail} attemptedProfiles={GetAutoReplacementAttemptedProfileCount(request)}");
                             }
+                            else if (TryGetAutoReplacementNoCreateScheduleBlock(
+                                         out var scheduleNextLocal,
+                                         out var scheduleWindowText))
+                            {
+                                scheduleCreateBlocked = true;
+                                lastError =
+                                    $"Khung giờ cấm CREATE: {scheduleWindowText}; chờ đến {scheduleNextLocal:dd/MM HH:mm}.";
+
+                                _log.Warn(
+                                    $"[AUTO_CREATE_SCHEDULE_BLOCKED] id={request.Id} closed={request.ClosedProfileName} " +
+                                    $"window={scheduleWindowText} nextLocal={scheduleNextLocal:O} attemptedProfiles={GetAutoReplacementAttemptedProfileCount(request)} action=WAIT_SCHEDULE_END");
+
+                                SetAutoReplacementUiPhase(
+                                    "CHỜ HẾT GIỜ CẤM TẠO",
+                                    $"{scheduleWindowText} → {scheduleNextLocal:HH:mm}",
+                                    request.Id);
+                            }
                             else if (TryGetAutoReplacementCreateLimitBlock(
                                          request,
                                          out var createLimitReason,
@@ -1339,7 +1433,36 @@ public sealed partial class ManagerForm
                                     execution.Generation,
                                     execution.Token);
 
+                                // Dựa vào marker do TryCreate đặt, KHÔNG dựa vào trạng thái
+                                // checkbox tại đúng micro-tick này. Nhờ vậy nếu user bật rồi tắt
+                                // rất nhanh trong lúc await, request không bị hiểu nhầm là CREATE fail.
                                 if (!filled
+                                    && request.LastError.StartsWith(
+                                        "Chế độ CHỈ PRF CHỜ: CREATE hard-gate",
+                                        StringComparison.OrdinalIgnoreCase))
+                                {
+                                    reuseOnlyCreateBlocked = true;
+                                    createAttempted = false;
+                                    lastError = request.LastError;
+
+                                    _log.Warn(
+                                        $"[AUTO_REPLACE_REUSE_ONLY_TOGGLED_DURING_CREATE] id={request.Id} closed={request.ClosedProfileName} " +
+                                        $"current={_autoCloseSettings.ReuseOnlyNoCreateProfile} action=route_by_live_setting");
+                                }
+                                else if (!filled
+                                    && request.LastError.StartsWith(
+                                        "Khung giờ cấm CREATE:",
+                                        StringComparison.OrdinalIgnoreCase))
+                                {
+                                    scheduleCreateBlocked = true;
+                                    createAttempted = false;
+                                    lastError = request.LastError;
+
+                                    _log.Warn(
+                                        $"[AUTO_CREATE_SCHEDULE_ENTERED_DURING_CREATE] id={request.Id} closed={request.ClosedProfileName} " +
+                                        $"action=WAIT_SCHEDULE_END");
+                                }
+                                else if (!filled
                                     && TryGetAutoReplacementCreateLimitBlock(
                                         request,
                                         out var postCreateLimitReason,
@@ -1450,6 +1573,25 @@ public sealed partial class ManagerForm
                         && lastError.StartsWith("Chế độ CHỈ PRF CHỜ", StringComparison.OrdinalIgnoreCase))
                     {
                         ScheduleAutoReplacementReuseOnlyRoundRetry(request.Id, lastError);
+                    }
+                    else if (reuseOnlyCreateBlocked)
+                    {
+                        // User đã TẮT lại trước lúc scheduler chạy: không được ngủ 5 phút
+                        // hay rơi vào backoff CREATE cũ. Retry gần như ngay; lần kế tiếp
+                        // hard-gate đọc live=false nên CREATE fallback được phép trở lại.
+                        ScheduleAutoReplacementOperationalRetry(
+                            request.Id,
+                            lastError,
+                            TimeSpan.FromMilliseconds(250));
+                    }
+                    else if (scheduleCreateBlocked
+                             || lastError.StartsWith(
+                                 "Khung giờ cấm CREATE:",
+                                 StringComparison.OrdinalIgnoreCase))
+                    {
+                        ScheduleAutoReplacementNoCreateScheduleRetry(
+                            request.Id,
+                            lastError);
                     }
                     else if (createLimitBlocked)
                     {
@@ -1936,12 +2078,69 @@ public sealed partial class ManagerForm
         return true;
     }
 
+    bool IsAutoReplacementCreateBlockedByReuseOnly(
+        AutoReplacementRequest request,
+        string stage,
+        string profileName = "")
+    {
+        // QUAN TRỌNG: đọc trực tiếp setting hiện tại, không dùng cờ latch/cache.
+        // Vì vậy bật => chặn ngay các CREATE chưa commit; tắt => tự mở lại ngay.
+        if (!_autoCloseSettings.ReuseOnlyNoCreateProfile)
+            return false;
+
+        request.LastError =
+            $"Chế độ CHỈ PRF CHỜ: CREATE hard-gate tại {stage}; không tạo profile mới.";
+
+        _log.Warn(
+            $"[AUTO_REPLACE_REUSE_ONLY_HARD_GATE] id={request.Id} closed={request.ClosedProfileName} " +
+            $"stage={stage} profile={profileName} action=BLOCK_NEW_CREATE");
+        return true;
+    }
+
+    bool IsAutoReplacementCreateBlockedBySchedule(
+        AutoReplacementRequest request,
+        string stage,
+        string profileName = "")
+    {
+        if (!TryGetAutoReplacementNoCreateScheduleBlock(
+                out var nextAllowedLocal,
+                out var windowText))
+        {
+            return false;
+        }
+
+        request.LastError =
+            $"Khung giờ cấm CREATE: {windowText}; chờ đến {nextAllowedLocal:dd/MM HH:mm}. stage={stage}.";
+
+        _log.Warn(
+            $"[AUTO_CREATE_SCHEDULE_HARD_GATE] id={request.Id} closed={request.ClosedProfileName} " +
+            $"stage={stage} profile={profileName} window={windowText} nextLocal={nextAllowedLocal:O} action=BLOCK_NEW_CREATE");
+
+        return true;
+    }
+
     async Task<bool> TryCreateReplacementAsync(
         AutoReplacementRequest request,
         int executionGeneration,
         CancellationToken executionToken)
     {
+        if (request.LastError.StartsWith(
+                "Chế độ CHỈ PRF CHỜ: CREATE hard-gate",
+                StringComparison.OrdinalIgnoreCase)
+            || request.LastError.StartsWith(
+                "Khung giờ cấm CREATE:",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            request.LastError = "";
+        }
+
         if (!IsAutoReplacementExecutionAllowed(executionGeneration))
+            return false;
+
+        if (IsAutoReplacementCreateBlockedByReuseOnly(request, "entry"))
+            return false;
+
+        if (IsAutoReplacementCreateBlockedBySchedule(request, "entry"))
             return false;
 
         executionToken.ThrowIfCancellationRequested();
@@ -1958,6 +2157,12 @@ public sealed partial class ManagerForm
             if (!IsAutoReplacementExecutionAllowed(executionGeneration))
                 return false;
 
+            if (IsAutoReplacementCreateBlockedByReuseOnly(request, "after_auto_profile_gate"))
+                return false;
+
+            if (IsAutoReplacementCreateBlockedBySchedule(request, "after_auto_profile_gate"))
+                return false;
+
             executionToken.ThrowIfCancellationRequested();
             // Một suất Tự bù cần đạt đúng 1 profile RUNNING khỏe. BAN/lỗi/skip
             // vẫn được thử tiếp nhưng bị chặn bởi cầu chì CREATE user cấu hình (mặc định 3/slot).
@@ -1971,11 +2176,55 @@ public sealed partial class ManagerForm
             {
                 executionToken.ThrowIfCancellationRequested();
 
+                // Hard gate LIVE ở đầu MỖI vòng account. Nếu user vừa bật
+                // "Chỉ dùng PRF chờ" thì dừng trước khi đụng account mới.
+                if (IsAutoReplacementCreateBlockedByReuseOnly(request, "before_candidate_loop"))
+                    return false;
+
+                if (IsAutoReplacementCreateBlockedBySchedule(request, "before_candidate_loop"))
+                    return false;
+
                 // NAME_SYNC_PENDING đã được vét ở tầng ngoài TRƯỚC khi vào hàm này.
                 // Không recovery xen kẽ lúc đang tạo mới để tránh vừa tạo xong lại mở
                 // chính profile đó kiểm tra tên trong cùng một suất bù.
                 var startName = DetectNextAutoProfileName();
 
+                if (TryGetAutoReplacementCreateLimitBlock(
+                        request,
+                        out var preCreateLimitReason,
+                        out _,
+                        out _,
+                        out _))
+                {
+                    _log.Warn(
+                        $"[AUTO_CREATE_LIMIT_BLOCK_BEFORE_COOLDOWN] id={request.Id} closed={request.ClosedProfileName} " +
+                        $"profile={startName} reason={preCreateLimitReason}");
+                    return false;
+                }
+
+                // Chờ cooldown TRƯỚC khi BuildAutoProfileQueue. BuildAutoProfileQueue có
+                // side effect ASSIGN account ngay, nên tuyệt đối không giữ account mới
+                // trong lúc chỉ đang chờ cooldown 4'/7'/15'.
+                var createCooldownCompleted = await WaitAutoReplacementCreateCooldownBeforeNewProfileAsync(
+                    request,
+                    startName,
+                    executionGeneration,
+                    executionToken);
+
+                if (!createCooldownCompleted)
+                    return false;
+
+                // User có thể bật CHỈ PRF CHỜ trong lúc await cooldown. Chặn lại ngay
+                // trước điểm COMMIT account. Khi user tắt lại, chốt này đọc live=false
+                // và CREATE được phép tiếp tục, không có cờ block bị latch.
+                if (IsAutoReplacementCreateBlockedByReuseOnly(request, "after_cooldown_before_account_assign", startName))
+                    return false;
+
+                if (IsAutoReplacementCreateBlockedBySchedule(request, "after_cooldown_before_account_assign", startName))
+                    return false;
+
+                var reuseOnlyBlockedAtAccountCommit = false;
+                var scheduleBlockedAtAccountCommit = false;
                 var queue = await RunAccountPoolIoAsync(
                     () =>
                     {
@@ -1986,13 +2235,56 @@ public sealed partial class ManagerForm
                             _accountPoolService.ReloadCurrentExcel();
                         _accountPoolService.EnsureAutoColumns();
 
-                        return BuildAutoProfileQueue(
-                            requestedNew: 1,
-                            requestedStartName: startName,
-                            resumeIncomplete: false,
-                            retryPaused: false);
+                        // Khung giờ được kiểm tra sát điểm ASSIGN account. Nếu giờ cấm
+                        // vừa bắt đầu trong lúc await I/O/cooldown thì không được lấy account mới.
+                        if (TryGetAutoReplacementNoCreateScheduleBlock(
+                                out _,
+                                out _))
+                        {
+                            scheduleBlockedAtAccountCommit = true;
+                            return new List<AutoProfileQueueItem>();
+                        }
+
+                        // Atomic COMMIT với thao tác bật/tắt checkbox: nếu checkbox ON
+                        // giành lock trước thì KHÔNG gọi BuildAutoProfileQueue => không
+                        // ASSIGN account. Nếu Build đã giành lock trước thì candidate đó
+                        // được xem là transaction đã bắt đầu; vòng kế tiếp vẫn bị chặn.
+                        lock (_autoReplacementCreateModeGate)
+                        {
+                            if (_autoCloseSettings.ReuseOnlyNoCreateProfile)
+                            {
+                                reuseOnlyBlockedAtAccountCommit = true;
+                                return new List<AutoProfileQueueItem>();
+                            }
+
+                            return BuildAutoProfileQueue(
+                                requestedNew: 1,
+                                requestedStartName: startName,
+                                resumeIncomplete: false,
+                                retryPaused: false);
+                        }
                     },
                     executionToken);
+
+                if (reuseOnlyBlockedAtAccountCommit)
+                {
+                    request.LastError =
+                        "Chế độ CHỈ PRF CHỜ: CREATE hard-gate tại account_assign_commit; không tạo profile mới.";
+
+                    _log.Warn(
+                        $"[AUTO_REPLACE_REUSE_ONLY_HARD_GATE] id={request.Id} closed={request.ClosedProfileName} " +
+                        $"stage=account_assign_commit profile={startName} action=BLOCK_NEW_CREATE");
+                    return false;
+                }
+
+                if (scheduleBlockedAtAccountCommit)
+                {
+                    IsAutoReplacementCreateBlockedBySchedule(
+                        request,
+                        "account_assign_commit",
+                        startName);
+                    return false;
+                }
 
                 // BuildAutoProfileQueue hiện nạp toàn bộ candidate phù hợp. Chọn account
                 // đầu tiên chưa được thử trong suất Tự bù hiện tại. Điều này đặc biệt
@@ -2029,31 +2321,6 @@ public sealed partial class ManagerForm
                 }
 
                 executionToken.ThrowIfCancellationRequested();
-
-                if (TryGetAutoReplacementCreateLimitBlock(
-                        request,
-                        out var preCreateLimitReason,
-                        out _,
-                        out _,
-                        out _))
-                {
-                    _log.Warn(
-                        $"[AUTO_CREATE_LIMIT_BLOCK_BEFORE_COOLDOWN] id={request.Id} closed={request.ClosedProfileName} " +
-                        $"profile={item.ProfileName} reason={preCreateLimitReason}");
-                    return false;
-                }
-
-                // Chỉ CREATE profile mới mới phải chờ cooldown. Các lane mở PRF đã có
-                // (TryUseReusableProfileQueueAsync / TryOpenNextExistingReplacementAsync)
-                // không đi qua đây nên không bị chậm bởi 4'/7'/15' của Auto Profile.
-                var createCooldownCompleted = await WaitAutoReplacementCreateCooldownBeforeNewProfileAsync(
-                    request,
-                    item.ProfileName,
-                    executionGeneration,
-                    executionToken);
-
-                if (!createCooldownCompleted)
-                    return false;
 
                 // Re-check + reserve quota ngay sát CREATE thật. Đây là chốt chống
                 // một lần gọi TryCreateReplacementAsync tự loop hàng chục account.
@@ -3023,6 +3290,157 @@ public sealed partial class ManagerForm
         }
     }
 
+    void ScheduleAutoReplacementNoCreateScheduleRetry(
+        string requestId,
+        string lastError)
+    {
+        // Đọc lại LIVE setting ngay lúc schedule retry. Nếu user vừa tắt/đổi
+        // khung giờ khiến hiện tại không còn bị chặn, retry gần như ngay và
+        // tuyệt đối không giữ một cờ block cũ.
+        if (!TryGetAutoReplacementNoCreateScheduleBlock(
+                out var nextAllowedLocal,
+                out var windowText))
+        {
+            ScheduleAutoReplacementOperationalRetry(
+                requestId,
+                lastError,
+                TimeSpan.FromMilliseconds(250));
+            return;
+        }
+
+        var nextUtc = nextAllowedLocal.ToUniversalTime();
+        var nowUtc = DateTime.UtcNow;
+        if (nextUtc <= nowUtc)
+            nextUtc = nowUtc.AddMilliseconds(250);
+
+        var clearedAttempted = 0;
+        lock (_autoReplacementQueueLock)
+        {
+            var request = _autoReplacementQueue.FirstOrDefault(x =>
+                x.Id.Equals(requestId, StringComparison.OrdinalIgnoreCase));
+
+            if (request is null)
+                return;
+
+            request.LastError = string.IsNullOrWhiteSpace(lastError)
+                ? $"Khung giờ cấm CREATE: {windowText}; chờ đến {nextAllowedLocal:dd/MM HH:mm}."
+                : lastError.Trim();
+
+            // Không tính giờ cấm là CREATE fail và không tăng AttemptCount/quota.
+            // Sau nhiều giờ chờ, cho quét lại toàn bộ PRF chờ trước khi cân nhắc CREATE.
+            request.AttemptedProfiles ??= new List<string>();
+            clearedAttempted = request.AttemptedProfiles.Count;
+            request.AttemptedProfiles.Clear();
+            request.NextAttemptUtc = nextUtc;
+            SaveAutoReplacementQueueUnsafe();
+        }
+
+        _log.Warn(
+            $"[AUTO_CREATE_SCHEDULE_WAIT] id={requestId} window={windowText} nextLocal={nextAllowedLocal:O} " +
+            $"clearedAttempted={clearedAttempted} countedAsCreateFail=false");
+    }
+
+    void NotifyAutoReplacementNoCreateScheduleSettingsChanged(string source)
+    {
+        if (!_autoReplacementFeatureInitialized)
+            return;
+
+        var isBlocked = TryGetAutoReplacementNoCreateScheduleBlock(
+            out var nextAllowedLocal,
+            out var windowText);
+
+        var nowUtc = DateTime.UtcNow;
+        var targetUtc = isBlocked
+            ? nextAllowedLocal.ToUniversalTime()
+            : nowUtc;
+
+        if (targetUtc < nowUtc)
+            targetUtc = nowUtc;
+
+        var touched = 0;
+        var woke = 0;
+
+        lock (_autoReplacementQueueLock)
+        {
+            foreach (var request in _autoReplacementQueue)
+            {
+                if (!request.LastError.StartsWith(
+                        "Khung giờ cấm CREATE:",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                touched++;
+                request.NextAttemptUtc = targetUtc;
+                if (!isBlocked)
+                    woke++;
+            }
+
+            if (touched > 0)
+                SaveAutoReplacementQueueUnsafe();
+        }
+
+        _log.Info(
+            $"[AUTO_CREATE_SCHEDULE_SETTINGS_APPLIED] source={source} blockedNow={isBlocked} " +
+            $"window={windowText} touched={touched} woke={woke} nextLocal={(isBlocked ? nextAllowedLocal.ToString("O") : "-")}");
+
+        if (woke > 0)
+            _ = RunAutoReplacementQueueAsync();
+    }
+
+    void NotifyAutoReplacementReuseOnlySettingChanged(
+        bool previousValue,
+        bool currentValue,
+        string source)
+    {
+        if (previousValue == currentValue)
+            return;
+
+        _log.Info(
+            $"[AUTO_REPLACE_REUSE_ONLY_SETTING_CHANGED] source={source} previous={previousValue} current={currentValue}");
+
+        // BẬT: không cancel/đóng cưỡng bức candidate đã qua điểm COMMIT account;
+        // mọi candidate CHƯA commit sẽ bị các hard-gate live chặn. Vòng account kế
+        // tiếp cũng bị chặn, nên không thể tiếp tục tạo hàng loạt.
+        if (currentValue)
+            return;
+
+        // TẮT: đánh thức NGAY các request đang ngủ 5 phút chỉ vì chế độ CHỈ PRF CHỜ.
+        // Đây là phần chống lỗi "đã tắt nhưng vẫn bị chặn tạo". Không đụng các timer
+        // cleanup/create-cooldown thật; những timer đó vẫn phải được tôn trọng.
+        var now = DateTime.UtcNow;
+        var woke = 0;
+
+        lock (_autoReplacementQueueLock)
+        {
+            foreach (var request in _autoReplacementQueue)
+            {
+                if (request.NextAttemptUtc <= now)
+                    continue;
+
+                if (!request.LastError.StartsWith(
+                        "Chế độ CHỈ PRF CHỜ",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                request.NextAttemptUtc = now;
+                woke++;
+            }
+
+            if (woke > 0)
+                SaveAutoReplacementQueueUnsafe();
+        }
+
+        _log.Info(
+            $"[AUTO_REPLACE_REUSE_ONLY_DISABLED_WAKE] source={source} woke={woke} action=ALLOW_CREATE_FALLBACK");
+
+        if (woke > 0)
+            _ = RunAutoReplacementQueueAsync();
+    }
+
     void ScheduleAutoReplacementReuseOnlyRoundRetry(string requestId, string lastError)
     {
         lock (_autoReplacementQueueLock)
@@ -3233,10 +3651,17 @@ public sealed partial class ManagerForm
                 if (request.NextAttemptUtc <= now)
                     continue;
 
-                // Chỉ đánh thức request đang chờ nhánh tạo mới. Retry cleanup/slot-gate
-                // ngắn giữ nguyên để không mở PRF trước khi hàng rào an toàn hoàn tất.
-                if (!request.CreateNotBeforeUtc.HasValue
-                    || request.CreateNotBeforeUtc.Value <= now)
+                // Chỉ đánh thức request đang chờ nhánh tạo mới HOẶC đang chờ hết
+                // khung giờ cấm CREATE. PRF chờ vẫn được phép mở trong giờ cấm nên
+                // schedule-wait phải được wake khi có supply mới.
+                var waitingForSchedule =
+                    request.LastError.StartsWith(
+                        "Khung giờ cấm CREATE:",
+                        StringComparison.OrdinalIgnoreCase);
+
+                if (!waitingForSchedule
+                    && (!request.CreateNotBeforeUtc.HasValue
+                        || request.CreateNotBeforeUtc.Value <= now))
                 {
                     continue;
                 }
