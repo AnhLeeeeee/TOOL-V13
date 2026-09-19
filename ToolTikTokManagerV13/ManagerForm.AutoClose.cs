@@ -197,10 +197,9 @@ public sealed partial class ManagerForm
         }
 
         _autoCloseToolbarButton = Button(
-            "Tự đóng",
+            "⚙ Cài đặt",
             (_, _) => ShowAutoCloseDialog(),
             UiButtonKind.Neutral);
-        _autoCloseToolbarButton.Paint += PaintAutoCloseToolbarButtonText;
 
         toolbar.Controls.Add(_autoCloseToolbarButton);
 
@@ -425,72 +424,79 @@ public sealed partial class ManagerForm
         if (_autoCloseToolbarButton is null || _autoCloseToolbarButton.IsDisposed)
             return;
 
-        if (IsAutomationHalted)
-        {
-            _autoCloseToolbarDisplayText = "⛔ ĐÃ DỪNG KHẨN CẤP — MỌI TỰ ĐỘNG HÓA ĐÃ DỪNG";
-            _autoCloseToolbarButton.Text = "";
-            _autoCloseToolbarButton.AutoSize = false;
-            _autoCloseToolbarButton.Width = Math.Max(
-                390,
-                MeasureAutoCloseToolbarTextWidth(_autoCloseToolbarButton, _autoCloseToolbarDisplayText) + 30);
-            _autoCloseToolbarButton.BackColor = Color.FromArgb(255, 237, 237);
-            _autoCloseToolbarButton.ForeColor = Color.FromArgb(175, 34, 34);
-            _autoCloseToolbarButton.Invalidate();
-            return;
-        }
-
+        // V14.2 UI: nút Tự động cũ trở thành điểm vào cấu hình chung.
+        // Trạng thái engine vẫn được ghi log/hiển thị trong các màn hình liên quan;
+        // toolbar chỉ giữ một nhãn ổn định, dễ hiểu.
+        _autoCloseToolbarDisplayText = "⚙ Cài đặt";
+        _autoCloseToolbarButton.Text = "⚙ Cài đặt";
+        _autoCloseToolbarButton.AutoSize = false;
+        _autoCloseToolbarButton.Width = 124;
         _autoCloseToolbarButton.BackColor = UiTheme.Card;
         _autoCloseToolbarButton.ForeColor = Color.FromArgb(42, 57, 76);
-
-        var parts = new List<string>();
-        if (_autoCloseSettings.CloseOnBan) parts.Add("BAN");
-        if (_autoCloseSettings.CloseOnRunTime) parts.Add($"{_autoCloseSettings.RunHours}h");
-        if (_autoCloseSettings.CloseOnNotRunning10Minutes) parts.Add("Lỗi10p");
-
-        if (parts.Count > 0 && _autoCloseSettings.OpenReplacementAfterAutoClose)
-            parts.Add(GetAutoReplacementUiStatusText());
-
-        _autoCloseToolbarDisplayText = parts.Count == 0
-            ? "Tự động: Tắt"
-            : $"Tự động: {string.Join(" + ", parts)}";
-
-        // Button WinForms không hỗ trợ rich text. Để riêng chữ “Tự động:” đậm,
-        // phần còn lại giữ font thường và tự canh giữa trong cùng một nút.
-        _autoCloseToolbarButton.Text = "";
-        _autoCloseToolbarButton.AutoSize = false;
-        _autoCloseToolbarButton.Width = Math.Max(250, MeasureAutoCloseToolbarTextWidth(_autoCloseToolbarButton, _autoCloseToolbarDisplayText) + 30);
         _autoCloseToolbarButton.Invalidate();
     }
 
     void ShowAutoCloseDialog()
     {
+        // Cửa sổ này là trung tâm cấu hình chung cho Auto Run + AutoClose/Tự bù.
+        // InitializeRunStrategyFeature an toàn khi gọi lặp và bảo đảm settings Dàn PRF
+        // đã được load trước khi dựng UI.
+        InitializeRunStrategyFeature();
+
+        var currentRun = NormalizeRunStrategySettings(new RunAllStrategySettings
+        {
+            Version = _runStrategySettings.Version,
+            Mode = _runStrategySettings.Mode,
+            PrimeModeArmed = _runStrategySettings.PrimeModeArmed,
+            PrimeModeSuspended = _runStrategySettings.PrimeModeSuspended,
+            AutoEnsureTarget = _runStrategySettings.AutoEnsureTarget,
+            TargetSlots = _runStrategySettings.TargetSlots,
+            PrimeStartHour = _runStrategySettings.PrimeStartHour,
+            PrimeEndHour = _runStrategySettings.PrimeEndHour,
+            FreshTarget = _runStrategySettings.FreshTarget,
+            FreshHours = _runStrategySettings.FreshHours,
+            OldHours = _runStrategySettings.OldHours,
+            RotationIntervalMinutes = _runStrategySettings.RotationIntervalMinutes,
+            PrepareMinutes = _runStrategySettings.PrepareMinutes,
+            PreserveFreshOffPeak = _runStrategySettings.PreserveFreshOffPeak,
+            RefreshAllBeforePrime = _runStrategySettings.RefreshAllBeforePrime,
+            PrePrimeRefreshSource = _runStrategySettings.PrePrimeRefreshSource,
+            CreateLimitEnabled = _runStrategySettings.CreateLimitEnabled,
+            CreateLimitPerSlot = _runStrategySettings.CreateLimitPerSlot,
+            CreateLimitPerHour = _runStrategySettings.CreateLimitPerHour,
+            CreateLimitPerSession = _runStrategySettings.CreateLimitPerSession,
+            CreateLimitReuseRetryMinutes = _runStrategySettings.CreateLimitReuseRetryMinutes,
+            NoCreateScheduleEnabled = _runStrategySettings.NoCreateScheduleEnabled,
+            NoCreateStartMinute = _runStrategySettings.NoCreateStartMinute,
+            NoCreateEndMinute = _runStrategySettings.NoCreateEndMinute
+        });
+
+        var currentVmMode = LoadManagerVmOptimizationModeForUi();
+
         using var form = new Form
         {
-            Text = $"Tự đóng Chrome + profile — {AppVersionInfo.Display}",
+            Text = $"Cài đặt tự động — {AppVersionInfo.Display}",
             StartPosition = FormStartPosition.CenterParent,
-            FormBorderStyle = FormBorderStyle.FixedDialog,
+            FormBorderStyle = FormBorderStyle.Sizable,
             MaximizeBox = false,
             MinimizeBox = false,
             ShowInTaskbar = false,
-            ClientSize = new Size(720, 410),
-            MinimumSize = new Size(600, 360),
+            ClientSize = new Size(820, 700),
+            MinimumSize = new Size(720, 600),
             BackColor = UiTheme.Canvas,
             Font = new Font("Segoe UI", 9F),
             AutoScaleMode = AutoScaleMode.Dpi
         };
 
-        // Header cố định: không bị cuộn mất.
         var header = new Panel
         {
             Dock = DockStyle.Top,
-            Height = 56,
-            Padding = new Padding(20, 14, 20, 8),
+            Height = 58,
             BackColor = UiTheme.Canvas
         };
-
         var title = new Label
         {
-            Text = "TỰ ĐÓNG CHROME + PROFILE",
+            Text = "CÀI ĐẶT TỰ ĐỘNG",
             AutoSize = true,
             Font = new Font("Segoe UI", 13F, FontStyle.Bold),
             ForeColor = Color.FromArgb(37, 77, 122),
@@ -498,90 +504,243 @@ public sealed partial class ManagerForm
         };
         header.Controls.Add(title);
 
-        // Footer cố định: Lưu/Hủy luôn nhìn thấy dù nội dung phải cuộn.
         var footer = new Panel
         {
             Dock = DockStyle.Bottom,
             Height = 58,
-            Padding = new Padding(12, 10, 12, 10),
             BackColor = UiTheme.Canvas
         };
-
         var save = new Button
         {
             Text = "Lưu",
             Width = 110,
-            Height = 34,
-            Anchor = AnchorStyles.Top | AnchorStyles.Right
+            Height = 34
         };
-
         var cancel = new Button
         {
             Text = "Hủy",
             Width = 110,
             Height = 34,
-            DialogResult = DialogResult.Cancel,
-            Anchor = AnchorStyles.Top | AnchorStyles.Right
+            DialogResult = DialogResult.Cancel
         };
-
         void LayoutFooterButtons()
         {
-            var right = Math.Max(250, footer.ClientSize.Width - 12);
-            cancel.Left = right - cancel.Width;
-            save.Left = cancel.Left - 10 - save.Width;
+            cancel.Left = Math.Max(12, footer.ClientSize.Width - cancel.Width - 12);
+            save.Left = Math.Max(12, cancel.Left - save.Width - 10);
             save.Top = cancel.Top = 10;
         }
-
         footer.Controls.Add(save);
         footer.Controls.Add(cancel);
         footer.Resize += (_, _) => LayoutFooterButtons();
-        LayoutFooterButtons();
 
-        // Toàn bộ cấu hình nằm trong viewport cuộn dọc.
-        // Đây là phần sửa chính: DPI cao/màn hình thấp sẽ có scrollbar thay vì cắt chữ.
-        var contentViewport = new Panel
+        // Chỉ cuộn dọc. Content luôn được ép vừa đúng chiều rộng viewport,
+        // không dùng min-width lớn hơn viewport để tránh scrollbar ngang ở DPI cao.
+        var viewport = new Panel
         {
             Dock = DockStyle.Fill,
             AutoScroll = true,
-            Padding = new Padding(18, 8, 18, 12),
             BackColor = UiTheme.Canvas
         };
-
         var content = new Panel
         {
-            AutoSize = false,
-            Location = new Point(18, 8),
-            Size = new Size(666, 300),
+            Location = new Point(16, 8),
+            Size = new Size(760, 850),
             BackColor = UiTheme.Canvas
         };
 
-        var closeOnBan = new CheckBox
+        // ------------------------------------------------------------
+        // 1) SỐ LƯỢNG & NGUỒN PRF
+        // ------------------------------------------------------------
+        var sourceGroup = new GroupBox
         {
-            Text = "Tự đóng khi tài khoản bị BAN",
-            Checked = _autoCloseSettings.CloseOnBan,
+            Text = "SỐ LƯỢNG & NGUỒN PRF",
+            Location = new Point(0, 0),
+            Size = new Size(760, 152),
+            Padding = new Padding(12),
+            ForeColor = Color.FromArgb(45, 67, 94)
+        };
+        var autoEnsureTarget = new CheckBox
+        {
+            Text = "Duy trì số lượng PRF",
+            Checked = currentRun.AutoEnsureTarget,
+            AutoSize = true,
+            Font = new Font("Segoe UI", 9.2F, FontStyle.Bold),
+            Location = new Point(18, 30)
+        };
+        var targetLabel = new Label
+        {
+            Text = "Số PRF muốn duy trì:",
+            AutoSize = true,
+            Location = new Point(42, 70)
+        };
+        var targetSlots = new NumericUpDown
+        {
+            Minimum = 1,
+            Maximum = 50,
+            Value = Math.Clamp(currentRun.TargetSlots, 1, 50),
+            Width = 82,
+            Location = new Point(190, 66)
+        };
+        var targetHint = new Label
+        {
+            AutoSize = false,
+            ForeColor = Color.DimGray,
+            Location = new Point(290, 68),
+            Size = new Size(430, 30)
+        };
+        var reuseOnly = new CheckBox
+        {
+            Text = "Chỉ dùng PRF chờ — không tạo PRF mới",
+            Checked = _autoCloseSettings.ReuseOnlyNoCreateProfile,
+            AutoSize = true,
+            Location = new Point(18, 110),
+            ForeColor = Color.FromArgb(37, 77, 122)
+        };
+        void UpdateTargetUi()
+        {
+            var enabled = autoEnsureTarget.Checked;
+            targetLabel.Enabled = enabled;
+            targetSlots.Enabled = enabled;
+            targetHint.Text = enabled
+                ? "Bật: Tool duy trì đúng số lượng này."
+                : "Tắt: chạy theo số PRF đang mở lúc bấm Bắt đầu.";
+        }
+        UpdateTargetUi();
+        sourceGroup.Controls.Add(autoEnsureTarget);
+        sourceGroup.Controls.Add(targetLabel);
+        sourceGroup.Controls.Add(targetSlots);
+        sourceGroup.Controls.Add(targetHint);
+        sourceGroup.Controls.Add(reuseOnly);
+
+        // ------------------------------------------------------------
+        // 2) TỐI ƯU — tái sử dụng nguyên engine VM Safe / VM Max của Worker
+        // ------------------------------------------------------------
+        var optimizationGroup = new GroupBox
+        {
+            Text = "TỐI ƯU",
+            Location = new Point(0, 164),
+            Size = new Size(760, 150),
+            Padding = new Padding(12),
+            ForeColor = Color.FromArgb(45, 67, 94)
+        };
+        var optimizationLabel = new Label
+        {
+            Text = "Chế độ tối ưu:",
             AutoSize = true,
             Location = new Point(18, 34)
         };
-
-        var closeOnTime = new CheckBox
+        var optimizationMode = new ComboBox
         {
-            Text = "Tự đóng khi Tổng thời gian Automation chạy đủ",
-            Checked = _autoCloseSettings.CloseOnRunTime,
-            AutoSize = true,
-            Location = new Point(18, 74)
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Width = 145,
+            Location = new Point(125, 29)
         };
+        optimizationMode.Items.AddRange(["Bình thường", "VM Safe", "VM Max"]);
+        optimizationMode.SelectedIndex = NormalizeManagerVmOptimizationMode(currentVmMode) switch
+        {
+            "Normal" => 0,
+            "VmSafe" => 1,
+            _ => 2
+        };
+        string SelectedVmMode() => optimizationMode.SelectedIndex switch
+        {
+            0 => "Normal",
+            1 => "VmSafe",
+            _ => "VmMax"
+        };
+        var applyOptimization = new Button
+        {
+            Text = "Áp dụng ngay cho tất cả PRF",
+            Width = 220,
+            Height = 32,
+            Location = new Point(288, 27)
+        };
+        var optimizationStatus = new Label
+        {
+            AutoSize = false,
+            Location = new Point(18, 72),
+            Size = new Size(710, 24),
+            ForeColor = Color.DarkGreen
+        };
+        var optimizationHint = new Label
+        {
+            Text = "Dùng nguyên cơ chế tối ưu sẵn có của Worker. PRF đang mở áp dụng ngay; PRF chưa mở được lưu cấu hình và tự dùng ở lần mở sau.",
+            AutoSize = false,
+            ForeColor = Color.DimGray,
+            Location = new Point(18, 101),
+            Size = new Size(710, 38)
+        };
+        applyOptimization.Click += async (_, _) =>
+        {
+            if (!applyOptimization.Enabled) return;
+            applyOptimization.Enabled = false;
+            optimizationStatus.ForeColor = Color.DarkOrange;
+            optimizationStatus.Text = "Đang áp dụng cho toàn bộ PRF...";
+            try
+            {
+                var result = await ApplyManagerVmOptimizationToAllProfilesAsync(
+                    SelectedVmMode(),
+                    "automation_settings_apply_now");
+                optimizationStatus.ForeColor = result.LiveWorkersDeferred > 0
+                    ? Color.DarkOrange
+                    : Color.DarkGreen;
+                optimizationStatus.Text =
+                    $"✓ {ManagerVmOptimizationDisplayName(result.Mode)} · cấu hình {result.ConfiguredProfiles}/{result.TotalProfiles} PRF · đang mở {result.LiveWorkersApplied} áp dụng ngay"
+                    + (result.LiveWorkersDeferred > 0 ? $" · {result.LiveWorkersDeferred} chờ lần mở sau" : "");
+            }
+            catch (Exception ex)
+            {
+                optimizationStatus.ForeColor = Color.Firebrick;
+                optimizationStatus.Text = "Không áp dụng được: " + ex.Message;
+            }
+            finally
+            {
+                applyOptimization.Enabled = true;
+            }
+        };
+        optimizationGroup.Controls.Add(optimizationLabel);
+        optimizationGroup.Controls.Add(optimizationMode);
+        optimizationGroup.Controls.Add(applyOptimization);
+        optimizationGroup.Controls.Add(optimizationStatus);
+        optimizationGroup.Controls.Add(optimizationHint);
 
+        // ------------------------------------------------------------
+        // 3) TỰ ĐỘNG ĐÓNG & BÙ
+        // ------------------------------------------------------------
+        var autoGroup = new GroupBox
+        {
+            Text = "TỰ ĐỘNG ĐÓNG & BÙ",
+            Location = new Point(0, 326),
+            Size = new Size(760, 242),
+            Padding = new Padding(12),
+            ForeColor = Color.FromArgb(45, 67, 94)
+        };
+        CheckBox AutoCheck(string textValue, bool isChecked, int y, int height = 26)
+            => new()
+            {
+                Text = textValue,
+                Checked = isChecked,
+                AutoSize = false,
+                Location = new Point(18, y),
+                Size = new Size(700, height)
+            };
+        var closeOnBan = AutoCheck(
+            "Tự động khi tài khoản bị BAN",
+            _autoCloseSettings.CloseOnBan,
+            28);
+        var closeOnTime = AutoCheck(
+            "Tự động khi Tổng thời gian Automation chạy đủ",
+            _autoCloseSettings.CloseOnRunTime,
+            64);
         var hours = new ComboBox
         {
             DropDownStyle = ComboBoxStyle.DropDownList,
             Width = 105,
-            Location = new Point(420, 70)
+            Location = new Point(620, 62)
         };
-
         var runHourOptions = new[] { 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 20, 24 };
         foreach (var value in runHourOptions)
             hours.Items.Add($"{value} giờ");
-
         var selectedRunHours = Math.Clamp(_autoCloseSettings.RunHours, 3, 24);
         var selectedHourIndex = Array.IndexOf(runHourOptions, selectedRunHours);
         if (selectedHourIndex < 0)
@@ -590,150 +749,343 @@ public sealed partial class ManagerForm
             if (selectedHourIndex < 0)
                 selectedHourIndex = runHourOptions.Length - 1;
         }
-
         hours.SelectedIndex = selectedHourIndex;
         hours.Enabled = closeOnTime.Checked;
         closeOnTime.CheckedChanged += (_, _) => hours.Enabled = closeOnTime.Checked;
 
-        var closeOnStuck = new CheckBox
-        {
-            Text = "Tự đóng nếu 10 phút lỗi / không RUNNING / không có tiến triển",
-            Checked = _autoCloseSettings.CloseOnNotRunning10Minutes,
-            AutoSize = true,
-            Location = new Point(18, 114)
-        };
+        var closeOnStuck = AutoCheck(
+            "Tự động nếu 10 phút lỗi / không RUNNING / không có tiến triển",
+            _autoCloseSettings.CloseOnNotRunning10Minutes,
+            100);
+        var openReplacement = AutoCheck(
+            "Tự bù sau khi đóng: ưu tiên PRF có sẵn; hết nguồn mới tạo nếu được phép",
+            _autoCloseSettings.OpenReplacementAfterAutoClose,
+            136,
+            36);
+        var deleteRetiredProfile = AutoCheck(
+            "Tự xóa profile hết vòng đời TIME_xH (BAN luôn xóa sau khi đã ghi note=ban)",
+            _autoCloseSettings.DeleteProfileAfterBanOrLifetime,
+            182,
+            36);
+        autoGroup.Controls.Add(closeOnBan);
+        autoGroup.Controls.Add(closeOnTime);
+        autoGroup.Controls.Add(hours);
+        autoGroup.Controls.Add(closeOnStuck);
+        autoGroup.Controls.Add(openReplacement);
+        autoGroup.Controls.Add(deleteRetiredProfile);
 
-        var openReplacement = new CheckBox
+        // ------------------------------------------------------------
+        // 4) GIỚI HẠN TẠO PRF — 2 hàng x 2 cột để không bị cắt ở DPI cao
+        // ------------------------------------------------------------
+        var createLimitGroup = new GroupBox
         {
-            Text = "Tự bù sau khi đóng: ưu tiên PRF có sẵn; không có thì tạo PRF mới",
-            Checked = _autoCloseSettings.OpenReplacementAfterAutoClose,
-            AutoSize = true,
-            Location = new Point(18, 154)
-        };
-
-        var reuseOnly = new CheckBox
-        {
-            Text = "Chỉ dùng PRF chờ — không tạo PRF mới",
-            Checked = _autoCloseSettings.ReuseOnlyNoCreateProfile,
-            AutoSize = true,
-            Location = new Point(42, 194),
-            ForeColor = Color.FromArgb(37, 77, 122)
-        };
-        reuseOnly.Enabled = openReplacement.Checked;
-        openReplacement.CheckedChanged += (_, _) => reuseOnly.Enabled = openReplacement.Checked;
-
-        var deleteRetiredProfile = new CheckBox
-        {
-            Text = "Tự xóa profile hết vòng đời TIME_xH (BAN luôn xóa sau khi đã ghi note=ban)",
-            Checked = _autoCloseSettings.DeleteProfileAfterBanOrLifetime,
-            AutoSize = true,
-            Location = new Point(18, 234)
-        };
-
-        var configGroup = new GroupBox
-        {
-            Text = "Cấu hình Tự đóng & Tự bù",
-            Location = new Point(0, 0),
-            Size = new Size(666, 285),
+            Text = "GIỚI HẠN TẠO PRF",
+            Location = new Point(0, 580),
+            Size = new Size(760, 176),
             Padding = new Padding(12),
-            ForeColor = Color.FromArgb(45, 67, 94),
-            Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
+            ForeColor = Color.FromArgb(45, 67, 94)
         };
+        var createLimitEnabled = new CheckBox
+        {
+            Text = "Bật giới hạn tạo PRF mới",
+            Checked = currentRun.CreateLimitEnabled,
+            AutoSize = true,
+            Font = new Font("Segoe UI", 9.1F, FontStyle.Bold),
+            Location = new Point(18, 28)
+        };
+        NumericUpDown LimitNum(int value, int min, int max)
+            => new()
+            {
+                Minimum = min,
+                Maximum = max,
+                Value = Math.Clamp(value, min, max),
+                Width = 70
+            };
+        Label LimitLabel(string textValue)
+            => new()
+            {
+                Text = textValue,
+                AutoSize = true
+            };
+        var slotLabel = LimitLabel("Mỗi slot");
+        var perSlot = LimitNum(currentRun.CreateLimitPerSlot, 1, 50);
+        var hourLabel = LimitLabel("Trong 1 giờ");
+        var perHour = LimitNum(currentRun.CreateLimitPerHour, 1, 200);
+        var sessionLabel = LimitLabel("Trong 1 phiên");
+        var perSession = LimitNum(currentRun.CreateLimitPerSession, 1, 500);
+        var retryLabel = LimitLabel("Retry PRF chờ (phút)");
+        var retryMinutes = LimitNum(currentRun.CreateLimitReuseRetryMinutes, 1, 120);
+        void UpdateCreateLimitUi()
+        {
+            var enabled = createLimitEnabled.Checked;
+            perSlot.Enabled = perHour.Enabled = perSession.Enabled = retryMinutes.Enabled = enabled;
+            slotLabel.Enabled = hourLabel.Enabled = sessionLabel.Enabled = retryLabel.Enabled = enabled;
+        }
+        createLimitEnabled.CheckedChanged += (_, _) => UpdateCreateLimitUi();
+        UpdateCreateLimitUi();
+        createLimitGroup.Controls.Add(createLimitEnabled);
+        createLimitGroup.Controls.Add(slotLabel);
+        createLimitGroup.Controls.Add(perSlot);
+        createLimitGroup.Controls.Add(hourLabel);
+        createLimitGroup.Controls.Add(perHour);
+        createLimitGroup.Controls.Add(sessionLabel);
+        createLimitGroup.Controls.Add(perSession);
+        createLimitGroup.Controls.Add(retryLabel);
+        createLimitGroup.Controls.Add(retryMinutes);
 
-        configGroup.Controls.Add(closeOnBan);
-        configGroup.Controls.Add(closeOnTime);
-        configGroup.Controls.Add(hours);
-        configGroup.Controls.Add(closeOnStuck);
-        configGroup.Controls.Add(openReplacement);
-        configGroup.Controls.Add(reuseOnly);
-        configGroup.Controls.Add(deleteRetiredProfile);
+        // ------------------------------------------------------------
+        // 5) KHUNG GIỜ KHÔNG TẠO PRF MỚI
+        // ------------------------------------------------------------
+        var noCreateGroup = new GroupBox
+        {
+            Text = "KHUNG GIỜ KHÔNG TẠO PRF MỚI",
+            Location = new Point(0, 768),
+            Size = new Size(760, 144),
+            Padding = new Padding(12),
+            ForeColor = Color.FromArgb(45, 67, 94)
+        };
+        var noCreateEnabled = new CheckBox
+        {
+            Text = "Không tạo PRF mới trong khung giờ",
+            Checked = currentRun.NoCreateScheduleEnabled,
+            AutoSize = true,
+            Font = new Font("Segoe UI", 9.1F, FontStyle.Bold),
+            Location = new Point(18, 28)
+        };
+        DateTime MinuteOfDayToPickerValue(int minute)
+        {
+            minute = Math.Clamp(minute, 0, (24 * 60) - 1);
+            return DateTime.Today.AddMinutes(minute);
+        }
+        DateTimePicker TimePicker(int minute) => new()
+        {
+            Format = DateTimePickerFormat.Custom,
+            CustomFormat = "HH:mm",
+            ShowUpDown = true,
+            Width = 86,
+            Value = MinuteOfDayToPickerValue(minute)
+        };
+        var fromLabel = new Label { Text = "Từ", AutoSize = true, Location = new Point(42, 69) };
+        var noCreateStart = TimePicker(currentRun.NoCreateStartMinute);
+        noCreateStart.Location = new Point(80, 64);
+        var toLabel = new Label { Text = "đến", AutoSize = true, Location = new Point(188, 69) };
+        var noCreateEnd = TimePicker(currentRun.NoCreateEndMinute);
+        noCreateEnd.Location = new Point(232, 64);
+        var scheduleHint = new Label
+        {
+            Text = "Trong giờ cấm vẫn dùng PRF chờ; chỉ CREATE tự động bị chặn. Hỗ trợ khung qua đêm.",
+            AutoSize = false,
+            ForeColor = Color.DimGray,
+            Location = new Point(42, 104),
+            Size = new Size(680, 28)
+        };
+        void UpdateNoCreateUi()
+        {
+            var enabled = noCreateEnabled.Checked;
+            noCreateStart.Enabled = noCreateEnd.Enabled = enabled;
+            fromLabel.Enabled = toLabel.Enabled = enabled;
+        }
+        noCreateEnabled.CheckedChanged += (_, _) => UpdateNoCreateUi();
+        UpdateNoCreateUi();
+        noCreateGroup.Controls.Add(noCreateEnabled);
+        noCreateGroup.Controls.Add(fromLabel);
+        noCreateGroup.Controls.Add(noCreateStart);
+        noCreateGroup.Controls.Add(toLabel);
+        noCreateGroup.Controls.Add(noCreateEnd);
+        noCreateGroup.Controls.Add(scheduleHint);
 
+        // ------------------------------------------------------------
+        // 6) NHẬT KÝ
+        // ------------------------------------------------------------
         var logGroup = new GroupBox
         {
-            Text = "Nhật ký tự động",
-            Location = new Point(0, 297),
-            Size = new Size(666, 68),
+            Text = "NHẬT KÝ TỰ ĐỘNG",
+            Location = new Point(0, 924),
+            Size = new Size(760, 80),
             Padding = new Padding(12),
-            ForeColor = Color.FromArgb(45, 67, 94),
-            Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
+            ForeColor = Color.FromArgb(45, 67, 94)
         };
-
         var logHint = new Label
         {
-            AutoSize = true,
+            AutoSize = false,
             Text = "Ghi riêng giờ đóng/mở profile, lý do, tài khoản bù và kết quả.",
             ForeColor = Color.FromArgb(70, 82, 96),
-            Location = new Point(16, 29)
+            Location = new Point(16, 33),
+            Size = new Size(560, 26)
         };
-
         var openLog = new Button
         {
             Text = "Xem nhật ký",
             Width = 125,
             Height = 30,
-            Anchor = AnchorStyles.Top | AnchorStyles.Right
+            Location = new Point(610, 25)
         };
-
-        void LayoutLogButton()
-        {
-            openLog.Left = Math.Max(420, logGroup.ClientSize.Width - openLog.Width - 16);
-            openLog.Top = 23;
-        }
-
+        openLog.Click += (_, _) => ShowAutoActivityLogDialog(form);
         logGroup.Controls.Add(logHint);
         logGroup.Controls.Add(openLog);
-        logGroup.Resize += (_, _) => LayoutLogButton();
-        LayoutLogButton();
 
-        openLog.Click += (_, _) => ShowAutoActivityLogDialog(form);
-
-        content.Controls.Add(configGroup);
+        content.Controls.Add(sourceGroup);
+        content.Controls.Add(optimizationGroup);
+        content.Controls.Add(autoGroup);
+        content.Controls.Add(createLimitGroup);
+        content.Controls.Add(noCreateGroup);
         content.Controls.Add(logGroup);
-        contentViewport.Controls.Add(content);
+        viewport.Controls.Add(content);
 
         void LayoutScrollableContent()
         {
-            // Trừ chiều rộng scrollbar + padding. Không dùng chiều cao viewport để
-            // ép content nhỏ lại; content luôn giữ đủ chiều cao để AutoScroll hoạt động.
+            // Không bao giờ làm content rộng hơn viewport -> không có scrollbar ngang.
             var availableWidth = Math.Max(
-                520,
-                contentViewport.ClientSize.Width
-                - contentViewport.Padding.Left
-                - contentViewport.Padding.Right
+                1,
+                viewport.ClientSize.Width
+                - content.Left
+                - 16
                 - SystemInformation.VerticalScrollBarWidth
-                - 4);
+                - 2);
 
             content.Width = availableWidth;
-            configGroup.Width = availableWidth;
+            sourceGroup.Width = availableWidth;
+            optimizationGroup.Width = availableWidth;
+            autoGroup.Width = availableWidth;
+            createLimitGroup.Width = availableWidth;
+            noCreateGroup.Width = availableWidth;
             logGroup.Width = availableWidth;
 
-            // Nội dung thật cao tới đáy logGroup. AutoScrollMinSize buộc WinForms
-            // sinh thanh cuộn dọc nếu viewport thấp hơn.
-            var requiredHeight = logGroup.Bottom + 14;
-            content.Height = requiredHeight;
-            contentViewport.AutoScrollMinSize = new Size(0, requiredHeight + 16);
+            // Số lượng PRF: hint chỉ chiếm phần còn lại bên phải.
+            targetHint.Width = Math.Max(80, sourceGroup.ClientSize.Width - targetHint.Left - 18);
 
-            // ComboBox giờ giữ bên phải nhưng không đè chữ khi cửa sổ/DPI thay đổi.
-            hours.Left = Math.Max(360, configGroup.ClientSize.Width - hours.Width - 24);
-            LayoutLogButton();
+            // Tối ưu: nút giữ bên phải nếu đủ rộng, còn mô tả co theo group.
+            applyOptimization.Left = Math.Max(288, optimizationGroup.ClientSize.Width - applyOptimization.Width - 18);
+            optimizationStatus.Width = Math.Max(120, optimizationGroup.ClientSize.Width - optimizationStatus.Left - 18);
+            optimizationHint.Width = Math.Max(120, optimizationGroup.ClientSize.Width - optimizationHint.Left - 18);
+
+            // Auto close: checkbox dài co theo group; combobox giờ cố định bên phải.
+            var autoTextWidth = Math.Max(220, autoGroup.ClientSize.Width - 36);
+            closeOnBan.Width = autoTextWidth;
+            closeOnStuck.Width = autoTextWidth;
+            openReplacement.Width = autoTextWidth;
+            deleteRetiredProfile.Width = autoTextWidth;
+            hours.Left = Math.Max(360, autoGroup.ClientSize.Width - hours.Width - 18);
+            closeOnTime.Width = Math.Max(220, hours.Left - closeOnTime.Left - 12);
+
+            // 2 cột, mỗi cột gồm label + numeric trên cùng một hàng.
+            var half = Math.Max(230, (createLimitGroup.ClientSize.Width - 36) / 2);
+            var leftX = 18;
+            var rightX = 18 + half;
+            var leftNumX = Math.Min(leftX + 150, rightX - perSlot.Width - 14);
+            var rightNumX = Math.Max(rightX + 150, createLimitGroup.ClientSize.Width - retryMinutes.Width - 18);
+
+            slotLabel.Location = new Point(leftX, 76);
+            perSlot.Location = new Point(leftNumX, 71);
+            hourLabel.Location = new Point(rightX, 76);
+            perHour.Location = new Point(rightNumX, 71);
+            sessionLabel.Location = new Point(leftX, 124);
+            perSession.Location = new Point(leftNumX, 119);
+            retryLabel.Location = new Point(rightX, 124);
+            retryMinutes.Location = new Point(rightNumX, 119);
+
+            scheduleHint.Width = Math.Max(100, noCreateGroup.ClientSize.Width - scheduleHint.Left - 18);
+            openLog.Left = Math.Max(380, logGroup.ClientSize.Width - openLog.Width - 16);
+            logHint.Width = Math.Max(100, openLog.Left - logHint.Left - 16);
+
+            content.Height = logGroup.Bottom + 12;
+            viewport.AutoScrollMinSize = new Size(0, content.Height + 12);
         }
-
-        contentViewport.Resize += (_, _) => LayoutScrollableContent();
+        viewport.Resize += (_, _) => LayoutScrollableContent();
         form.Shown += (_, _) => LayoutScrollableContent();
+
+        RunAllStrategySettings BuildRunSettings()
+            => NormalizeRunStrategySettings(new RunAllStrategySettings
+            {
+                Version = _runStrategySettings.Version,
+                Mode = _runStrategySettings.Mode,
+                PrimeModeArmed = _runStrategySettings.PrimeModeArmed,
+                PrimeModeSuspended = _runStrategySettings.PrimeModeSuspended,
+                AutoEnsureTarget = autoEnsureTarget.Checked,
+                TargetSlots = (int)targetSlots.Value,
+                PrimeStartHour = _runStrategySettings.PrimeStartHour,
+                PrimeEndHour = _runStrategySettings.PrimeEndHour,
+                FreshTarget = _runStrategySettings.FreshTarget,
+                FreshHours = _runStrategySettings.FreshHours,
+                OldHours = _runStrategySettings.OldHours,
+                RotationIntervalMinutes = _runStrategySettings.RotationIntervalMinutes,
+                PrepareMinutes = _runStrategySettings.PrepareMinutes,
+                PreserveFreshOffPeak = _runStrategySettings.PreserveFreshOffPeak,
+                RefreshAllBeforePrime = _runStrategySettings.RefreshAllBeforePrime,
+                PrePrimeRefreshSource = _runStrategySettings.PrePrimeRefreshSource,
+                CreateLimitEnabled = createLimitEnabled.Checked,
+                CreateLimitPerSlot = (int)perSlot.Value,
+                CreateLimitPerHour = (int)perHour.Value,
+                CreateLimitPerSession = (int)perSession.Value,
+                CreateLimitReuseRetryMinutes = (int)retryMinutes.Value,
+                NoCreateScheduleEnabled = noCreateEnabled.Checked,
+                NoCreateStartMinute = (noCreateStart.Value.Hour * 60) + noCreateStart.Value.Minute,
+                NoCreateEndMinute = (noCreateEnd.Value.Hour * 60) + noCreateEnd.Value.Minute
+            });
+
+        autoEnsureTarget.CheckedChanged += (_, _) =>
+        {
+            UpdateTargetUi();
+
+            // Giữ hành vi đã chốt ở patch trước: preference ON/OFF được lưu ngay,
+            // nên thoát Tool mà chưa bấm Lưu vẫn nhớ đúng trạng thái.
+            try
+            {
+                _runStrategySettings.AutoEnsureTarget = autoEnsureTarget.Checked;
+                SaveRunStrategySettings(_runStrategySettings);
+                _log.Info($"[AUTOMATION_SETTINGS_MAINTAIN_TARGET_PREF_SAVE] enabled={autoEnsureTarget.Checked}");
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"[AUTOMATION_SETTINGS_MAINTAIN_TARGET_PREF_SAVE_WARN] enabled={autoEnsureTarget.Checked} error={ex.Message}");
+            }
+        };
 
         save.Click += (_, _) =>
         {
-            _autoCloseSettings.CloseOnBan = closeOnBan.Checked;
-            _autoCloseSettings.CloseOnRunTime = closeOnTime.Checked;
-            _autoCloseSettings.RunHours = runHourOptions[Math.Clamp(hours.SelectedIndex, 0, runHourOptions.Length - 1)];
-            _autoCloseSettings.CloseOnNotRunning10Minutes = closeOnStuck.Checked;
-            _autoCloseSettings.OpenReplacementAfterAutoClose = openReplacement.Checked;
-            _autoCloseSettings.ReuseOnlyNoCreateProfile = reuseOnly.Checked;
-            _autoCloseSettings.DeleteProfileAfterBanOrLifetime = deleteRetiredProfile.Checked;
+            if (noCreateEnabled.Checked
+                && noCreateStart.Value.Hour == noCreateEnd.Value.Hour
+                && noCreateStart.Value.Minute == noCreateEnd.Value.Minute)
+            {
+                ModernDialog.ShowMessage(
+                    form,
+                    "Khung giờ không tạo PRF phải có giờ bắt đầu khác giờ kết thúc.",
+                    "Cài đặt tự động",
+                    MessageBoxIcon.Warning);
+                return;
+            }
 
+            var previousReuseOnly = _autoCloseSettings.ReuseOnlyNoCreateProfile;
             try
             {
+                // Nút Lưu chỉ lưu mode global cho các lần mở sau; nút "Áp dụng ngay"
+                // phía trên mới đẩy runtime policy tới toàn bộ Worker đang mở.
+                SaveManagerVmOptimizationMode(SelectedVmMode(), "automation_settings_save");
+
+                _autoCloseSettings.CloseOnBan = closeOnBan.Checked;
+                _autoCloseSettings.CloseOnRunTime = closeOnTime.Checked;
+                _autoCloseSettings.RunHours = runHourOptions[Math.Clamp(hours.SelectedIndex, 0, runHourOptions.Length - 1)];
+                _autoCloseSettings.CloseOnNotRunning10Minutes = closeOnStuck.Checked;
+                _autoCloseSettings.OpenReplacementAfterAutoClose = openReplacement.Checked;
+                _autoCloseSettings.ReuseOnlyNoCreateProfile = reuseOnly.Checked;
+                _autoCloseSettings.DeleteProfileAfterBanOrLifetime = deleteRetiredProfile.Checked;
                 SaveAutoCloseSettings();
+
+                var savedRun = BuildRunSettings();
+                SaveRunStrategySettings(savedRun);
+
+                NotifyAutoReplacementReuseOnlySettingChanged(
+                    previousReuseOnly,
+                    _autoCloseSettings.ReuseOnlyNoCreateProfile,
+                    "automation_settings_save");
+                NotifyAutoReplacementCreateLimitSettingsChanged("automation_settings_save");
+                NotifyAutoReplacementNoCreateScheduleSettingsChanged("automation_settings_save");
+
+                _log.Info(
+                    $"[AUTOMATION_SETTINGS_SAVE] maintainTarget={savedRun.AutoEnsureTarget} target={savedRun.TargetSlots} " +
+                    $"reuseOnly={_autoCloseSettings.ReuseOnlyNoCreateProfile} replacement={_autoCloseSettings.OpenReplacementAfterAutoClose} " +
+                    $"createLimit={savedRun.CreateLimitEnabled} noCreateSchedule={savedRun.NoCreateScheduleEnabled}");
+
                 form.DialogResult = DialogResult.OK;
                 form.Close();
             }
@@ -741,22 +1093,21 @@ public sealed partial class ManagerForm
             {
                 ModernDialog.ShowMessage(
                     form,
-                    "Không lưu được cấu hình Tự đóng.\r\n\r\n" + ex.Message,
-                    "Tự đóng",
+                    "Không lưu được Cài đặt tự động.\r\n\r\n" + ex.Message,
+                    "Cài đặt tự động",
                     MessageBoxIcon.Error);
             }
         };
 
         form.AcceptButton = save;
         form.CancelButton = cancel;
-
-        // Thứ tự Dock quan trọng: header + footer cố định, viewport chiếm phần còn lại.
-        form.Controls.Add(contentViewport);
+        form.Controls.Add(viewport);
         form.Controls.Add(footer);
         form.Controls.Add(header);
 
         UiTheme.Apply(form);
         UiTheme.StyleButton(openLog, UiButtonKind.Neutral);
+        UiTheme.StyleButton(applyOptimization, UiButtonKind.Primary);
         UiTheme.StyleButton(save, UiButtonKind.Primary);
         UiTheme.StyleButton(cancel, UiButtonKind.Neutral);
 

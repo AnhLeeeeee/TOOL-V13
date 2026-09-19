@@ -2925,6 +2925,24 @@ public sealed partial class ChromeController : IAsyncDisposable
 
         var compact = (signal ?? "").Replace('\r', ' ').Replace('\n', ' ').Trim();
         if (compact.Length > 180) compact = compact[..180];
+
+        var markerEnd = compact.IndexOf('|');
+        var marker = (markerEnd >= 0 ? compact[..markerEnd] : compact).Trim();
+        var invalidCredentials = marker.Contains("PASSWORD", StringComparison.OrdinalIgnoreCase)
+            || marker.Contains("INVALID_CREDENTIALS", StringComparison.OrdinalIgnoreCase);
+
+        if (invalidCredentials)
+        {
+            // Theo nghiệp vụ của Tool: lỗi credential hiển thị rõ sau khi submit
+            // được loại ngay như BAN để không retry làm giảm số lần đăng nhập còn lại.
+            _log.Warn($"[TIKTOK_LOGIN_INVALID_CREDENTIALS_AS_BAN] marker={marker} signal={compact}");
+            return new TikTokStartupResult(
+                "ACCOUNT_BANNED",
+                "TikTok hiển thị sai tài khoản hoặc mật khẩu; Tool loại tài khoản này như BAN.",
+                false,
+                false);
+        }
+
         _log.Warn($"[TIKTOK_LOGIN_ACCOUNT_BANNED] signal={compact}");
         return new TikTokStartupResult(
             "ACCOUNT_BANNED",
@@ -3028,7 +3046,20 @@ public sealed partial class ChromeController : IAsyncDisposable
     ['EN_USER_NOT_EXIST', 'user does not exist'],
     ['EN_USER_NOT_EXIST_SHORT', "user doesn't exist"],
     ['EN_ACCOUNT_NOT_EXIST', 'account does not exist'],
-    ['EN_ACCOUNT_NOT_EXIST_SHORT', "account doesn't exist"]
+    ['EN_ACCOUNT_NOT_EXIST_SHORT', "account doesn't exist"],
+
+    // Theo nghiệp vụ: lỗi credential hiển thị sau submit cũng loại như BAN.
+    // Detector vẫn chỉ xét innerText của node thực sự đang hiển thị trong viewport.
+    ['VI_INVALID_CREDENTIALS', 'sai tai khoan hoac mat khau'],
+    ['VI_WRONG_PASSWORD', 'sai mat khau'],
+    ['VI_ACCOUNT_PASSWORD_INCORRECT', 'tai khoan hoac mat khau khong chinh xac'],
+    ['VI_PASSWORD_INCORRECT', 'mat khau khong chinh xac'],
+    ['EN_INVALID_CREDENTIALS', 'incorrect account or password'],
+    ['EN_INVALID_USERNAME_PASSWORD', 'incorrect username or password'],
+    ['EN_USERNAME_PASSWORD_INCORRECT', 'username or password is incorrect'],
+    ['EN_INCORRECT_PASSWORD', 'incorrect password'],
+    ['EN_WRONG_PASSWORD', 'wrong password'],
+    ['EN_ENTERED_PASSWORD_INCORRECT', 'password you entered is incorrect']
   ];
 
   // Không còn quét document.body text để quyết định BAN.

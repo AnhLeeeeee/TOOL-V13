@@ -837,6 +837,10 @@ public sealed partial class ManagerForm : Form
         var exe = ResolveWorkerExe();
         var dataRoot = _profileService.ResolveDataRoot(ctx.Profile);
         Directory.CreateDirectory(dataRoot);
+        ApplyManagerVmOptimizationToProfileConfigIfConfigured(
+            dataRoot,
+            ctx.Profile.Name,
+            "before_worker_start");
         var pipe = PipeName(ctx.Profile.Name);
         var args = $"--worker --embedded --profile {Quote(ctx.Profile.Name)} --profile-path {Quote(ctx.Profile.ProfilePath)} --cdp-port {ctx.Profile.CdpPort} --data-root {Quote(dataRoot)} --pipe-name {Quote(pipe)}";
         var process = new Process
@@ -991,12 +995,16 @@ public sealed partial class ManagerForm : Form
                     continue;
                 }
 
-                // V13.5: profile đang xem vẫn refresh 1 giây như cũ. Các tab nền
-                // chỉ refresh 5 giây/lần để giảm pipe/JSON/UI work khi chạy nhiều VM profile.
-                // Chrome Monitor chỉ đọc LastSnapshot đã có trong RAM; việc mở Monitor
-                // không còn ép TẤT CẢ Worker poll status 1 giây/lần. Thứ tự xử lý
-                // RefreshStatus -> embed recovery của mỗi lượt poll vẫn giữ nguyên.
-                var interval = ReferenceEquals(ctx.Tab, selectedTab)
+                // UI refresh policy:
+                // - Tab đang xem: status poll 1 giây.
+                // - Khi Chrome Monitor đang mở: poll mọi Worker 1 giây để các ô trạng thái
+                //   và snapshot trên giao diện tổng cập nhật mượt như trước.
+                // - Khi Monitor đóng: tab nền vẫn 5 giây để giữ tối ưu tải VM.
+                // Các vòng scan/cache/background khác không đổi chu kỳ.
+                var monitorVisible = _chromeMonitor is not null
+                    && !_chromeMonitor.IsDisposed
+                    && _chromeMonitor.Visible;
+                var interval = ReferenceEquals(ctx.Tab, selectedTab) || monitorVisible
                     ? TimeSpan.FromSeconds(1)
                     : TimeSpan.FromSeconds(5);
                 if (now - ctx.LastStatusPollAttemptUtc < interval) continue;
@@ -1636,6 +1644,12 @@ public sealed partial class ManagerForm : Form
                 backup = CaptureProfileConfigFilesBackup(dataRoot);
 
             var sourceLabel = ApplyManagerDefaultConfigFiles(dataRoot, allowPackagedDefaults: true);
+            if (!string.IsNullOrWhiteSpace(sourceLabel))
+                ApplyManagerVmOptimizationToProfileConfigIfConfigured(
+                    dataRoot,
+                    ctx.Profile.Name,
+                    "after_default_config_sync");
+
             if (string.IsNullOrWhiteSpace(sourceLabel))
             {
                 _log.Warn(
@@ -1654,6 +1668,10 @@ public sealed partial class ManagerForm : Form
                     if (!string.Equals(reply, "reloaded", StringComparison.OrdinalIgnoreCase))
                     {
                         if (backup is not null) RestoreProfileConfigFilesBackup(dataRoot, backup);
+                        ApplyManagerVmOptimizationToProfileConfigIfConfigured(
+                            dataRoot,
+                            ctx.Profile.Name,
+                            "default_config_sync_reload_deferred");
                         _log.Warn(
                             $"[DEFAULT_CONFIG_SYNC_DEFER] profile={ctx.Profile.Name} revision={state.Revision} reason={reason} reload={reply}");
                         return;
@@ -1665,6 +1683,10 @@ public sealed partial class ManagerForm : Form
                     {
                         try { RestoreProfileConfigFilesBackup(dataRoot, backup); } catch { }
                     }
+                    ApplyManagerVmOptimizationToProfileConfigIfConfigured(
+                        dataRoot,
+                        ctx.Profile.Name,
+                        "default_config_sync_reload_error");
                     _log.Warn(
                         $"[DEFAULT_CONFIG_SYNC_DEFER] profile={ctx.Profile.Name} revision={state.Revision} reason={reason} reload_error={ex.Message}");
                     return;
@@ -1732,13 +1754,21 @@ public sealed partial class ManagerForm : Form
         // Giữ đúng hành vi cũ cho PRF mới: chỉ chép cấu hình riêng của Manager.
         // Defaults gốc vẫn do Worker dùng theo cơ chế hiện tại nếu Manager chưa có cấu hình riêng.
         var sourceLabel = ApplyManagerDefaultConfigFiles(dataRoot, allowPackagedDefaults: false);
-        if (string.IsNullOrWhiteSpace(sourceLabel)) return;
+        if (!string.IsNullOrWhiteSpace(sourceLabel))
+        {
+            var syncState = LoadManagerDefaultConfigSyncState();
+            if (syncState.Enabled && syncState.Revision > 0)
+                SaveManagerDefaultAppliedRevision(dataRoot, syncState.Revision, sourceLabel);
 
-        var syncState = LoadManagerDefaultConfigSyncState();
-        if (syncState.Enabled && syncState.Revision > 0)
-            SaveManagerDefaultAppliedRevision(dataRoot, syncState.Revision, sourceLabel);
+            _log.Info($"[DEFAULT_CONFIG_APPLIED] dataRoot={dataRoot} source={sourceLabel} revision={(syncState.Enabled ? syncState.Revision : 0)}");
+        }
 
-        _log.Info($"[DEFAULT_CONFIG_APPLIED] dataRoot={dataRoot} source={sourceLabel} revision={(syncState.Enabled ? syncState.Revision : 0)}");
+        // Tối ưu VM là cấu hình global riêng. Nếu người dùng đã chọn global mode,
+        // PRF mới nhận đúng mode ngay cả khi Manager không có default config riêng.
+        ApplyManagerVmOptimizationToProfileConfigIfConfigured(
+            dataRoot,
+            "<new_profile>",
+            "new_profile");
     }
 
     void ShowDefaultConfigDialog()

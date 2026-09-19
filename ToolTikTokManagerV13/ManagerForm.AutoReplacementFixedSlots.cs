@@ -15,6 +15,11 @@ public sealed partial class ManagerForm
         int OccupiedSlots,
         string Detail);
 
+    sealed record AutoReplacementPendingCapacitySnapshot(
+        int Total,
+        int Reserving,
+        int Waiting);
+
     readonly object _autoReplacementFixedSlotLock = new();
     int _autoReplacementTargetSlots;
     // Phân biệt target=0 do user chủ động đóng hết với trạng thái "chưa từng capture".
@@ -27,6 +32,26 @@ public sealed partial class ManagerForm
     bool _autoReplacementStartAllInProgress;
     DateTime _autoReplacementNextCapacityReconcileUtc = DateTime.MinValue;
     static readonly TimeSpan AutoReplacementCapacityReconcileInterval = TimeSpan.FromSeconds(15);
+
+    AutoReplacementPendingCapacitySnapshot GetAutoReplacementPendingCapacitySnapshot()
+    {
+        lock (_autoReplacementQueueLock)
+        {
+            var nowUtc = DateTime.UtcNow;
+            var total = _autoReplacementQueue.Count;
+
+            // Chỉ request đã tới hạn xử lý mới được giữ một suất capacity.
+            // Request đã lỗi/cooldown/đang chờ retry vẫn còn trong queue để không
+            // mất lượt bù, nhưng KHÔNG được làm Tool tưởng rằng slot đó đã được lấp.
+            var reserving = _autoReplacementQueue.Count(x =>
+                x.NextAttemptUtc <= nowUtc);
+
+            return new AutoReplacementPendingCapacitySnapshot(
+                total,
+                reserving,
+                Math.Max(0, total - reserving));
+        }
+    }
 
     void CaptureAutoReplacementTargetForStartAll(int requestedSlots)
     {
@@ -101,13 +126,14 @@ public sealed partial class ManagerForm
             await PruneStaleAutoReplacementExpectedRunningAsync(probeRequest);
 
             var occupiedPass1 = CountAutoReplacementFulfilledSlots();
-            var pendingPass1 = GetAutoReplacementPendingCount();
-            var initialDeficit = target - occupiedPass1 - pendingPass1;
+            var pendingPass1 = GetAutoReplacementPendingCapacitySnapshot();
+            var initialDeficit = target - occupiedPass1 - pendingPass1.Reserving;
 
             if (initialDeficit <= 0)
             {
                 _log.Info(
-                    $"[AUTO_REPLACE_CAPACITY_OK] source={source} target={target} occupied={occupiedPass1} pending={pendingPass1} deficit=0");
+                    $"[AUTO_REPLACE_CAPACITY_OK] source={source} target={target} occupied={occupiedPass1} " +
+                    $"pending={pendingPass1.Total} pendingActive={pendingPass1.Reserving} pendingWaiting={pendingPass1.Waiting} deficit=0");
                 return;
             }
 
@@ -115,7 +141,9 @@ public sealed partial class ManagerForm
             // Nếu profile chỉ đang chuyển trạng thái chậm, lượt 2 sẽ thấy nó trở lại và không bù thừa.
             var delayMs = Random.Shared.Next(1000, 2001);
             _log.Warn(
-                $"[AUTO_REPLACE_CAPACITY_GAP_CHECK] source={source} pass=1/2 target={target} occupied={occupiedPass1} pending={pendingPass1} deficit={initialDeficit} delayMs={delayMs}");
+                $"[AUTO_REPLACE_CAPACITY_GAP_CHECK] source={source} pass=1/2 target={target} occupied={occupiedPass1} " +
+                $"pending={pendingPass1.Total} pendingActive={pendingPass1.Reserving} pendingWaiting={pendingPass1.Waiting} " +
+                $"deficit={initialDeficit} delayMs={delayMs}");
             await Task.Delay(delayMs);
 
             if (_closing
@@ -151,14 +179,18 @@ public sealed partial class ManagerForm
             }
 
             var occupiedPass2 = CountAutoReplacementFulfilledSlots();
-            var pendingPass2 = GetAutoReplacementPendingCount();
+            var pendingPass2 = GetAutoReplacementPendingCapacitySnapshot();
 
             // Lấy occupied lớn hơn của 2 pass để fail-safe chống mở thừa.
+            // Chỉ pending đang ACTIVE mới reserve capacity. Pending đang WAITING
+            // vì lỗi/cooldown/retry không được làm deficit giả về 0.
             var stableOccupied = Math.Max(occupiedPass1, occupiedPass2);
-            var deficit = target - stableOccupied - pendingPass2;
+            var deficit = target - stableOccupied - pendingPass2.Reserving;
 
             _log.Warn(
-                $"[AUTO_REPLACE_CAPACITY_GAP_CHECK] source={source} pass=2/2 target={target} occupied1={occupiedPass1} occupied2={occupiedPass2} stableOccupied={stableOccupied} pending={pendingPass2} deficit={Math.Max(0, deficit)}");
+                $"[AUTO_REPLACE_CAPACITY_GAP_CHECK] source={source} pass=2/2 target={target} occupied1={occupiedPass1} occupied2={occupiedPass2} " +
+                $"stableOccupied={stableOccupied} pending={pendingPass2.Total} pendingActive={pendingPass2.Reserving} " +
+                $"pendingWaiting={pendingPass2.Waiting} deficit={Math.Max(0, deficit)}");
 
             if (deficit <= 0)
                 return;
@@ -186,7 +218,7 @@ public sealed partial class ManagerForm
         string source,
         int target,
         int occupied,
-        int pendingBefore)
+        AutoReplacementPendingCapacitySnapshot pendingBefore)
     {
         if (requestedCount <= 0
             || _closing
@@ -206,12 +238,24 @@ public sealed partial class ManagerForm
         }
 
         var queued = new List<AutoReplacementRequest>();
+        var currentPendingTotal = 0;
+        var currentPendingActive = 0;
+        var currentPendingWaiting = 0;
 
         lock (_autoReplacementQueueLock)
         {
-            // Recheck pending ngay trong lock để 2 reconcile không thể tạo dư request.
-            var currentPending = _autoReplacementQueue.Count;
-            var allowed = Math.Max(0, target - occupied - currentPending);
+            // Recheck ngay trong lock để 2 reconcile không thể tạo dư request.
+            // QUAN TRỌNG: pending WAITING không reserve capacity, nhưng vẫn là một
+            // request chưa giải quyết cho chính slot thiếu đó. Vì vậy dùng TOTAL ở
+            // đây để chống sinh request trùng, còn deficit phía trên dùng ACTIVE.
+            var nowUtc = DateTime.UtcNow;
+            currentPendingTotal = _autoReplacementQueue.Count;
+            currentPendingActive = _autoReplacementQueue.Count(x =>
+                x.NextAttemptUtc <= nowUtc);
+            currentPendingWaiting = Math.Max(0, currentPendingTotal - currentPendingActive);
+
+            var unresolvedSlots = Math.Max(0, target - occupied);
+            var allowed = Math.Max(0, unresolvedSlots - currentPendingTotal);
             var count = Math.Min(requestedCount, allowed);
 
             for (var i = 0; i < count; i++)
@@ -235,10 +279,21 @@ public sealed partial class ManagerForm
         }
 
         if (queued.Count == 0)
+        {
+            // Đây là trạng thái quan trọng của bản vá: vẫn thiếu slot thật, nhưng
+            // đã có request cũ đang WAIT retry. Không coi là đủ target và cũng
+            // không tạo thêm request trùng.
+            _log.Warn(
+                $"[AUTO_REPLACE_CAPACITY_DEFICIT_WAITING] source={source} target={target} occupied={occupied} " +
+                $"deficit={requestedCount} pending={currentPendingTotal} pendingActive={currentPendingActive} " +
+                $"pendingWaiting={currentPendingWaiting} action=KEEP_EXISTING_REQUESTS_NO_DUPLICATE");
             return;
+        }
 
         _log.Warn(
-            $"[AUTO_REPLACE_CAPACITY_DEFICIT_QUEUED] source={source} target={target} occupied={occupied} pendingBefore={pendingBefore} added={queued.Count} pendingNow={GetAutoReplacementPendingCount()}");
+            $"[AUTO_REPLACE_CAPACITY_DEFICIT_QUEUED] source={source} target={target} occupied={occupied} " +
+            $"pendingBefore={pendingBefore.Total} pendingActiveBefore={pendingBefore.Reserving} pendingWaitingBefore={pendingBefore.Waiting} " +
+            $"added={queued.Count} pendingNow={GetAutoReplacementPendingCount()}");
 
         WriteAutoActivityLog(
             action: "TỰ BÙ",
@@ -316,6 +371,8 @@ public sealed partial class ManagerForm
             // Sau Stop All, các tab STOPPED vẫn còn mở; nếu lấy occupied vật lý thì
             // Start thủ công 1 PRF có thể làm target nhảy từ 0 lên toàn bộ số tab cũ.
             var activeForTarget = CountAutoReplacementActiveTargetSlots();
+            var expanded = false;
+            var expandedTarget = 0;
 
             lock (_autoReplacementFixedSlotLock)
             {
@@ -325,9 +382,19 @@ public sealed partial class ManagerForm
                     var old = _autoReplacementTargetSlots;
                     _autoReplacementTargetSlots = Math.Max(activeForTarget, 1);
                     _autoReplacementTargetInitialized = true;
+                    expanded = true;
+                    expandedTarget = _autoReplacementTargetSlots;
                     _log.Info(
                         $"[AUTO_REPLACE_TARGET_MANUAL_EXPAND] old={old} target={_autoReplacementTargetSlots} active={activeForTarget} profile={profileName}");
                 }
+            }
+
+            if (expanded)
+            {
+                PersistRunStrategySessionTarget(
+                    expandedTarget,
+                    active: true,
+                    source: $"manual_start_expand:{profileName}");
             }
 
             return;
@@ -641,43 +708,21 @@ public sealed partial class ManagerForm
             return 0;
 
         var staleCandidates = new List<string>();
-        var checkedPass1 = 0;
-        var presentPass1 = 0;
-        var workerAlivePass1 = 0;
-        var windowAlivePass1 = 0;
-        var cdpListeningPass1 = 0;
-        var openingPass1 = 0;
 
         // PASS 1: chỉ đánh dấu ứng viên stale, chưa xóa ngay.
-        // Vẫn probe TẤT CẢ profile với đúng tần suất cũ; chỉ giảm ghi log chi tiết khi profile
-        // đang hiện diện bình thường để tránh hàng nghìn dòng I/O không cần thiết.
         foreach (var profileName in expectedNames)
         {
             if (!_autoCloseExpectedRunningProfiles.Contains(profileName))
                 continue;
 
             var probe = await ProbeAutoReplacementExpectedRuntimeAsync(profileName);
-            checkedPass1++;
-            if (probe.Present) presentPass1++;
-            if (probe.WorkerAlive) workerAlivePass1++;
-            if (probe.WindowAlive) windowAlivePass1++;
-            if (probe.CdpListening) cdpListeningPass1++;
-            if (probe.Opening) openingPass1++;
 
-            // Chỉ log detail ngay khi thật sự có ứng viên stale. Các cảnh báo probe exception
-            // vẫn được ProbeAutoReplacementExpectedRuntimeAsync log riêng như trước.
+            _log.Info(
+                $"[AUTO_REPLACE_EXPECTED_SLOT_PROBE] request={request.Id} profile={profileName} pass=1/2 present={probe.Present} workerAlive={probe.WorkerAlive} windowAlive={probe.WindowAlive} cdpListening={probe.CdpListening} opening={probe.Opening} source={probe.Source}");
+
             if (!probe.Present)
-            {
-                _log.Info(
-                    $"[AUTO_REPLACE_EXPECTED_SLOT_PROBE] request={request.Id} profile={profileName} pass=1/2 present={probe.Present} workerAlive={probe.WorkerAlive} windowAlive={probe.WindowAlive} cdpListening={probe.CdpListening} opening={probe.Opening} source={probe.Source}");
                 staleCandidates.Add(profileName);
-            }
         }
-
-        _log.Info(
-            $"[AUTO_REPLACE_EXPECTED_SLOT_PROBE_SUMMARY] request={request.Id} pass=1/2 checked={checkedPass1} " +
-            $"present={presentPass1} staleCandidates={staleCandidates.Count} workerAlive={workerAlivePass1} " +
-            $"windowAlive={windowAlivePass1} cdpListening={cdpListeningPass1} opening={openingPass1}");
 
         if (staleCandidates.Count == 0)
             return 0;

@@ -158,6 +158,33 @@ public sealed partial class MainForm
                     ApplyVmOptimizationSettings();
                     _log.Info("[MANAGED_CONFIG_RELOADED] source=manager_default_sync");
                     return "reloaded";
+                case "apply_vm_mode":
+                {
+                    var requestedMode = (commandPayload ?? "").Trim();
+                    if (!Enum.TryParse<ToolTikTokV11.Models.VmOptimizationMode>(
+                            requestedMode,
+                            ignoreCase: true,
+                            out var vmMode))
+                    {
+                        return "invalid_vm_mode";
+                    }
+
+                    _settings.VmOptimization.Mode = vmMode;
+                    _settingsService.Save(_settings);
+                    LoadVmOptimizationToUi();
+                    ApplyVmOptimizationSettings();
+                    if (_chrome.Connected)
+                        await _chrome.ApplyVmRuntimePolicyAsync();
+
+                    var appliedName = vmMode switch
+                    {
+                        ToolTikTokV11.Models.VmOptimizationMode.VmSafe => "VmSafe",
+                        ToolTikTokV11.Models.VmOptimizationMode.VmMax => "VmMax",
+                        _ => "Normal"
+                    };
+                    _log.Info($"[MANAGED_VM_MODE_APPLIED] mode={appliedName} source=manager_global");
+                    return "applied|" + appliedName;
+                }
                 case "start":
                     if (IsManagerEmergencyStopActive()) return "emergency_stopped";
                     if (IsMessageReplyRunning) return "message_reply_running";

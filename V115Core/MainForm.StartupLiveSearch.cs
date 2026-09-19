@@ -123,6 +123,16 @@ public sealed partial class MainForm
             return false;
         }
 
+        // Mỗi lượt START chỉ xáo thứ tự keyword đúng 1 lần. Bên trong từng keyword vẫn giữ
+        // nguyên flow cũ TOP -> LIVE; nếu keyword đầu không đạt thì tiếp tục keyword còn lại.
+        var originalKeywordOrder = string.Join("|", keywords);
+        for (var i = keywords.Count - 1; i > 0; i--)
+        {
+            var j = Random.Shared.Next(i + 1);
+            (keywords[i], keywords[j]) = (keywords[j], keywords[i]);
+        }
+        _log.Info($"[STARTUP_LIVE_SEARCH_KEYWORD_ORDER] original={originalKeywordOrder} randomized={string.Join("|", keywords)}");
+
         var threshold = Math.Max(0, _settings.Viewer?.Threshold ?? 0);
         var maxCards = Math.Clamp(cfg.MaxCards, 3, 50);
         var totalTimeoutSec = Math.Clamp(cfg.TotalTimeoutSec, 20, 300);

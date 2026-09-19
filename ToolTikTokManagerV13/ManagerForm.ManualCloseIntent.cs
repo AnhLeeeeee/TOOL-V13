@@ -346,6 +346,13 @@ public sealed partial class ManagerForm
                 _log.Info(
                     $"[RUN_STRATEGY_TARGET_MANUAL_CLOSE] profile={profileName} old={oldRunStrategyTarget} target={newRunStrategyTarget} origin={origin}");
             }
+
+            // Manual close đã giảm fixed target bằng engine cũ; chỉ đồng bộ snapshot
+            // để nếu Manager restart sau đó thì không hồi target cũ trở lại.
+            PersistRunStrategySessionTarget(
+                newTarget,
+                active: newTarget > 0,
+                source: $"manual_close:{profileName}:{origin}");
         }
 
         // Manual close là intent mạnh: bỏ request quota tổng quát và cả request AutoClose

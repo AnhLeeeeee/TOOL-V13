@@ -93,7 +93,7 @@ public sealed partial class AutomationEngine
     const int ViewerChainModeMaxTransitions = 10;
     const int ViewerChainModeMaxSeconds = 60;
     const int ViewerGateRetryCooldownMs = 1000;
-    const int ViewerLowStreakFeedResetThreshold = 5;
+    const int ViewerLowStreakFeedResetThreshold = 10;
     // VM/chrome chậm: document.readyState có thể đã complete nhưng TikTok React/DOM LIVE
     // vẫn chưa hydrate xong. Chờ tín hiệu DOM thực tế trước khi Viewer/InputGuard kết luận lỗi.
     const int PageReadyPollMs = 500;
@@ -145,7 +145,8 @@ public sealed partial class AutomationEngine
     int _step = 1; // V10: buocHienTai 1..8
     long _rounds;
     int _lastViewerValue = -1; // snapshot nhẹ cho Manager/Chrome Monitor
-    int _consecutiveLowViewerLives; // reset nguồn đề xuất sau N LIVE liên tiếp <= ngưỡng
+    int _consecutiveLowViewerLives; // đổi chuỗi đề xuất sau N LIVE liên tiếp <= ngưỡng
+    string _lastLowViewerLiveKey = ""; // chống đếm lặp cùng một LIVE khi Viewer Gate chạy lại
 
     // Snapshot Viewer/lock ổn định chỉ sống rất ngắn và luôn ràng buộc theo identity của LIVE.
     int _recentViewerValue = -1;
@@ -280,6 +281,7 @@ public sealed partial class AutomationEngine
         _rounds = 0;
         Volatile.Write(ref _lastViewerValue, -1);
         _consecutiveLowViewerLives = 0;
+        _lastLowViewerLiveKey = "";
         _recentViewerValue = -1;
         _recentViewerLiveKey = "";
         _recentViewerAtUtc = DateTime.MinValue;
@@ -1965,30 +1967,17 @@ public sealed partial class AutomationEngine
             _log.Warn($"[VIEWER_GATE_NO_VALUE] source={source}; tối đa {max} vòng chuyển LIVE để tìm LIVE có Viewer đọc được và > ngưỡng (F5 chỉ fallback khi cần).");
         }
 
-        // Bình thường ưu tiên cột “Nhà sáng tạo LIVE đề xuất”. Riêng khi vừa rời một LIVE
-        // đề xuất vì comment bị khóa, đi theo chuỗi ArrowDown hữu hạn trước để tránh bounce
-        // ngay về đúng LIVE neo vừa bị chặn.
-        if (!IsViewerChainModeActive())
-        {
-            if (await TryOpenBestRecommendedViewerLiveAsync(source + " / trước chuyển LIVE", ct))
-                return true;
-        }
-        else
-        {
-            _log.Info($"[VIEWER_CHAIN_MODE_SKIP_RECOMMENDATION] source={source} phase=before-first-switch transitions={_viewerChainTransitions}/{ViewerChainModeMaxTransitions}");
-        }
+        // Viewer thấp bình thường: ưu tiên đi tiếp chuỗi LIVE bằng ArrowDown. Chỉ sau khi
+        // đủ ViewerLowStreakFeedResetThreshold LIVE thấp liên tiếp mới quét sidebar đề xuất
+        // để đổi sang một chuỗi LIVE khác. Nhánh comment-restriction vẫn dùng chain mode cũ.
+        _log.Info(
+            $"[VIEWER_LOW_CHAIN_ARROW_FIRST] source={source} " +
+            $"streak={_consecutiveLowViewerLives}/{ViewerLowStreakFeedResetThreshold} action=ARROWDOWN_UNTIL_STREAK_LIMIT");
 
         for (int i = 1; i <= max && _running; i++)
         {
             await WaitIfPausedAsync(ct);
             SetStatus("TÌM LIVE ĐỦ NGƯỜI", $"{source} • vòng {i}/{max} • LIVE thấp {_consecutiveLowViewerLives}/{ViewerLowStreakFeedResetThreshold}");
-
-            if (i > 1 && !IsViewerChainModeActive()
-                && await TryOpenBestRecommendedViewerLiveAsync($"{source} / trước ArrowDown vòng {i}/{max}", ct))
-                return true;
-
-            if (i > 1 && IsViewerChainModeActive())
-                _log.Info($"[VIEWER_CHAIN_MODE_SKIP_RECOMMENDATION] source={source} phase=loop loop={i}/{max} transitions={_viewerChainTransitions}/{ViewerChainModeMaxTransitions}");
 
             var transitioned = await TransitionAsync(
                 $"Viewer Gate {source} vòng {i}/{max}",
@@ -2041,8 +2030,25 @@ public sealed partial class AutomationEngine
 
     void RecordLowViewerLive(string source, int value)
     {
+        // ReadViewerWithRetryAsync luôn cập nhật _recentViewerLiveKey theo roomId/url hiện tại.
+        // Nếu vòng chính quay lại kiểm tra đúng cùng LIVE thì không được tính thêm một LIVE thấp.
+        var liveKey = (_recentViewerLiveKey ?? "").Trim();
+        if (!string.IsNullOrWhiteSpace(liveKey)
+            && string.Equals(liveKey, _lastLowViewerLiveKey, StringComparison.OrdinalIgnoreCase))
+        {
+            _log.Info(
+                $"[VIEWER_LOW_STREAK_DUPLICATE_SKIP] source={source} key={liveKey} value={value} " +
+                $"streak={_consecutiveLowViewerLives}/{ViewerLowStreakFeedResetThreshold}");
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(liveKey))
+            _lastLowViewerLiveKey = liveKey;
+
         _consecutiveLowViewerLives++;
-        _log.Warn($"[VIEWER_LOW_STREAK] source={source} value={value} threshold={_s.Viewer.Threshold} streak={_consecutiveLowViewerLives}/{ViewerLowStreakFeedResetThreshold}");
+        _log.Warn(
+            $"[VIEWER_LOW_STREAK] source={source} key={(string.IsNullOrWhiteSpace(liveKey) ? "(unknown)" : liveKey)} " +
+            $"value={value} threshold={_s.Viewer.Threshold} streak={_consecutiveLowViewerLives}/{ViewerLowStreakFeedResetThreshold}");
     }
 
     void ResetLowViewerStreak(string reason)
@@ -2050,6 +2056,7 @@ public sealed partial class AutomationEngine
         if (_consecutiveLowViewerLives > 0)
             _log.Info($"[VIEWER_LOW_STREAK_RESET] previous={_consecutiveLowViewerLives} reason={reason}");
         _consecutiveLowViewerLives = 0;
+        _lastLowViewerLiveKey = "";
     }
 
     async Task<bool?> MaybeResetLowViewerRecommendationFeedAsync(string source, CancellationToken ct)
@@ -2064,13 +2071,14 @@ public sealed partial class AutomationEngine
             // Chain mode có giới hạn riêng theo số lần chuyển/thời gian. Không để low-streak
             // lén kéo profile quay lại recommendation hoặc /live trước khi chain kết thúc.
             _consecutiveLowViewerLives = 0;
+            _lastLowViewerLiveKey = "";
             _log.Info(
                 $"[VIEWER_CHAIN_MODE_SKIP_FEED_RESET] source={source} streak={streak} " +
                 $"transitions={_viewerChainTransitions}/{ViewerChainModeMaxTransitions} action=KEEP_CHAIN");
             return null;
         }
 
-        // Đủ 5 LIVE thấp: quét lại sidebar trước. Chỉ hard-reset /live khi sidebar
+        // Đủ ngưỡng LIVE thấp liên tiếp: quét lại sidebar trước. Chỉ hard-reset /live khi sidebar
         // không có LIVE đề xuất nào > ngưỡng (và không thuộc Live cũ active).
         SetStatus("QUÉT LẠI LIVE ĐỀ XUẤT", $"{streak} LIVE thấp liên tiếp • tìm LIVE > {_s.Viewer.Threshold} trước khi reset");
         _log.Warn($"[VIEWER_FEED_RESET_PRECHECK_RECOMMENDED] source={source} streak={streak} threshold={_s.Viewer.Threshold}");
@@ -2078,6 +2086,7 @@ public sealed partial class AutomationEngine
             return true;
 
         _consecutiveLowViewerLives = 0; // Hard-reset chỉ xảy ra sau khi sidebar không có LIVE phù hợp.
+        _lastLowViewerLiveKey = "";
         SetStatus("LÀM MỚI ĐỀ XUẤT LIVE", $"{streak} LIVE liên tiếp ≤ {_s.Viewer.Threshold} người → sidebar không phù hợp → tải lại /live");
         _log.Warn($"[VIEWER_FEED_RESET_START] source={source} streak={streak} threshold={_s.Viewer.Threshold} action=navigate:/live reason=no-suitable-sidebar-live");
 
@@ -2126,7 +2135,7 @@ public sealed partial class AutomationEngine
         catch (Exception ex)
         {
             ReportProblem("VIEWER_FEED_RESET_FAILED", "Người xem",
-                $"Đã có {streak} LIVE thấp liên tiếp nhưng chưa tải lại được /live: {ex.Message}. Sẽ tiếp tục tìm LIVE và chỉ thử hard-reset lại sau 5 LIVE thấp mới.",
+                $"Đã có {streak} LIVE thấp liên tiếp nhưng chưa tải lại được /live: {ex.Message}. Sẽ tiếp tục tìm LIVE và chỉ thử hard-reset lại sau {ViewerLowStreakFeedResetThreshold} LIVE thấp mới.",
                 error: IsLikelyCdpIssue(ex), throttleSeconds: 15);
             _log.Warn($"[VIEWER_FEED_RESET_FAILED] source={source} reason={ex.Message}");
             return false;
