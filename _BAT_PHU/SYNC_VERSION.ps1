@@ -10,17 +10,30 @@ if ([string]::IsNullOrWhiteSpace($Root)) {
 }
 $Root = [System.IO.Path]::GetFullPath($Root)
 
-$versionFile = Join-Path $Root 'VERSION.txt'
-$latestManifestFile = Join-Path $Root 'version.json'
-$historyManifestFile = Join-Path $Root 'versions.json'
+$layoutHelper = Join-Path $PSScriptRoot 'ENSURE_VERSION_LAYOUT.ps1'
+if (Test-Path -LiteralPath $layoutHelper) {
+    & $layoutHelper -Root $Root
+}
+
+$versionDir = Join-Path $Root '_version'
+New-Item -ItemType Directory -Force -Path $versionDir | Out-Null
+
+$versionFile = Join-Path $versionDir 'VERSION.txt'
+$latestManifestFile = Join-Path $versionDir 'version.json'
+$historyManifestFile = Join-Path $versionDir 'versions.json'
+
+# Hai file o root chi la ban tuong thich tam thoi cho cac client cu
+# dang doc /version.json va /versions.json tren GitHub. Nguon chinh nam trong _version.
+$legacyLatestManifestFile = Join-Path $Root 'version.json'
+$legacyHistoryManifestFile = Join-Path $Root 'versions.json'
 
 if (-not (Test-Path -LiteralPath $versionFile)) {
-    throw "Khong tim thay VERSION.txt: $versionFile"
+    throw "Khong tim thay _version/VERSION.txt: $versionFile"
 }
 
 $version = (Get-Content -LiteralPath $versionFile -Raw).Trim()
 if ($version -notmatch '^\d+\.\d+\.\d+$') {
-    throw "VERSION.txt phai co dang X.Y.Z, vi du 13.6.4. Gia tri hien tai: '$version'"
+    throw "_version/VERSION.txt phai co dang X.Y.Z, vi du 13.6.4. Gia tri hien tai: '$version'"
 }
 
 $setupFileName = "ToolTikTok_V${version}_Setup.exe"
@@ -139,6 +152,16 @@ function Write-JsonUtf8NoBom([string]$path, $obj) {
         if (Test-Path -LiteralPath $tmp) {
             Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
         }
+    }
+}
+
+function Sync-LegacyManifestCopy([string]$source, [string]$destination) {
+    if (-not (Test-Path -LiteralPath $source)) { return }
+    try {
+        [System.IO.File]::Copy($source, $destination, $true)
+    }
+    catch {
+        throw "Khong dong bo duoc manifest tuong thich: $destination. $($_.Exception.Message)"
     }
 }
 
@@ -269,13 +292,18 @@ if (-not [string]::IsNullOrWhiteSpace($setupSha)) {
     Write-JsonUtf8NoBom $historyManifestFile $history
 }
 
+# Luon giu 2 manifest root dong bo de cac ban Tool cu van nhan duoc cap nhat.
+# Khi tat ca client da chuyen sang _version, co the bo 2 ban tuong thich nay.
+Sync-LegacyManifestCopy $latestManifestFile $legacyLatestManifestFile
+Sync-LegacyManifestCopy $historyManifestFile $legacyHistoryManifestFile
+
 Write-Host "[VERSION] Da dong bo version = $version"
 Write-Host "[VERSION] setupUrl = $setupUrl"
-Write-Host "[VERSION] version.json = $latestManifestFile"
+Write-Host "[VERSION] _version/version.json = $latestManifestFile"
 if (-not [string]::IsNullOrWhiteSpace($setupSha)) {
     Write-Host "[VERSION] SHA-256 = $setupSha"
-    Write-Host "[VERSION] Da upsert vao versions.json = $historyManifestFile"
+    Write-Host "[VERSION] Da upsert vao _version/versions.json = $historyManifestFile"
 }
 else {
-    Write-Host "[VERSION] Chua co Setup: versions.json duoc giu nguyen, se cap nhat sau khi build Setup."
+    Write-Host "[VERSION] Chua co Setup: _version/versions.json duoc giu nguyen, se cap nhat sau khi build Setup."
 }

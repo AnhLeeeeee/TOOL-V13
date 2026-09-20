@@ -76,7 +76,47 @@ public sealed partial class ManagerForm
     }
 
     readonly SemaphoreSlim _autoProfileQueueGate = new(1, 1);
+    readonly object _autoProfileRunCtsLock = new();
+    CancellationTokenSource? _autoProfileActiveRunCts;
     Form? _autoProfileDialog;
+
+    void RegisterActiveAutoProfileRun(CancellationTokenSource cts)
+    {
+        lock (_autoProfileRunCtsLock)
+            _autoProfileActiveRunCts = cts;
+    }
+
+    void ClearActiveAutoProfileRun(CancellationTokenSource? cts)
+    {
+        lock (_autoProfileRunCtsLock)
+        {
+            if (ReferenceEquals(_autoProfileActiveRunCts, cts))
+                _autoProfileActiveRunCts = null;
+        }
+    }
+
+    void CancelActiveAutoProfileRun(string source)
+    {
+        CancellationTokenSource? cts;
+        lock (_autoProfileRunCtsLock)
+            cts = _autoProfileActiveRunCts;
+
+        if (cts is null)
+            return;
+
+        try
+        {
+            cts.Cancel();
+            _log.Warn($"[AUTO_PROFILE_GLOBAL_STOP] source={source} action=CANCEL_SEQUENCE_AND_REUSE_DRAIN");
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"[AUTO_PROFILE_GLOBAL_STOP_WARN] source={source} error={ex.Message}");
+        }
+    }
 
     static readonly TimeSpan AutoProfileAfterCreateDelay = TimeSpan.FromSeconds(2);
     static readonly TimeSpan AutoProfileAfterLoginDelay = TimeSpan.FromSeconds(3);
@@ -271,6 +311,123 @@ public sealed partial class ManagerForm
 
         _log.Info($"[AUTO_PROFILE_COOLDOWN_END] kind={kind} actual={actualDelay:c}");
         return true;
+    }
+
+    async Task<int> TryDrainReusableProfilesAfterFailedAutoProfileAsync(
+        AutoProfileQueueItem failedItem,
+        int maxRecoverCount,
+        Func<bool> isPaused,
+        CancellationToken ct,
+        Action<string> updateStatus)
+    {
+        ct.ThrowIfCancellationRequested();
+        maxRecoverCount = Math.Max(0, maxRecoverCount);
+        if (maxRecoverCount == 0)
+            return 0;
+
+        var request = new AutoReplacementRequest
+        {
+            ClosedProfileName = failedItem.ProfileName,
+            Reason = "AUTO_PROFILE_FAILED_CREATE_REUSE_DRAIN",
+            RequiresSourceCleanup = false
+        };
+
+        var recoveredCount = 0;
+
+        _log.Warn(
+            $"[AUTO_PROFILE_REUSE_DRAIN_BEGIN] failed={failedItem.ProfileName} account={failedItem.Account.Username} "
+            + $"need={maxRecoverCount} reusePending={GetReusableProfileQueueCount()} action=CHECK_ALL_REUSE_BEFORE_NEXT_CREATE");
+
+        var waitedForGate = _autoReplacementOperationGate.CurrentCount == 0;
+        if (waitedForGate)
+        {
+            _log.Info(
+                $"[AUTO_PROFILE_REUSE_DRAIN_GATE_WAIT] failed={failedItem.ProfileName} detail=another_replacement_running");
+        }
+
+        await _autoReplacementOperationGate.WaitAsync(ct);
+        try
+        {
+            _log.Info(
+                $"[AUTO_PROFILE_REUSE_DRAIN_GATE_ENTER] failed={failedItem.ProfileName} waited={waitedForGate}");
+
+            while (recoveredCount < maxRecoverCount)
+            {
+                ct.ThrowIfCancellationRequested();
+                await WaitAutoProfilePausePointAsync(isPaused, ct);
+
+                updateStatus(
+                    $"PRF {failedItem.ProfileName} lỗi đã đóng sạch — đang vét PRF bù {recoveredCount}/{maxRecoverCount} trước khi cho phép tạo mới...");
+
+                // Lane 1: PRF chờ bình thường. Engine tự mở tuần tự từng PRF;
+                // PRF nào lỗi sẽ đóng sạch trước khi thử PRF kế tiếp.
+                var filled = await TryOpenNextExistingReplacementAsync(
+                    request,
+                    AutoProfileReuseDrainExecutionGeneration,
+                    ct);
+
+                if (!filled)
+                {
+                    // Lane 2: PRF đã Save tên nhưng TikTok chưa đồng bộ. Chỉ probe
+                    // những entry đủ tuổi; mỗi PRF tối đa 1 lần trong sweep hiện tại.
+                    filled = await TryRecoverNameSyncPendingReusableProfilesOnceAsync(
+                        request,
+                        AutoProfileReuseDrainExecutionGeneration,
+                        ct);
+                }
+
+                if (filled)
+                {
+                    recoveredCount++;
+                    _log.Info(
+                        $"[AUTO_PROFILE_REUSE_DRAIN_FILLED] failed={failedItem.ProfileName} recovered={recoveredCount}/{maxRecoverCount} "
+                        + $"attempted={GetAutoReplacementAttemptedProfileCount(request)} action=CONTINUE_DRAIN_BEFORE_CREATE");
+
+                    updateStatus(
+                        $"Đã lấy được {recoveredCount}/{maxRecoverCount} PRF bù RUNNING khỏe — tiếp tục kiểm tra PRF bù còn lại trước khi tạo mới...");
+                    continue;
+                }
+
+                // Nếu vẫn còn PRF bù hợp lệ chưa thể kiểm tra ngay (ví dụ NAME_SYNC
+                // còn vài giây, OPENING/UNKNOWN đang settle), tuyệt đối chưa được rơi
+                // xuống CREATE. Chờ ngắn rồi vét lại đúng queue hiện có.
+                if (TryFindUntestedEligibleReusableProfile(
+                        request,
+                        out var pendingProfile,
+                        out var pendingLane,
+                        out var pendingDetail))
+                {
+                    _log.Info(
+                        $"[AUTO_PROFILE_REUSE_DRAIN_WAIT] failed={failedItem.ProfileName} profile={pendingProfile} "
+                        + $"lane={pendingLane} detail={pendingDetail} recovered={recoveredCount}/{maxRecoverCount} "
+                        + $"attempted={GetAutoReplacementAttemptedProfileCount(request)}");
+
+                    updateStatus(
+                        $"Đang chờ kiểm tra PRF bù {pendingProfile} ({pendingLane}) — chưa cho phép tạo PRF mới...");
+
+                    await Task.Delay(AutoReplacementReusableStateRetry, ct);
+                    continue;
+                }
+
+                _log.Info(
+                    $"[AUTO_PROFILE_REUSE_DRAIN_EXHAUSTED] failed={failedItem.ProfileName} recovered={recoveredCount}/{maxRecoverCount} "
+                    + $"attempted={GetAutoReplacementAttemptedProfileCount(request)} reusePending={GetReusableProfileQueueCount()} "
+                    + "action=ALLOW_NEXT_CREATE_AFTER_COOLDOWN");
+                return recoveredCount;
+            }
+
+            _log.Info(
+                $"[AUTO_PROFILE_REUSE_DRAIN_TARGET_FILLED] failed={failedItem.ProfileName} recovered={recoveredCount}/{maxRecoverCount} "
+                + "action=NO_NEW_CREATE_NEEDED_FOR_REMAINING_TARGET");
+            return recoveredCount;
+        }
+        finally
+        {
+            ClearAutoReplacementUiPhase(request.Id);
+            _autoReplacementOperationGate.Release();
+            _log.Info(
+                $"[AUTO_PROFILE_REUSE_DRAIN_GATE_EXIT] failed={failedItem.ProfileName} recovered={recoveredCount}/{maxRecoverCount}");
+        }
     }
 
     void ShowAutoProfileDialog()
@@ -998,6 +1155,7 @@ public sealed partial class ManagerForm
                 paused = false;
                 pause.Text = "Tạm dừng";
                 runCts = CreateEmergencyLinkedCancellationSource();
+                RegisterActiveAutoProfileRun(runCts);
                 SetInputsEnabled(false);
                 SetPopupInputsEnabled(false);
 
@@ -1317,6 +1475,7 @@ public sealed partial class ManagerForm
                     paused = false;
                     preCreateRunning = false;
                     preCreateStopRequested = false;
+                    ClearActiveAutoProfileRun(runCts);
                     try { runCts?.Dispose(); } catch { }
                     runCts = null;
                     SetInputsEnabled(true);
@@ -1392,6 +1551,7 @@ public sealed partial class ManagerForm
                 paused = false;
                 pause.Text = "Tạm dừng";
                 runCts = CreateEmergencyLinkedCancellationSource();
+                RegisterActiveAutoProfileRun(runCts);
                 SetInputsEnabled(false);
                 status.Text = requestedNew > 0
                     ? $"Mục tiêu: tạo đủ {requestedNew} profile mới thành công | Có {newCandidates} account phù hợp trong kho | Resume: {resumeQueued}."
@@ -1401,6 +1561,7 @@ public sealed partial class ManagerForm
                 var skippedByExcel = 0;
                 var pausedOrError = 0;
                 var newSuccess = 0;
+                var reuseRecovered = 0;
                 var newAttempts = 0;
                 var newNotSuccessful = 0;
                 var resumeSuccess = 0;
@@ -1413,7 +1574,7 @@ public sealed partial class ManagerForm
 
                         // Resume được xử lý độc lập. Với lane profile mới, dừng ngay
                         // khi đã đủ số profile THÀNH CÔNG mà người dùng yêu cầu.
-                        if (!item.ResumeExisting && newSuccess >= requestedNew)
+                        if (!item.ResumeExisting && (newSuccess + reuseRecovered) >= requestedNew)
                             break;
 
                         await WaitAutoProfilePausePointAsync(() => paused, runCts.Token);
@@ -1436,7 +1597,8 @@ public sealed partial class ManagerForm
                         {
                             newAttempts++;
                             status.Text =
-                                $"Đang tạo profile mới: thành công {newSuccess}/{requestedNew} | "
+                                $"Đang tạo profile mới: đạt {newSuccess + reuseRecovered}/{requestedNew} "
+                                + $"(mới {newSuccess}, bù {reuseRecovered}) | "
                                 + $"lần thử {newAttempts} | {item.ProfileName} — {item.Account.Username}";
                         }
 
@@ -1578,7 +1740,7 @@ public sealed partial class ManagerForm
 
                                 _log.Info(
                                     $"[AUTO_PROFILE_FAILED_NEW_CLEAN_CONFIRMED] profile={item.ProfileName} account={item.Account.Username} "
-                                    + $"chrome=0 worker=closed queuedForRetry={queuedForRetry} action=ALLOW_COOLDOWN_AND_NEXT_CREATE");
+                                    + $"chrome=0 worker=closed queuedForRetry={queuedForRetry} action=DRAIN_REUSE_BEFORE_NEXT_CREATE");
 
                                 UpdateGridRow(
                                     item,
@@ -1609,9 +1771,46 @@ public sealed partial class ManagerForm
                             }
                         }
 
+                        // Sau một CREATE mới thất bại, không được nhảy thẳng sang account
+                        // mới tiếp theo. Vét toàn bộ PRF Chờ dùng lại theo thứ tự, mỗi lần
+                        // chỉ mở 1 PRF; PRF lỗi phải được đóng sạch trước PRF kế tiếp.
+                        // Chỉ khi queue thật sự hết ứng viên mới cho phép CREATE tiếp.
+                        if (!item.ResumeExisting && !outcome.Success && !outcome.Skipped
+                            && (newSuccess + reuseRecovered) < requestedNew)
+                        {
+                            status.Text =
+                                $"PRF {item.ProfileName} lỗi đã đóng sạch — đang ưu tiên kiểm tra PRF bù trước khi tạo mới...";
+
+                            var needFromReuse = Math.Max(
+                                0,
+                                requestedNew - (newSuccess + reuseRecovered));
+
+                            var recoveredNow = await TryDrainReusableProfilesAfterFailedAutoProfileAsync(
+                                item,
+                                needFromReuse,
+                                () => paused,
+                                runCts.Token,
+                                text => status.Text = text);
+
+                            if (recoveredNow > 0)
+                            {
+                                reuseRecovered += recoveredNow;
+                                UpdateGridRow(
+                                    item,
+                                    $"ĐÃ BÙ x{recoveredNow}",
+                                    $"{outcome.Status} — {outcome.Note} | PRF lỗi đã đóng sạch; đã lấy được {recoveredNow} PRF bù RUNNING khỏe. "
+                                    + $"Đạt {newSuccess + reuseRecovered}/{requestedNew} (mới {newSuccess}, bù {reuseRecovered}).",
+                                    Color.DarkGreen);
+
+                                status.Text =
+                                    $"Đã bù {recoveredNow} PRF sau lỗi {item.ProfileName}. "
+                                    + $"Đạt {newSuccess + reuseRecovered}/{requestedNew} (mới {newSuccess}, bù {reuseRecovered}).";
+                            }
+                        }
+
                         var hasMoreRequiredWork =
                             i + 1 < queue.Count
-                            && (queue[i + 1].ResumeExisting || newSuccess < requestedNew);
+                            && (queue[i + 1].ResumeExisting || (newSuccess + reuseRecovered) < requestedNew);
 
                         if (hasMoreRequiredWork && !outcome.Skipped)
                         {
@@ -1628,7 +1827,8 @@ public sealed partial class ManagerForm
                                 {
                                     status.Text = item.ResumeExisting
                                         ? text + " trước profile tiếp theo..."
-                                        : $"Thành công {newSuccess}/{requestedNew}. "
+                                        : $"Đạt {newSuccess + reuseRecovered}/{requestedNew} "
+                                          + $"(mới {newSuccess}, bù {reuseRecovered}). "
                                           + $"Account vừa rồi {(outcome.Success ? "đã đạt" : "chưa đạt")} — {text}.";
                                 });
                         }
@@ -1636,18 +1836,20 @@ public sealed partial class ManagerForm
 
                     if (requestedNew > 0)
                     {
-                        if (newSuccess >= requestedNew)
+                        if ((newSuccess + reuseRecovered) >= requestedNew)
                         {
                             status.Text =
-                                $"Hoàn tất đủ mục tiêu. PROFILE MỚI: {newSuccess}/{requestedNew} | "
-                                + $"ĐÃ THỬ: {newAttempts} | CHƯA THÀNH CÔNG: {newNotSuccessful} | "
+                                $"Hoàn tất đủ mục tiêu. ĐẠT: {newSuccess + reuseRecovered}/{requestedNew} "
+                                + $"(TẠO MỚI OK: {newSuccess}, BÙ OK: {reuseRecovered}) | "
+                                + $"ĐÃ THỬ TẠO: {newAttempts} | CHƯA THÀNH CÔNG: {newNotSuccessful} | "
                                 + $"RESUME DONE: {resumeSuccess} | BỎ QUA EXCEL: {skippedByExcel}.";
                         }
                         else
                         {
                             status.Text =
-                                $"Đã hết kho tài khoản phù hợp trước khi đủ mục tiêu. PROFILE MỚI: {newSuccess}/{requestedNew} | "
-                                + $"ĐÃ THỬ: {newAttempts} | CHƯA THÀNH CÔNG: {newNotSuccessful} | "
+                                $"Đã hết kho tài khoản phù hợp trước khi đủ mục tiêu. ĐẠT: {newSuccess + reuseRecovered}/{requestedNew} "
+                                + $"(TẠO MỚI OK: {newSuccess}, BÙ OK: {reuseRecovered}) | "
+                                + $"ĐÃ THỬ TẠO: {newAttempts} | CHƯA THÀNH CÔNG: {newNotSuccessful} | "
                                 + $"RESUME DONE: {resumeSuccess} | BỎ QUA EXCEL: {skippedByExcel}.";
                         }
                     }
@@ -1679,6 +1881,7 @@ public sealed partial class ManagerForm
                 paused = false;
                 preCreateRunning = false;
                 preCreateStopRequested = false;
+                ClearActiveAutoProfileRun(runCts);
                 try { runCts?.Dispose(); } catch { }
                 runCts = null;
                 SetInputsEnabled(true);

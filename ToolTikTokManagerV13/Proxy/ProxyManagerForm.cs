@@ -1,4 +1,4 @@
-using ToolTikTokV12.Models;
+﻿using ToolTikTokV12.Models;
 
 namespace ToolTikTokManagerV13.Proxy;
 
@@ -30,6 +30,7 @@ public sealed class ProxyManagerForm : Form
     readonly Button _replaceBadButton = new() { Text = "Gán lại Proxy lỗi", AutoSize = true };
     readonly Button _applyButton = new() { Text = "Áp dụng cho lần mở tiếp theo", AutoSize = true };
     readonly Button _clearAssignmentsButton = new() { Text = "Xóa gán đã chọn", AutoSize = true };
+    readonly Button _proxyLogButton = new() { Text = "Nhật ký Proxy", Width = 120, Height = 32 };
     CancellationTokenSource? _operationCts;
     bool _loading;
 
@@ -74,12 +75,14 @@ public sealed class ProxyManagerForm : Form
             ColumnCount = 1,
             RowCount = 4,
             Padding = new Padding(10),
-            Height = 760
+            Height = 1130
         };
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 64F));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 202F));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 430F));
+        // Hai bảng Pool/Gán PRF cần đủ cao để đọc nhiều dòng. Cửa sổ đã có AutoScroll
+        // nên ưu tiên chiều cao thực tế thay vì ép nhỏ vừa một màn hình.
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 790F));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 54F));
 
         void FitScrollableRootWidth()
@@ -91,11 +94,18 @@ public sealed class ProxyManagerForm : Form
 
         var masterBox = new GroupBox { Text = "PROXY", Dock = DockStyle.Fill, Padding = new Padding(12, 8, 12, 8) };
         var masterFlow = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, WrapContents = false };
+        _proxyLogButton.Margin = new Padding(18, 0, 0, 0);
+        _proxyLogButton.Click += (_, _) =>
+        {
+            using var form = new ProxyLogForm(_coordinator.Diagnostics);
+            form.ShowDialog(this);
+        };
         masterFlow.Controls.Add(_master);
+        masterFlow.Controls.Add(_proxyLogButton);
         masterFlow.Controls.Add(new Label
         {
             AutoSize = true,
-            Margin = new Padding(18, 5, 0, 0),
+            Margin = new Padding(12, 5, 0, 0),
             ForeColor = Color.DimGray,
             Text = "Tắt = module Proxy ngừng hoàn toàn; PRF mở sau đó dùng mạng có sẵn. PRF đang chạy không bị restart."
         });
@@ -153,8 +163,8 @@ public sealed class ProxyManagerForm : Form
         configBox.Controls.Add(cfg);
         root.Controls.Add(configBox, 0, 1);
 
-        _body.RowStyles.Add(new RowStyle(SizeType.Percent, 54F));
-        _body.RowStyles.Add(new RowStyle(SizeType.Percent, 46F));
+        _body.RowStyles.Add(new RowStyle(SizeType.Percent, 52F));
+        _body.RowStyles.Add(new RowStyle(SizeType.Percent, 48F));
         _body.Controls.Add(BuildPoolGroup(), 0, 0);
         _body.Controls.Add(BuildAssignmentGroup(), 0, 1);
         root.Controls.Add(_body, 0, 2);

@@ -50,3 +50,20 @@ Name: "{autodesktop}\Tool TikTok V{#MyAppVersion}"; Filename: "{app}\{#MyAppExeN
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Mở Tool TikTok V{#MyAppVersion}"; WorkingDir: "{app}"; \
   Flags: nowait postinstall skipifsilent
+[Code]
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ExistingExe: String;
+  MarkerPath: String;
+begin
+  Result := '';
+  ExistingExe := ExpandConstant('{app}\ToolTikTokManagerV13.exe');
+  MarkerPath := ExpandConstant('{app}\.device_access_upgrade_marker');
+
+  { Chỉ tạo marker nếu trước khi Setup ghi file mới, máy này đã có Tool trong thư mục cài. }
+  if FileExists(ExistingExe) then
+  begin
+    { Nếu ghi marker thất bại, app vẫn còn nhánh nhận diện dữ liệu runtime cũ. }
+    SaveStringToFile(MarkerPath, 'existing_before_upgrade=1' + #13#10, False);
+  end;
+end;

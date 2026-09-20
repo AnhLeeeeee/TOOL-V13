@@ -1,4 +1,4 @@
-@echo off
+﻿@echo off
 setlocal EnableExtensions
 cd /d "%~dp0"
 
@@ -30,6 +30,10 @@ if not exist ".\dist_v13\ToolTikTokManagerV13.exe" (
     pause
     exit /b 1
 )
+
+rem DEV BUILD: cho phep chinh may dang build source duoc kich hoat local.
+rem Marker nay nam trong dist_v13, KHONG nam trong publish/setup client.
+> ".\dist_v13\.device_access_upgrade_marker" echo dev_build=1
 
 start "" ".\dist_v13\ToolTikTokManagerV13.exe"
 exit /b 0

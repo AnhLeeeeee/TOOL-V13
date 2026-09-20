@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
 
@@ -16,13 +16,6 @@ public sealed class ProxyTestService
     public async Task<ProxyTestResult> TestAsync(ProxyEndpoint proxy, CancellationToken cancellationToken)
     {
         var watch = Stopwatch.StartNew();
-        // Chromium không hỗ trợ username/password cho SOCKS5. Không gán loại này
-        // vào PRF dù endpoint có thể test được bằng HttpClient.
-        if (proxy.Protocol == ProxyProtocol.Socks5 && proxy.HasCredentials)
-        {
-            watch.Stop();
-            return new ProxyTestResult(ProxyHealthState.Error, "", 0, "Chrome không hỗ trợ xác thực username/password cho SOCKS5. Hãy dùng SOCKS5 không auth hoặc HTTP/HTTPS proxy.");
-        }
         try
         {
             using var handler = new HttpClientHandler

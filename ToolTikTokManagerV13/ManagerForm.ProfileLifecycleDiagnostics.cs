@@ -2,6 +2,7 @@
 using System.IO.Compression;
 using System.Text;
 using ToolTikTokV12.Controls;
+using ToolTikTokV12.Services;
 using ToolTikTokV12.Utils;
 
 namespace ToolTikTokManagerV13;
@@ -418,6 +419,27 @@ public sealed partial class ManagerForm
             }
         }
 
+        var deviceAuditPath = DeviceAccessService.AuditLogPath;
+        if (File.Exists(deviceAuditPath))
+        {
+            try
+            {
+                using var input = new FileStream(
+                    deviceAuditPath,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete);
+                var entry = archive.CreateEntry("device-access/device-access.log", CompressionLevel.Fastest);
+                using var output = entry.Open();
+                input.CopyTo(output);
+                included++;
+            }
+            catch (Exception ex)
+            {
+                skipped.Add($"device-access.log: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
         var infoEntry = archive.CreateEntry("diagnostic-info.txt", CompressionLevel.Fastest);
         using (var writer = new StreamWriter(infoEntry.Open(), new UTF8Encoding(false)))
         {
@@ -425,6 +447,10 @@ public sealed partial class ManagerForm
             writer.WriteLine($"Version: {AppVersionInfo.Display}");
             writer.WriteLine($"Exported local time: {DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}");
             writer.WriteLine($"Manager PID: {Environment.ProcessId}");
+            writer.WriteLine($"Device ID: {DeviceAccessService.GetDeviceId(_baseDir)}");
+            var deviceDecision = DeviceAccessService.LastDecision;
+            if (deviceDecision is not null)
+                writer.WriteLine($"Device access: allowRun={deviceDecision.AllowRun}; allowUpdate={deviceDecision.AllowUpdate}; activated={deviceDecision.Activated}; source={deviceDecision.ActivationSource}; remote={deviceDecision.RemotePolicyApplied}");
             writer.WriteLine($"Base directory: {_baseDir}");
             writer.WriteLine($"Log directory: {ToolLogDirectory}");
             writer.WriteLine($"Included files: {included}");

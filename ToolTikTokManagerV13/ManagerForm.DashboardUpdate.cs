@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using ToolTikTokV12.Controls;
+using ToolTikTokV12.Services;
 
 namespace ToolTikTokManagerV13;
 
@@ -88,6 +89,7 @@ public sealed partial class ManagerForm
     DataGridView? _dashboardGrid;
     Label? _dashboardSummary;
     Label? _dashboardUpdateStatus;
+    Label? _dashboardDeviceId;
     Button? _dashboardUpdateButton;
     ComboBox? _dashboardVersionSelector;
     CheckBox? _dashboardHoldVersionToggle;
@@ -241,7 +243,7 @@ public sealed partial class ManagerForm
         var panel = new Panel
         {
             Dock = DockStyle.Top,
-            Height = 92,
+            Height = 118,
             Padding = new Padding(10, 7, 10, 7),
             Margin = new Padding(0, 8, 0, 8),
             BackColor = Color.FromArgb(245, 248, 252)
@@ -255,6 +257,18 @@ public sealed partial class ManagerForm
             Text = $"Phiên bản hiện tại: V{ManagerDisplayVersion} — chưa tải danh sách phiên bản.",
             ForeColor = Color.FromArgb(55, 76, 103),
             Location = new Point(10, 5),
+            AutoEllipsis = true
+        };
+
+        var currentDeviceId = DeviceAccessService.GetDeviceId(_baseDir);
+        _dashboardDeviceId = new Label
+        {
+            AutoSize = false,
+            Height = 24,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Text = $"Mã thiết bị: {currentDeviceId}",
+            ForeColor = Color.DimGray,
+            Location = new Point(10, 82),
             AutoEllipsis = true
         };
 
@@ -312,6 +326,7 @@ public sealed partial class ManagerForm
         _dashboardHoldVersionToggle.CheckedChanged += (_, _) => OnHoldVersionToggleChanged();
 
         panel.Controls.Add(_dashboardUpdateStatus);
+        panel.Controls.Add(_dashboardDeviceId);
         panel.Controls.Add(_dashboardVersionSelector);
         panel.Controls.Add(_dashboardUpdateButton);
         panel.Controls.Add(check);
@@ -329,6 +344,8 @@ public sealed partial class ManagerForm
             const int gap = 8;
             const int rightPadding = 10;
             _dashboardUpdateStatus.Width = Math.Max(250, panel.ClientSize.Width - 20);
+            if (_dashboardDeviceId is not null && !_dashboardDeviceId.IsDisposed)
+                _dashboardDeviceId.Width = Math.Max(220, panel.ClientSize.Width - 20);
 
             var right = Math.Max(0, panel.ClientSize.Width - rightPadding);
             _dashboardHoldVersionToggle.Left = Math.Max(10, right - _dashboardHoldVersionToggle.Width);
@@ -1063,9 +1080,60 @@ public sealed partial class ManagerForm
             lastError);
     }
 
+    async Task<bool> EnsureDeviceUpdateAllowedAsync(bool showWhenCurrent)
+    {
+        DeviceAccessService.DeviceAccessDecision access;
+        try
+        {
+            access = await DeviceAccessService.RefreshForUpdateAsync(_baseDir, AppVersionInfo.Current);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn("[UPDATE_DEVICE_POLICY_CHECK_FAILED] " + ex.Message);
+            access = DeviceAccessService.LastDecision ?? new DeviceAccessService.DeviceAccessDecision
+            {
+                AllowRun = true,
+                AllowUpdate = true,
+                DeviceId = DeviceAccessService.GetDeviceId(_baseDir),
+                Reason = "Không đọc được policy thiết bị; giữ quyền local hiện tại."
+            };
+        }
+
+        _log.Info($"[UPDATE_DEVICE_POLICY] id={access.DeviceId} allowRun={access.AllowRun} allowUpdate={access.AllowUpdate} remote={access.RemotePolicyApplied}");
+
+        if (!access.AllowRun)
+        {
+            ModernDialog.ShowMessage(this,
+                $"Thiết bị này không còn được cấp quyền sử dụng Tool.\n\nMã thiết bị: {access.DeviceId}",
+                "Quyền thiết bị", MessageBoxIcon.Warning);
+            BeginInvoke(new Action(Close));
+            return false;
+        }
+
+        if (access.AllowUpdate) return true;
+
+        _latestUpdate = null;
+        _availableVersions.Clear();
+        RefreshVersionSelector();
+        if (_dashboardUpdateStatus is not null && !_dashboardUpdateStatus.IsDisposed)
+        {
+            _dashboardUpdateStatus.Text = $"Phiên bản hiện tại: V{ManagerDisplayVersion} — đã kiểm tra cập nhật.";
+            _dashboardUpdateStatus.ForeColor = Color.FromArgb(55, 76, 103);
+        }
+        RefreshSelectedVersionAction();
+
+        // Cố ý không tiết lộ rằng máy đang bị chặn update: phía máy khách chỉ thấy như không có bản mới.
+        if (showWhenCurrent)
+            ModernDialog.ShowMessage(this,
+                $"Bạn đang dùng V{ManagerDisplayVersion}. Không có bản cập nhật mới.",
+                "Trình quản lý phiên bản", MessageBoxIcon.Information);
+        return false;
+    }
+
     async Task CheckForUpdatesAsync(bool showWhenCurrent)
     {
         if (_updateCheckInProgress) return;
+        if (!await EnsureDeviceUpdateAllowedAsync(showWhenCurrent)) return;
         var settings = LoadUpdateSettings();
         if (string.IsNullOrWhiteSpace(settings.ManifestUrl))
         {
@@ -1319,6 +1387,12 @@ public sealed partial class ManagerForm
     {
         var button = _dashboardUpdateButton;
         if (button is null || button.IsDisposed) return;
+        if (DeviceAccessService.LastDecision is { AllowUpdate: false })
+        {
+            button.Text = "Đang sử dụng";
+            button.Enabled = false;
+            return;
+        }
         var target = SelectedVersionManifest();
         if (target is null)
         {
@@ -1362,6 +1436,7 @@ public sealed partial class ManagerForm
     async Task DownloadAndInstallSelectedVersionAsync()
     {
         if (_updateDownloadInProgress) return;
+        if (!await EnsureDeviceUpdateAllowedAsync(showWhenCurrent: false)) return;
         var manifest = SelectedVersionManifest();
         if (manifest is null)
         {

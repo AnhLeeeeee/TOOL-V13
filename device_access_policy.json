@@ -1,0 +1,9 @@
+{
+  "enabled": true,
+  "policyVersion": "1",
+  "enforceAllowList": false,
+  "allowedDeviceIds": [],
+  "blockedDeviceIds": [],
+  "blockedUpdateDeviceIds": [],
+  "blockMessage": "Thiết bị này chưa được cấp quyền sử dụng Tool."
+}

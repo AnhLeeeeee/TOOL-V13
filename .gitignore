@@ -24,3 +24,10 @@ RELEASE_OUTPUT/
 *.bak_statistics
 
 SOURCE_OUTPUT/
+
+# Device access runtime markers - generated per installed machine
+.device_access_migrated
+.device_access_upgrade_marker
+
+# Local version-layout migration marker
+_version/.layout_v1_migrated

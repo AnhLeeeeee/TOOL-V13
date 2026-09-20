@@ -4447,6 +4447,7 @@ public sealed partial class ChromeController : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        StopProxyBridge();
         await DisconnectAsync();
         _http.Dispose();
         _manualCloseGate.Dispose();

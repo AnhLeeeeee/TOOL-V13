@@ -1,3 +1,5 @@
+using ToolTikTokV12.Services;
+using ToolTikTokV12.Utils;
 using System.IO.Pipes;
 using System.Security.Cryptography;
 using System.Text;
@@ -10,6 +12,18 @@ internal static class Program
     static void Main(string[] args)
     {
         ApplicationConfiguration.Initialize();
+
+        var baseDir = Path.GetFullPath(AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar));
+        var access = DeviceAccessService.EvaluateLocalAccess(baseDir, AppVersionInfo.Current);
+        if (!access.AllowRun)
+        {
+            MessageBox.Show(
+                $"Thiết bị này chưa được cấp quyền sử dụng Tool.\n\nMã thiết bị: {access.DeviceId}",
+                "Tool TikTok — Thiết bị chưa được cấp quyền",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
 
         // File picker helper chạy trong process Worker sạch, không tạo MainForm/IPC.
         // Mục đích: cách ly native Windows file dialog khỏi Worker automation.

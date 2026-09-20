@@ -117,6 +117,13 @@ public sealed partial class ManagerForm
     const int AutoReplacementReusableHealthyConfirmTimeoutSeconds = 45;
     const int AutoReplacementReusableHealthyStableSeconds = 4;
     const int AutoReplacementReusableStartCommandTimeoutSeconds = 20;
+
+    // Sentinel execution generation dành riêng cho +Auto Profile khi phải vét PRF
+    // trong "Chờ dùng lại" sau một lượt CREATE lỗi. Luồng này dùng lại toàn bộ
+    // safety/cleanup của AutoReplacement nhưng KHÔNG phụ thuộc việc Tự bù đang bật.
+    // CancellationToken của +Auto Profile vẫn là nguồn dừng chính.
+    const int AutoProfileReuseDrainExecutionGeneration = int.MinValue + 4242;
+
     static readonly TimeSpan AutoReplacementReusableRecoveryInterval = TimeSpan.FromSeconds(8);
     static readonly TimeSpan AutoReplacementFailedProfileCooldown = TimeSpan.FromMinutes(5);
     static readonly TimeSpan AutoReplacementQueueWaitSlice = TimeSpan.FromSeconds(5);
@@ -795,8 +802,18 @@ public sealed partial class ManagerForm
         if (IsAutomationHalted
             || _closing
             || IsDisposed
-            || Disposing
-            || !_autoReplacementSessionArmed
+            || Disposing)
+        {
+            return false;
+        }
+
+        // +Auto Profile dùng engine kiểm tra PRF bù ngay cả khi tính năng Tự bù
+        // không được arm. Chỉ bypass hai cờ của AutoReplacement; mọi hard-stop,
+        // cleanup barrier và CancellationToken của caller vẫn giữ nguyên.
+        if (generation == AutoProfileReuseDrainExecutionGeneration)
+            return true;
+
+        if (!_autoReplacementSessionArmed
             || !_autoCloseSettings.OpenReplacementAfterAutoClose)
         {
             return false;

@@ -9,8 +9,10 @@ set "OUT=%CD%\publish_v13_5_vm"
 set "ZIP=%CD%\ToolTikTok_V13.5_VM_CLIENT_WIN_X64.zip"
 set "TMPZIP=%TEMP%\ToolTikTok_V13.5_VM_CLIENT_WIN_X64_%RANDOM%_%RANDOM%.zip"
 
-if not exist "VERSION.txt" goto :versionfail
-set /p APP_VERSION=<"VERSION.txt"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%ENSURE_VERSION_LAYOUT.ps1" -Root "%ROOT%"
+if errorlevel 1 goto :versionfail
+if not exist "_version\VERSION.txt" goto :versionfail
+set /p APP_VERSION=<"_version\VERSION.txt"
 powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%SYNC_VERSION.ps1" -Root "%ROOT%"
 if errorlevel 1 goto :versionfail
 
@@ -112,7 +114,7 @@ exit /b 0
 echo.
 echo ========================================
 echo LOI: VERSION KHONG HOP LE HOAC KHONG DONG BO DUOC
-echo Kiem tra VERSION.txt va SYNC_VERSION.ps1
+echo Kiem tra _version\VERSION.txt va SYNC_VERSION.ps1
 echo ========================================
 if /I not "%NOPAUSE%"=="--no-pause" pause
 exit /b 1

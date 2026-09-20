@@ -1,4 +1,5 @@
-﻿using ToolTikTokV12.Utils;
+﻿using ToolTikTokV12.Services;
+using ToolTikTokV12.Utils;
 
 namespace ToolTikTokManagerV13;
 
@@ -38,6 +39,41 @@ internal static class Program
 
         try
         {
+            var baseDir = Path.GetFullPath(AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar));
+            DeviceAccessService.DeviceAccessDecision access;
+            try
+            {
+                access = DeviceAccessService
+                    .EvaluateStartupAsync(baseDir, AppVersionInfo.Current)
+                    .GetAwaiter()
+                    .GetResult();
+            }
+            catch (Exception accessEx)
+            {
+                ManagerProcessDiagnostics.Append(
+                    $"[DEVICE_ACCESS_FATAL] pid={Environment.ProcessId} exception={ManagerProcessDiagnostics.ExceptionOneLine(accessEx)}");
+                MessageBox.Show(
+                    "Không thể xác minh quyền sử dụng trên thiết bị này.\n\n" + accessEx.Message,
+                    "Tool TikTok — Xác minh thiết bị",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
+
+            ManagerProcessDiagnostics.Append(
+                $"[DEVICE_ACCESS] id={access.DeviceId} allowRun={access.AllowRun} allowUpdate={access.AllowUpdate} " +
+                $"activated={access.Activated} source={access.ActivationSource} remote={access.RemotePolicyApplied}");
+
+            if (!access.AllowRun)
+            {
+                MessageBox.Show(
+                    $"Thiết bị này chưa được cấp quyền sử dụng Tool.\n\nMã thiết bị: {access.DeviceId}\n\n{access.Reason}",
+                    "Tool TikTok — Thiết bị chưa được cấp quyền",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
+
             Application.Run(new ManagerForm());
             ManagerProcessDiagnostics.Append(
                 $"[MANAGER_APPLICATION_RUN_RETURNED] time={DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} pid={Environment.ProcessId}");

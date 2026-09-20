@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using System.Text.Json;
 using ToolTikTokV12.Models;
 using ToolTikTokV12.Utils;
@@ -17,6 +17,7 @@ public sealed class ProxyCoordinator
     readonly ProxyTestService _tester = new();
     readonly ProxyAssignmentService _assigner = new();
     readonly Logger _log;
+    readonly ProxyDiagnostics _diagnostics;
     ProxyState _state;
 
     static readonly JsonSerializerOptions ProfileWriteJson = new() { WriteIndented = true };
@@ -25,8 +26,12 @@ public sealed class ProxyCoordinator
     {
         _store = new ProxyConfigStore(baseDir);
         _log = log;
+        _diagnostics = new ProxyDiagnostics(baseDir);
         _state = _store.Load();
+        _diagnostics.Write("INIT", $"enabled={_state.Settings.Enabled} mode={_state.Settings.DistributionMode} proxies={_state.Proxies.Count} assignments={_state.Assignments.Count}");
     }
+
+    public ProxyDiagnostics Diagnostics => _diagnostics;
 
     public ProxyState GetSnapshot()
     {
@@ -44,6 +49,7 @@ public sealed class ProxyCoordinator
         {
             _state.Settings = NormalizeSettings(settings);
             SaveLocked();
+            _diagnostics.Write("SETTINGS", $"enabled={_state.Settings.Enabled} mode={_state.Settings.DistributionMode} perProxy={_state.Settings.ProfilesPerProxy} autoAssign={_state.Settings.AutoAssignNewProfiles} autoReplace={_state.Settings.AutoReplaceBadProxy}");
         }
     }
 
@@ -78,6 +84,7 @@ public sealed class ProxyCoordinator
             }
             if (added > 0) SaveLocked();
         }
+        _diagnostics.Write("IMPORT", $"added={added} duplicate={duplicate} invalid={invalid}");
         return (added, duplicate, invalid, errors);
     }
 
@@ -95,6 +102,7 @@ public sealed class ProxyCoordinator
                     _state.ActiveManagerProxyId = "";
                 SaveLocked();
             }
+            if (removed > 0) _diagnostics.Write("REMOVE", $"removed={removed}");
             return removed;
         }
     }
@@ -113,6 +121,7 @@ public sealed class ProxyCoordinator
                 _state.Assignments.RemoveAll(x => names.Contains(x.ProfileName));
             }
             SaveLocked();
+            _diagnostics.Write("ASSIGNMENT_CLEAR", profileNames is null ? "scope=all" : "scope=selected");
         }
     }
 
@@ -130,6 +139,7 @@ public sealed class ProxyCoordinator
             foreach (var profile in profiles)
                 TryWriteProfileConfig(profile, endpoint: null, enabled: false, out _);
             _log.Info("[PROXY_MASTER_OFF] module=disabled action=direct_network_on_next_launch");
+            _diagnostics.Write("MASTER_OFF", "action=direct_network_on_next_launch");
         }
         else
         {
@@ -138,6 +148,7 @@ public sealed class ProxyCoordinator
             _log.Info(mode == ProxyDistributionMode.ManagerShared
                 ? "[PROXY_MASTER_ON] module=enabled mode=manager_shared action=use_one_proxy_for_all_profiles_on_next_launch"
                 : "[PROXY_MASTER_ON] module=enabled mode=per_profile action=use_saved_assignments_on_next_launch");
+            _diagnostics.Write("MASTER_ON", $"mode={mode} profiles={profiles.Count}");
         }
     }
 
@@ -155,6 +166,7 @@ public sealed class ProxyCoordinator
                 SaveLocked();
             }
 
+            _diagnostics.Write("TEST_ALL_START", $"count={endpoints.Count}");
             var done = 0;
             using var limiter = new SemaphoreSlim(6, 6);
             var tasks = endpoints.Select(async endpoint =>
@@ -164,6 +176,7 @@ public sealed class ProxyCoordinator
                 {
                     var result = await _tester.TestAsync(endpoint, cancellationToken);
                     ApplyTestResult(endpoint.Id, result);
+                    _diagnostics.Write("TEST", $"proxy={endpoint.MaskedDisplay} health={result.Health} exitIp={result.ExitIp} latencyMs={result.LatencyMs} error={Short(result.Error)}");
                     var current = Interlocked.Increment(ref done);
                     progress?.Report($"Đã test {current}/{endpoints.Count}: {endpoint.MaskedDisplay} → {result.Health}");
                 }
@@ -174,6 +187,7 @@ public sealed class ProxyCoordinator
             }).ToArray();
             await Task.WhenAll(tasks);
             ReconcileManagerSharedProxyAfterTests("test_all");
+            _diagnostics.Write("TEST_ALL_DONE", $"count={endpoints.Count}");
         }
         finally
         {
@@ -322,6 +336,7 @@ public sealed class ProxyCoordinator
             {
                 TryWriteProfileConfig(profile, endpoint: null, enabled: false, out _);
                 _log.Warn($"[PROXY_FALLBACK_DIRECT] profile={profile.Name} reason=no_healthy_or_available_proxy");
+                _diagnostics.Write("PREPARE_FALLBACK", $"profile={profile.Name} reason=no_healthy_or_available_proxy");
                 return new ProxyPrepareResult(true, false, profile.Name, "", "no_healthy_or_available_proxy");
             }
 
@@ -329,11 +344,13 @@ public sealed class ProxyCoordinator
             {
                 TryWriteProfileConfig(profile, endpoint: null, enabled: false, out _);
                 _log.Warn($"[PROXY_FALLBACK_DIRECT] profile={profile.Name} proxy={endpoint.MaskedDisplay} reason=config_write_failed detail={writeError}");
+                _diagnostics.Write("PREPARE_WRITE_FAIL", $"profile={profile.Name} proxy={endpoint.MaskedDisplay} detail={writeError}");
                 return new ProxyPrepareResult(true, false, profile.Name, endpoint.MaskedDisplay, "config_write_failed");
             }
 
             var modeTag = settings.DistributionMode == ProxyDistributionMode.ManagerShared ? "manager_shared" : "per_profile";
             _log.Info($"[PROXY_PREPARED] profile={profile.Name} mode={modeTag} proxy={endpoint.MaskedDisplay} exitIp={endpoint.ExitIp} latencyMs={endpoint.LastLatencyMs}");
+            _diagnostics.Write("PREPARED", $"profile={profile.Name} mode={modeTag} proxy={endpoint.MaskedDisplay} exitIp={endpoint.ExitIp} latencyMs={endpoint.LastLatencyMs}");
             return new ProxyPrepareResult(true, true, profile.Name, endpoint.MaskedDisplay, "ok");
         }
         catch (Exception ex)
@@ -341,6 +358,7 @@ public sealed class ProxyCoordinator
             // Fail-open: module Proxy không bao giờ được phép làm luồng Chrome cũ chết theo.
             TryWriteProfileConfig(profile, endpoint: null, enabled: false, out _);
             _log.Warn($"[PROXY_FAIL_OPEN] profile={profile.Name} action=direct_network detail={Short(ex.Message)}");
+            _diagnostics.Write("PREPARE_ERROR", $"profile={profile.Name} action=direct_network detail={Short(ex.Message)}");
             return new ProxyPrepareResult(true, false, profile.Name, "", "module_error_fail_open");
         }
     }
@@ -520,7 +538,10 @@ public sealed class ProxyCoordinator
         }
 
         if (!fromId.Equals(toId, StringComparison.OrdinalIgnoreCase))
+        {
             _log.Warn($"[PROXY_MANAGER_SHARED_SWITCH] from={fromDisplay} to={toDisplay} reason={reason} action=next_launch_only");
+            _diagnostics.Write("SHARED_SWITCH", $"from={fromDisplay} to={toDisplay} reason={reason}");
+        }
     }
 
     ProxyEndpoint? GetProxyById(string proxyId)
@@ -546,7 +567,10 @@ public sealed class ProxyCoordinator
             SaveLocked();
         }
         if (!proxyId.Equals(previousId, StringComparison.OrdinalIgnoreCase))
+        {
             _log.Warn($"[PROXY_MANAGER_SHARED_SWITCH] from={fromDisplay} to={toDisplay} reason={reason} action=next_launch_only");
+            _diagnostics.Write("SHARED_SWITCH", $"from={fromDisplay} to={toDisplay} reason={reason}");
+        }
     }
 
     void ClearActiveManagerProxy(string reason)
@@ -558,6 +582,7 @@ public sealed class ProxyCoordinator
             SaveLocked();
         }
         _log.Warn($"[PROXY_MANAGER_SHARED_CLEAR] reason={reason} action=direct_network_on_next_launch");
+        _diagnostics.Write("SHARED_CLEAR", $"reason={reason}");
     }
 
     void ApplyTestResult(string proxyId, ProxyTestResult result)
@@ -606,9 +631,10 @@ public sealed class ProxyCoordinator
                     Port = endpoint.Port,
                     Username = endpoint.Username,
                     Password = endpoint.Password,
-                    ProxyId = endpoint.Id
+                    ProxyId = endpoint.Id,
+                    DiagnosticsDirectory = _diagnostics.LogDirectory
                 }
-                : new WorkerProxyConfig { Enabled = false };
+                : new WorkerProxyConfig { Enabled = false, DiagnosticsDirectory = _diagnostics.LogDirectory };
             var json = JsonSerializer.Serialize(payload, ProfileWriteJson);
             var temp = path + ".tmp";
             File.WriteAllText(temp, json, new UTF8Encoding(false));
@@ -682,5 +708,6 @@ public sealed class ProxyCoordinator
         public string Username { get; set; } = "";
         public string Password { get; set; } = "";
         public string ProxyId { get; set; } = "";
+        public string DiagnosticsDirectory { get; set; } = "";
     }
 }

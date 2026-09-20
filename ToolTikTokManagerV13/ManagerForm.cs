@@ -2,6 +2,7 @@
 using System.IO.Compression;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using ToolTikTokV12.Controls;
@@ -129,6 +130,9 @@ public sealed partial class ManagerForm : Form
     readonly TikTokAuthService _tiktokAuthService = new();
     readonly TikTokAccountPoolService _accountPoolService;
     readonly Logger _log;
+    readonly string _instancePipeKey;
+    readonly int _instanceCdpPortBase;
+    readonly Dictionary<string, FileStream> _cdpPortLeases = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, ProfileContext> _contexts = new(StringComparer.OrdinalIgnoreCase);
     readonly TabControl _tabs = new() { Dock = DockStyle.Fill, DrawMode = TabDrawMode.OwnerDrawFixed, Padding = new Point(18, 6) };
     readonly System.Windows.Forms.Timer _refreshTimer = new() { Interval = 1000, Enabled = true };
@@ -157,6 +161,9 @@ public sealed partial class ManagerForm : Form
         _profileService = new TikTokProfileService(_baseDir);
         _accountPoolService = new TikTokAccountPoolService(_baseDir);
         _log = new Logger(_baseDir, "manager", "manager-v13.log");
+        _instancePipeKey = BuildInstancePipeKey(_baseDir);
+        _instanceCdpPortBase = BuildInstanceCdpPortBase(_baseDir);
+        _log.Info($"[INSTANCE_IPC_NAMESPACE] key={_instancePipeKey} cdpBase={_instanceCdpPortBase} baseDir={_baseDir}");
         Text = $"Tool TikTok Manager {AppVersionInfo.Display} — VM Optimized Multi Worker";
         // Phải bật DPI scaling trước khi tạo layout/handle để kéo qua màn hình
         // có Scale khác (100%/125%/150%) không giữ kích thước cache cũ.
@@ -881,6 +888,12 @@ public sealed partial class ManagerForm : Form
     async Task EnsureWorkerAsync(ProfileContext ctx)
     {
         if (ctx.Worker is not null && !ctx.Worker.HasExited && await PingAsync(ctx)) return;
+
+        // Hai bản Tool chạy trên cùng một máy có thể có cùng CdpPort trong profiles.json
+        // (ví dụ cả hai đều là 9222). Trước khi spawn Worker phải giữ một lease
+        // liên-process cho cổng đó; nếu cổng đã thuộc Tool khác hoặc đang bị chiếm,
+        // tự chuyển profile hiện tại sang cổng trống khác và lưu lại ngay.
+        EnsureExclusiveCdpPortForWorker(ctx);
         if (ctx.Worker is not null)
         {
             try { ctx.Worker.Dispose(); } catch { }
@@ -1194,7 +1207,7 @@ public sealed partial class ManagerForm : Form
         if (ctx.Worker is null || ctx.Worker.HasExited || !await PingAsync(ctx)) await EnsureWorkerAsync(ctx);
     }
 
-    static async Task<string> SendPipeAsync(string profileName, string command, TimeSpan timeout)
+    async Task<string> SendPipeAsync(string profileName, string command, TimeSpan timeout)
     {
         using var pipe = new NamedPipeClientStream(".", PipeName(profileName), PipeDirection.InOut, PipeOptions.Asynchronous);
         using var cts = new CancellationTokenSource(timeout);
@@ -1271,6 +1284,11 @@ public sealed partial class ManagerForm : Form
 
     async Task StopAllAsync()
     {
+        // Stop All phải dừng cả +Auto Profile đang CREATE / cooldown / vét PRF bù.
+        // CancellationToken sẽ khiến PRF bù đang kiểm tra đi qua cleanup hiện có,
+        // tránh hết cooldown rồi tiếp tục tạo account mới ngoài ý muốn.
+        CancelActiveAutoProfileRun("stop_all");
+
         // Dừng tất cả cũng kết thúc phiên Giờ vàng. Nếu không tắt scheduler ở đây,
         // vòng Tick kế tiếp có thể hiểu các slot vừa dừng là thiếu và chuẩn bị xoay lại.
         StopRunStrategySession("stop_all");
@@ -1360,6 +1378,8 @@ public sealed partial class ManagerForm : Form
         // Best-effort flush sau khi shutdown Worker để các event cuối của chu trình
         // được ghi đủ. Timeout ngắn để không làm Manager treo khi ổ đĩa có vấn đề.
         try { await FlushAutoActivityLogAsync(TimeSpan.FromSeconds(5)); } catch { }
+
+        ReleaseAllCdpPortLeases();
 
         FormClosing -= OnClosing;
         Close();
@@ -5563,7 +5583,193 @@ public sealed partial class ManagerForm : Form
     [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr hWnd, int id);
     [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
 
-    static string PipeName(string profileName) => "ToolTikTokV13_" + profileName;
+    string PipeName(string profileName) => $"ToolTikTokV13_{_instancePipeKey}_{profileName}";
+
+    const int InstanceCdpBlockSize = 128;
+    const int InstanceCdpBaseStart = 20000;
+    const int InstanceCdpBlockCount = 192;
+
+    static byte[] BuildInstanceHash(string baseDir)
+    {
+        var normalized = Path.GetFullPath(baseDir)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            .ToUpperInvariant();
+        return SHA256.HashData(Encoding.UTF8.GetBytes(normalized));
+    }
+
+    static string BuildInstancePipeKey(string baseDir)
+        => Convert.ToHexString(BuildInstanceHash(baseDir))[..12];
+
+    static int BuildInstanceCdpPortBase(string baseDir)
+    {
+        var hash = BuildInstanceHash(baseDir);
+        var bucket = (int)(BitConverter.ToUInt32(hash, 0) % InstanceCdpBlockCount);
+        return InstanceCdpBaseStart + bucket * InstanceCdpBlockSize;
+    }
+
+    void EnsureExclusiveCdpPortForWorker(ProfileContext ctx)
+    {
+        var leaseKey = GetCdpLeaseKey(ctx.Profile);
+        if (_cdpPortLeases.ContainsKey(leaseKey))
+            return;
+
+        var oldPort = ctx.Profile.CdpPort > 0
+            ? ctx.Profile.CdpPort
+            : CdpPortAllocator.BasePort;
+
+        var reservedByThisManager = _contexts.Values
+            .Where(other => !ReferenceEquals(other, ctx))
+            .Select(other => other.Profile.CdpPort)
+            .Where(port => port > 0)
+            .ToHashSet();
+
+        foreach (var candidate in EnumerateCdpPortCandidates(oldPort, reservedByThisManager))
+        {
+            var lease = TryAcquireCdpPortLease(candidate);
+            if (lease is null)
+                continue;
+
+            // Lease chống hai bản Tool giành cùng cổng. Check TCP tiếp để tránh
+            // đụng ứng dụng khác hoặc Chrome cũ còn giữ cổng từ lần chạy trước.
+            if (!_profileService.IsPortAvailable(candidate))
+            {
+                lease.Dispose();
+                continue;
+            }
+
+            try
+            {
+                if (candidate != ctx.Profile.CdpPort)
+                    PersistReassignedCdpPort(ctx, oldPort, candidate);
+
+                _cdpPortLeases[leaseKey] = lease;
+                _log.Info(
+                    $"[CDP_PORT_LEASE_ACQUIRED] profile={ctx.Profile.Name} port={candidate} " +
+                    $"oldPort={oldPort} instance={_instancePipeKey} cdpBase={_instanceCdpPortBase}");
+                return;
+            }
+            catch
+            {
+                lease.Dispose();
+                throw;
+            }
+        }
+
+        throw new InvalidOperationException(
+            $"Không tìm được cổng CDP trống cho profile {ctx.Profile.Name}. " +
+            "Hãy đóng Chrome/Tool dư rồi thử lại.");
+    }
+
+    IEnumerable<int> EnumerateCdpPortCandidates(int preferredPort, HashSet<int> reservedByThisManager)
+    {
+        var blockEnd = _instanceCdpPortBase + InstanceCdpBlockSize - 1;
+        var preferredBelongsToThisInstance = preferredPort >= _instanceCdpPortBase
+            && preferredPort <= blockEnd;
+
+        // Mỗi thư mục cài Tool có một block cổng riêng (20k-44k). Vì vậy bản test
+        // mới có thể chạy song song với bản cài cũ vẫn dùng 9222 mà không cần bản cũ
+        // hiểu cơ chế lease mới. Port đã migrate trong block của instance được ưu tiên giữ ổn định.
+        if (preferredBelongsToThisInstance && !reservedByThisManager.Contains(preferredPort))
+            yield return preferredPort;
+
+        for (var port = _instanceCdpPortBase; port <= blockEnd; port++)
+        {
+            if (port == preferredPort || reservedByThisManager.Contains(port))
+                continue;
+            yield return port;
+        }
+
+        // Fallback hiếm khi một Manager có >128 profile. Vẫn chỉ dùng dải cố định
+        // dưới dynamic/ephemeral range thông dụng và vẫn có cross-process lease.
+        for (var port = InstanceCdpBaseStart; port < 49152; port++)
+        {
+            if ((port >= _instanceCdpPortBase && port <= blockEnd)
+                || port == preferredPort
+                || reservedByThisManager.Contains(port))
+            {
+                continue;
+            }
+            yield return port;
+        }
+    }
+
+    static string GetCdpLeaseKey(TikTokProfileEntry profile)
+    {
+        try { return Path.GetFullPath(profile.ProfilePath); }
+        catch { return profile.Name; }
+    }
+
+    static FileStream? TryAcquireCdpPortLease(int port)
+    {
+        try
+        {
+            var lockDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "ToolTikTokV13",
+                "cdp-port-locks");
+            Directory.CreateDirectory(lockDir);
+            var lockPath = Path.Combine(lockDir, $"cdp-{port}.lock");
+            return new FileStream(
+                lockPath,
+                FileMode.OpenOrCreate,
+                FileAccess.ReadWrite,
+                FileShare.None,
+                bufferSize: 1,
+                options: FileOptions.None);
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    void PersistReassignedCdpPort(ProfileContext ctx, int oldPort, int newPort)
+    {
+        var catalog = _profileService.LoadPersistedCatalog();
+        TikTokProfileEntry? stored = catalog.Profiles.FirstOrDefault(p =>
+            p.Name.Equals(ctx.Profile.Name, StringComparison.OrdinalIgnoreCase));
+
+        if (stored is null)
+        {
+            var targetPath = Path.GetFullPath(ctx.Profile.ProfilePath);
+            stored = catalog.Profiles.FirstOrDefault(p =>
+            {
+                try
+                {
+                    return Path.GetFullPath(p.ProfilePath)
+                        .Equals(targetPath, StringComparison.OrdinalIgnoreCase);
+                }
+                catch { return false; }
+            });
+        }
+
+        if (stored is null)
+            throw new InvalidOperationException(
+                $"Không tìm thấy profile {ctx.Profile.Name} trong profiles.json để lưu cổng CDP mới.");
+
+        stored.CdpPort = newPort;
+        _profileService.SaveWithBackupPreservingPorts(catalog);
+        ctx.Profile.CdpPort = newPort;
+        RefreshSelectedProfilePresentation();
+
+        _log.Warn(
+            $"[CDP_PORT_REASSIGNED_CROSS_INSTANCE] profile={ctx.Profile.Name} " +
+            $"oldPort={oldPort} newPort={newPort} reason=port_in_use_or_other_tool_instance");
+    }
+
+    void ReleaseAllCdpPortLeases()
+    {
+        foreach (var lease in _cdpPortLeases.Values)
+        {
+            try { lease.Dispose(); } catch { }
+        }
+        _cdpPortLeases.Clear();
+    }
+
     static string Quote(string value) => "\"" + value.Replace("\"", "\\\"") + "\"";
 
     sealed class WorkerSnapshot

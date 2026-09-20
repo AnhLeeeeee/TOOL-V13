@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 
 namespace ToolTikTokV11.Services;
 
@@ -11,6 +11,7 @@ internal sealed class ProxyLaunchProfile
     public string Username { get; set; } = "";
     public string Password { get; set; } = "";
     public string ProxyId { get; set; } = "";
+    public string DiagnosticsDirectory { get; set; } = "";
 
     public bool HasCredentials => !string.IsNullOrWhiteSpace(Username);
 

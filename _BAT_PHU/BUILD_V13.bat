@@ -5,8 +5,10 @@ set "SCRIPT_DIR=%~dp0"
 for %%I in ("%SCRIPT_DIR%..") do set "ROOT=%%~fI"
 cd /d "%ROOT%"
 
-if not exist "VERSION.txt" goto :versionfail
-set /p APP_VERSION=<"VERSION.txt"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%ENSURE_VERSION_LAYOUT.ps1" -Root "%ROOT%"
+if errorlevel 1 goto :versionfail
+if not exist "_version\VERSION.txt" goto :versionfail
+set /p APP_VERSION=<"_version\VERSION.txt"
 powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%SYNC_VERSION.ps1" -Root "%ROOT%"
 if errorlevel 1 goto :versionfail
 
@@ -45,7 +47,7 @@ exit /b 1
 echo.
 echo ========================================
 echo VERSION SYNC FAILED
-echo Kiem tra VERSION.txt va _BAT_PHU\SYNC_VERSION.ps1
+echo Kiem tra _version\VERSION.txt va _BAT_PHU\SYNC_VERSION.ps1
 echo ========================================
 echo.
 if /I not "%NOPAUSE%"=="--no-pause" pause
