@@ -23,6 +23,10 @@ public sealed partial class ManagerForm
         // tuyệt đối không tiêu account mới để tạo profile.
         public bool ReuseOnlyNoCreateProfile { get; set; }
 
+        // Khi bật "Chỉ dùng PRF chờ", Night Reserve có thể được cho phép CREATE
+        // như một ngoại lệ riêng. Mặc định TRUE để giữ hành vi dự phòng đêm cũ.
+        public bool AllowNightReserveCreateWhenReuseOnly { get; set; } = true;
+
         // TIME_xH: tùy chọn có tự xóa sau khi Excel đã ghi/xác minh hay không.
         // BAN luôn tự xóa sau khi note=ban đã được xác minh (nếu CloseOnBan bật).
         // Giữ nguyên tên property để tương thích manager_auto_close.json cũ.
@@ -72,7 +76,7 @@ public sealed partial class ManagerForm
         _refreshTimer.Tick += async (_, _) => await CheckAutoCloseRuntimeAsync();
 
         _log.Info(
-            $"[AUTO_CLOSE_INIT] ban={_autoCloseSettings.CloseOnBan} time={_autoCloseSettings.CloseOnRunTime} hours={_autoCloseSettings.RunHours} stuck10m={_autoCloseSettings.CloseOnNotRunning10Minutes} replace={_autoCloseSettings.OpenReplacementAfterAutoClose} reuseOnly={_autoCloseSettings.ReuseOnlyNoCreateProfile} deleteRetired={_autoCloseSettings.DeleteProfileAfterBanOrLifetime} settingsPath={AutoCloseSettingsPath}");
+            $"[AUTO_CLOSE_INIT] ban={_autoCloseSettings.CloseOnBan} time={_autoCloseSettings.CloseOnRunTime} hours={_autoCloseSettings.RunHours} stuck10m={_autoCloseSettings.CloseOnNotRunning10Minutes} replace={_autoCloseSettings.OpenReplacementAfterAutoClose} reuseOnly={_autoCloseSettings.ReuseOnlyNoCreateProfile} nightReserveCreateWhenReuseOnly={_autoCloseSettings.AllowNightReserveCreateWhenReuseOnly} deleteRetired={_autoCloseSettings.DeleteProfileAfterBanOrLifetime} settingsPath={AutoCloseSettingsPath}");
     }
 
     AutoCloseSettingsDocument LoadAutoCloseSettings()
@@ -176,7 +180,7 @@ public sealed partial class ManagerForm
         NotifyAutoReplacementSettingsChanged();
 
         _log.Info(
-            $"[AUTO_CLOSE_SETTINGS_SAVE] ban={_autoCloseSettings.CloseOnBan} time={_autoCloseSettings.CloseOnRunTime} hours={_autoCloseSettings.RunHours} stuck10m={_autoCloseSettings.CloseOnNotRunning10Minutes} replace={_autoCloseSettings.OpenReplacementAfterAutoClose} reuseOnly={_autoCloseSettings.ReuseOnlyNoCreateProfile} deleteRetired={_autoCloseSettings.DeleteProfileAfterBanOrLifetime}");
+            $"[AUTO_CLOSE_SETTINGS_SAVE] ban={_autoCloseSettings.CloseOnBan} time={_autoCloseSettings.CloseOnRunTime} hours={_autoCloseSettings.RunHours} stuck10m={_autoCloseSettings.CloseOnNotRunning10Minutes} replace={_autoCloseSettings.OpenReplacementAfterAutoClose} reuseOnly={_autoCloseSettings.ReuseOnlyNoCreateProfile} nightReserveCreateWhenReuseOnly={_autoCloseSettings.AllowNightReserveCreateWhenReuseOnly} deleteRetired={_autoCloseSettings.DeleteProfileAfterBanOrLifetime}");
     }
 
     void InjectAutoCloseToolbarButton()
@@ -555,7 +559,7 @@ public sealed partial class ManagerForm
         {
             Text = "SỐ LƯỢNG & NGUỒN PRF",
             Location = new Point(0, 0),
-            Size = new Size(760, 152),
+            Size = new Size(760, 112),
             Padding = new Padding(12),
             ForeColor = Color.FromArgb(45, 67, 94)
         };
@@ -588,14 +592,6 @@ public sealed partial class ManagerForm
             Location = new Point(290, 68),
             Size = new Size(430, 30)
         };
-        var reuseOnly = new CheckBox
-        {
-            Text = "Chỉ dùng PRF chờ — không tạo PRF mới",
-            Checked = _autoCloseSettings.ReuseOnlyNoCreateProfile,
-            AutoSize = true,
-            Location = new Point(18, 110),
-            ForeColor = Color.FromArgb(37, 77, 122)
-        };
         void UpdateTargetUi()
         {
             var enabled = autoEnsureTarget.Checked;
@@ -610,7 +606,6 @@ public sealed partial class ManagerForm
         sourceGroup.Controls.Add(targetLabel);
         sourceGroup.Controls.Add(targetSlots);
         sourceGroup.Controls.Add(targetHint);
-        sourceGroup.Controls.Add(reuseOnly);
 
         // ------------------------------------------------------------
         // 2) TỐI ƯU — tái sử dụng nguyên engine VM Safe / VM Max của Worker
@@ -618,7 +613,7 @@ public sealed partial class ManagerForm
         var optimizationGroup = new GroupBox
         {
             Text = "TỐI ƯU",
-            Location = new Point(0, 164),
+            Location = new Point(0, 124),
             Size = new Size(760, 150),
             Padding = new Padding(12),
             ForeColor = Color.FromArgb(45, 67, 94)
@@ -710,8 +705,8 @@ public sealed partial class ManagerForm
         var autoGroup = new GroupBox
         {
             Text = "TỰ ĐỘNG ĐÓNG, BÙ",
-            Location = new Point(0, 326),
-            Size = new Size(760, 242),
+            Location = new Point(0, 286),
+            Size = new Size(760, 318),
             Padding = new Padding(12),
             ForeColor = Color.FromArgb(45, 67, 94)
         };
@@ -762,16 +757,57 @@ public sealed partial class ManagerForm
             _autoCloseSettings.OpenReplacementAfterAutoClose,
             136,
             36);
+
+        // Hai tùy chọn con của Tự bù. Reuse-only lùi một cấp; Night Reserve lùi
+        // thêm một cấp để thể hiện đây là ngoại lệ CREATE riêng của Dự phòng đêm.
+        var reuseOnly = new CheckBox
+        {
+            Text = "Chỉ dùng PRF chờ — không tạo PRF mới",
+            Checked = _autoCloseSettings.ReuseOnlyNoCreateProfile,
+            AutoSize = false,
+            Location = new Point(42, 180),
+            Size = new Size(676, 26),
+            ForeColor = Color.FromArgb(37, 77, 122)
+        };
+        var allowNightReserveCreate = new CheckBox
+        {
+            Text = "Dự phòng đêm được phép tạo PRF mới",
+            Checked = _autoCloseSettings.ReuseOnlyNoCreateProfile
+                ? _autoCloseSettings.AllowNightReserveCreateWhenReuseOnly
+                : true,
+            AutoSize = false,
+            Location = new Point(70, 212),
+            Size = new Size(648, 26),
+            ForeColor = Color.FromArgb(70, 82, 96)
+        };
+        void UpdateNightReserveCreateExceptionUi()
+        {
+            if (!reuseOnly.Checked)
+            {
+                // CREATE đang được phép chung nên Night Reserve mặc nhiên được phép.
+                // Hiển thị checked + mờ để người dùng thấy trạng thái nhưng không cần chỉnh.
+                allowNightReserveCreate.Checked = true;
+                allowNightReserveCreate.Enabled = false;
+                return;
+            }
+
+            allowNightReserveCreate.Enabled = true;
+        }
+        reuseOnly.CheckedChanged += (_, _) => UpdateNightReserveCreateExceptionUi();
+        UpdateNightReserveCreateExceptionUi();
+
         var deleteRetiredProfile = AutoCheck(
             "Tự xóa profile hết vòng đời TIME_xH (BAN luôn xóa sau khi đã ghi note=ban)",
             _autoCloseSettings.DeleteProfileAfterBanOrLifetime,
-            182,
+            254,
             36);
         autoGroup.Controls.Add(closeOnBan);
         autoGroup.Controls.Add(closeOnTime);
         autoGroup.Controls.Add(hours);
         autoGroup.Controls.Add(closeOnStuck);
         autoGroup.Controls.Add(openReplacement);
+        autoGroup.Controls.Add(reuseOnly);
+        autoGroup.Controls.Add(allowNightReserveCreate);
         autoGroup.Controls.Add(deleteRetiredProfile);
 
         // ------------------------------------------------------------
@@ -780,7 +816,7 @@ public sealed partial class ManagerForm
         var createLimitGroup = new GroupBox
         {
             Text = "GIỚI HẠN TẠO PRF",
-            Location = new Point(0, 580),
+            Location = new Point(0, 616),
             Size = new Size(760, 176),
             Padding = new Padding(12),
             ForeColor = Color.FromArgb(45, 67, 94)
@@ -839,7 +875,7 @@ public sealed partial class ManagerForm
         var noCreateGroup = new GroupBox
         {
             Text = "KHUNG GIỜ KHÔNG TẠO PRF MỚI",
-            Location = new Point(0, 768),
+            Location = new Point(0, 804),
             Size = new Size(760, 144),
             Padding = new Padding(12),
             ForeColor = Color.FromArgb(45, 67, 94)
@@ -900,7 +936,7 @@ public sealed partial class ManagerForm
         var logGroup = new GroupBox
         {
             Text = "NHẬT KÝ TỰ ĐỘNG",
-            Location = new Point(0, 924),
+            Location = new Point(0, 960),
             Size = new Size(760, 80),
             Padding = new Padding(12),
             ForeColor = Color.FromArgb(45, 67, 94)
@@ -964,6 +1000,8 @@ public sealed partial class ManagerForm
             closeOnBan.Width = autoTextWidth;
             closeOnStuck.Width = autoTextWidth;
             openReplacement.Width = autoTextWidth;
+            reuseOnly.Width = Math.Max(220, autoGroup.ClientSize.Width - reuseOnly.Left - 18);
+            allowNightReserveCreate.Width = Math.Max(200, autoGroup.ClientSize.Width - allowNightReserveCreate.Left - 18);
             deleteRetiredProfile.Width = autoTextWidth;
             hours.Left = Math.Max(360, autoGroup.ClientSize.Width - hours.Width - 18);
             closeOnTime.Width = Math.Max(220, hours.Left - closeOnTime.Left - 12);
@@ -1068,6 +1106,11 @@ public sealed partial class ManagerForm
                 _autoCloseSettings.CloseOnNotRunning10Minutes = closeOnStuck.Checked;
                 _autoCloseSettings.OpenReplacementAfterAutoClose = openReplacement.Checked;
                 _autoCloseSettings.ReuseOnlyNoCreateProfile = reuseOnly.Checked;
+                // Khi reuse-only OFF, Night Reserve mặc nhiên được phép CREATE và UI
+                // luôn hiển thị checked + disabled. Lưu TRUE để lần sau bật reuse-only
+                // thì mặc định vẫn cho phép dự phòng đêm tạo mới như đã chốt.
+                _autoCloseSettings.AllowNightReserveCreateWhenReuseOnly = !reuseOnly.Checked
+                    || allowNightReserveCreate.Checked;
                 _autoCloseSettings.DeleteProfileAfterBanOrLifetime = deleteRetiredProfile.Checked;
                 SaveAutoCloseSettings();
 
@@ -1083,8 +1126,9 @@ public sealed partial class ManagerForm
 
                 _log.Info(
                     $"[AUTOMATION_SETTINGS_SAVE] maintainTarget={savedRun.AutoEnsureTarget} target={savedRun.TargetSlots} " +
-                    $"reuseOnly={_autoCloseSettings.ReuseOnlyNoCreateProfile} replacement={_autoCloseSettings.OpenReplacementAfterAutoClose} " +
-                    $"createLimit={savedRun.CreateLimitEnabled} noCreateSchedule={savedRun.NoCreateScheduleEnabled}");
+                    $"reuseOnly={_autoCloseSettings.ReuseOnlyNoCreateProfile} nightReserveCreateWhenReuseOnly={_autoCloseSettings.AllowNightReserveCreateWhenReuseOnly} " +
+                    $"replacement={_autoCloseSettings.OpenReplacementAfterAutoClose} createLimit={savedRun.CreateLimitEnabled} " +
+                    $"noCreateSchedule={savedRun.NoCreateScheduleEnabled}");
 
                 form.DialogResult = DialogResult.OK;
                 form.Close();

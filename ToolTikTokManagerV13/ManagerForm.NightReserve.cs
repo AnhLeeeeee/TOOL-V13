@@ -676,6 +676,22 @@ public sealed partial class ManagerForm
                         return;
                     }
 
+                    // Reuse-only là hard gate cho CREATE của Tự bù. Night Reserve chỉ
+                    // được vượt gate này khi người dùng giữ tùy chọn ngoại lệ riêng.
+                    // Khi reuse-only OFF thì CREATE vốn đã được phép chung nên không
+                    // cần kiểm tra cờ ngoại lệ. Inventory/reconcile phía trên vẫn chạy
+                    // bình thường để số dự phòng hiển thị và state luôn đúng.
+                    if (_autoCloseSettings.ReuseOnlyNoCreateProfile
+                        && !_autoCloseSettings.AllowNightReserveCreateWhenReuseOnly)
+                    {
+                        _log.Info(
+                            $"[NIGHT_RESERVE_CREATE_BLOCK_REUSE_ONLY] primary={fulfilled}/{target} "
+                            + $"reserve={count}/{_nightReserveSettings.TargetCount} "
+                            + "reuseOnly=True allowNightReserveCreate=False action=SKIP_CREATE");
+                        _nightReserveNextCheckUtc = DateTime.UtcNow.AddMinutes(2);
+                        return;
+                    }
+
                     _log.Info(
                         $"[NIGHT_RESERVE_NEED_CREATE] primary={fulfilled}/{target} reserve={count}/{_nightReserveSettings.TargetCount} action=CREATE_ONE");
 
