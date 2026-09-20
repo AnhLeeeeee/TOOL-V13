@@ -7,13 +7,18 @@ if ([string]::IsNullOrWhiteSpace($Root)) {
     $Root = Split-Path -Parent $PSScriptRoot
 }
 $Root = [System.IO.Path]::GetFullPath($Root)
-$versionFile = Join-Path $Root 'VERSION.txt'
+
+$layoutHelper = Join-Path $PSScriptRoot 'ENSURE_VERSION_LAYOUT.ps1'
+if (Test-Path -LiteralPath $layoutHelper) {
+    & $layoutHelper -Root $Root
+}
+$versionFile = Join-Path $Root '_version\VERSION.txt'
 if (-not (Test-Path -LiteralPath $versionFile)) {
-    throw "Khong tim thay VERSION.txt: $versionFile"
+    throw "Khong tim thay _version/VERSION.txt: $versionFile"
 }
 $version = (Get-Content -LiteralPath $versionFile -Raw).Trim()
 if ($version -notmatch '^\d+\.\d+\.\d+$') {
-    throw "VERSION.txt khong hop le: $version"
+    throw "_version/VERSION.txt khong hop le: $version"
 }
 
 $outDir = Join-Path $Root 'SOURCE_OUTPUT'

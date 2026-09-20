@@ -13,8 +13,10 @@ namespace ToolTikTokManagerV13;
 internal static class UpdateManifestCacheBootstrap
 {
     const string SettingsFileName = "manager_update.json";
-    const string DefaultManifestUrl = "https://raw.githubusercontent.com/AnhLeeeeee/TOOL-V13/main/version.json";
-    const string DefaultVersionsManifestUrl = "https://raw.githubusercontent.com/AnhLeeeeee/TOOL-V13/main/versions.json";
+    const string LegacyDefaultManifestUrl = "https://raw.githubusercontent.com/AnhLeeeeee/TOOL-V13/main/version.json";
+    const string LegacyDefaultVersionsManifestUrl = "https://raw.githubusercontent.com/AnhLeeeeee/TOOL-V13/main/versions.json";
+    const string DefaultManifestUrl = "https://raw.githubusercontent.com/AnhLeeeeee/TOOL-V13/main/_version/version.json";
+    const string DefaultVersionsManifestUrl = "https://raw.githubusercontent.com/AnhLeeeeee/TOOL-V13/main/_version/versions.json";
     const string CacheBustKey = "_cb";
 
     [ModuleInitializer]
@@ -48,8 +50,13 @@ internal static class UpdateManifestCacheBootstrap
 
             if (string.IsNullOrWhiteSpace(manifestUrl))
                 manifestUrl = DefaultManifestUrl;
+            else
+                manifestUrl = MigrateLegacyDefaultUrl(manifestUrl, LegacyDefaultManifestUrl, DefaultManifestUrl);
+
             if (string.IsNullOrWhiteSpace(versionsUrl))
                 versionsUrl = DeriveVersionsUrl(manifestUrl) ?? DefaultVersionsManifestUrl;
+            else
+                versionsUrl = MigrateLegacyDefaultUrl(versionsUrl, LegacyDefaultVersionsManifestUrl, DefaultVersionsManifestUrl);
 
             // Mỗi lần mở Manager dùng token mới. URL hiển thị/cấu hình vẫn giữ nguyên nguồn,
             // chỉ thay _cb để CDN coi đây là request mới.
@@ -72,6 +79,29 @@ internal static class UpdateManifestCacheBootstrap
     {
         try { return root[propertyName]?.GetValue<string>()?.Trim() ?? ""; }
         catch { return ""; }
+    }
+
+    static string MigrateLegacyDefaultUrl(string url, string legacyUrl, string newUrl)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var current)) return url;
+        if (!Uri.TryCreate(legacyUrl, UriKind.Absolute, out var legacy)) return url;
+
+        try
+        {
+            var currentBuilder = new UriBuilder(current)
+            {
+                Query = RemoveQueryKey(current.Query, CacheBustKey)
+            };
+            var legacyBuilder = new UriBuilder(legacy)
+            {
+                Query = RemoveQueryKey(legacy.Query, CacheBustKey)
+            };
+
+            var left = currentBuilder.Uri.GetLeftPart(UriPartial.Path).TrimEnd('/');
+            var right = legacyBuilder.Uri.GetLeftPart(UriPartial.Path).TrimEnd('/');
+            return left.Equals(right, StringComparison.OrdinalIgnoreCase) ? newUrl : url;
+        }
+        catch { return url; }
     }
 
     static string? DeriveVersionsUrl(string manifestUrl)

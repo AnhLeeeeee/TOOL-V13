@@ -27,7 +27,13 @@ echo %C_TITLE%============================================================%C_RES
 echo.
 
 set "CURRENT_VERSION="
-if exist "VERSION.txt" set /p CURRENT_VERSION=<"VERSION.txt"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%HELPER%\ENSURE_VERSION_LAYOUT.ps1" -Root "%CD%" >nul
+if errorlevel 1 (
+    echo %C_ERR%[LOI] Khong chuan hoa duoc thu muc _version.%C_RESET%
+    pause
+    exit /b 1
+)
+if exist "_version\VERSION.txt" set /p CURRENT_VERSION=<"_version\VERSION.txt"
 
 echo %C_INFO%Phien ban hien tai:%C_RESET% %C_OK%%CURRENT_VERSION%%C_RESET%
 set "NEW_VERSION="
@@ -55,9 +61,9 @@ set "SETUP_NAME=ToolTikTok_V%NEW_VERSION%_Setup.exe"
 set "CLIENT_ZIP_NAME=ToolTikTok_V%NEW_VERSION%_VM_CLIENT_WIN_X64.zip"
 set "SETUP_URL=https://github.com/AnhLeeeeee/TOOL-V13/releases/download/v%NEW_VERSION%/%SETUP_NAME%"
 
->"VERSION.txt" echo %NEW_VERSION%
+>"_version\VERSION.txt" echo %NEW_VERSION%
 echo.
-echo %C_OK%[OK] VERSION.txt = %NEW_VERSION%%C_RESET%
+echo %C_OK%[OK] _version\VERSION.txt = %NEW_VERSION%%C_RESET%
 echo.
 
 echo %C_STEP%============================================================%C_RESET%
@@ -150,29 +156,29 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if not exist "version.json" (
+if not exist "_version\version.json" (
     echo.
     echo %C_ERR%[LOI] version.json khong ton tai sau khi dong bo.%C_RESET%
     pause
     exit /b 1
 )
-if not exist "versions.json" (
+if not exist "_version\versions.json" (
     echo.
     echo %C_ERR%[LOI] versions.json khong ton tai sau khi dong bo.%C_RESET%
     pause
     exit /b 1
 )
 
-copy /y "version.json" "%RELEASE_DIR%\version.json" >nul
-copy /y "versions.json" "%RELEASE_DIR%\versions.json" >nul
-copy /y "VERSION.txt" "%RELEASE_DIR%\VERSION.txt" >nul
+copy /y "_version\version.json" "%RELEASE_DIR%\version.json" >nul
+copy /y "_version\versions.json" "%RELEASE_DIR%\versions.json" >nul
+copy /y "_version\VERSION.txt" "%RELEASE_DIR%\VERSION.txt" >nul
 
 echo %C_OK%[OK] Da dong bo manifest%C_RESET%
 echo %C_DIM%     version       =%C_RESET% %C_INFO%%NEW_VERSION%%C_RESET%
 echo %C_DIM%     setupUrl      =%C_RESET% %C_INFO%%SETUP_URL%%C_RESET%
 echo %C_DIM%     sha256        =%C_RESET% %C_INFO%%SETUP_SHA%%C_RESET%
-echo %C_DIM%     version.json  =%C_RESET% %C_INFO%%CD%\version.json%C_RESET%
-echo %C_DIM%     versions.json =%C_RESET% %C_INFO%%CD%\versions.json%C_RESET%
+echo %C_DIM%     version.json  =%C_RESET% %C_INFO%%CD%\_version\version.json%C_RESET%
+echo %C_DIM%     versions.json =%C_RESET% %C_INFO%%CD%\_version\versions.json%C_RESET%
 echo.
 
 echo %C_OK%============================================================%C_RESET%
@@ -193,8 +199,8 @@ echo %C_INFO%File ZIP may khach:%C_RESET%
 echo %C_ACCENT%%RELEASE_DIR%\%CLIENT_ZIP_NAME%%C_RESET%
 echo.
 echo %C_INFO%Manifest da tu dong cap nhat:%C_RESET%
-echo %C_ACCENT%%CD%\version.json%C_RESET%
-echo %C_ACCENT%%CD%\versions.json%C_RESET%
+echo %C_ACCENT%%CD%\_version\version.json%C_RESET%
+echo %C_ACCENT%%CD%\_version\versions.json%C_RESET%
 echo %C_OK%============================================================%C_RESET%
 echo.
 pause

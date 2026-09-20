@@ -1,10 +1,10 @@
 <Project>
   <!--
-    VERSION.txt là nguồn version DUY NHẤT cho toàn bộ solution.
-    Chỉ sửa VERSION.txt (ví dụ 13.5.4 -> 13.5.5), sau đó build/publish lại.
+    _version/VERSION.txt là nguồn version DUY NHẤT cho toàn bộ solution.
+    Chỉ sửa _version/VERSION.txt (ví dụ 13.5.4 -> 13.5.5), sau đó build/publish lại.
   -->
   <PropertyGroup>
-    <AppVersion>$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)VERSION.txt').Trim())</AppVersion>
+    <AppVersion>$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)_version\VERSION.txt').Trim())</AppVersion>
     <Version>$(AppVersion)</Version>
     <FileVersion>$(AppVersion).0</FileVersion>
     <AssemblyVersion>$(AppVersion).0</AssemblyVersion>

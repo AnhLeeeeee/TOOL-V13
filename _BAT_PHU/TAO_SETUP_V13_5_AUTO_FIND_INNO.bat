@@ -6,12 +6,19 @@ set "SCRIPT_DIR=%~dp0"
 for %%I in ("%SCRIPT_DIR%..") do set "ROOT=%%~fI"
 cd /d "%ROOT%"
 
-if not exist "VERSION.txt" (
-    echo [LOI] Khong tim thay VERSION.txt
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%ENSURE_VERSION_LAYOUT.ps1" -Root "%ROOT%"
+if errorlevel 1 (
+    echo [LOI] Khong chuan hoa duoc thu muc _version
     if /I not "%NOPAUSE%"=="--no-pause" pause
     exit /b 1
 )
-set /p APP_VERSION=<"VERSION.txt"
+
+if not exist "_version\VERSION.txt" (
+    echo [LOI] Khong tim thay _version\VERSION.txt
+    if /I not "%NOPAUSE%"=="--no-pause" pause
+    exit /b 1
+)
+set /p APP_VERSION=<"_version\VERSION.txt"
 set "SETUP_NAME=ToolTikTok_V%APP_VERSION%_Setup.exe"
 powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%SYNC_VERSION.ps1" -Root "%ROOT%"
 if errorlevel 1 (

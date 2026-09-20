@@ -4,7 +4,7 @@ namespace ToolTikTokV12.Utils;
 
 /// <summary>
 /// Version runtime dùng chung cho Manager và Worker.
-/// Giá trị được đóng vào assembly từ VERSION.txt qua Directory.Build.props.
+/// Giá trị được đóng vào assembly từ _version/VERSION.txt qua Directory.Build.props.
 /// </summary>
 public static class AppVersionInfo
 {

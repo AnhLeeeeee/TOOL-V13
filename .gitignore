@@ -24,3 +24,6 @@ RELEASE_OUTPUT/
 *.bak_statistics
 
 SOURCE_OUTPUT/
+
+# Local version-layout migration marker
+_version/.layout_v1_migrated
