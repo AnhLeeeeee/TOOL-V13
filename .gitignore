@@ -25,9 +25,12 @@ RELEASE_OUTPUT/
 
 SOURCE_OUTPUT/
 
+<<<<<<< HEAD
 # Device access runtime markers - generated per installed machine
 .device_access_migrated
 .device_access_upgrade_marker
 
+=======
+>>>>>>> 4c2b57f58a814df623db28a712e9e478efa286c9
 # Local version-layout migration marker
 _version/.layout_v1_migrated
