@@ -1237,7 +1237,10 @@ public sealed partial class MainForm : Form
         }
     }
 
-    async Task PrepareTikTokProfileStartupAsync(bool openLiveWhenReady = true, bool stopOnCaptcha = false)
+    async Task PrepareTikTokProfileStartupAsync(
+        bool openLiveWhenReady = true,
+        bool stopOnCaptcha = false,
+        bool? forceAutoLogin = null)
     {
         try
         {
@@ -1247,7 +1250,9 @@ public sealed partial class MainForm : Form
                 "TikTok: 🟡 Nếu có CAPTCHA, hãy xử lý trên Chrome — tool sẽ tự tiếp tục", Color.Goldenrod);
             var auth = _tiktokAuthService.Load(_baseDir);
             var result = await _chrome.PrepareTikTokStartupAsync(
-                auth.Username, auth.Password, auth.TotpSecret, auth.AutoLogin, openLiveWhenReady, stopOnCaptcha);
+                auth.Username, auth.Password, auth.TotpSecret,
+                forceAutoLogin ?? auth.AutoLogin,
+                openLiveWhenReady, stopOnCaptcha);
             _startupPreparationState = result.State;
 
             switch (result.State)

@@ -188,7 +188,7 @@ public sealed partial class ManagerForm
             .OfType<FlowLayoutPanel>()
             .FirstOrDefault(panel => panel.Controls
                 .OfType<Button>()
-                .Any(button => button.Text.Equals("Stop All", StringComparison.OrdinalIgnoreCase)));
+                .Any(button => NormalizeToolbarButtonText(button.Text).Equals("Stop All", StringComparison.OrdinalIgnoreCase)));
 
         if (toolbar is null)
         {
@@ -709,7 +709,7 @@ public sealed partial class ManagerForm
         // ------------------------------------------------------------
         var autoGroup = new GroupBox
         {
-            Text = "TỰ ĐỘNG ĐÓNG & BÙ",
+            Text = "TỰ ĐỘNG ĐÓNG, BÙ",
             Location = new Point(0, 326),
             Size = new Size(760, 242),
             Padding = new Padding(12),
@@ -725,11 +725,11 @@ public sealed partial class ManagerForm
                 Size = new Size(700, height)
             };
         var closeOnBan = AutoCheck(
-            "Tự động khi tài khoản bị BAN",
+            "Tự đóng khi tài khoản bị BAN",
             _autoCloseSettings.CloseOnBan,
             28);
         var closeOnTime = AutoCheck(
-            "Tự động khi Tổng thời gian Automation chạy đủ",
+            "Tự đóng khi Tổng thời gian Automation chạy đủ",
             _autoCloseSettings.CloseOnRunTime,
             64);
         var hours = new ComboBox
@@ -754,7 +754,7 @@ public sealed partial class ManagerForm
         closeOnTime.CheckedChanged += (_, _) => hours.Enabled = closeOnTime.Checked;
 
         var closeOnStuck = AutoCheck(
-            "Tự động nếu 10 phút lỗi / không RUNNING / không có tiến triển",
+            "Tự đóng nếu 10 phút lỗi / không RUNNING / không có tiến triển",
             _autoCloseSettings.CloseOnNotRunning10Minutes,
             100);
         var openReplacement = AutoCheck(

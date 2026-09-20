@@ -193,9 +193,11 @@ public sealed partial class ManagerForm
                 async (_, _) => await ExportDiagnosticLogsAsync());
 
             _profileLifecycleDiagnosticButton = Button(
-                "Log ▼",
+                "📝 Log ▼",
                 (_, _) => ShowProfileLifecycleDiagnosticMenu(),
                 UiButtonKind.Neutral);
+            _profileLifecycleDiagnosticButton.AutoSize = false;
+            _profileLifecycleDiagnosticButton.Width = 124;
 
             toolbar.Controls.Add(_profileLifecycleDiagnosticButton);
         }
@@ -219,18 +221,18 @@ public sealed partial class ManagerForm
         // Không phụ thuộc ngôn ngữ của label. Các patch UI có thể đổi
         // "Dừng tất cả" <-> "Stop All" mà Log vẫn phải tìm đúng hàng 2.
         if (buttons.Any(button =>
-                button.Text.Equals("Stop All", StringComparison.OrdinalIgnoreCase)
-                || button.Text.Equals("Dừng tất cả", StringComparison.OrdinalIgnoreCase)))
+                NormalizeToolbarButtonText(button.Text).Equals("Stop All", StringComparison.OrdinalIgnoreCase)
+                || NormalizeToolbarButtonText(button.Text).Equals("Dừng tất cả", StringComparison.OrdinalIgnoreCase)))
         {
             return true;
         }
 
         var hasRun = buttons.Any(button =>
-            button.Text.Equals("Auto Run", StringComparison.OrdinalIgnoreCase)
-            || button.Text.Equals("Chạy tất cả", StringComparison.OrdinalIgnoreCase));
+            NormalizeToolbarButtonText(button.Text).Equals("Auto Run", StringComparison.OrdinalIgnoreCase)
+            || NormalizeToolbarButtonText(button.Text).Equals("Chạy tất cả", StringComparison.OrdinalIgnoreCase));
         var hasDelete = buttons.Any(button =>
-            button.Text.Equals("Delete", StringComparison.OrdinalIgnoreCase)
-            || button.Text.Equals("Xóa profile", StringComparison.OrdinalIgnoreCase));
+            NormalizeToolbarButtonText(button.Text).Equals("Delete", StringComparison.OrdinalIgnoreCase)
+            || NormalizeToolbarButtonText(button.Text).Equals("Xóa profile", StringComparison.OrdinalIgnoreCase));
 
         return hasRun && hasDelete;
     }

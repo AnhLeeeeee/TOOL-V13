@@ -235,11 +235,12 @@ public sealed partial class MainForm
                     // cũ ngay sau khi reopen, vì chính cookie stale làm launch_auto báo
                     // "opened" rồi Start lại automation -> popup login -> loop.
                     //
-                    // Vẫn gọi nguyên flow đăng nhập hiện có: chỉ xóa cookie của phiên
-                    // Chrome vừa reopen rồi gọi PrepareTikTokProfileStartupAsync().
-                    // Flow đó tiếp tục giữ toàn bộ xử lý sẵn có: form login, CAPTCHA,
-                    // TOTP/2FA, login failure, hard BAN và trạng thái startup.
-                    await LaunchChromeAsync(stopOnCaptcha: true, suppressDialogs: true);
+                    // CHỈ đảm bảo Chrome/CDP sẵn sàng ở đây. Không gọi LaunchChromeAsync
+                    // vì LaunchChromeAsync tự chạy PrepareTikTokProfileStartupAsync một lượt
+                    // trước forced-login, làm recovery bị thừa một vòng startup/session check.
+                    // EnsureChromeAsync tái sử dụng đúng logic connect/launch Chrome hiện có
+                    // nhưng KHÔNG chạy startup TikTok; sau đó ta đi thẳng vào flow login cũ.
+                    await EnsureChromeAsync(respectEmergencyStop: true);
                     if (!_chrome.Connected) return "not_opened";
 
                     try
@@ -295,7 +296,8 @@ public sealed partial class MainForm
                         // đi tiếp workflow LIVE theo logic hiện tại.
                         await PrepareTikTokProfileStartupAsync(
                             openLiveWhenReady: false,
-                            stopOnCaptcha: true);
+                            stopOnCaptcha: true,
+                            forceAutoLogin: true);
 
                         var reloginState = MapManagedLaunchState();
                         _log.Warn(

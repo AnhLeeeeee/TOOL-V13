@@ -192,8 +192,12 @@ public sealed partial class ManagerForm
                         x => x.OrderBy(a => a.SourceRow).First(),
                         StringComparer.OrdinalIgnoreCase);
 
-            // Ngưỡng quét tự động dùng CHÍNH cấu hình "Tự động khi Tổng thời gian
-            // Automation chạy đủ X giờ". Không còn cố định 1 giờ.
+            // Ngưỡng runtime chỉ được dùng để loại PRF khỏi hàng Chờ khi nhánh
+            // Auto Close TIME đang BẬT. Khi TIME đang TẮT, Tổng >= Xh không được
+            // tự quyết định vòng đời PRF; PRF vẫn được recovery/reuse theo các gate khác.
+            var automaticRuntimeLimitEnabled =
+                _autoCloseSettings.CloseOnRunTime;
+
             var automaticMaxHours =
                 Math.Clamp(
                     _autoCloseSettings.RunHours,
@@ -290,7 +294,8 @@ public sealed partial class ManagerForm
                         continue;
                     }
 
-                    if (totalSeconds >= automaticMaxTotalSeconds)
+                    if (automaticRuntimeLimitEnabled
+                        && totalSeconds >= automaticMaxTotalSeconds)
                     {
                         reasons[profileName] = $"TỔNG >= {automaticMaxHours}H";
                         continue;
@@ -426,7 +431,8 @@ public sealed partial class ManagerForm
                     continue;
                 }
 
-                if (totalSeconds >= automaticMaxTotalSeconds)
+                if (automaticRuntimeLimitEnabled
+                    && totalSeconds >= automaticMaxTotalSeconds)
                 {
                     reasons[profileName] = $"TỔNG >= {automaticMaxHours}H";
                     continue;

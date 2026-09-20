@@ -147,6 +147,9 @@ public sealed partial class ManagerForm : Form
     const int WM_HOTKEY = 0x0312;
     const int HOTKEY_CHROME_MONITOR_TOGGLE = 0x1348;
     bool _chromeMonitorHotkeyRegistered;
+    FlowLayoutPanel? _managerPrimaryToolbar;
+    FlowLayoutPanel? _managerActionToolbar;
+    Button? _proxyToolbarButton;
 
     public ManagerForm()
     {
@@ -166,6 +169,7 @@ public sealed partial class ManagerForm : Form
         // Đọc cờ Dừng khẩn cấp trước khi các scheduler/timer tự động được khởi tạo.
         InitializeEmergencyStopState();
         InitializeProfileLifecycleDiagnostics();
+        InjectProxyToolbarButton();
         InitializeMonitorRelayoutHooks();
         ReloadCatalog();
         EnsureAddTab();
@@ -220,18 +224,21 @@ public sealed partial class ManagerForm : Form
         };
 
         var toolbarRow1 = ToolbarRow();
-        toolbarRow1.Controls.Add(Button("Mở profile", (_, _) => OpenProfileChooser(), UiButtonKind.Primary));
-        toolbarRow1.Controls.Add(Button("+ Profile", (_, _) => AddProfile(), UiButtonKind.Primary));
-        toolbarRow1.Controls.Add(Button("+ Auto Profile", (_, _) => ShowAutoProfileDialog(), UiButtonKind.Primary));
-        toolbarRow1.Controls.Add(Button("Kho tài khoản", (_, _) => ShowAccountPoolDialog(), UiButtonKind.Neutral));
-        toolbarRow1.Controls.Add(Button("Cấu hình mặc định", (_, _) => ShowDefaultConfigDialog(), UiButtonKind.Neutral));
-        toolbarRow1.Controls.Add(Button("Tên & ảnh TikTok", (_, _) => ShowTikTokIdentityDialog(), UiButtonKind.Neutral));
-        toolbarRow1.Controls.Add(Button("Tin nhắn TikTok", (_, _) => ShowTikTokMessageReplyDialog(), UiButtonKind.Neutral));
+        toolbarRow1.Controls.Add(Button("📂 Mở profile", (_, _) => OpenProfileChooser(), UiButtonKind.Primary));
+        toolbarRow1.Controls.Add(Button("➕ Profile", (_, _) => AddProfile(), UiButtonKind.Primary));
+        toolbarRow1.Controls.Add(Button("🤖 + Auto Profile", (_, _) => ShowAutoProfileDialog(), UiButtonKind.Primary));
+        toolbarRow1.Controls.Add(Button("🗂 Kho tài khoản", (_, _) => ShowAccountPoolDialog(), UiButtonKind.Neutral));
+        toolbarRow1.Controls.Add(Button("🧩 Cấu hình mặc định", (_, _) => ShowDefaultConfigDialog(), UiButtonKind.Neutral));
+        toolbarRow1.Controls.Add(Button("🖼 Tên ảnh TikTok", (_, _) => ShowTikTokIdentityDialog(), UiButtonKind.Neutral));
+        toolbarRow1.Controls.Add(Button("💬 Tin nhắn TikTok", (_, _) => ShowTikTokMessageReplyDialog(), UiButtonKind.Neutral));
 
         var toolbarRow2 = ToolbarRow();
-        toolbarRow2.Controls.Add(Button("Delete", (_, _) => ShowDeleteProfilesDialog(), UiButtonKind.Danger));
-        toolbarRow2.Controls.Add(Button("Auto Run", async (_, _) => await ShowRunAllStrategyDialogAndStartAsync(), UiButtonKind.Primary));
-        toolbarRow2.Controls.Add(Button("Stop All", async (_, _) => await StopAllAsync(), UiButtonKind.Danger));
+        toolbarRow2.Controls.Add(Button("🗑 Delete", (_, _) => ShowDeleteProfilesDialog(), UiButtonKind.Danger));
+        toolbarRow2.Controls.Add(Button("▶ Auto Run", async (_, _) => await ShowRunAllStrategyDialogAndStartAsync(), UiButtonKind.Primary));
+        toolbarRow2.Controls.Add(Button("⏹ Stop All", async (_, _) => await StopAllAsync(), UiButtonKind.Danger));
+
+        _managerPrimaryToolbar = toolbarRow1;
+        _managerActionToolbar = toolbarRow2;
         // Không hiển thị "Profile chưa mở" trên toolbar; thông tin này không cần thiết
         // trong vận hành hằng ngày và làm hàng nút bị dài trên VM màn hình nhỏ.
 
@@ -288,11 +295,12 @@ public sealed partial class ManagerForm : Form
     {
         foreach (var button in toolbar.Controls.OfType<Button>())
         {
-            var (background, foreground) = button.Text switch
+            var normalized = NormalizeToolbarButtonText(button.Text);
+            var (background, foreground) = normalized switch
             {
                 "Mở profile" => (Color.FromArgb(232, 242, 255), Color.FromArgb(35, 91, 152)),
-                "+ Profile" or "+ Auto Profile" => (Color.FromArgb(238, 246, 255), Color.FromArgb(35, 91, 152)),
-                "Kho tài khoản" or "Cấu hình mặc định" or "Tên & ảnh TikTok" or "Tin nhắn TikTok" => (Color.FromArgb(242, 246, 251), Color.FromArgb(55, 76, 103)),
+                "Profile" or "+ Auto Profile" => (Color.FromArgb(238, 246, 255), Color.FromArgb(35, 91, 152)),
+                "Kho tài khoản" or "Cấu hình mặc định" or "Tên ảnh TikTok" or "Tên & ảnh TikTok" or "Tin nhắn TikTok" => (Color.FromArgb(242, 246, 251), Color.FromArgb(55, 76, 103)),
                 "Delete" or "Stop All" => (Color.FromArgb(255, 239, 239), Color.FromArgb(171, 62, 62)),
                 "Auto Run" => (Color.FromArgb(234, 248, 238), Color.FromArgb(36, 119, 66)),
                 _ => (UiTheme.Card, Color.FromArgb(42, 57, 76))
@@ -303,6 +311,47 @@ public sealed partial class ManagerForm : Form
             button.FlatAppearance.MouseOverBackColor = ControlPaint.LightLight(background);
             button.FlatAppearance.MouseDownBackColor = ControlPaint.Dark(background);
         }
+    }
+
+    static string NormalizeToolbarButtonText(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return string.Empty;
+
+        var value = text.Trim();
+        if (value.EndsWith("▼", StringComparison.Ordinal))
+            value = value[..^1].TrimEnd();
+
+        var prefixes = new[]
+        {
+            "📂", "➕", "🤖", "🗂", "🧩", "🖼", "💬", "📝", "🌐", "⚙", "🛑", "🗑", "▶", "⏹"
+        };
+
+        foreach (var prefix in prefixes)
+        {
+            if (value.StartsWith(prefix + " ", StringComparison.Ordinal))
+                return value[(prefix.Length + 1)..].TrimStart();
+            if (value.StartsWith(prefix, StringComparison.Ordinal))
+                return value[prefix.Length..].TrimStart();
+        }
+
+        return value;
+    }
+
+    void InjectProxyToolbarButton()
+    {
+        if (_proxyToolbarButton is not null && !_proxyToolbarButton.IsDisposed)
+            return;
+
+        var toolbar = _managerActionToolbar;
+        if (toolbar is null || toolbar.IsDisposed)
+            return;
+
+        _proxyToolbarButton = Button("🌐 Proxy", (_, _) => ShowProxyManagerDialog(), UiButtonKind.Neutral);
+        _proxyToolbarButton.AutoSize = false;
+        _proxyToolbarButton.Width = 124;
+        toolbar.Controls.Add(_proxyToolbarButton);
+        StyleToolbarButtons(toolbar);
     }
 
     void ReloadCatalog()
@@ -679,6 +728,9 @@ public sealed partial class ManagerForm : Form
         _autoIdentityNextProbeUtc.Remove(ctx.Profile.Name);
         _nameGuardVerifiedSessionAccount.Remove(ctx.Profile.Name);
         SetStatus(ctx, "Đang mở Chrome của profile này...", Color.DarkOrange);
+        // Proxy là module tùy chọn và fail-open: nếu OFF/lỗi/không có proxy tốt,
+        // helper chỉ ghi cấu hình direct rồi luồng launch cũ vẫn chạy nguyên vẹn.
+        await TryPrepareProxyBeforeChromeLaunchAsync(ctx);
         var result = await SendCommandAsync(ctx, "launch", TimeSpan.FromSeconds(75));
         if (string.Equals(result, "captcha_required", StringComparison.OrdinalIgnoreCase))
         {

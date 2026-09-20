@@ -280,36 +280,36 @@ public sealed partial class ManagerForm
         var oldLimit = TimeSpan.FromHours(
             Math.Max(_runStrategySettings.FreshHours + 1, _runStrategySettings.OldHours)).TotalSeconds;
 
-        // "Dưới trung bình" ở đây là toàn bộ PRF hàng chờ thuộc 2 lane
-        // MỚI + TB. Chúng chỉ CỘNG QUOTA dự phòng mềm, không bị gắn marker
-        // Night Reserve nên logic lấy hàng chờ/cooldown hiện tại không thay đổi.
-        var freshQueuedNames = supply
+        // Quota reserve được tính theo đúng số PRF THỰC SỰ còn idle trong hàng Chờ
+        // sau khi dàn chạy chính đã đủ. Marker Night Reserve chỉ dùng để bảo vệ/trace,
+        // tuyệt đối không được cộng quota nếu profile đó đã rời hàng Chờ để OPEN/RUN.
+        var freshIdleNames = supply
             .Where(x =>
                 x.TotalRunSeconds < freshLimit
                 && !IsReusableProfileBusy(x.ProfileName))
             .Select(x => x.ProfileName.Trim())
-            .Where(x => x.Length > 0 && !dedicatedFresh.Contains(x))
+            .Where(x => x.Length > 0)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-        var mediumQueuedNames = supply
+        var mediumIdleNames = supply
             .Where(x =>
                 x.TotalRunSeconds >= freshLimit
                 && x.TotalRunSeconds < oldLimit
                 && !IsReusableProfileBusy(x.ProfileName))
             .Select(x => x.ProfileName.Trim())
-            .Where(x =>
-                x.Length > 0
-                && !dedicatedFresh.Contains(x)
-                && !freshQueuedNames.Contains(x))
+            .Where(x => x.Length > 0 && !freshIdleNames.Contains(x))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
+        var dedicatedFreshIdleCount = dedicatedFresh.Count(freshIdleNames.Contains);
+        var freshQueuedCount = freshIdleNames.Count - dedicatedFreshIdleCount;
+
         return (
-            dedicatedFresh.Count + freshQueuedNames.Count + mediumQueuedNames.Count,
-            dedicatedFresh.Count,
-            freshQueuedNames.Count,
-            mediumQueuedNames.Count);
+            freshIdleNames.Count + mediumIdleNames.Count,
+            dedicatedFreshIdleCount,
+            freshQueuedCount,
+            mediumIdleNames.Count);
     }
 
     int GetNightReserveCountSnapshot()
@@ -425,15 +425,8 @@ public sealed partial class ManagerForm
                 return false;
             });
 
-            // Hàng chờ MỚI + TB chỉ CỘNG QUOTA mềm. Không đổi marker/protection
-            // để logic chọn PRF, cooldown và thứ tự lấy hàng chờ hiện tại giữ nguyên.
-            var freshQueuedQuotaCount = freshIdleNames.Count(name =>
-                !_nightReserveState.Profiles.Any(r =>
-                    r.Equals(name, StringComparison.OrdinalIgnoreCase)));
-            var mediumQuotaCount = mediumIdleNames.Count(name =>
-                !_nightReserveState.Profiles.Any(r =>
-                    r.Equals(name, StringComparison.OrdinalIgnoreCase))
-                && !freshIdleNames.Contains(name));
+            // Hàng chờ MỚI + TB tiếp tục là supply mềm. Marker/protection không đổi,
+            // nên logic chọn PRF, cooldown và thứ tự lấy hàng chờ vẫn dùng code cũ.
 
             // Nếu user giảm target, chỉ prune marker MỚI giữ riêng khi chính số marker
             // đã vượt target. Supply mềm MỚI/TB trong hàng chờ không tự khóa/mở marker.
@@ -455,22 +448,19 @@ public sealed partial class ManagerForm
             if (before != _nightReserveState.Profiles.Count)
                 SaveNightReserveStateUnsafe();
 
-            dedicatedCount = _nightReserveState.Profiles.Count;
-            freshQueuedQuotaCount = freshIdleNames.Count(name =>
-                !_nightReserveState.Profiles.Any(r =>
-                    r.Equals(name, StringComparison.OrdinalIgnoreCase)));
-            mediumQuotaCount = mediumIdleNames.Count(name =>
-                !_nightReserveState.Profiles.Any(r =>
-                    r.Equals(name, StringComparison.OrdinalIgnoreCase))
-                && !freshIdleNames.Contains(name));
-            effectiveCount = dedicatedCount + freshQueuedQuotaCount + mediumQuotaCount;
+            // Quy tắc quota: chỉ số PRF MỚI + TB đang THỰC SỰ idle trong hàng Chờ
+            // mới được tính. Marker dedicated vẫn giữ nguyên để phục vụ protection/trace,
+            // nhưng không thể làm quota "ảo" khi profile đã được lấy lên OPEN/RUN.
+            dedicatedCount = _nightReserveState.Profiles.Count(name =>
+                freshIdleNames.Contains(name));
+            effectiveCount = freshIdleNames.Count + mediumIdleNames.Count;
         }
 
         var readyCount = freshIdle.Count(x => !x.NameSyncPending);
         var pendingNameCount = freshIdle.Count(x => x.NameSyncPending);
         _log.Info(
             $"[NIGHT_RESERVE_RECONCILE] reserve={effectiveCount}/{_nightReserveSettings.TargetCount} "
-            + $"dedicatedFresh={dedicatedCount} freshQueued={freshIdleNames.Count} mediumQueued={mediumIdleNames.Count} "
+            + $"dedicatedFreshIdle={dedicatedCount} freshQueuedOther={Math.Max(0, freshIdleNames.Count - dedicatedCount)} mediumQueued={mediumIdleNames.Count} "
             + $"freshIdle={freshIdle.Count} ready={readyCount} nameSyncPending={pendingNameCount} adopted={adopted} adopt={adoptExistingFresh}");
 
         return effectiveCount;
@@ -989,8 +979,9 @@ public sealed partial class ManagerForm
             AutoEllipsis = true,
             ForeColor = Color.DimGray,
             Text =
-                "Dự phòng = PRF giữ riêng + toàn bộ PRF MỚI và TB đang nằm trong Chờ dùng lại. MỚI/TB hàng chờ chỉ được cộng quota mềm, không bị khóa reserve; logic lấy hàng chờ và cooldown vẫn giữ nguyên. "
-                + "PRF CŨ không tính. Chỉ tạo thêm khi tổng các nguồn còn thiếu target.",
+                "Dự phòng = số PRF MỚI + TB thực sự còn idle trong Chờ dùng lại SAU KHI dàn chạy chính đã đủ target. "
+                + "Ví dụ chạy 5 và đặt dự phòng 3 thì Tool giữ 5 PRF chạy + tối thiểu 3 PRF trong Chờ. "
+                + "PRF CŨ không tính; logic lấy hàng chờ, cooldown và khung giờ tạo vẫn giữ nguyên.",
             Margin = new Padding(0, 8, 0, 0)
         };
         panel.Controls.Add(info, 0, 5);

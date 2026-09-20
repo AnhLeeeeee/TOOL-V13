@@ -61,7 +61,7 @@ public sealed partial class ChromeController
     .split(/\r?\n/)
     .map(clean)
     .filter(Boolean)
-    .filter(t => /lỗi|loi|error|server|try again|thử lại|thu lai|banned|suspended|đình chỉ|dinh chi|bị cấm|bi cam|không tồn tại|khong ton tai|does not exist|doesn't exist/i.test(t))
+    .filter(t => /lỗi|loi|error|server|try again|thử lại|thu lai|banned|suspended|đình chỉ|dinh chi|bị cấm|bi cam|không tồn tại|khong ton tai|does not exist|doesn't exist|mật khẩu sai|mat khau sai|sai mật khẩu|sai mat khau|incorrect password|wrong password/i.test(t))
     .slice(0, 8);
 
   // Diagnostic-only: dùng cùng marker với DetectLoginAccountBanAsync, nhưng ghi rõ
@@ -79,7 +79,18 @@ public sealed partial class ChromeController
     ['EN_USER_NOT_EXIST', 'user does not exist'],
     ['EN_USER_NOT_EXIST_SHORT', "user doesn't exist"],
     ['EN_ACCOUNT_NOT_EXIST', 'account does not exist'],
-    ['EN_ACCOUNT_NOT_EXIST_SHORT', "account doesn't exist"]
+    ['EN_ACCOUNT_NOT_EXIST_SHORT', "account doesn't exist"],
+    ['VI_INVALID_CREDENTIALS', 'sai tai khoan hoac mat khau'],
+    ['VI_WRONG_PASSWORD', 'sai mat khau'],
+    ['VI_PASSWORD_WRONG', 'mat khau sai'],
+    ['VI_ACCOUNT_PASSWORD_INCORRECT', 'tai khoan hoac mat khau khong chinh xac'],
+    ['VI_PASSWORD_INCORRECT', 'mat khau khong chinh xac'],
+    ['EN_INVALID_CREDENTIALS', 'incorrect account or password'],
+    ['EN_INVALID_USERNAME_PASSWORD', 'incorrect username or password'],
+    ['EN_USERNAME_PASSWORD_INCORRECT', 'username or password is incorrect'],
+    ['EN_INCORRECT_PASSWORD', 'incorrect password'],
+    ['EN_WRONG_PASSWORD', 'wrong password'],
+    ['EN_ENTERED_PASSWORD_INCORRECT', 'password you entered is incorrect']
   ];
 
   const allElements = document.body ? Array.from(document.body.querySelectorAll('*')) : [];

@@ -2363,6 +2363,13 @@ public sealed partial class ManagerForm
             $"[RUN_STRATEGY_RESTORE_ARMED] source={source} target={desiredTarget} previousActive={sessionActive} previousTarget={currentTarget}");
 
         StartRunStrategySession(settings, desiredTarget);
+
+        // Manager restart/update có thể khôi phục target + session Giờ vàng mà không
+        // đi qua nút Auto Run. Khôi phục luôn quyền Night Reserve của CHÍNH phiên đó;
+        // các gate cũ (đủ target, pending=0, ổn định 20s, khung giờ tạo) vẫn giữ nguyên.
+        MarkNightReservePrimaryRunIntent(
+            desiredTarget,
+            "run_strategy_restore:" + source);
     }
 
     void ObserveRunStrategyPhaseClock()

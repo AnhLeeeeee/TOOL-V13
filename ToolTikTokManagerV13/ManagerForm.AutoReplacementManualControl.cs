@@ -184,18 +184,18 @@ public sealed partial class ManagerForm
         var buttons = panel.Controls.OfType<Button>().ToList();
 
         if (buttons.Any(button =>
-                button.Text.Equals("Stop All", StringComparison.OrdinalIgnoreCase)
-                || button.Text.Equals("Dừng tất cả", StringComparison.OrdinalIgnoreCase)))
+                NormalizeToolbarButtonText(button.Text).Equals("Stop All", StringComparison.OrdinalIgnoreCase)
+                || NormalizeToolbarButtonText(button.Text).Equals("Dừng tất cả", StringComparison.OrdinalIgnoreCase)))
         {
             return true;
         }
 
         var hasRun = buttons.Any(button =>
-            button.Text.Equals("Auto Run", StringComparison.OrdinalIgnoreCase)
-            || button.Text.Equals("Chạy tất cả", StringComparison.OrdinalIgnoreCase));
+            NormalizeToolbarButtonText(button.Text).Equals("Auto Run", StringComparison.OrdinalIgnoreCase)
+            || NormalizeToolbarButtonText(button.Text).Equals("Chạy tất cả", StringComparison.OrdinalIgnoreCase));
         var hasDelete = buttons.Any(button =>
-            button.Text.Equals("Delete", StringComparison.OrdinalIgnoreCase)
-            || button.Text.Equals("Xóa profile", StringComparison.OrdinalIgnoreCase));
+            NormalizeToolbarButtonText(button.Text).Equals("Delete", StringComparison.OrdinalIgnoreCase)
+            || NormalizeToolbarButtonText(button.Text).Equals("Xóa profile", StringComparison.OrdinalIgnoreCase));
 
         return hasRun && hasDelete;
     }

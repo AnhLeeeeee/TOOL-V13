@@ -160,10 +160,13 @@ public sealed partial class ChromeController : IAsyncDisposable
         var backgroundFlags = _vmOptimization.AllowChromeBackgroundThrottling
             ? ""
             : "--disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding ";
+        // Module Proxy là tùy chọn và fail-open. Helper trả chuỗi rỗng khi Proxy OFF,
+        // file cấu hình lỗi hoặc extension auth không tạo được, nên launch cũ vẫn nguyên vẹn.
+        var proxyFlags = BuildOptionalProxyLaunchArguments(profileDir);
         var args =
             $"--remote-debugging-port={port} --remote-allow-origins=* --user-data-dir=\"{profileDir}\" " +
             "--no-first-run --no-default-browser-check " +
-            "--lang=vi --accept-lang=vi-VN,vi,en-US,en --start-maximized " + backgroundFlags +
+            "--lang=vi --accept-lang=vi-VN,vi,en-US,en --start-maximized " + backgroundFlags + proxyFlags +
             TikTokUrl;
         var psi = new ProcessStartInfo(chrome, args)
         {
