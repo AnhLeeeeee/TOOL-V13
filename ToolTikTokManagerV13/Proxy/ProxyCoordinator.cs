@@ -53,7 +53,10 @@ public sealed class ProxyCoordinator
         }
     }
 
-    public (int Added, int Duplicate, int Invalid, List<string> Errors) ImportLines(string text, ProxyProtocol defaultProtocol)
+    public (int Added, int Duplicate, int Invalid, List<string> Errors) ImportLines(
+        string text,
+        ProxyProtocol defaultProtocol,
+        DateTimeOffset? expiresAtUtc = null)
     {
         var added = 0;
         var duplicate = 0;
@@ -79,6 +82,8 @@ public sealed class ProxyCoordinator
                     duplicate++;
                     continue;
                 }
+                endpoint.AddedAtUtc = DateTimeOffset.UtcNow;
+                endpoint.ExpiresAtUtc = expiresAtUtc?.ToUniversalTime();
                 _state.Proxies.Add(endpoint);
                 added++;
             }
@@ -105,6 +110,45 @@ public sealed class ProxyCoordinator
             if (removed > 0) _diagnostics.Write("REMOVE", $"removed={removed}");
             return removed;
         }
+    }
+
+    public int SetProxyExpiry(IEnumerable<string> proxyIds, DateTimeOffset? expiresAtUtc)
+    {
+        var ids = proxyIds
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (ids.Count == 0) return 0;
+
+        var normalizedExpiry = expiresAtUtc?.ToUniversalTime();
+        var updated = 0;
+        var expiredIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        lock (_stateSync)
+        {
+            foreach (var proxy in _state.Proxies.Where(x => ids.Contains(x.Id)))
+            {
+                proxy.ExpiresAtUtc = normalizedExpiry;
+                updated++;
+                if (proxy.IsExpired) expiredIds.Add(proxy.Id);
+            }
+
+            // Không restart PRF đang chạy. Chỉ bỏ mapping/Proxy chung đã hết hạn để
+            // lần mở Chrome kế tiếp chọn Proxy còn hạn.
+            if (expiredIds.Count > 0)
+            {
+                _state.Assignments.RemoveAll(x => expiredIds.Contains(x.ProxyId));
+                if (expiredIds.Contains(_state.ActiveManagerProxyId))
+                    _state.ActiveManagerProxyId = "";
+            }
+
+            if (updated > 0) SaveLocked();
+        }
+
+        if (updated > 0)
+        {
+            var expiryText = normalizedExpiry?.ToLocalTime().ToString("dd/MM/yyyy HH:mm") ?? "khong_xac_dinh";
+            _diagnostics.Write("EXPIRY_UPDATE", $"count={updated} expires={expiryText} expiredNow={expiredIds.Count}");
+        }
+        return updated;
     }
 
     public void ClearAssignments(IEnumerable<string>? profileNames = null)
@@ -160,8 +204,8 @@ public sealed class ProxyCoordinator
             List<ProxyEndpoint> endpoints;
             lock (_stateSync)
             {
-                endpoints = _state.Proxies.Where(x => x.Enabled).Select(CloneEndpoint).ToList();
-                foreach (var endpoint in _state.Proxies.Where(x => x.Enabled))
+                endpoints = _state.Proxies.Where(x => x.Enabled && !x.IsExpired).Select(CloneEndpoint).ToList();
+                foreach (var endpoint in _state.Proxies.Where(x => x.Enabled && !x.IsExpired))
                     endpoint.Health = ProxyHealthState.Testing;
                 SaveLocked();
             }
@@ -392,6 +436,7 @@ public sealed class ProxyCoordinator
             var now = DateTimeOffset.UtcNow;
             candidates = _state.Proxies
                 .Where(x => x.Enabled
+                            && !x.IsExpired
                             && !x.IsHealthy
                             && (x.QuarantineUntilUtc is null || x.QuarantineUntilUtc <= now))
                 .Select(CloneEndpoint)
@@ -448,7 +493,12 @@ public sealed class ProxyCoordinator
                 if (active.IsHealthy && !forceHealthCheck && fresh)
                     return active;
 
-                if (active.Enabled && (active.QuarantineUntilUtc is null || active.QuarantineUntilUtc <= now))
+                if (active.IsExpired)
+                {
+                    _log.Warn($"[PROXY_MANAGER_SHARED_EXPIRED] proxy={active.MaskedDisplay} expires={active.ExpiresAtUtc?.ToLocalTime():dd/MM/yyyy HH:mm} action=next_proxy");
+                    _diagnostics.Write("SHARED_EXPIRED", $"proxy={active.MaskedDisplay} action=next_proxy");
+                }
+                else if (active.Enabled && (active.QuarantineUntilUtc is null || active.QuarantineUntilUtc <= now))
                 {
                     var test = await _tester.TestAsync(active, cancellationToken);
                     ApplyTestResult(active.Id, test);
@@ -472,7 +522,7 @@ public sealed class ProxyCoordinator
             {
                 var index = (start + offset) % count;
                 var candidate = ordered[index];
-                if (!candidate.Enabled) continue;
+                if (!candidate.Enabled || candidate.IsExpired) continue;
                 if (candidate.QuarantineUntilUtc is not null && candidate.QuarantineUntilUtc > DateTimeOffset.UtcNow) continue;
                 if (activeIndex >= 0 && candidate.Id.Equals(activeId, StringComparison.OrdinalIgnoreCase)) continue;
 
@@ -683,7 +733,9 @@ public sealed class ProxyCoordinator
             LastTestUtc = source.LastTestUtc,
             ConsecutiveFailures = source.ConsecutiveFailures,
             QuarantineUntilUtc = source.QuarantineUntilUtc,
-            LastError = source.LastError
+            LastError = source.LastError,
+            AddedAtUtc = source.AddedAtUtc,
+            ExpiresAtUtc = source.ExpiresAtUtc
         };
 
     static ProxyEndpoint? Resolve(ProxyState snapshot, string profileName)

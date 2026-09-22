@@ -56,6 +56,62 @@ function Migrate-LegacyFile([string]$name, [bool]$isJson, [bool]$removeLegacy) {
     }
 }
 
+function Try-RecoverVersionTxtFromManifest {
+    $target = Join-Path $versionDir 'VERSION.txt'
+    if (Test-VersionFile $target) { return $true }
+
+    $candidates = @(
+        (Join-Path $versionDir 'version.json'),
+        (Join-Path $Root 'version.json')
+    )
+
+    foreach ($manifest in $candidates) {
+        if (-not (Test-JsonFile $manifest)) { continue }
+        try {
+            $obj = Get-Content -LiteralPath $manifest -Raw -Encoding UTF8 | ConvertFrom-Json
+            $value = ([string]$obj.version).Trim().TrimStart('v','V')
+            if ($value -match '^\d+\.\d+\.\d+$') {
+                [System.IO.File]::WriteAllText(
+                    $target,
+                    $value + [Environment]::NewLine,
+                    (New-Object System.Text.UTF8Encoding($false))
+                )
+                Write-Host "[VERSION] Da tu phuc hoi _version/VERSION.txt = $value tu $manifest" -ForegroundColor Yellow
+                return $true
+            }
+        }
+        catch { }
+    }
+
+    $historyCandidates = @(
+        (Join-Path $versionDir 'versions.json'),
+        (Join-Path $Root 'versions.json')
+    )
+
+    foreach ($manifest in $historyCandidates) {
+        if (-not (Test-JsonFile $manifest)) { continue }
+        try {
+            $obj = Get-Content -LiteralPath $manifest -Raw -Encoding UTF8 | ConvertFrom-Json
+            $items = @($obj.versions)
+            if ($items.Count -le 0) { continue }
+
+            $value = ([string]$items[0].version).Trim().TrimStart('v','V')
+            if ($value -match '^\d+\.\d+\.\d+$') {
+                [System.IO.File]::WriteAllText(
+                    $target,
+                    $value + [Environment]::NewLine,
+                    (New-Object System.Text.UTF8Encoding($false))
+                )
+                Write-Host "[VERSION] Da tu phuc hoi _version/VERSION.txt = $value tu $manifest" -ForegroundColor Yellow
+                return $true
+            }
+        }
+        catch { }
+    }
+
+    return $false
+}
+
 # VERSION.txt va 2 file lastgood cu khong can nam o root nua.
 Migrate-LegacyFile 'VERSION.txt' $false $true
 Migrate-LegacyFile 'version.json.lastgood' $true $true
@@ -67,10 +123,21 @@ Migrate-LegacyFile 'version.json' $true $false
 Migrate-LegacyFile 'versions.json' $true $false
 
 $requiredVersion = Join-Path $versionDir 'VERSION.txt'
+
+# Safety-net: neu VERSION.txt bi mat sau khi copy patch/merge Git,
+# tu khoi phuc version tu manifest hop le thay vi lam build chet.
 if (-not (Test-VersionFile $requiredVersion)) {
-    throw "Khong tim thay _version/VERSION.txt hop le: $requiredVersion"
+    $null = Try-RecoverVersionTxtFromManifest
+}
+
+if (-not (Test-VersionFile $requiredVersion)) {
+    throw "Khong tim thay _version/VERSION.txt hop le va khong the phuc hoi tu version.json/versions.json: $requiredVersion"
 }
 
 if ($firstMigration) {
-    [System.IO.File]::WriteAllText($layoutMarker, 'layout=v1' + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
+    [System.IO.File]::WriteAllText(
+        $layoutMarker,
+        'layout=v1' + [Environment]::NewLine,
+        (New-Object System.Text.UTF8Encoding($false))
+    )
 }

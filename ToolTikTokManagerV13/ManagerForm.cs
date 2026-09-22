@@ -134,7 +134,7 @@ public sealed partial class ManagerForm : Form
     readonly int _instanceCdpPortBase;
     readonly Dictionary<string, FileStream> _cdpPortLeases = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, ProfileContext> _contexts = new(StringComparer.OrdinalIgnoreCase);
-    readonly TabControl _tabs = new() { Dock = DockStyle.Fill, DrawMode = TabDrawMode.OwnerDrawFixed, Padding = new Point(18, 6) };
+    readonly TabControl _tabs = new() { Dock = DockStyle.Fill, DrawMode = TabDrawMode.OwnerDrawFixed, Padding = new Point(30, 6) };
     readonly System.Windows.Forms.Timer _refreshTimer = new() { Interval = 1000, Enabled = true };
     readonly Label _availability = new() { AutoSize = true, Margin = new Padding(12, 9, 4, 0), ForeColor = Color.DimGray };
     readonly AddTabMarker _addMarker = new();

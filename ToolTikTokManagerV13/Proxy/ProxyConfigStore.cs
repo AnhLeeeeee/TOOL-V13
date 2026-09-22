@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using System.Text.Json;
 
 namespace ToolTikTokManagerV13.Proxy;
@@ -86,6 +86,8 @@ public sealed class ProxyConfigStore
         foreach (var proxy in state.Proxies)
         {
             if (proxy is null || string.IsNullOrWhiteSpace(proxy.Host) || proxy.Port is < 1 or > 65535) continue;
+            if (proxy.AddedAtUtc == default)
+                proxy.AddedAtUtc = state.UpdatedAtUtc == default ? DateTimeOffset.UtcNow : state.UpdatedAtUtc;
             if (string.IsNullOrWhiteSpace(proxy.Id)) proxy.Id = Guid.NewGuid().ToString("N");
             if (!uniqueProxyIds.Add(proxy.Id)) proxy.Id = Guid.NewGuid().ToString("N");
             if (!uniqueKeys.Add(proxy.DedupKey)) continue;

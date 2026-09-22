@@ -102,6 +102,7 @@ public sealed partial class ManagerForm
     bool _runStrategySessionActive;
     bool _runStrategyTickBusy;
     bool _runStrategyRotationRunning;
+    bool _runStrategyAutoRunStartedThisManagerSession;
     int _runStrategyTargetSlots;
     DateTime _runStrategyNextRotationUtc = DateTime.MinValue;
     string _runStrategyObservedPhase = "";
@@ -125,9 +126,9 @@ public sealed partial class ManagerForm
     string RunStrategySettingsPath
         => Path.Combine(_baseDir, "manager_run_strategy.json");
 
-    // Snapshot rất nhỏ chỉ để giữ đúng target của phiên Auto Run đang hoạt động
-    // qua một lần Manager restart/update. Đây KHÔNG phải queue công việc và cũng
-    // không tự arm Tự bù: Stop All/Dừng khẩn cấp sẽ xóa hiệu lực snapshot.
+    // Snapshot nhỏ phục vụ chẩn đoán/trạng thái của phiên Auto Run hiện tại.
+    // Từ bản vá startup sạch, snapshot ACTIVE tuyệt đối không được hồi sinh runtime
+    // ở lần mở Manager tiếp theo; startup luôn ghi đè nó về inactive/target=0.
     sealed class RunStrategySessionTargetDocument
     {
         public int Version { get; set; } = 1;
@@ -174,59 +175,65 @@ public sealed partial class ManagerForm
         }
     }
 
-    void RestorePersistedRunStrategySessionTargetIfEligible(string source)
+    void ResetRunStrategyRuntimeOnManagerStartup(string source)
     {
-        // Chỉ Giờ vàng đang ARMED và không bị Stop All/Dừng khẩn cấp mới có quyền
-        // khôi phục target qua restart. Chế độ Theo thời gian vẫn bắt đầu phiên mới
-        // bằng thao tác user như trước, tránh mang target cũ sang một phiên mới.
-        if (_runStrategySettings.Mode != RunAllStrategyMode.PrimeFresh
-            || !_runStrategySettings.PrimeModeArmed
-            || _runStrategySettings.PrimeModeSuspended
-            || !File.Exists(RunStrategySessionTargetPath))
-        {
-            return;
-        }
+        // Mỗi lần mở Manager là một phiên vận hành sạch. Chỉ giữ CẤU HÌNH Auto Run,
+        // tuyệt đối không khôi phục target/queue/session đang chạy của phiên trước.
+        // Run Strategy chỉ được quyền tự chạy sau khi user bấm Bắt đầu trong Auto Run
+        // của chính phiên Manager hiện tại.
+        var previousActive = false;
+        var previousTarget = 0;
+        var previousUpdatedUtc = default(DateTime);
 
         try
         {
-            var document = JsonSerializer.Deserialize<RunStrategySessionTargetDocument>(
-                File.ReadAllText(RunStrategySessionTargetPath, Encoding.UTF8));
-
-            if (document is null
-                || document.Version != 1
-                || document.TargetSlots < 0
-                || document.TargetSlots > 50
-                || (document.Active && document.TargetSlots <= 0))
+            if (File.Exists(RunStrategySessionTargetPath))
             {
-                return;
+                var document = JsonSerializer.Deserialize<RunStrategySessionTargetDocument>(
+                    File.ReadAllText(RunStrategySessionTargetPath, Encoding.UTF8));
+
+                if (document is not null && document.Version == 1)
+                {
+                    previousActive = document.Active;
+                    previousTarget = Math.Clamp(document.TargetSlots, 0, 50);
+                    previousUpdatedUtc = document.UpdatedUtc;
+                }
             }
-
-            // Snapshot chỉ phục vụ restart/update gần đây; không hồi sinh quota rất cũ.
-            if (document.UpdatedUtc == default
-                || DateTime.UtcNow - document.UpdatedUtc > TimeSpan.FromHours(24))
-            {
-                _log.Info(
-                    $"[RUN_SESSION_TARGET_RESTORE_SKIP] source={source} reason=stale target={document.TargetSlots} updated={document.UpdatedUtc:O}");
-                return;
-            }
-
-            var restoredTarget = document.Active ? document.TargetSlots : 0;
-
-            lock (_autoReplacementFixedSlotLock)
-            {
-                _autoReplacementTargetSlots = restoredTarget;
-                _autoReplacementTargetInitialized = true;
-                _autoReplacementNextCapacityReconcileUtc = DateTime.MinValue;
-            }
-
-            _log.Warn(
-                $"[RUN_SESSION_TARGET_RESTORE] source={source} active={document.Active} target={restoredTarget} updated={document.UpdatedUtc:O} action=FIX_TARGET_BEFORE_RUNTIME_EVENTS");
         }
         catch (Exception ex)
         {
+            // Snapshot cũ hỏng cũng không được phép cản startup sạch.
             _log.Warn(
-                $"[RUN_SESSION_TARGET_RESTORE_WARN] source={source} error={ex.Message}");
+                $"[RUN_SESSION_STARTUP_RESET_READ_WARN] source={source} error={ex.Message}");
         }
+
+        lock (_runStrategyLock)
+        {
+            _runStrategySessionActive = false;
+            _runStrategyAutoRunStartedThisManagerSession = false;
+            _runStrategyTargetSlots = 0;
+            _runStrategyNextRotationUtc = DateTime.MinValue;
+            _runStrategyObservedPhase = "";
+        }
+
+        lock (_autoReplacementFixedSlotLock)
+        {
+            _autoReplacementTargetSlots = 0;
+            _autoReplacementTargetInitialized = true;
+            _autoReplacementNextCapacityReconcileUtc = DateTime.MinValue;
+        }
+
+        // InitializeAutoReplacementFeature() đã xóa queue cũ và disarm phiên bù.
+        // Gán lại lần nữa ở đây để startup luôn fail-closed nếu thứ tự init thay đổi.
+        _autoReplacementSessionArmed = false;
+        ResetNightReservePrimaryRunIntent("manager_startup_clean");
+
+        // Ghi đè snapshot cũ thành inactive để lần mở sau không còn dữ liệu active.
+        PersistRunStrategySessionTarget(0, active: false, source: source);
+
+        _log.Warn(
+            $"[RUN_SESSION_STARTUP_RESET] source={source} previousActive={previousActive} previousTarget={previousTarget} " +
+            $"previousUpdated={previousUpdatedUtc:O} target=0 replacementArmed=false action=WAIT_FOR_EXPLICIT_AUTO_RUN");
     }
 
     void InitializeRunStrategyFeature()
@@ -240,7 +247,7 @@ public sealed partial class ManagerForm
         // các subsystem này đã được load trước khi dialog đọc trạng thái.
         InitializeAutoCloseFeature();
         _runStrategySettings = LoadRunStrategySettings();
-        RestorePersistedRunStrategySessionTargetIfEligible("run_strategy_init");
+        ResetRunStrategyRuntimeOnManagerStartup("run_strategy_init");
 
         // Theo dõi phase bằng một handler đồng bộ riêng. Nhờ vậy OFFPEAK/PREPARE/PRIME
         // đổi ngay theo đồng hồ, kể cả khi tick async trước đó còn đang chờ pipeline.
@@ -1655,6 +1662,12 @@ public sealed partial class ManagerForm
 
         SaveRunStrategySettings(selected);
         StopRunStrategySession("run_all_new_selection");
+
+        // Chỉ thao tác Bắt đầu trong hộp Auto Run mới cấp quyền cho Run Strategy
+        // tự chạy trong phiên Manager hiện tại. Mở Tool/Start thủ công không được
+        // hồi sinh scheduler từ PrimeModeArmed của phiên trước.
+        _runStrategyAutoRunStartedThisManagerSession = true;
+
         ResetRunStrategyPrePrimeRefreshState("run_all_new_selection");
         ResetAutoReplacementCreateLimitSession("run_all_new_selection");
 
@@ -2167,8 +2180,9 @@ public sealed partial class ManagerForm
         if (!_runStrategySessionActive)
             return;
 
-        // Giữ target phiên qua Manager restart/update. Snapshot không tự tạo PRF;
-        // nó chỉ giúp fixed-slot target được phục hồi trước các event BAN/FAULT.
+        // Ghi snapshot để chẩn đoán trạng thái phiên hiện tại. Nếu Manager đóng/crash,
+        // lần mở sau ResetRunStrategyRuntimeOnManagerStartup() sẽ vô hiệu hóa snapshot
+        // này thay vì tự phục hồi target.
         PersistRunStrategySessionTarget(
             targetSlots,
             active: true,
@@ -2216,6 +2230,13 @@ public sealed partial class ManagerForm
             try { startCts.Cancel(); } catch { }
         }
 
+        if (source.Equals("stop_all", StringComparison.OrdinalIgnoreCase)
+            || source.Equals("emergency_stop", StringComparison.OrdinalIgnoreCase)
+            || source.Equals("emergency_resume_resync", StringComparison.OrdinalIgnoreCase))
+        {
+            _runStrategyAutoRunStartedThisManagerSession = false;
+        }
+
         if (source.Equals("stop_all", StringComparison.OrdinalIgnoreCase))
         {
             lock (_autoReplacementFixedSlotLock)
@@ -2235,9 +2256,9 @@ public sealed partial class ManagerForm
             PersistRunStrategySessionTarget(0, active: false, source: source);
         }
 
-        // Không disarm Giờ vàng; chỉ persist trạng thái "đang chờ START mới".
-        // Điều này phân biệt restart bình thường (được tự restore nếu Worker còn RUNNING)
-        // với restart sau Stop All / Dừng khẩn cấp (không được tự bật lại do Worker sót).
+        // Không xóa cấu hình Giờ vàng; chỉ persist trạng thái "đang chờ START mới".
+        // Stop All / Dừng khẩn cấp đồng thời thu hồi quyền Auto Run của phiên hiện tại;
+        // lần mở Manager sau cũng luôn bắt đầu sạch và chờ user bấm Auto Run.
         if (source.Equals("stop_all", StringComparison.OrdinalIgnoreCase)
             || source.Equals("emergency_stop", StringComparison.OrdinalIgnoreCase)
             || source.Equals("emergency_resume_resync", StringComparison.OrdinalIgnoreCase))
@@ -2272,6 +2293,9 @@ public sealed partial class ManagerForm
 
     void RestoreArmedRunStrategySessionIfNeeded(string source)
     {
+        if (!_runStrategyAutoRunStartedThisManagerSession)
+            return;
+
         if (IsAutomationHalted
             || !_runStrategyFeatureInitialized
             || _closing
@@ -2336,9 +2360,9 @@ public sealed partial class ManagerForm
 
         if (!targetInitialized)
         {
-            // Manager vừa restart không mang target session cũ sang. Nếu Worker cũ
-            // thực sự đang RUNNING/RECOVERING thì khôi phục Giờ vàng theo đúng số
-            // runtime đang hoạt động; tab STOPPED không được tính.
+            // Fallback chỉ dành cho một phiên Auto Run đã được user bắt đầu trong
+            // chính Manager hiện tại nhưng target chưa kịp initialized. Startup mới
+            // luôn đặt initialized=true,target=0 nên Worker cũ không thể kích hoạt nhánh này.
             desiredTarget = _contexts.Values.Count(ctx =>
             {
                 if (ctx.Tab is null
@@ -2364,9 +2388,9 @@ public sealed partial class ManagerForm
 
         StartRunStrategySession(settings, desiredTarget);
 
-        // Manager restart/update có thể khôi phục target + session Giờ vàng mà không
-        // đi qua nút Auto Run. Khôi phục luôn quyền Night Reserve của CHÍNH phiên đó;
-        // các gate cũ (đủ target, pending=0, ổn định 20s, khung giờ tạo) vẫn giữ nguyên.
+        // Chỉ phục hồi session nội bộ của Auto Run đã được user bắt đầu trong
+        // chính phiên Manager hiện tại; không bao giờ phục hồi xuyên restart.
+        // Night Reserve chỉ nhận intent từ đúng phiên Auto Run đó.
         MarkNightReservePrimaryRunIntent(
             desiredTarget,
             "run_strategy_restore:" + source);
@@ -2443,9 +2467,9 @@ public sealed partial class ManagerForm
             return;
         }
 
-        // Giờ vàng là mode đã "arm", không còn phụ thuộc lifetime của một phiên
-        // Auto Run. Stop All/Emergency chỉ pause runtime; khi target hợp lệ quay lại
-        // (Start thủ công hoặc Worker cũ sau restart) scheduler tự khôi phục.
+        // Chỉ session Auto Run đã được user bấm Bắt đầu trong phiên Manager hiện tại
+        // mới được phép khôi phục scheduler nội bộ. Mở Tool hoặc Start thủ công không
+        // được dùng PrimeModeArmed cũ để tự bật Run Strategy.
         RestoreArmedRunStrategySessionIfNeeded("tick");
 
         if (!_runStrategySessionActive)

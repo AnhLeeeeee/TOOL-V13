@@ -1,4 +1,4 @@
-using System.Text.Json.Serialization;
+﻿using System.Text.Json.Serialization;
 
 namespace ToolTikTokManagerV13.Proxy;
 
@@ -44,12 +44,30 @@ public sealed class ProxyEndpoint
     public DateTimeOffset? QuarantineUntilUtc { get; set; }
     public string LastError { get; set; } = "";
 
+    // Quản lý vòng đời Proxy. Proxy cũ không có các field này vẫn đọc được bình thường.
+    public DateTimeOffset AddedAtUtc { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset? ExpiresAtUtc { get; set; }
+
     [JsonIgnore]
     public bool HasCredentials => !string.IsNullOrWhiteSpace(Username);
 
     [JsonIgnore]
+    public bool HasExpiry => ExpiresAtUtc is not null;
+
+    [JsonIgnore]
+    public bool IsExpired
+        => ExpiresAtUtc is not null && ExpiresAtUtc.Value <= DateTimeOffset.UtcNow;
+
+    [JsonIgnore]
+    public bool IsExpiringSoon
+        => ExpiresAtUtc is not null
+           && ExpiresAtUtc.Value > DateTimeOffset.UtcNow
+           && ExpiresAtUtc.Value - DateTimeOffset.UtcNow <= TimeSpan.FromHours(24);
+
+    [JsonIgnore]
     public bool IsHealthy
         => Enabled
+           && !IsExpired
            && (Health == ProxyHealthState.Good || Health == ProxyHealthState.Slow)
            && (QuarantineUntilUtc is null || QuarantineUntilUtc <= DateTimeOffset.UtcNow);
 

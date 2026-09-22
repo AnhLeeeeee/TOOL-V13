@@ -31,6 +31,17 @@ public sealed class ProxyManagerForm : Form
     readonly Button _applyButton = new() { Text = "Áp dụng cho lần mở tiếp theo", AutoSize = true };
     readonly Button _clearAssignmentsButton = new() { Text = "Xóa gán đã chọn", AutoSize = true };
     readonly Button _proxyLogButton = new() { Text = "Nhật ký Proxy", Width = 120, Height = 32 };
+    readonly ComboBox _expiryPreset = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 125 };
+    readonly DateTimePicker _expiryCustom = new()
+    {
+        Format = DateTimePickerFormat.Custom,
+        CustomFormat = "dd/MM/yyyy HH:mm",
+        Width = 150,
+        ShowUpDown = true
+    };
+    readonly Button _setExpiryButton = new() { Text = "Đặt hạn Proxy chọn", Width = 145, Height = 29 };
+    readonly Label _expirySummary = new() { AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(12, 6, 0, 0) };
+    readonly System.Windows.Forms.Timer _expiryTimer = new() { Interval = 60_000 };
     CancellationTokenSource? _operationCts;
     bool _loading;
 
@@ -46,14 +57,27 @@ public sealed class ProxyManagerForm : Form
         Font = new Font("Segoe UI", 9F);
 
         _defaultProtocol.Items.AddRange(["HTTP", "HTTPS", "SOCKS5"]);
+        _expiryPreset.Items.AddRange(["Không xác định", "1 ngày", "3 ngày", "7 ngày", "30 ngày", "Tùy chỉnh"]);
+        _expiryPreset.SelectedIndex = 0;
+        _expiryCustom.Value = DateTime.Now.AddDays(7);
+        _expiryCustom.Enabled = false;
+        _expiryPreset.SelectedIndexChanged += (_, _) => UpdateExpiryInputUi();
+        _setExpiryButton.Click += (_, _) => SetSelectedProxyExpiry();
+        _expiryTimer.Tick += (_, _) =>
+        {
+            if (!IsDisposed && Visible) RefreshGrids();
+        };
+
         BuildUi();
         ConfigureProxyGrid();
         ConfigureAssignmentGrid();
         LoadFromState();
+        _expiryTimer.Start();
         FormClosing += (_, _) =>
         {
             try { SaveSettingsFromUi(); } catch { }
             try { _operationCts?.Cancel(); } catch { }
+            try { _expiryTimer.Stop(); _expiryTimer.Dispose(); } catch { }
         };
     }
 
@@ -205,14 +229,15 @@ public sealed class ProxyManagerForm : Form
         // WinForms control margins/DPI scaling are included, causing the last button
         // ("Xóa Proxy chọn") to be clipped behind the grid. Keep the same controls
         // and event flow; only reserve enough layout height for the existing toolbar.
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 118F));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 162F));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
 
-        var import = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 2 };
+        var import = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 3 };
         import.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
         import.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 170F));
         import.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
         import.RowStyles.Add(new RowStyle(SizeType.Absolute, 28F));
+        import.RowStyles.Add(new RowStyle(SizeType.Absolute, 38F));
         import.Controls.Add(_importText, 0, 0);
         var buttons = new FlowLayoutPanel
         {
@@ -233,13 +258,21 @@ public sealed class ProxyManagerForm : Form
         buttons.Controls.Add(_testButton);
         buttons.Controls.Add(remove);
         import.Controls.Add(buttons, 1, 0);
-        import.SetRowSpan(buttons, 2);
+        import.SetRowSpan(buttons, 3);
         import.Controls.Add(new Label
         {
             Dock = DockStyle.Fill,
             ForeColor = Color.DimGray,
             Text = "Mỗi dòng: ip:port | ip:port:user:pass | user:pass@ip:port | http(s)/socks5://..."
         }, 0, 1);
+
+        var expiryFlow = Flow(
+            new Label { Text = "Hạn Proxy khi thêm:", AutoSize = true, Margin = new Padding(0, 6, 8, 0) },
+            _expiryPreset,
+            _expiryCustom,
+            _setExpiryButton,
+            _expirySummary);
+        import.Controls.Add(expiryFlow, 0, 2);
 
         layout.Controls.Add(import, 0, 0);
         layout.Controls.Add(_proxyGrid, 0, 1);
@@ -303,12 +336,14 @@ public sealed class ProxyManagerForm : Form
     void ConfigureProxyGrid()
     {
         _proxyGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "ProxyId", Visible = false });
-        _proxyGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Proxy", HeaderText = "Proxy", FillWeight = 190 });
-        _proxyGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "State", HeaderText = "Trạng thái", FillWeight = 85 });
-        _proxyGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "ExitIp", HeaderText = "IP ra", FillWeight = 95 });
-        _proxyGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Latency", HeaderText = "Độ trễ", FillWeight = 65 });
-        _proxyGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Usage", HeaderText = "Đang dùng", FillWeight = 70 });
-        _proxyGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "LastTest", HeaderText = "Lần test", FillWeight = 100 });
+        _proxyGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Proxy", HeaderText = "Proxy", FillWeight = 160 });
+        _proxyGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "State", HeaderText = "Trạng thái", FillWeight = 82 });
+        _proxyGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "ExitIp", HeaderText = "IP ra", FillWeight = 82 });
+        _proxyGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Latency", HeaderText = "Độ trễ", FillWeight = 58 });
+        _proxyGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Usage", HeaderText = "Đang dùng", FillWeight = 64 });
+        _proxyGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Expires", HeaderText = "Hết hạn", FillWeight = 105 });
+        _proxyGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Remaining", HeaderText = "Còn lại", FillWeight = 82 });
+        _proxyGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "LastTest", HeaderText = "Lần test", FillWeight = 92 });
     }
 
     void ConfigureAssignmentGrid()
@@ -404,12 +439,226 @@ public sealed class ProxyManagerForm : Form
 
     void ImportProxies()
     {
+        if (string.IsNullOrWhiteSpace(_importText.Text))
+        {
+            _status.Text = "Hãy nhập ít nhất 1 Proxy trước khi thêm vào Pool.";
+            return;
+        }
+
         SaveSettingsFromUi();
-        var result = _coordinator.ImportLines(_importText.Text, SelectedProtocol());
+
+        // Proxy luôn có hạn sử dụng: mỗi lần bấm Thêm vào Pool phải chốt hạn trước.
+        // Phần "Đặt hạn Proxy chọn" phía dưới vẫn giữ nguyên để sửa hạn sau này.
+        if (!TryPromptImportExpiry(out var expiry))
+        {
+            _status.Text = "Đã hủy thêm Proxy.";
+            return;
+        }
+
+        var result = _coordinator.ImportLines(_importText.Text, SelectedProtocol(), expiry);
         _importText.Clear();
         RefreshGrids();
         var detail = result.Errors.Count == 0 ? "" : " | " + string.Join("; ", result.Errors);
-        _status.Text = $"Đã thêm {result.Added}; trùng {result.Duplicate}; lỗi {result.Invalid}.{detail}";
+        var expiryText = expiry.ToLocalTime().ToString("dd/MM/yyyy HH:mm");
+        _status.Text = $"Đã thêm {result.Added}; trùng {result.Duplicate}; lỗi {result.Invalid}; hạn {expiryText}.{detail}";
+    }
+
+    bool TryPromptImportExpiry(out DateTimeOffset expiryUtc)
+    {
+        expiryUtc = default;
+        var selectedExpiryUtc = default(DateTimeOffset);
+
+        using var form = new Form
+        {
+            Text = "Hạn sử dụng Proxy",
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MaximizeBox = false,
+            MinimizeBox = false,
+            ShowInTaskbar = false,
+            ClientSize = new Size(470, 205),
+            Font = Font,
+            AutoScaleMode = AutoScaleMode.Dpi
+        };
+
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 4,
+            Padding = new Padding(16)
+        };
+        root.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 135F));
+        root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 38F));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 38F));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 45F));
+
+        var preset = new ComboBox
+        {
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Dock = DockStyle.Fill
+        };
+        preset.Items.AddRange(["1 ngày", "3 ngày", "7 ngày", "30 ngày", "Tùy chỉnh"]);
+        preset.SelectedIndex = 3; // Mặc định 30 ngày, có thể đổi trước khi thêm.
+
+        var custom = new DateTimePicker
+        {
+            Format = DateTimePickerFormat.Custom,
+            CustomFormat = "dd/MM/yyyy HH:mm",
+            Dock = DockStyle.Fill,
+            ShowUpDown = true,
+            Value = DateTime.Now.AddDays(30),
+            Enabled = false
+        };
+
+        var preview = new Label
+        {
+            AutoSize = false,
+            Dock = DockStyle.Fill,
+            ForeColor = Color.DimGray,
+            TextAlign = ContentAlignment.MiddleLeft
+        };
+
+        DateTime ResolveLocalExpiry()
+        {
+            var now = DateTime.Now;
+            return preset.SelectedIndex switch
+            {
+                0 => now.AddDays(1),
+                1 => now.AddDays(3),
+                2 => now.AddDays(7),
+                3 => now.AddDays(30),
+                _ => custom.Value
+            };
+        }
+
+        void RefreshPreview()
+        {
+            custom.Enabled = preset.SelectedIndex == 4;
+            var value = ResolveLocalExpiry();
+            preview.Text = $"Proxy sẽ hết hạn lúc: {value:dd/MM/yyyy HH:mm}";
+        }
+
+        preset.SelectedIndexChanged += (_, _) =>
+        {
+            if (preset.SelectedIndex != 4)
+                custom.Value = ResolveLocalExpiry();
+            RefreshPreview();
+        };
+        custom.ValueChanged += (_, _) => RefreshPreview();
+
+        root.Controls.Add(new Label
+        {
+            Text = "Thời hạn:",
+            AutoSize = true,
+            Margin = new Padding(0, 8, 8, 0)
+        }, 0, 0);
+        root.Controls.Add(preset, 1, 0);
+
+        root.Controls.Add(new Label
+        {
+            Text = "Hết hạn lúc:",
+            AutoSize = true,
+            Margin = new Padding(0, 8, 8, 0)
+        }, 0, 1);
+        root.Controls.Add(custom, 1, 1);
+
+        root.Controls.Add(preview, 0, 2);
+        root.SetColumnSpan(preview, 2);
+
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.RightToLeft,
+            WrapContents = false
+        };
+        var ok = new Button { Text = "Thêm Proxy", Width = 105, Height = 30 };
+        var cancel = new Button { Text = "Hủy", Width = 90, Height = 30 };
+        buttons.Controls.Add(ok);
+        buttons.Controls.Add(cancel);
+        root.Controls.Add(buttons, 0, 3);
+        root.SetColumnSpan(buttons, 2);
+
+        form.Controls.Add(root);
+        form.AcceptButton = ok;
+        form.CancelButton = cancel;
+
+        ok.Click += (_, _) =>
+        {
+            var local = ResolveLocalExpiry();
+            if (local <= DateTime.Now.AddMinutes(1))
+            {
+                MessageBox.Show(
+                    form,
+                    "Thời điểm hết hạn phải lớn hơn thời gian hiện tại ít nhất 1 phút.",
+                    "Hạn Proxy không hợp lệ",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
+
+            selectedExpiryUtc = new DateTimeOffset(local).ToUniversalTime();
+            form.DialogResult = DialogResult.OK;
+            form.Close();
+        };
+        cancel.Click += (_, _) =>
+        {
+            form.DialogResult = DialogResult.Cancel;
+            form.Close();
+        };
+
+        RefreshPreview();
+        if (form.ShowDialog(this) != DialogResult.OK)
+            return false;
+
+        expiryUtc = selectedExpiryUtc;
+        return true;
+    }
+
+    void UpdateExpiryInputUi()
+    {
+        _expiryCustom.Enabled = _expiryPreset.SelectedIndex == 5;
+    }
+
+    DateTimeOffset? SelectedExpiryUtc()
+    {
+        var now = DateTimeOffset.Now;
+        return _expiryPreset.SelectedIndex switch
+        {
+            1 => now.AddDays(1).ToUniversalTime(),
+            2 => now.AddDays(3).ToUniversalTime(),
+            3 => now.AddDays(7).ToUniversalTime(),
+            4 => now.AddDays(30).ToUniversalTime(),
+            5 => new DateTimeOffset(_expiryCustom.Value).ToUniversalTime(),
+            _ => null
+        };
+    }
+
+    void SetSelectedProxyExpiry()
+    {
+        var ids = _proxyGrid.SelectedRows.Cast<DataGridViewRow>()
+            .Select(row => row.Cells["ProxyId"].Value?.ToString() ?? "")
+            .Where(x => x.Length > 0)
+            .ToArray();
+        if (ids.Length == 0)
+        {
+            _status.Text = "Hãy chọn ít nhất 1 Proxy để đặt hạn.";
+            return;
+        }
+
+        var expiry = SelectedExpiryUtc();
+        if (expiry is not null && expiry <= DateTimeOffset.UtcNow)
+        {
+            _status.Text = "Thời điểm hết hạn phải lớn hơn thời gian hiện tại.";
+            return;
+        }
+
+        var updated = _coordinator.SetProxyExpiry(ids, expiry);
+        RefreshGrids();
+        var expiryText = expiry?.ToLocalTime().ToString("dd/MM/yyyy HH:mm") ?? "không xác định";
+        _status.Text = $"Đã đặt hạn {expiryText} cho {updated} Proxy. PRF đang chạy không bị restart.";
     }
 
     void RemoveSelectedProxies()
@@ -558,6 +807,9 @@ public sealed class ProxyManagerForm : Form
     {
         if (IsDisposed) return;
         var state = _coordinator.GetSnapshot();
+        var expiredCount = state.Proxies.Count(x => x.IsExpired);
+        var expiringSoonCount = state.Proxies.Count(x => x.IsExpiringSoon);
+        _expirySummary.Text = $"Sắp hết <24h: {expiringSoonCount}  |  Hết hạn: {expiredCount}";
         var currentProfiles = Profiles();
         var currentNames = currentProfiles
             .Where(x => !string.IsNullOrWhiteSpace(x.Name))
@@ -573,7 +825,12 @@ public sealed class ProxyManagerForm : Form
         {
             usage.TryGetValue(proxy.Id, out var used);
             var isSharedActive = sharedMode && proxy.Id.Equals(state.ActiveManagerProxyId, StringComparison.OrdinalIgnoreCase);
-            var stateText = isSharedActive ? $"ĐANG DÙNG · {proxy.Health}" : proxy.Health.ToString();
+            var expiryState = proxy.IsExpired
+                ? "HẾT HẠN"
+                : proxy.IsExpiringSoon
+                    ? $"SẮP HẾT · {proxy.Health}"
+                    : proxy.Health.ToString();
+            var stateText = isSharedActive ? $"ĐANG DÙNG · {expiryState}" : expiryState;
             var usageText = sharedMode
                 ? (isSharedActive ? $"CHUNG ({currentProfiles.Count(x => x.Enabled)} PRF)" : "Dự phòng")
                 : $"{used}/{Math.Max(1, state.Settings.ProfilesPerProxy)}";
@@ -584,9 +841,15 @@ public sealed class ProxyManagerForm : Form
                 proxy.ExitIp,
                 proxy.LastLatencyMs > 0 ? proxy.LastLatencyMs + " ms" : "—",
                 usageText,
+                proxy.ExpiresAtUtc?.ToLocalTime().ToString("dd/MM/yyyy HH:mm") ?? "Không rõ",
+                FormatRemaining(proxy),
                 proxy.LastTestUtc?.ToLocalTime().ToString("dd/MM HH:mm:ss") ?? "—");
             var row = _proxyGrid.Rows[index];
-            if (proxy.Health is ProxyHealthState.Dead or ProxyHealthState.Timeout or ProxyHealthState.AuthError or ProxyHealthState.Error)
+            if (proxy.IsExpired)
+                row.DefaultCellStyle.ForeColor = Color.Firebrick;
+            else if (proxy.IsExpiringSoon)
+                row.DefaultCellStyle.ForeColor = Color.DarkOrange;
+            else if (proxy.Health is ProxyHealthState.Dead or ProxyHealthState.Timeout or ProxyHealthState.AuthError or ProxyHealthState.Error)
                 row.DefaultCellStyle.ForeColor = Color.Firebrick;
             else if (proxy.Health is ProxyHealthState.Good)
                 row.DefaultCellStyle.ForeColor = Color.DarkGreen;
@@ -619,6 +882,18 @@ public sealed class ProxyManagerForm : Form
                 _assignmentGrid.Rows.Add(profile.Name, "—", "—", "Chưa gán");
             }
         }
+    }
+
+    static string FormatRemaining(ProxyEndpoint proxy)
+    {
+        if (proxy.ExpiresAtUtc is null) return "—";
+        var remaining = proxy.ExpiresAtUtc.Value - DateTimeOffset.UtcNow;
+        if (remaining <= TimeSpan.Zero) return "HẾT HẠN";
+        if (remaining.TotalDays >= 1)
+            return $"{(int)remaining.TotalDays}d {remaining.Hours}h";
+        if (remaining.TotalHours >= 1)
+            return $"{(int)remaining.TotalHours}h {remaining.Minutes}m";
+        return $"{Math.Max(1, remaining.Minutes)}m";
     }
 
     IReadOnlyList<TikTokProfileEntry> Profiles() => _profilesProvider() ?? Array.Empty<TikTokProfileEntry>();
