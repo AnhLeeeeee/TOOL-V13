@@ -2,7 +2,9 @@
   "enabled": true,
   "policyVersion": "1",
   "enforceAllowList": false,
-  "allowedDeviceIds": [],
+  "allowedDeviceIds": [
+    "TT-3DCD4-24C16-64433-55DB7"
+  ],
   "blockedDeviceIds": [],
   "blockedUpdateDeviceIds": [],
   "blockMessage": "Thiết bị này chưa được cấp quyền sử dụng Tool."
