@@ -7,5 +7,10 @@
   ],
   "blockedDeviceIds": [],
   "blockedUpdateDeviceIds": [],
-  "blockMessage": "Thiết bị này chưa được cấp quyền sử dụng Tool."
+  "blockMessage": "Thiết bị này chưa được cấp quyền sử dụng Tool.",
+  "versionControl": {
+    "enabled": false,
+    "policyUrl": "",
+    "failClosedOnDowngrade": true
+  }
 }

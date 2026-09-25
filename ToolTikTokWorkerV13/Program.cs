@@ -1,4 +1,4 @@
-using ToolTikTokV12.Services;
+﻿using ToolTikTokV12.Services;
 using ToolTikTokV12.Utils;
 using System.IO.Pipes;
 using System.Security.Cryptography;
@@ -14,7 +14,10 @@ internal static class Program
         ApplicationConfiguration.Initialize();
 
         var baseDir = Path.GetFullPath(AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar));
-        var access = DeviceAccessService.EvaluateLocalAccess(baseDir, AppVersionInfo.Current);
+        var access = DeviceAccessService
+            .EvaluateStartupAsync(baseDir, AppVersionInfo.Current)
+            .GetAwaiter()
+            .GetResult();
         if (!access.AllowRun)
         {
             MessageBox.Show(
@@ -23,6 +26,32 @@ internal static class Program
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Warning);
             return;
+        }
+
+        if (access.VersionControlEnabled)
+        {
+            var versionGuard = VersionRollbackGuard
+                .EvaluateAndRecordAsync(
+                    AppVersionInfo.Current,
+                    access.DeviceId,
+                    true,
+                    access.VersionPolicyUrl,
+                    access.VersionPolicyFailClosedOnDowngrade)
+                .GetAwaiter()
+                .GetResult();
+            if (!versionGuard.AllowRun)
+            {
+                MessageBox.Show(
+                    versionGuard.Reason +
+                    $"\n\nPhiên bản hiện tại: {versionGuard.CurrentVersion}" +
+                    (string.IsNullOrWhiteSpace(versionGuard.HighestVersionEver)
+                        ? ""
+                        : $"\nPhiên bản cao nhất đã dùng: {versionGuard.HighestVersionEver}"),
+                    "Tool TikTok — Phiên bản không được phép",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
         }
 
         // File picker helper chạy trong process Worker sạch, không tạo MainForm/IPC.

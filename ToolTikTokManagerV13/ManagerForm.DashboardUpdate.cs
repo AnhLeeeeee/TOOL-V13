@@ -286,7 +286,7 @@ public sealed partial class ManagerForm
 
         _dashboardUpdateButton = new Button
         {
-            Text = "Cài / Hạ phiên bản",
+            Text = "Cài phiên bản",
             AutoSize = true,
             Height = 32,
             Enabled = false,
@@ -1099,7 +1099,8 @@ public sealed partial class ManagerForm
             };
         }
 
-        _log.Info($"[UPDATE_DEVICE_POLICY] id={access.DeviceId} allowRun={access.AllowRun} allowUpdate={access.AllowUpdate} remote={access.RemotePolicyApplied}");
+        _log.Info($"[UPDATE_DEVICE_POLICY] id={access.DeviceId} allowRun={access.AllowRun} allowUpdate={access.AllowUpdate} remote={access.RemotePolicyApplied} " +
+            $"versionControl={access.VersionControlEnabled}");
 
         if (!access.AllowRun)
         {
@@ -1110,7 +1111,35 @@ public sealed partial class ManagerForm
             return false;
         }
 
-        if (access.AllowUpdate) return true;
+        if (access.AllowUpdate)
+        {
+            if (access.VersionControlEnabled)
+            {
+                try
+                {
+                    var versionPolicy = await VersionRollbackGuard.RefreshServerPolicyAsync(
+                        AppVersionInfo.Current,
+                        access.DeviceId,
+                        true,
+                        access.VersionPolicyUrl,
+                        action: "update_check");
+
+                    _log.Info($"[UPDATE_VERSION_POLICY] applied={versionPolicy is not null} mode={versionPolicy?.Mode ?? "none"} " +
+                        $"allowed={string.Join(",", versionPolicy?.AllowedVersions ?? new List<string>())}");
+                }
+                catch (Exception ex)
+                {
+                    _log.Warn("[UPDATE_VERSION_POLICY_CHECK_FAILED] " + ex.Message);
+                }
+            }
+            else
+            {
+                _log.Info("[UPDATE_VERSION_POLICY_BYPASS] versionControl.enabled=false");
+            }
+
+            RefreshVersionSelector();
+            return true;
+        }
 
         _latestUpdate = null;
         _availableVersions.Clear();
@@ -1337,7 +1366,13 @@ public sealed partial class ManagerForm
         if (string.IsNullOrWhiteSpace(oldSelection) && selector.SelectedItem is VersionChoice oldChoice)
             oldSelection = oldChoice.Manifest.Version;
 
-        var versions = _availableVersions.ToList();
+        var serverVersionControlEnabled = DeviceAccessService.LastDecision?.VersionControlEnabled == true;
+        var versions = _availableVersions
+            .Where(v =>
+                CompareVersions(v.Version, ManagerDisplayVersion) >= 0
+                || (serverVersionControlEnabled
+                    && VersionRollbackGuard.IsDowngradeInstallAllowed(v.Version, ManagerDisplayVersion, out _)))
+            .ToList();
         if (!versions.Any(v => VersionEquals(v.Version, ManagerDisplayVersion)))
         {
             versions.Add(new UpdateManifest
@@ -1396,7 +1431,7 @@ public sealed partial class ManagerForm
         var target = SelectedVersionManifest();
         if (target is null)
         {
-            button.Text = "Cài / Hạ phiên bản";
+            button.Text = "Cài phiên bản";
             button.Enabled = false;
             return;
         }
@@ -1407,6 +1442,17 @@ public sealed partial class ManagerForm
             button.Text = "Đang sử dụng";
             button.Enabled = false;
             return;
+        }
+        if (compare < 0)
+        {
+            var serverVersionControlEnabled = DeviceAccessService.LastDecision?.VersionControlEnabled == true;
+            if (!serverVersionControlEnabled
+                || !VersionRollbackGuard.IsDowngradeInstallAllowed(target.Version, ManagerDisplayVersion, out _))
+            {
+                button.Text = "Bản cũ bị chặn";
+                button.Enabled = false;
+                return;
+            }
         }
         if (!target.IsInstallAllowed || target.EffectiveStatus.Equals("withdrawn", StringComparison.OrdinalIgnoreCase))
         {
@@ -1447,6 +1493,46 @@ public sealed partial class ManagerForm
         var compare = CompareVersions(manifest.Version, ManagerDisplayVersion);
         if (compare == 0) return;
         var isDowngrade = compare < 0;
+
+        if (isDowngrade)
+        {
+            var access = DeviceAccessService.LastDecision;
+            if (access is null)
+            {
+                access = await DeviceAccessService.RefreshForUpdateAsync(_baseDir, AppVersionInfo.Current);
+            }
+
+            // Khi server version control chưa bật, giữ nguyên hành vi trước patch server:
+            // bản cũ không được đưa vào danh sách/cài đặt và không gọi VersionRollbackGuard/server.
+            if (!access.VersionControlEnabled)
+            {
+                RefreshVersionSelector();
+                ModernDialog.ShowMessage(this,
+                    $"V{NormalizeVersion(manifest.Version)} là phiên bản cũ và hiện không được mở quyền hạ phiên bản.",
+                    "Không được phép hạ phiên bản",
+                    MessageBoxIcon.Warning);
+                return;
+            }
+
+            await VersionRollbackGuard.RefreshServerPolicyAsync(
+                AppVersionInfo.Current,
+                access.DeviceId,
+                true,
+                access.VersionPolicyUrl,
+                action: "install_check");
+
+            if (!VersionRollbackGuard.IsDowngradeInstallAllowed(manifest.Version, ManagerDisplayVersion, out var downgradeReason))
+            {
+                RefreshVersionSelector();
+                ModernDialog.ShowMessage(this,
+                    string.IsNullOrWhiteSpace(downgradeReason)
+                        ? $"Server không cho phép cài V{NormalizeVersion(manifest.Version)} trên máy này."
+                        : downgradeReason,
+                    "Không được phép hạ phiên bản",
+                    MessageBoxIcon.Warning);
+                return;
+            }
+        }
 
         if (!manifest.IsInstallAllowed || manifest.EffectiveStatus.Equals("withdrawn", StringComparison.OrdinalIgnoreCase))
         {

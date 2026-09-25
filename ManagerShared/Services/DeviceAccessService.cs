@@ -54,6 +54,9 @@ public static class DeviceAccessService
         public bool Activated { get; init; }
         public bool RemotePolicyApplied { get; init; }
         public string ActivationSource { get; init; } = "";
+        public bool VersionControlEnabled { get; init; }
+        public string VersionPolicyUrl { get; init; } = "";
+        public bool VersionPolicyFailClosedOnDowngrade { get; init; } = true;
     }
 
     sealed class DeviceIdentity
@@ -67,6 +70,13 @@ public static class DeviceAccessService
         public DateTime LastSeenUtc { get; set; }
     }
 
+    sealed class VersionControlBootstrap
+    {
+        public bool Enabled { get; set; }
+        public string PolicyUrl { get; set; } = "";
+        public bool FailClosedOnDowngrade { get; set; } = true;
+    }
+
     sealed class DeviceAccessPolicy
     {
         public bool Enabled { get; set; } = true;
@@ -76,6 +86,7 @@ public static class DeviceAccessService
         public List<string> BlockedUpdateDeviceIds { get; set; } = new();
         public string BlockMessage { get; set; } = "Thiết bị này chưa được cấp quyền sử dụng Tool.";
         public string PolicyVersion { get; set; } = "1";
+        public VersionControlBootstrap VersionControl { get; set; } = new();
     }
 
     sealed class PolicyCacheEnvelope
@@ -115,7 +126,10 @@ public static class DeviceAccessService
             Reason = reason,
             Activated = identity.Activated,
             RemotePolicyApplied = false,
-            ActivationSource = identity.ActivationSource
+            ActivationSource = identity.ActivationSource,
+            VersionControlEnabled = false,
+            VersionPolicyUrl = "",
+            VersionPolicyFailClosedOnDowngrade = true
         };
         lock (Sync) _lastDecision = decision;
         AppendAudit(baseDir,
@@ -135,11 +149,17 @@ public static class DeviceAccessService
         var allowUpdate = localAllowed;
         var reason = localReason;
         var remoteApplied = false;
+        var versionControlEnabled = false;
+        var versionPolicyUrl = "";
+        var versionPolicyFailClosed = true;
 
         var policy = await TryLoadRemotePolicyAsync(cancellationToken).ConfigureAwait(false);
         if (policy is not null && policy.Enabled)
         {
             remoteApplied = true;
+            versionControlEnabled = policy.VersionControl?.Enabled == true;
+            versionPolicyUrl = (policy.VersionControl?.PolicyUrl ?? "").Trim();
+            versionPolicyFailClosed = policy.VersionControl?.FailClosedOnDowngrade ?? true;
             var id = identity.DeviceId;
 
             if (ContainsId(policy.BlockedDeviceIds, id))
@@ -189,14 +209,18 @@ public static class DeviceAccessService
             Reason = reason,
             Activated = identity.Activated,
             RemotePolicyApplied = remoteApplied,
-            ActivationSource = identity.ActivationSource
+            ActivationSource = identity.ActivationSource,
+            VersionControlEnabled = versionControlEnabled,
+            VersionPolicyUrl = versionPolicyUrl,
+            VersionPolicyFailClosedOnDowngrade = versionPolicyFailClosed
         };
 
         lock (Sync) _lastDecision = decision;
         AppendAudit(baseDir,
             $"[DEVICE_ACCESS_STARTUP] id={identity.DeviceId} version={currentVersion} activated={identity.Activated} " +
             $"source={SafeOneLine(identity.ActivationSource)} allowRun={allowRun} allowUpdate={allowUpdate} " +
-            $"remote={remoteApplied} reason={SafeOneLine(reason)}");
+            $"remote={remoteApplied} versionControl={versionControlEnabled} versionPolicyUrl={SafeOneLine(versionPolicyUrl)} " +
+            $"reason={SafeOneLine(reason)}");
         return decision;
     }
 

@@ -74,6 +74,43 @@ internal static class Program
                 return;
             }
 
+            if (access.VersionControlEnabled)
+            {
+                var versionGuard = VersionRollbackGuard
+                    .EvaluateAndRecordAsync(
+                        AppVersionInfo.Current,
+                        access.DeviceId,
+                        true,
+                        access.VersionPolicyUrl,
+                        access.VersionPolicyFailClosedOnDowngrade)
+                    .GetAwaiter()
+                    .GetResult();
+
+                ManagerProcessDiagnostics.Append(
+                    $"[VERSION_GUARD] allowRun={versionGuard.AllowRun} current={versionGuard.CurrentVersion} " +
+                    $"highest={versionGuard.HighestVersionEver} updated={versionGuard.RecordUpdated} " +
+                    $"serverApplied={versionGuard.ServerPolicyApplied} mode={versionGuard.DowngradeMode} " +
+                    $"reason={ManagerProcessDiagnostics.OneLine(versionGuard.Reason)}");
+
+                if (!versionGuard.AllowRun)
+                {
+                    MessageBox.Show(
+                        versionGuard.Reason +
+                        $"\n\nPhiên bản hiện tại: {versionGuard.CurrentVersion}" +
+                        (string.IsNullOrWhiteSpace(versionGuard.HighestVersionEver)
+                            ? ""
+                            : $"\nPhiên bản cao nhất đã dùng: {versionGuard.HighestVersionEver}"),
+                        "Tool TikTok — Phiên bản không được phép",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                    return;
+                }
+            }
+            else
+            {
+                ManagerProcessDiagnostics.Append("[VERSION_GUARD_BYPASS] versionControl.enabled=false");
+            }
+
             Application.Run(new ManagerForm());
             ManagerProcessDiagnostics.Append(
                 $"[MANAGER_APPLICATION_RUN_RETURNED] time={DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} pid={Environment.ProcessId}");

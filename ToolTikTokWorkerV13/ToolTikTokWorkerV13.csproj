@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
@@ -28,6 +28,7 @@
     <Compile Include="..\V115Core\Utils\*.cs" Link="V115Core\Utils\%(Filename)%(Extension)" />
     <Compile Include="..\ManagerShared\Services\ChromeProfileNameSyncService.cs" Link="Shared\ChromeProfileNameSyncService.cs" />
     <Compile Include="..\ManagerShared\Services\DeviceAccessService.cs" Link="Shared\DeviceAccessService.cs" />
+    <Compile Include="..\ManagerShared\Services\VersionRollbackGuard.cs" Link="Shared\VersionRollbackGuard.cs" />
     <Compile Include="..\ManagerShared\Services\TikTokAuthService.cs" Link="Shared\TikTokAuthService.cs" />
     <Compile Include="..\ManagerShared\Utils\AppVersionInfo.cs" Link="Shared\AppVersionInfo.cs" />
     <Compile Include="..\ManagerShared\Controls\*.cs" Link="Shared\Controls\%(Filename)%(Extension)" />
