@@ -56,44 +56,13 @@ public sealed partial class AutomationEngine
 
     async Task<bool> QueueVisibleCommentRestrictionBeforeInputAsync(string pointName, CancellationToken ct)
     {
-        string marker;
-        try
-        {
-            marker = await DetectCommentRestrictionToastAsync(ct);
-        }
-        catch (OperationCanceledException) { throw; }
-        catch (Exception ex)
-        {
-            if (!IsLikelyCdpIssue(ex))
-            {
-                ReportProblem(
-                    "COMMENT_RESTRICTION_PRE_INPUT_CHECK_FAILED",
-                    pointName,
-                    "Không kiểm tra được toast cấm bình luận trong thời gian ổn định LIVE: " + ex.Message,
-                    throttleSeconds: 60);
-            }
-            return false;
-        }
-
-        if (string.IsNullOrWhiteSpace(marker))
-            return false;
-
-        _step = CurrentRestartStep;
-        _postEnterCommentRestrictionPending = true;
-        _postEnterCommentRestrictionContext = pointName;
-        ClearLiveTargetStabilization("phát hiện cấm bình luận trước InputGuard");
-        MaybeArmViewerChainModeForCommentRestriction($"toast cấm bình luận trước InputGuard tại {pointName}");
-
-        _log.Warn(
-            $"[COMMENT_RESTRICTION_DETECTED_PRE_INPUT] point={pointName} marker={marker} " +
-            $"action=SWITCH_LIVE restartStep={_step}");
-        ReportProblem(
-            "COMMENT_RESTRICTION_DETECTED",
-            pointName,
-            "TikTok báo ‘Bạn hiện bị cấm bình luận’. Bỏ qua thời gian ổn định và chuyển LIVE ngay.",
-            throttleSeconds: 5);
-        SetStatus("BỊ CẤM BÌNH LUẬN", $"{pointName}: phát hiện toast trong lúc chờ LIVE ổn định → chuyển LIVE.");
-        return true;
+        // Toast “Bạn hiện bị cấm bình luận” chỉ được dùng làm tín hiệu trong cửa sổ
+        // theo dõi NGAY SAU Enter. Không quét toast độc lập trước InputGuard nữa vì TikTok
+        // có thể giữ DOM/aria-live cũ và gây false-positive. Hard restriction của chính ô
+        // nhập (mute/comment off/disabled) vẫn được QueueHardCommentRestrictionFromInputSnapshot
+        // xử lý ngay như cũ. Giữ method để không phải thay cấu trúc flow ổn định hiện tại.
+        await Task.CompletedTask;
+        return false;
     }
 
     async Task<bool?> ConfirmStabilizedLiveViewerAsync(string pointName, CancellationToken ct)

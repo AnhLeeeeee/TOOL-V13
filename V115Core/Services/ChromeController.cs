@@ -1,4 +1,5 @@
 ﻿using System.Diagnostics;
+using System.Drawing;
 using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -60,6 +61,7 @@ public sealed partial class ChromeController : IAsyncDisposable
     readonly SemaphoreSlim _manualCloseGate = new(1, 1);
     IntPtr _managedWindowHandle;
     VmOptimizationSettings _vmOptimization = new();
+    ChromeWindowSettings _chromeWindowSettings = new();
 
     public CdpPage? Page { get; private set; }
     public bool Connected => _cdp?.Connected == true;
@@ -116,6 +118,69 @@ public sealed partial class ChromeController : IAsyncDisposable
         _log.Info($"[VM_MODE] chrome={_vmOptimization.Mode}");
     }
 
+    public void ConfigureChromeWindow(ChromeWindowSettings? settings)
+    {
+        settings ??= new ChromeWindowSettings();
+        _chromeWindowSettings = new ChromeWindowSettings
+        {
+            Mode = NormalizeChromeWindowMode(settings.Mode),
+            Percent = Math.Clamp(settings.Percent, 50, 100),
+            Position = NormalizeChromeWindowPosition(settings.Position)
+        };
+        _log.Info($"[CHROME_WINDOW_CONFIG] mode={_chromeWindowSettings.Mode} percent={_chromeWindowSettings.Percent} position={_chromeWindowSettings.Position}");
+    }
+
+    static string NormalizeChromeWindowMode(string? value)
+        => string.Equals((value ?? "").Trim(), "Percent", StringComparison.OrdinalIgnoreCase)
+            ? "Percent"
+            : "Full";
+
+    static string NormalizeChromeWindowPosition(string? value)
+    {
+        value = (value ?? "").Trim().Replace("_", "", StringComparison.Ordinal).Replace("-", "", StringComparison.Ordinal);
+        return value.ToLowerInvariant() switch
+        {
+            "bottomright" => "BottomRight",
+            "topleft" => "TopLeft",
+            "topright" => "TopRight",
+            _ => "BottomLeft"
+        };
+    }
+
+    static double GetAutoPageScale(int percent)
+        => percent >= 90 ? 1.00
+            : percent >= 75 ? 0.90
+            : percent >= 65 ? 0.85
+            : 0.80;
+
+    static Rectangle CalculatePercentWindowBounds(Rectangle work, int percent, string position)
+    {
+        percent = Math.Clamp(percent, 50, 100);
+        var width = Math.Max(640, (int)Math.Round(work.Width * (percent / 100d)));
+        var height = Math.Max(360, (int)Math.Round(work.Height * (percent / 100d)));
+        width = Math.Min(width, work.Width);
+        height = Math.Min(height, work.Height);
+
+        var right = position.Equals("BottomRight", StringComparison.OrdinalIgnoreCase)
+            || position.Equals("TopRight", StringComparison.OrdinalIgnoreCase);
+        var bottom = position.Equals("BottomLeft", StringComparison.OrdinalIgnoreCase)
+            || position.Equals("BottomRight", StringComparison.OrdinalIgnoreCase);
+        var x = right ? work.Right - width : work.Left;
+        var y = bottom ? work.Bottom - height : work.Top;
+        return new Rectangle(x, y, width, height);
+    }
+
+    string BuildChromeWindowLaunchArguments()
+    {
+        if (!_chromeWindowSettings.Mode.Equals("Percent", StringComparison.OrdinalIgnoreCase))
+            return "--start-maximized ";
+
+        var screen = System.Windows.Forms.Screen.PrimaryScreen;
+        var work = screen?.WorkingArea ?? new Rectangle(0, 0, 1920, 1080);
+        var bounds = CalculatePercentWindowBounds(work, _chromeWindowSettings.Percent, _chromeWindowSettings.Position);
+        return $"--window-position={bounds.X},{bounds.Y} --window-size={bounds.Width},{bounds.Height} ";
+    }
+
     static string TrimForLog(string text, int max = 140)
     {
         if (string.IsNullOrWhiteSpace(text)) return "";
@@ -163,10 +228,11 @@ public sealed partial class ChromeController : IAsyncDisposable
         // Module Proxy là tùy chọn và fail-open. Helper trả chuỗi rỗng khi Proxy OFF,
         // file cấu hình lỗi hoặc extension auth không tạo được, nên launch cũ vẫn nguyên vẹn.
         var proxyFlags = BuildOptionalProxyLaunchArguments(profileDir);
+        var windowFlags = BuildChromeWindowLaunchArguments();
         var args =
             $"--remote-debugging-port={port} --remote-allow-origins=* --user-data-dir=\"{profileDir}\" " +
             "--no-first-run --no-default-browser-check " +
-            "--lang=vi --accept-lang=vi-VN,vi,en-US,en --start-maximized " + backgroundFlags + proxyFlags +
+            "--lang=vi --accept-lang=vi-VN,vi,en-US,en " + windowFlags + backgroundFlags + proxyFlags +
             TikTokUrl;
         var psi = new ProcessStartInfo(chrome, args)
         {
@@ -819,6 +885,8 @@ public sealed partial class ChromeController : IAsyncDisposable
             await _cdp.CallAsync("Page.enable");
             Page = page;
             AttachManagedWindow(_managedProfileDir, port);
+            if (!string.IsNullOrWhiteSpace(_managedProfileDir))
+                await ApplyConfiguredChromeWindowAsync(_managedProfileDir, port);
             await ApplyVmRuntimePolicyAsync();
             _log.Info("CDP_CONNECTED");
             _log.Info($"Đã kết nối CDP tới tab: {page.Title} | {page.Url} | chế độ=HIỂN THỊ");
@@ -847,6 +915,8 @@ public sealed partial class ChromeController : IAsyncDisposable
         await _cdp.CallAsync("Page.enable", ct: ct);
         Page = page;
         AttachManagedWindow(_managedProfileDir, _port);
+        if (!string.IsNullOrWhiteSpace(_managedProfileDir))
+            await ApplyConfiguredChromeWindowAsync(_managedProfileDir, _port, ct);
         await ApplyVmRuntimePolicyAsync(ct);
         _log.Info("CDP_RECONNECTED");
         _log.Info($"Đã reconnect CDP tới tab: {page.Title} | {page.Url}");
@@ -2689,12 +2759,10 @@ public sealed partial class ChromeController : IAsyncDisposable
     {
         const string liveUrl = "https://www.tiktok.com/live";
 
-        // Startup V13.7.2:
-        // Chrome/CDP ổn định -> tiktok.com -> PAGE_READY -> nghỉ 3-5s -> mới vào LIVE.
-        await WarmUpTikTokHomeAsync(ct);
-
+        // Khi cần trang LIVE tổng thì đi thẳng /live. Không warm-up qua tiktok.com trước
+        // vì navigation Home không làm mới nguồn LIVE và chỉ tăng thêm một lần tải trang.
         _log.Info(
-            "[TIKTOK_LIVE_NAVIGATE_AFTER_HOME_READY] target=https://www.tiktok.com/live");
+            "[TIKTOK_LIVE_NAVIGATE_DIRECT] target=https://www.tiktok.com/live skipHomeWarmup=true");
 
         await NavigateAndWaitAsync(
             liveUrl,
@@ -4374,6 +4442,109 @@ public sealed partial class ChromeController : IAsyncDisposable
         catch { return false; }
     }
 
+    public async Task<bool> ApplyConfiguredChromeWindowAsync(
+        string profileDir,
+        int port,
+        CancellationToken ct = default)
+    {
+        try
+        {
+            if (!IsManagedContext(profileDir, port))
+                AttachManagedWindow(profileDir, port);
+
+            if (!IsLiveWindowHandle(_managedWindowHandle))
+            {
+                var resolution = await ResolveManagedWindowAsync(
+                    profileDir,
+                    port,
+                    windowAttempts: 6,
+                    retryDelayMs: 250);
+                if (resolution.WindowHandle != 0)
+                    _managedWindowHandle = new IntPtr(resolution.WindowHandle);
+            }
+
+            if (!IsLiveWindowHandle(_managedWindowHandle))
+            {
+                _log.Warn($"[CHROME_WINDOW_APPLY_SKIP] mode={_chromeWindowSettings.Mode} reason=window_not_found port={port}");
+                return false;
+            }
+
+            if (!_chromeWindowSettings.Mode.Equals("Percent", StringComparison.OrdinalIgnoreCase))
+            {
+                ShowWindowAsync(_managedWindowHandle, SW_MAXIMIZE);
+                await ApplyChromeViewportScaleAsync(1.0, null, ct);
+                _log.Info($"[CHROME_WINDOW_APPLIED] mode=Full hwnd={_managedWindowHandle.ToInt64()}");
+                return true;
+            }
+
+            var work = System.Windows.Forms.Screen.FromHandle(_managedWindowHandle).WorkingArea;
+            var bounds = CalculatePercentWindowBounds(
+                work,
+                _chromeWindowSettings.Percent,
+                _chromeWindowSettings.Position);
+
+            ShowWindowAsync(_managedWindowHandle, SW_RESTORE);
+            await Task.Delay(80, ct);
+            var moved = MoveWindow(
+                _managedWindowHandle,
+                bounds.X,
+                bounds.Y,
+                bounds.Width,
+                bounds.Height,
+                true);
+
+            var scale = GetAutoPageScale(_chromeWindowSettings.Percent);
+            await ApplyChromeViewportScaleAsync(scale, bounds.Size, ct);
+            _log.Info(
+                $"[CHROME_WINDOW_APPLIED] mode=Percent percent={_chromeWindowSettings.Percent} position={_chromeWindowSettings.Position} " +
+                $"bounds={bounds.X},{bounds.Y},{bounds.Width}x{bounds.Height} autoScale={scale:0.00} moved={moved}");
+            return moved;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"[CHROME_WINDOW_APPLY_WARN] mode={_chromeWindowSettings.Mode} error={TrimForLog(ex.Message)}");
+            return false;
+        }
+    }
+
+    async Task ApplyChromeViewportScaleAsync(double scale, Size? outerSize, CancellationToken ct)
+    {
+        if (!Connected) return;
+
+        try
+        {
+            if (scale >= 0.999 || outerSize is null)
+            {
+                await Cdp.CallAsync("Emulation.clearDeviceMetricsOverride", ct: ct);
+                return;
+            }
+
+            scale = Math.Clamp(scale, 0.70, 1.0);
+            var virtualWidth = Math.Clamp((int)Math.Round(outerSize.Value.Width / scale), 640, 10000);
+            var virtualHeight = Math.Clamp((int)Math.Round(outerSize.Value.Height / scale), 360, 10000);
+            await Cdp.CallAsync(
+                "Emulation.setDeviceMetricsOverride",
+                new
+                {
+                    width = virtualWidth,
+                    height = virtualHeight,
+                    deviceScaleFactor = 1,
+                    mobile = false,
+                    scale
+                },
+                ct);
+            _log.Info($"[CHROME_VIEWPORT_SCALE] scale={scale:0.00} virtual={virtualWidth}x{virtualHeight}");
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"[CHROME_VIEWPORT_SCALE_WARN] scale={scale:0.00} error={TrimForLog(ex.Message)}");
+        }
+    }
+
     public ChromeWindowState GetManagedWindowState(string profileDir, int port)
     {
         if (!IsManagedContext(profileDir, port)) return ChromeWindowState.NotFound;
@@ -4453,6 +4624,7 @@ public sealed partial class ChromeController : IAsyncDisposable
         _manualCloseGate.Dispose();
     }
 
+    const int SW_MAXIMIZE = 3;
     const int SW_MINIMIZE = 6;
     const int SW_RESTORE = 9;
     const uint GW_OWNER = 4;
@@ -4461,6 +4633,7 @@ public sealed partial class ChromeController : IAsyncDisposable
 
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
     [DllImport("user32.dll")] static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll", SetLastError = true)] static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
     [DllImport("user32.dll")] static extern bool IsWindow(IntPtr hWnd);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hWnd);
     [DllImport("user32.dll")] static extern bool IsIconic(IntPtr hWnd);

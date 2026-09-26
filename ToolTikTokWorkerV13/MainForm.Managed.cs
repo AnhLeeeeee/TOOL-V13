@@ -155,9 +155,40 @@ public sealed partial class MainForm
                     ApplyManagedStartupOverrides();
                     ApplySelectedProfileToSettings(logSelection: false);
                     LoadToUi();
+                    ApplyChromeWindowSettings();
                     ApplyVmOptimizationSettings();
                     _log.Info("[MANAGED_CONFIG_RELOADED] source=manager_default_sync");
                     return "reloaded";
+                case "apply_chrome_window":
+                {
+                    var parts = (commandPayload ?? "").Split('|');
+                    if (parts.Length < 3) return "invalid_chrome_window_payload";
+
+                    var mode = string.Equals(parts[0].Trim(), "Percent", StringComparison.OrdinalIgnoreCase)
+                        ? "Percent"
+                        : "Full";
+                    var percent = int.TryParse(parts[1].Trim(), out var parsedPercent)
+                        ? Math.Clamp(parsedPercent, 50, 100)
+                        : 70;
+                    var position = NormalizeChromeWindowPosition(parts[2]);
+
+                    _settings.ChromeWindow ??= new ToolTikTokV11.Models.ChromeWindowSettings();
+                    _settings.ChromeWindow.Mode = mode;
+                    _settings.ChromeWindow.Percent = percent;
+                    _settings.ChromeWindow.Position = position;
+                    // Manager đã persist riêng [ChromeWindow] vào INI trước khi gửi IPC.
+                    // Không Save toàn bộ _settings ở đây để tránh ghi đè cấu hình khác đang mới hơn trên disk.
+                    ApplyChromeWindowSettings();
+
+                    var applied = true;
+                    if (_chrome.Connected)
+                        applied = await _chrome.ApplyConfiguredChromeWindowAsync(
+                            CurrentProfilePath,
+                            _settings.ChromePort);
+
+                    _log.Info($"[MANAGED_CHROME_WINDOW_APPLIED] mode={mode} percent={percent} position={position} connected={_chrome.Connected} applied={applied}");
+                    return $"applied|{mode}|{percent}|{position}|{(applied ? "ok" : "deferred")}";
+                }
                 case "apply_vm_mode":
                 {
                     var requestedMode = (commandPayload ?? "").Trim();

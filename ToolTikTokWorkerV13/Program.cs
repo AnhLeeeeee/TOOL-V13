@@ -28,30 +28,29 @@ internal static class Program
             return;
         }
 
-        if (access.VersionControlEnabled)
+        // Local rollback guard luôn chạy, kể cả khi server version-policy chưa cấu hình.
+        // Điều này ngăn chạy Worker thấp hơn mốc HighestVersionEver đã ghi trên máy.
+        var versionGuard = VersionRollbackGuard
+            .EvaluateAndRecordAsync(
+                AppVersionInfo.Current,
+                access.DeviceId,
+                access.VersionControlEnabled,
+                access.VersionPolicyUrl,
+                access.VersionPolicyFailClosedOnDowngrade)
+            .GetAwaiter()
+            .GetResult();
+        if (!versionGuard.AllowRun)
         {
-            var versionGuard = VersionRollbackGuard
-                .EvaluateAndRecordAsync(
-                    AppVersionInfo.Current,
-                    access.DeviceId,
-                    true,
-                    access.VersionPolicyUrl,
-                    access.VersionPolicyFailClosedOnDowngrade)
-                .GetAwaiter()
-                .GetResult();
-            if (!versionGuard.AllowRun)
-            {
-                MessageBox.Show(
-                    versionGuard.Reason +
-                    $"\n\nPhiên bản hiện tại: {versionGuard.CurrentVersion}" +
-                    (string.IsNullOrWhiteSpace(versionGuard.HighestVersionEver)
-                        ? ""
-                        : $"\nPhiên bản cao nhất đã dùng: {versionGuard.HighestVersionEver}"),
-                    "Tool TikTok — Phiên bản không được phép",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Warning);
-                return;
-            }
+            MessageBox.Show(
+                versionGuard.Reason +
+                $"\n\nPhiên bản hiện tại: {versionGuard.CurrentVersion}" +
+                (string.IsNullOrWhiteSpace(versionGuard.HighestVersionEver)
+                    ? ""
+                    : $"\nPhiên bản cao nhất đã dùng: {versionGuard.HighestVersionEver}"),
+                "Tool TikTok — Phiên bản không được phép",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
         }
 
         // File picker helper chạy trong process Worker sạch, không tạo MainForm/IPC.

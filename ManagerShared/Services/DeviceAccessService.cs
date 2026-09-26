@@ -115,6 +115,22 @@ public static class DeviceAccessService
         }
     }
 
+    /// <summary>
+    /// Fingerprint hash đang được Device Access dùng cho chính thiết bị hiện tại.
+    /// Chỉ trả về hash SHA-256; không gửi các serial/thành phần phần cứng thô lên server.
+    /// </summary>
+    public static string GetFingerprintHash()
+    {
+        try
+        {
+            return ComputeMachineFingerprint();
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
     public static DeviceAccessDecision EvaluateLocalAccess(string baseDir, string currentVersion)
     {
         var identity = EnsureIdentity(baseDir, allowGrandfatherMigration: true, out var reason);

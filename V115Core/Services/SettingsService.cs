@@ -40,6 +40,13 @@ public sealed class SettingsService
             ChromeMode = ini.Get("V11", "ChromeMode", "visible")
         };
 
+        s.ChromeWindow = new ChromeWindowSettings
+        {
+            Mode = NormalizeChromeWindowMode(ini.Get("ChromeWindow", "Mode", "Full")),
+            Percent = Math.Clamp(ini.GetInt("ChromeWindow", "Percent", 70), 50, 100),
+            Position = NormalizeChromeWindowPosition(ini.Get("ChromeWindow", "Position", "BottomLeft"))
+        };
+
         // Runtime luôn dùng một profile cố định đã có từ trước; không phụ thuộc AppContext/BaseDirectory
         // và không đọc profile runtime từ auto_chrome.ini để tránh dotnet run tạo profile riêng.
         s.ChromeProfileDir = fixedProfileDir;
@@ -98,6 +105,13 @@ public sealed class SettingsService
         ini.Set("F5DinhKy", "Phut", s.PeriodicF5Minutes); ini.Set("HenGio", "Phut", s.TimerStopMinutes);
         ini.Set("V11", "ChromePort", s.ChromePort);
         ini.Set("V11", "StrictXPathOnly", s.StrictXPathOnly ? 1 : 0); ini.Set("V11", "ChromeMode", s.ChromeMode); ini.Set("V11", "UseArrowDownForLiveSwitch", s.UseArrowDownForLiveSwitch ? 1 : 0);
+        s.ChromeWindow ??= new ChromeWindowSettings();
+        s.ChromeWindow.Mode = NormalizeChromeWindowMode(s.ChromeWindow.Mode);
+        s.ChromeWindow.Percent = Math.Clamp(s.ChromeWindow.Percent, 50, 100);
+        s.ChromeWindow.Position = NormalizeChromeWindowPosition(s.ChromeWindow.Position);
+        ini.Set("ChromeWindow", "Mode", s.ChromeWindow.Mode);
+        ini.Set("ChromeWindow", "Percent", s.ChromeWindow.Percent);
+        ini.Set("ChromeWindow", "Position", s.ChromeWindow.Position);
         ini.Set("InputGuard", "Enabled", s.InputGuard.Enabled ? 1 : 0);
         ini.Set("InputGuard", "NormalPlaceholderText", s.InputGuard.NormalPlaceholderText);
         ini.Set("InputGuard", "ConfirmReads", Math.Clamp(s.InputGuard.ConfirmReads, 1, 5));
@@ -126,6 +140,28 @@ public sealed class SettingsService
         foreach (var key in new[] { "AfterClickScanEnabled", "AfterClickScanMs", "AfterEnterScanEnabled", "AfterEnterScanMs" }) ini.Remove("ThoiGian", key);
         foreach (var key in new[] { "XPath", "Variation", "RX1", "RY1", "RX2", "RY2", "X1", "Y1", "X2", "Y2" }) ini.Remove("LiveCu", key);
         ini.Save();
+    }
+
+    static string NormalizeChromeWindowMode(string? value)
+    {
+        value = (value ?? "").Trim();
+        return value.Equals("Percent", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("Custom", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("ThuGon", StringComparison.OrdinalIgnoreCase)
+            ? "Percent"
+            : "Full";
+    }
+
+    static string NormalizeChromeWindowPosition(string? value)
+    {
+        value = (value ?? "").Trim().Replace("_", "", StringComparison.Ordinal).Replace("-", "", StringComparison.Ordinal);
+        return value.ToLowerInvariant() switch
+        {
+            "bottomright" => "BottomRight",
+            "topleft" => "TopLeft",
+            "topright" => "TopRight",
+            _ => "BottomLeft"
+        };
     }
 
     static VmOptimizationMode ParseVmOptimizationMode(string value)

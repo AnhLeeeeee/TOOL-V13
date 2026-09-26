@@ -476,6 +476,7 @@ public sealed partial class ManagerForm
         });
 
         var currentVmMode = LoadManagerVmOptimizationModeForUi();
+        var currentChromeWindow = LoadManagerChromeWindowSettingsForUi();
 
         using var form = new Form
         {
@@ -554,12 +555,14 @@ public sealed partial class ManagerForm
 
         // ------------------------------------------------------------
         // 1) SỐ LƯỢNG & NGUỒN PRF
+        // Dùng layout theo hàng để NumericUpDown luôn nằm ngay sau nhãn
+        // "Số PRF muốn duy trì:" ở mọi mức DPI/scale.
         // ------------------------------------------------------------
         var sourceGroup = new GroupBox
         {
             Text = "SỐ LƯỢNG & NGUỒN PRF",
             Location = new Point(0, 0),
-            Size = new Size(760, 112),
+            Size = new Size(760, 132),
             Padding = new Padding(12),
             ForeColor = Color.FromArgb(45, 67, 94)
         };
@@ -569,13 +572,15 @@ public sealed partial class ManagerForm
             Checked = currentRun.AutoEnsureTarget,
             AutoSize = true,
             Font = new Font("Segoe UI", 9.2F, FontStyle.Bold),
-            Location = new Point(18, 30)
+            Margin = new Padding(0, 4, 0, 0)
         };
         var targetLabel = new Label
         {
             Text = "Số PRF muốn duy trì:",
-            AutoSize = true,
-            Location = new Point(42, 70)
+            AutoSize = false,
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Margin = new Padding(0)
         };
         var targetSlots = new NumericUpDown
         {
@@ -583,29 +588,63 @@ public sealed partial class ManagerForm
             Maximum = 50,
             Value = Math.Clamp(currentRun.TargetSlots, 1, 50),
             Width = 82,
-            Location = new Point(190, 66)
+            Anchor = AnchorStyles.Left,
+            Margin = new Padding(0, 3, 12, 0)
         };
         var targetHint = new Label
         {
             AutoSize = false,
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
             ForeColor = Color.DimGray,
-            Location = new Point(290, 68),
-            Size = new Size(430, 30)
+            Margin = new Padding(0)
         };
+
+        var targetRow = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 3,
+            RowCount = 1,
+            Margin = new Padding(0),
+            Padding = new Padding(24, 0, 0, 0)
+        };
+        targetRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 170F));
+        targetRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96F));
+        targetRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        targetRow.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+        targetRow.Controls.Add(targetLabel, 0, 0);
+        targetRow.Controls.Add(targetSlots, 1, 0);
+        targetRow.Controls.Add(targetHint, 2, 0);
+
+        var sourceLayout = new TableLayoutPanel
+        {
+            Location = new Point(16, 27),
+            Size = new Size(728, 88),
+            Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
+            ColumnCount = 1,
+            RowCount = 3,
+            Margin = new Padding(0),
+            Padding = new Padding(0)
+        };
+        sourceLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        sourceLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 32F));
+        sourceLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 8F));
+        sourceLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40F));
+        sourceLayout.Controls.Add(autoEnsureTarget, 0, 0);
+        sourceLayout.Controls.Add(targetRow, 0, 2);
+
         void UpdateTargetUi()
         {
             var enabled = autoEnsureTarget.Checked;
             targetLabel.Enabled = enabled;
             targetSlots.Enabled = enabled;
+            targetHint.Enabled = true;
             targetHint.Text = enabled
                 ? "Bật: Tool duy trì đúng số lượng này."
                 : "Tắt: chạy theo số PRF đang mở lúc bấm Bắt đầu.";
         }
         UpdateTargetUi();
-        sourceGroup.Controls.Add(autoEnsureTarget);
-        sourceGroup.Controls.Add(targetLabel);
-        sourceGroup.Controls.Add(targetSlots);
-        sourceGroup.Controls.Add(targetHint);
+        sourceGroup.Controls.Add(sourceLayout);
 
         // ------------------------------------------------------------
         // 2) TỐI ƯU — tái sử dụng nguyên engine VM Safe / VM Max của Worker
@@ -613,7 +652,7 @@ public sealed partial class ManagerForm
         var optimizationGroup = new GroupBox
         {
             Text = "TỐI ƯU",
-            Location = new Point(0, 124),
+            Location = new Point(0, sourceGroup.Bottom + 16),
             Size = new Size(760, 150),
             Padding = new Padding(12),
             ForeColor = Color.FromArgb(45, 67, 94)
@@ -700,12 +739,234 @@ public sealed partial class ManagerForm
         optimizationGroup.Controls.Add(optimizationHint);
 
         // ------------------------------------------------------------
-        // 3) TỰ ĐỘNG ĐÓNG & BÙ
+        // 3) KÍCH THƯỚC CHROME — Full giữ nguyên code cũ, Thu gọn theo % màn hình
+        // Dùng layout container thay cho tọa độ control cố định để không chồng chữ/control
+        // ở các mức DPI 100% / 125% / 150%.
+        // ------------------------------------------------------------
+        var chromeWindowGroup = new GroupBox
+        {
+            Text = "KÍCH THƯỚC CHROME",
+            Location = new Point(0, optimizationGroup.Bottom + 16),
+            Size = new Size(760, 236),
+            Padding = new Padding(12),
+            ForeColor = Color.FromArgb(45, 67, 94)
+        };
+        var chromeFull = new RadioButton
+        {
+            Text = "Full màn hình (như hiện tại)",
+            AutoSize = true,
+            Checked = currentChromeWindow.Mode.Equals("Full", StringComparison.OrdinalIgnoreCase),
+            Margin = new Padding(0, 3, 0, 0)
+        };
+        var chromePercentMode = new RadioButton
+        {
+            Text = "Thu gọn theo % màn hình:",
+            AutoSize = true,
+            Checked = currentChromeWindow.Mode.Equals("Percent", StringComparison.OrdinalIgnoreCase),
+            Margin = new Padding(0, 5, 14, 0)
+        };
+        var chromePercent = new NumericUpDown
+        {
+            Minimum = 50,
+            Maximum = 100,
+            Value = Math.Clamp(currentChromeWindow.Percent, 50, 100),
+            Width = 72,
+            Margin = new Padding(0, 3, 6, 0)
+        };
+        var chromePercentSuffix = new Label
+        {
+            Text = "%",
+            AutoSize = true,
+            Margin = new Padding(0, 7, 20, 0)
+        };
+        var chromePositionLabel = new Label
+        {
+            Text = "Vị trí:",
+            AutoSize = true,
+            Margin = new Padding(0, 7, 8, 0)
+        };
+        var chromePosition = new ComboBox
+        {
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Width = 145,
+            Margin = new Padding(0, 2, 0, 0)
+        };
+        chromePosition.Items.AddRange(["Góc dưới trái", "Góc dưới phải", "Góc trên trái", "Góc trên phải"]);
+        chromePosition.SelectedIndex = NormalizeManagerChromeWindowPosition(currentChromeWindow.Position) switch
+        {
+            "BottomRight" => 1,
+            "TopLeft" => 2,
+            "TopRight" => 3,
+            _ => 0
+        };
+        string SelectedChromePosition() => chromePosition.SelectedIndex switch
+        {
+            1 => "BottomRight",
+            2 => "TopLeft",
+            3 => "TopRight",
+            _ => "BottomLeft"
+        };
+        string SelectedChromeMode() => chromePercentMode.Checked ? "Percent" : "Full";
+
+        var chromePreview = new Label
+        {
+            AutoSize = false,
+            Dock = DockStyle.Fill,
+            ForeColor = Color.DimGray,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Margin = new Padding(24, 2, 8, 2)
+        };
+        var chromeWindowStatus = new Label
+        {
+            AutoSize = false,
+            Dock = DockStyle.Fill,
+            ForeColor = Color.DarkGreen,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Margin = new Padding(0, 2, 8, 2)
+        };
+        var applyChromeWindow = new Button
+        {
+            Text = "Áp dụng ngay cho tất cả PRF",
+            Width = 220,
+            Height = 32,
+            Anchor = AnchorStyles.Right | AnchorStyles.Top,
+            Margin = new Padding(0, 5, 0, 0)
+        };
+
+        // Hàng 1: Full màn hình.
+        var chromeFullRow = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            AutoSize = false,
+            Margin = new Padding(0),
+            Padding = new Padding(0)
+        };
+        chromeFullRow.Controls.Add(chromeFull);
+
+        // Hàng 2: toàn bộ control tùy chỉnh nằm trong FlowLayoutPanel.
+        // Nếu DPI lớn làm thiếu chiều rộng, WinForms sẽ xuống hàng thay vì chồng lên nhau.
+        var chromeCustomRow = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = true,
+            AutoSize = false,
+            Margin = new Padding(0),
+            Padding = new Padding(0)
+        };
+        chromeCustomRow.Controls.Add(chromePercentMode);
+        chromeCustomRow.Controls.Add(chromePercent);
+        chromeCustomRow.Controls.Add(chromePercentSuffix);
+        chromeCustomRow.Controls.Add(chromePositionLabel);
+        chromeCustomRow.Controls.Add(chromePosition);
+
+        // Hàng cuối: trạng thái ở trái, nút áp dụng bám phải.
+        var chromeActionRow = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 1,
+            Margin = new Padding(0),
+            Padding = new Padding(0)
+        };
+        chromeActionRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        chromeActionRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 228F));
+        chromeActionRow.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+        chromeActionRow.Controls.Add(chromeWindowStatus, 0, 0);
+        chromeActionRow.Controls.Add(applyChromeWindow, 1, 0);
+
+        var chromeLayout = new TableLayoutPanel
+        {
+            Location = new Point(16, 28),
+            Size = new Size(728, 194),
+            Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
+            ColumnCount = 1,
+            RowCount = 7,
+            Margin = new Padding(0),
+            Padding = new Padding(0)
+        };
+        chromeLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        chromeLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 32F));
+        chromeLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 8F));   // khoảng cách
+        chromeLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40F));
+        chromeLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 10F));  // khoảng cách
+        chromeLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44F));
+        chromeLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 10F));  // khoảng cách
+        chromeLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 46F));
+        chromeLayout.Controls.Add(chromeFullRow, 0, 0);
+        chromeLayout.Controls.Add(chromeCustomRow, 0, 2);
+        chromeLayout.Controls.Add(chromePreview, 0, 4);
+        chromeLayout.Controls.Add(chromeActionRow, 0, 6);
+
+        void UpdateChromeWindowUi()
+        {
+            var custom = chromePercentMode.Checked;
+            chromePercent.Enabled = chromePercentSuffix.Enabled = custom;
+            chromePositionLabel.Enabled = chromePosition.Enabled = custom;
+
+            if (!custom)
+            {
+                chromePreview.Text = "Full dùng nguyên hành vi mở Chrome cũ; không áp viewport scale.";
+                return;
+            }
+
+            var work = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 1920, 1080);
+            var percent = (int)chromePercent.Value;
+            var width = Math.Max(640, (int)Math.Round(work.Width * (percent / 100d)));
+            var height = Math.Max(360, (int)Math.Round(work.Height * (percent / 100d)));
+            width = Math.Min(width, work.Width);
+            height = Math.Min(height, work.Height);
+            var zoom = GetManagerChromeAutoZoomPercent(percent);
+            chromePreview.Text = $"Dự kiến: {width} × {height} · TikTok auto zoom ≈ {zoom}% · tối thiểu 50% (dưới 60% là chế độ thử nghiệm).";
+        }
+        chromeFull.CheckedChanged += (_, _) => UpdateChromeWindowUi();
+        chromePercentMode.CheckedChanged += (_, _) => UpdateChromeWindowUi();
+        chromePercent.ValueChanged += (_, _) => UpdateChromeWindowUi();
+        UpdateChromeWindowUi();
+
+        applyChromeWindow.Click += async (_, _) =>
+        {
+            if (!applyChromeWindow.Enabled) return;
+            applyChromeWindow.Enabled = false;
+            chromeWindowStatus.ForeColor = Color.DarkOrange;
+            chromeWindowStatus.Text = "Đang áp dụng...";
+            try
+            {
+                var result = await ApplyManagerChromeWindowToAllProfilesAsync(
+                    SelectedChromeMode(),
+                    (int)chromePercent.Value,
+                    SelectedChromePosition(),
+                    "automation_settings_apply_now");
+                chromeWindowStatus.ForeColor = result.LiveWorkersDeferred > 0
+                    ? Color.DarkOrange
+                    : Color.DarkGreen;
+                chromeWindowStatus.Text = result.Mode == "Full"
+                    ? $"✓ Full · {result.LiveWorkersApplied} PRF đang mở"
+                    : $"✓ {result.Percent}% · {result.LiveWorkersApplied} PRF đang mở";
+                if (result.LiveWorkersDeferred > 0)
+                    chromeWindowStatus.Text += $" · {result.LiveWorkersDeferred} chờ lần mở sau";
+            }
+            catch (Exception ex)
+            {
+                chromeWindowStatus.ForeColor = Color.Firebrick;
+                chromeWindowStatus.Text = "Không áp dụng được: " + ex.Message;
+            }
+            finally
+            {
+                applyChromeWindow.Enabled = true;
+            }
+        };
+        chromeWindowGroup.Controls.Add(chromeLayout);
+
+        // ------------------------------------------------------------
+        // 4) TỰ ĐỘNG ĐÓNG & BÙ
         // ------------------------------------------------------------
         var autoGroup = new GroupBox
         {
             Text = "TỰ ĐỘNG ĐÓNG, BÙ",
-            Location = new Point(0, 286),
+            Location = new Point(0, chromeWindowGroup.Bottom + 16),
             Size = new Size(760, 318),
             Padding = new Padding(12),
             ForeColor = Color.FromArgb(45, 67, 94)
@@ -811,12 +1072,12 @@ public sealed partial class ManagerForm
         autoGroup.Controls.Add(deleteRetiredProfile);
 
         // ------------------------------------------------------------
-        // 4) GIỚI HẠN TẠO PRF — 2 hàng x 2 cột để không bị cắt ở DPI cao
+        // 5) GIỚI HẠN TẠO PRF — 2 hàng x 2 cột để không bị cắt ở DPI cao
         // ------------------------------------------------------------
         var createLimitGroup = new GroupBox
         {
             Text = "GIỚI HẠN TẠO PRF",
-            Location = new Point(0, 616),
+            Location = new Point(0, autoGroup.Bottom + 16),
             Size = new Size(760, 176),
             Padding = new Padding(12),
             ForeColor = Color.FromArgb(45, 67, 94)
@@ -870,12 +1131,12 @@ public sealed partial class ManagerForm
         createLimitGroup.Controls.Add(retryMinutes);
 
         // ------------------------------------------------------------
-        // 5) KHUNG GIỜ KHÔNG TẠO PRF MỚI
+        // 6) KHUNG GIỜ KHÔNG TẠO PRF MỚI
         // ------------------------------------------------------------
         var noCreateGroup = new GroupBox
         {
             Text = "KHUNG GIỜ KHÔNG TẠO PRF MỚI",
-            Location = new Point(0, 804),
+            Location = new Point(0, createLimitGroup.Bottom + 16),
             Size = new Size(760, 144),
             Padding = new Padding(12),
             ForeColor = Color.FromArgb(45, 67, 94)
@@ -931,12 +1192,12 @@ public sealed partial class ManagerForm
         noCreateGroup.Controls.Add(scheduleHint);
 
         // ------------------------------------------------------------
-        // 6) NHẬT KÝ
+        // 7) NHẬT KÝ
         // ------------------------------------------------------------
         var logGroup = new GroupBox
         {
             Text = "NHẬT KÝ TỰ ĐỘNG",
-            Location = new Point(0, 960),
+            Location = new Point(0, noCreateGroup.Bottom + 16),
             Size = new Size(760, 80),
             Padding = new Padding(12),
             ForeColor = Color.FromArgb(45, 67, 94)
@@ -960,11 +1221,13 @@ public sealed partial class ManagerForm
         logGroup.Controls.Add(logHint);
         logGroup.Controls.Add(openLog);
 
+        // Thứ tự hiển thị ưu tiên các mục dùng thường xuyên lên trên.
         content.Controls.Add(sourceGroup);
-        content.Controls.Add(optimizationGroup);
         content.Controls.Add(autoGroup);
-        content.Controls.Add(createLimitGroup);
         content.Controls.Add(noCreateGroup);
+        content.Controls.Add(createLimitGroup);
+        content.Controls.Add(optimizationGroup);
+        content.Controls.Add(chromeWindowGroup);
         content.Controls.Add(logGroup);
         viewport.Controls.Add(content);
 
@@ -982,18 +1245,32 @@ public sealed partial class ManagerForm
             content.Width = availableWidth;
             sourceGroup.Width = availableWidth;
             optimizationGroup.Width = availableWidth;
+            chromeWindowGroup.Width = availableWidth;
             autoGroup.Width = availableWidth;
             createLimitGroup.Width = availableWidth;
             noCreateGroup.Width = availableWidth;
             logGroup.Width = availableWidth;
 
-            // Số lượng PRF: hint chỉ chiếm phần còn lại bên phải.
-            targetHint.Width = Math.Max(80, sourceGroup.ClientSize.Width - targetHint.Left - 18);
+            // Số lượng PRF: layout theo hàng tự co giãn theo DPI/kích thước group.
+            sourceLayout.Width = Math.Max(240, sourceGroup.ClientSize.Width - sourceLayout.Left - 16);
+
+            // Xếp nhóm theo tần suất sử dụng, giữ Nhật ký ở cuối.
+            const int groupGap = 16;
+            sourceGroup.Location = new Point(0, 0);
+            autoGroup.Location = new Point(0, sourceGroup.Bottom + groupGap);
+            noCreateGroup.Location = new Point(0, autoGroup.Bottom + groupGap);
+            createLimitGroup.Location = new Point(0, noCreateGroup.Bottom + groupGap);
+            optimizationGroup.Location = new Point(0, createLimitGroup.Bottom + groupGap);
+            chromeWindowGroup.Location = new Point(0, optimizationGroup.Bottom + groupGap);
+            logGroup.Location = new Point(0, chromeWindowGroup.Bottom + groupGap);
 
             // Tối ưu: nút giữ bên phải nếu đủ rộng, còn mô tả co theo group.
             applyOptimization.Left = Math.Max(288, optimizationGroup.ClientSize.Width - applyOptimization.Width - 18);
             optimizationStatus.Width = Math.Max(120, optimizationGroup.ClientSize.Width - optimizationStatus.Left - 18);
             optimizationHint.Width = Math.Max(120, optimizationGroup.ClientSize.Width - optimizationHint.Left - 18);
+
+            // Chrome: layout con tự co giãn theo DPI/kích thước group, không dùng tọa độ tuyệt đối.
+            chromeLayout.Width = Math.Max(220, chromeWindowGroup.ClientSize.Width - chromeLayout.Left - 16);
 
             // Auto close: checkbox dài co theo group; combobox giờ cố định bên phải.
             var autoTextWidth = Math.Max(220, autoGroup.ClientSize.Width - 36);
@@ -1026,11 +1303,13 @@ public sealed partial class ManagerForm
             openLog.Left = Math.Max(380, logGroup.ClientSize.Width - openLog.Width - 16);
             logHint.Width = Math.Max(100, openLog.Left - logHint.Left - 16);
 
-            content.Height = logGroup.Bottom + 12;
-            viewport.AutoScrollMinSize = new Size(0, content.Height + 12);
+            content.Height = logGroup.Bottom + 16;
+            viewport.AutoScrollMinSize = new Size(0, content.Height + 16);
         }
         viewport.Resize += (_, _) => LayoutScrollableContent();
         form.Shown += (_, _) => LayoutScrollableContent();
+        // Layout ngay từ lúc dựng form để không có một frame chồng group trước khi Shown.
+        LayoutScrollableContent();
 
         RunAllStrategySettings BuildRunSettings()
             => NormalizeRunStrategySettings(new RunAllStrategySettings
@@ -1099,6 +1378,11 @@ public sealed partial class ManagerForm
                 // Nút Lưu chỉ lưu mode global cho các lần mở sau; nút "Áp dụng ngay"
                 // phía trên mới đẩy runtime policy tới toàn bộ Worker đang mở.
                 SaveManagerVmOptimizationMode(SelectedVmMode(), "automation_settings_save");
+                SaveManagerChromeWindowSettings(
+                    SelectedChromeMode(),
+                    (int)chromePercent.Value,
+                    SelectedChromePosition(),
+                    "automation_settings_save");
 
                 _autoCloseSettings.CloseOnBan = closeOnBan.Checked;
                 _autoCloseSettings.CloseOnRunTime = closeOnTime.Checked;
@@ -1152,6 +1436,7 @@ public sealed partial class ManagerForm
         UiTheme.Apply(form);
         UiTheme.StyleButton(openLog, UiButtonKind.Neutral);
         UiTheme.StyleButton(applyOptimization, UiButtonKind.Primary);
+        UiTheme.StyleButton(applyChromeWindow, UiButtonKind.Primary);
         UiTheme.StyleButton(save, UiButtonKind.Primary);
         UiTheme.StyleButton(cancel, UiButtonKind.Neutral);
 
@@ -1367,9 +1652,9 @@ public sealed partial class ManagerForm
         {
             var timeThreshold = TimeSpan.FromHours(_autoCloseSettings.RunHours);
             var stuckThreshold = TimeSpan.FromMinutes(AutoCloseNotRunningMinutes);
-            var closeOnRunTime =
-                _autoCloseSettings.CloseOnRunTime
-                && !ShouldSuppressAutoCloseTimeForPrePrimeRefresh();
+            // Nếu người dùng đã bật Tự đóng theo tổng thời gian thì mốc giờ là luật cứng.
+            // PrimeFresh / giờ vàng / RefreshAllBeforePrime không được phép vô hiệu hóa TIME.
+            var closeOnRunTime = _autoCloseSettings.CloseOnRunTime;
 
             // Không phụ thuộc tab Manager. Một profile có thể mất/tab bị detach nhưng
             // Worker/Chrome vẫn còn chạy và trang TikTok đã OOM. Nếu chỉ lọc theo Tab,

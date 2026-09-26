@@ -112,7 +112,7 @@ public sealed partial class ManagerForm
                 }
             }
 
-            // 4) Runtime đã xác nhận mất login bằng popup lặp 3/3. Sau clean reopen
+            // 4) Runtime đã xác nhận mất login bằng popup lặp 2/2. Sau clean reopen
             // phải đi THẲNG vào flow đăng nhập, không được để launch_auto tin cookie
             // stale rồi trả "opened". Worker command này chỉ ép bỏ session cookie cũ,
             // sau đó gọi nguyên PrepareTikTokProfileStartupAsync hiện có để giữ toàn bộ
@@ -148,7 +148,7 @@ public sealed partial class ManagerForm
             if (string.Equals(launchReply, "login_failed", StringComparison.OrdinalIgnoreCase))
             {
                 // Theo rule đã chốt cho flow này: logout đã được xác nhận qua popup
-                // Đăng nhập lặp 3/3 sau Enter; sau clean reopen mà login flow hiện tại
+                // Đăng nhập lặp 2/2 sau Enter; sau clean reopen mà login flow hiện tại
                 // vẫn kết thúc LOGIN_FAILED thì
                 // xử lý operational như BAN. Các trạng thái CAPTCHA/TOTP/config/error khác
                 // KHÔNG đi nhánh này để tránh false-positive.
@@ -161,7 +161,7 @@ public sealed partial class ManagerForm
                     ctx,
                     source: "runtime_logout_relogin_failed",
                     detail:
-                        "BAN_INFERRED: Runtime đã xác nhận popup Đăng nhập lặp 3/3 sau Enter; Chrome/Worker đã đóng sạch và mở lại đúng PRF nhưng logic đăng nhập hiện tại trả LOGIN_FAILED.");
+                        "BAN_INFERRED: Runtime đã xác nhận popup Đăng nhập lặp 2/2 sau Enter; Chrome/Worker đã đóng sạch và mở lại đúng PRF nhưng logic đăng nhập hiện tại trả LOGIN_FAILED.");
                 return;
             }
 

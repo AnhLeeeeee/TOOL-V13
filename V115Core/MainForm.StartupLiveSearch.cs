@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using ToolTikTokV11.Models;
 using ToolTikTokV11.Services;
 
@@ -17,7 +17,7 @@ public sealed partial class MainForm
 
     readonly CheckBox _startupLiveSearchEnabled = new()
     {
-        Text = "Tìm LIVE bằng TikTok Search khi bắt đầu (chỉ khi chưa đứng sẵn trong LIVE)",
+        Text = "Bật tìm LIVE bằng TikTok Search (startup + làm mới nguồn khi đang chạy)",
         AutoSize = true,
         Checked = true
     };
@@ -32,7 +32,7 @@ public sealed partial class MainForm
     {
         var group = new GroupBox
         {
-            Text = "Nguồn tìm LIVE khi bắt đầu — TikTok Search",
+            Text = "Nguồn tìm LIVE — TikTok Search",
             Dock = DockStyle.Top,
             AutoSize = true,
             Padding = new Padding(8),
@@ -66,8 +66,8 @@ public sealed partial class MainForm
             AutoSize = true,
             MaximumSize = new Size(980, 0),
             Margin = new Padding(4, 5, 4, 2),
-            Text = "Thứ tự startup: nếu đang ở /@user/live → bỏ qua Search và chạy Viewer Gate như hiện tại. Nếu chưa ở LIVE → Search Top trước; không có LIVE phù hợp thì chuyển đúng tab LIVE; hết keyword/timeout → quay về flow LIVE cũ. " +
-                   "Chỉ badge SVG hình người mới được tính Viewer; badge Like bị bỏ qua. Mỗi bước có deadline (mở Search 8s, quét Top 8s, tab LIVE 5s, quét LIVE 8s, mở candidate 10s) nên không thể treo vô hạn. Ngưỡng dùng chung Viewer Gate hiện tại."
+            Text = "Startup: nếu đang ở /@user/live thì giữ LIVE hiện tại; nếu chưa ở LIVE thì Search theo từ khóa. Khi đang chạy, cứ đủ 2 LIVE thấp sẽ tính 1 lượt đổi nguồn; lượt 1–4 ưu tiên sidebar, sidebar trống thì Search; đủ 5 lượt sẽ bắt buộc Search để lấy đầu vào chuỗi mới. " +
+                   "Chỉ badge SVG hình người mới được tính Viewer; badge Like bị bỏ qua. Mỗi bước Search có deadline nên không thể treo vô hạn. Ngưỡng dùng chung Viewer Gate hiện tại."
         });
 
         group.Controls.Add(panel);
@@ -111,7 +111,18 @@ public sealed partial class MainForm
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
 
-    async Task<bool> TryStartupLiveSearchAsync()
+    Task<bool> TryStartupLiveSearchAsync()
+        => TryLiveSearchAsync(CancellationToken.None);
+
+    async Task<bool> TryRuntimeLiveSearchAsync(string reason, CancellationToken ct)
+    {
+        _log.Warn($"[RUNTIME_LIVE_SEARCH_BEGIN] reason={ShortText(reason, 180)}");
+        var ok = await TryLiveSearchAsync(ct);
+        _log.Warn($"[RUNTIME_LIVE_SEARCH_DONE] reason={ShortText(reason, 180)} result={(ok ? "OPENED" : "MISS")}");
+        return ok;
+    }
+
+    async Task<bool> TryLiveSearchAsync(CancellationToken parentCt)
     {
         var cfg = _settings.StartupLiveSearch ?? new StartupLiveSearchSettings();
         if (!cfg.Enabled) return false;
@@ -138,7 +149,8 @@ public sealed partial class MainForm
         var totalTimeoutSec = Math.Clamp(cfg.TotalTimeoutSec, 20, 300);
         var keywordTimeoutSec = Math.Clamp(cfg.KeywordTimeoutSec, 10, 120);
 
-        using var totalCts = new CancellationTokenSource(TimeSpan.FromSeconds(totalTimeoutSec));
+        using var totalCts = CancellationTokenSource.CreateLinkedTokenSource(parentCt);
+        totalCts.CancelAfter(TimeSpan.FromSeconds(totalTimeoutSec));
         var totalSw = System.Diagnostics.Stopwatch.StartNew();
         _log.Info($"[STARTUP_LIVE_SEARCH_BEGIN] keywords={string.Join("|", keywords)} threshold={threshold} keywordTimeoutSec={keywordTimeoutSec} totalTimeoutSec={totalTimeoutSec} maxCards={maxCards}");
 
@@ -212,7 +224,7 @@ public sealed partial class MainForm
 
                 _log.Warn($"[STARTUP_LIVE_SEARCH_KEYWORD_MISS] keyword={keyword} topCards={topCandidates.Count} liveCards={liveCandidates.Count} elapsedMs={keywordSw.ElapsedMilliseconds}");
             }
-            catch (OperationCanceledException) when (keywordCts.IsCancellationRequested)
+            catch (OperationCanceledException) when (keywordCts.IsCancellationRequested && !parentCt.IsCancellationRequested)
             {
                 _log.Warn($"[STARTUP_LIVE_SEARCH_KEYWORD_TIMEOUT] keyword={keyword} elapsedMs={keywordSw.ElapsedMilliseconds} totalElapsedMs={totalSw.ElapsedMilliseconds}");
             }
@@ -222,7 +234,8 @@ public sealed partial class MainForm
             }
         }
 
-        _log.Warn($"[STARTUP_LIVE_SEARCH_FAIL] elapsedMs={totalSw.ElapsedMilliseconds} totalTimedOut={totalCts.IsCancellationRequested} action=OLD_LIVE_FLOW");
+        parentCt.ThrowIfCancellationRequested();
+        _log.Warn($"[STARTUP_LIVE_SEARCH_FAIL] elapsedMs={totalSw.ElapsedMilliseconds} totalTimedOut={totalCts.IsCancellationRequested} action=RETURN_FALSE_TO_CALLER");
         return false;
     }
 

@@ -19,6 +19,10 @@ public sealed class AppSettings
     public string ChromeProfileDir { get; set; } = "";
     public bool StrictXPathOnly { get; set; } = true;
     public string ChromeMode { get; set; } = "visible"; // visible | background
+    // V14.2.9: kích thước cửa sổ Chrome do Manager cấu hình toàn cục.
+    // Full giữ nguyên hành vi cũ (--start-maximized). Percent thu theo % WorkingArea
+    // và tự scale viewport TikTok để hạn chế responsive layout.
+    public ChromeWindowSettings ChromeWindow { get; set; } = new();
     // V13 runtime dùng InputGuard thay cho image-scan vùng lỗi.
     public InputGuardSettings InputGuard { get; set; } = new();
     // V13.4: chế độ tiết kiệm tài nguyên cho máy ảo.
@@ -54,4 +58,13 @@ public sealed class OldLiveSettings
     public string IdentityXPath { get; set; } = "";
     public string ActionXPath { get; set; } = "";
     public int KeepMinutes { get; set; } = 10;
+}
+
+public sealed class ChromeWindowSettings
+{
+    // Full | Percent
+    public string Mode { get; set; } = "Full";
+    public int Percent { get; set; } = 70;
+    // BottomLeft | BottomRight | TopLeft | TopRight
+    public string Position { get; set; } = "BottomLeft";
 }

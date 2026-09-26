@@ -1,5 +1,12 @@
 ﻿# SERVER VERSION POLICY CONTRACT
 
+## Chế độ an toàn áp dụng từ V14.2.9+
+
+- `HighestVersionEver` local luôn được đọc/ghi ở Manager và Worker, kể cả khi API version-policy chưa cấu hình.
+- `versionControl.enabled=true` trong `device_access_policy.json` giúp các build cũ đã có `VersionRollbackGuard` cũng kích hoạt guard khi nhận policy mới.
+- `policyUrl` có thể để trống: khi đó hệ thống chạy **local-only**, bản thấp hơn `HighestVersionEver` bị chặn và không phụ thuộc server.
+- Khi cần cho phép rollback đúng máy/đúng phiên bản, chỉ cần cấu hình `policyUrl` tới API server; server cấp `allow_specific`/`allow_all_old`. Client không hạ mốc local.
+
 ## Trạng thái tắt hoàn toàn
 
 Khi `device_access_policy.json` có:
@@ -12,7 +19,7 @@ Khi `device_access_policy.json` có:
 }
 ```
 
-Version-control mới **bypass hoàn toàn**: không gọi API policy, không đọc/ghi `HighestVersionEver`, không chặn Manager/Worker theo version. Updater giữ hành vi trước server-control (bản cũ không được mở quyền cài). Chỉ khi `enabled=true` mới kích hoạt các API/quyền rollback dưới đây.
+Với build cũ chưa nhận patch "local always-on", `enabled=false` vẫn có thể bypass guard. Vì vậy policy phát hành nên giữ `versionControl.enabled=true`. Với build mới, local `HighestVersionEver` luôn hoạt động; cờ này chỉ còn quyết định có dùng lớp server ngoại lệ rollback hay không.
 
 
 Client patch này dùng 2 tầng:

@@ -906,6 +906,10 @@ public sealed partial class ManagerForm : Form
             dataRoot,
             ctx.Profile.Name,
             "before_worker_start");
+        ApplyManagerChromeWindowToProfileConfigIfConfigured(
+            dataRoot,
+            ctx.Profile.Name,
+            "before_worker_start");
         var pipe = PipeName(ctx.Profile.Name);
         var args = $"--worker --embedded --profile {Quote(ctx.Profile.Name)} --profile-path {Quote(ctx.Profile.ProfilePath)} --cdp-port {ctx.Profile.CdpPort} --data-root {Quote(dataRoot)} --pipe-name {Quote(pipe)}";
         var process = new Process
@@ -1717,10 +1721,16 @@ public sealed partial class ManagerForm : Form
 
             var sourceLabel = ApplyManagerDefaultConfigFiles(dataRoot, allowPackagedDefaults: true);
             if (!string.IsNullOrWhiteSpace(sourceLabel))
+            {
                 ApplyManagerVmOptimizationToProfileConfigIfConfigured(
                     dataRoot,
                     ctx.Profile.Name,
                     "after_default_config_sync");
+                ApplyManagerChromeWindowToProfileConfigIfConfigured(
+                    dataRoot,
+                    ctx.Profile.Name,
+                    "after_default_config_sync");
+            }
 
             if (string.IsNullOrWhiteSpace(sourceLabel))
             {
@@ -1744,6 +1754,10 @@ public sealed partial class ManagerForm : Form
                             dataRoot,
                             ctx.Profile.Name,
                             "default_config_sync_reload_deferred");
+                        ApplyManagerChromeWindowToProfileConfigIfConfigured(
+                            dataRoot,
+                            ctx.Profile.Name,
+                            "default_config_sync_reload_deferred");
                         _log.Warn(
                             $"[DEFAULT_CONFIG_SYNC_DEFER] profile={ctx.Profile.Name} revision={state.Revision} reason={reason} reload={reply}");
                         return;
@@ -1756,6 +1770,10 @@ public sealed partial class ManagerForm : Form
                         try { RestoreProfileConfigFilesBackup(dataRoot, backup); } catch { }
                     }
                     ApplyManagerVmOptimizationToProfileConfigIfConfigured(
+                        dataRoot,
+                        ctx.Profile.Name,
+                        "default_config_sync_reload_error");
+                    ApplyManagerChromeWindowToProfileConfigIfConfigured(
                         dataRoot,
                         ctx.Profile.Name,
                         "default_config_sync_reload_error");
@@ -1838,6 +1856,10 @@ public sealed partial class ManagerForm : Form
         // Tối ưu VM là cấu hình global riêng. Nếu người dùng đã chọn global mode,
         // PRF mới nhận đúng mode ngay cả khi Manager không có default config riêng.
         ApplyManagerVmOptimizationToProfileConfigIfConfigured(
+            dataRoot,
+            "<new_profile>",
+            "new_profile");
+        ApplyManagerChromeWindowToProfileConfigIfConfigured(
             dataRoot,
             "<new_profile>",
             "new_profile");

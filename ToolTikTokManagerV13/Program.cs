@@ -64,6 +64,30 @@ internal static class Program
                 $"[DEVICE_ACCESS] id={access.DeviceId} allowRun={access.AllowRun} allowUpdate={access.AllowUpdate} " +
                 $"activated={access.Activated} source={access.ActivationSource} remote={access.RemotePolicyApplied}");
 
+            // QITool License Server - SHADOW MODE.
+            // Register được gọi trước gate local để máy mới/PENDING cũng xuất hiện trên web quản lý.
+            // Kết quả server ở bản vá này CHỈ ghi log, chưa thay đổi quyền AllowRun cũ.
+            using var licenseServer = LicenseServerClient.TryCreate(
+                baseDir,
+                access.DeviceId,
+                DeviceAccessService.GetFingerprintHash(),
+                AppVersionInfo.Current);
+
+            if (licenseServer is not null)
+            {
+                var registerDecision = licenseServer
+                    .RegisterAsync()
+                    .GetAwaiter()
+                    .GetResult();
+
+                ManagerProcessDiagnostics.Append(
+                    $"[LICENSE_SERVER_SHADOW_STARTUP] device={access.DeviceId} " +
+                    $"reachable={registerDecision.Reachable} http={registerDecision.HttpStatus} " +
+                    $"allowed={(registerDecision.Allowed is null ? "unknown" : registerDecision.Allowed.Value ? "true" : "false")} " +
+                    $"status={ManagerProcessDiagnostics.OneLine(registerDecision.Status)} " +
+                    $"localAllowRun={access.AllowRun} action=no_enforcement");
+            }
+
             if (!access.AllowRun)
             {
                 MessageBox.Show(
@@ -74,44 +98,67 @@ internal static class Program
                 return;
             }
 
-            if (access.VersionControlEnabled)
+            // Rollback Guard local luôn chạy để ghi HighestVersionEver và chặn bản thấp hơn.
+            // versionControl.enabled chỉ bật/tắt lớp server ngoại lệ rollback; local guard không bypass.
+            var versionGuard = VersionRollbackGuard
+                .EvaluateAndRecordAsync(
+                    AppVersionInfo.Current,
+                    access.DeviceId,
+                    access.VersionControlEnabled,
+                    access.VersionPolicyUrl,
+                    access.VersionPolicyFailClosedOnDowngrade)
+                .GetAwaiter()
+                .GetResult();
+
+            ManagerProcessDiagnostics.Append(
+                $"[VERSION_GUARD] allowRun={versionGuard.AllowRun} current={versionGuard.CurrentVersion} " +
+                $"highest={versionGuard.HighestVersionEver} updated={versionGuard.RecordUpdated} " +
+                $"remoteControl={access.VersionControlEnabled} serverApplied={versionGuard.ServerPolicyApplied} " +
+                $"mode={versionGuard.DowngradeMode} reason={ManagerProcessDiagnostics.OneLine(versionGuard.Reason)}");
+
+            if (!versionGuard.AllowRun)
             {
-                var versionGuard = VersionRollbackGuard
-                    .EvaluateAndRecordAsync(
-                        AppVersionInfo.Current,
-                        access.DeviceId,
-                        true,
-                        access.VersionPolicyUrl,
-                        access.VersionPolicyFailClosedOnDowngrade)
-                    .GetAwaiter()
-                    .GetResult();
+                MessageBox.Show(
+                    versionGuard.Reason +
+                    $"\n\nPhiên bản hiện tại: {versionGuard.CurrentVersion}" +
+                    (string.IsNullOrWhiteSpace(versionGuard.HighestVersionEver)
+                        ? ""
+                        : $"\nPhiên bản cao nhất đã dùng: {versionGuard.HighestVersionEver}"),
+                    "Tool TikTok — Phiên bản không được phép",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
 
+            using var heartbeatCts = new CancellationTokenSource();
+            Task? heartbeatTask = null;
+            if (licenseServer is not null)
+            {
+                heartbeatTask = licenseServer.RunHeartbeatLoopAsync(heartbeatCts.Token);
                 ManagerProcessDiagnostics.Append(
-                    $"[VERSION_GUARD] allowRun={versionGuard.AllowRun} current={versionGuard.CurrentVersion} " +
-                    $"highest={versionGuard.HighestVersionEver} updated={versionGuard.RecordUpdated} " +
-                    $"serverApplied={versionGuard.ServerPolicyApplied} mode={versionGuard.DowngradeMode} " +
-                    $"reason={ManagerProcessDiagnostics.OneLine(versionGuard.Reason)}");
+                    $"[LICENSE_SERVER_HEARTBEAT_STARTED] session={licenseServer.SessionId} mode=shadow");
+            }
 
-                if (!versionGuard.AllowRun)
+            try
+            {
+                Application.Run(new ManagerForm());
+            }
+            finally
+            {
+                heartbeatCts.Cancel();
+                if (heartbeatTask is not null)
                 {
-                    MessageBox.Show(
-                        versionGuard.Reason +
-                        $"\n\nPhiên bản hiện tại: {versionGuard.CurrentVersion}" +
-                        (string.IsNullOrWhiteSpace(versionGuard.HighestVersionEver)
-                            ? ""
-                            : $"\nPhiên bản cao nhất đã dùng: {versionGuard.HighestVersionEver}"),
-                        "Tool TikTok — Phiên bản không được phép",
-                        MessageBoxButtons.OK,
-                        MessageBoxIcon.Warning);
-                    return;
+                    try
+                    {
+                        heartbeatTask.Wait(TimeSpan.FromSeconds(2));
+                    }
+                    catch
+                    {
+                        // Shutdown không được bị chặn vì heartbeat.
+                    }
                 }
             }
-            else
-            {
-                ManagerProcessDiagnostics.Append("[VERSION_GUARD_BYPASS] versionControl.enabled=false");
-            }
 
-            Application.Run(new ManagerForm());
             ManagerProcessDiagnostics.Append(
                 $"[MANAGER_APPLICATION_RUN_RETURNED] time={DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} pid={Environment.ProcessId}");
         }

@@ -133,7 +133,7 @@ public sealed partial class MainForm : Form
         var settingsSw = System.Diagnostics.Stopwatch.StartNew();
         _settings = _settingsService.Load();
         settingsSw.Stop();
-        _chrome = new ChromeController(_log); ApplyVmOptimizationSettings(); _engine = new AutomationEngine(_baseDir, _chrome, _log); _runtimeStats = new RuntimeStatsTracker(_baseDir, _log);
+        _chrome = new ChromeController(_log); ApplyChromeWindowSettings(); ApplyVmOptimizationSettings(); _engine = new AutomationEngine(_baseDir, _chrome, _log); _engine.RuntimeLiveSearchAsync = TryRuntimeLiveSearchAsync; _runtimeStats = new RuntimeStatsTracker(_baseDir, _log);
         var profileSw = System.Diagnostics.Stopwatch.StartNew();
         if (_managedMode)
         {
@@ -431,6 +431,12 @@ public sealed partial class MainForm : Form
 
     void SetChromeStatus(string chromeText, Color chromeColor, string tikTokText = "TikTok: —", Color? tikTokColor = null, bool pinUntilChange = true)
     {
+        if (InvokeRequired)
+        {
+            BeginInvoke(new Action(() => SetChromeStatus(chromeText, chromeColor, tikTokText, tikTokColor, pinUntilChange)));
+            return;
+        }
+
         _chromeStateText = chromeText;
         _chromePageStateText = tikTokText;
         _chromeStateColor = chromeColor;
@@ -932,6 +938,32 @@ public sealed partial class MainForm : Form
         _log.Info($"CDPPort={_settings.ChromePort}");
     }
 
+    void ApplyChromeWindowSettings()
+    {
+        _settings.ChromeWindow ??= new ChromeWindowSettings();
+        _settings.ChromeWindow.Mode = string.Equals(
+            _settings.ChromeWindow.Mode,
+            "Percent",
+            StringComparison.OrdinalIgnoreCase)
+            ? "Percent"
+            : "Full";
+        _settings.ChromeWindow.Percent = Math.Clamp(_settings.ChromeWindow.Percent, 50, 100);
+        _settings.ChromeWindow.Position = NormalizeChromeWindowPosition(_settings.ChromeWindow.Position);
+        _chrome.ConfigureChromeWindow(_settings.ChromeWindow);
+    }
+
+    static string NormalizeChromeWindowPosition(string? value)
+    {
+        value = (value ?? "").Trim().Replace("_", "", StringComparison.Ordinal).Replace("-", "", StringComparison.Ordinal);
+        return value.ToLowerInvariant() switch
+        {
+            "bottomright" => "BottomRight",
+            "topleft" => "TopLeft",
+            "topright" => "TopRight",
+            _ => "BottomLeft"
+        };
+    }
+
     decimal Clamp(int v, NumericUpDown n) => Math.Clamp((decimal)v, n.Minimum, n.Maximum);
     static void SelectCombo(ComboBox c, string s) { var i = c.Items.IndexOf(s); c.SelectedIndex = i >= 0 ? i : 0; }
 
@@ -1346,6 +1378,7 @@ public sealed partial class MainForm : Form
             SetChromeStatus("Trạng thái Chrome: 🟡 Đang kết nối CDP...", Color.Goldenrod, "TikTok: 🟡 Đang kết nối CDP...", Color.Goldenrod);
             await _chrome.ConnectAsync(_settings.ChromePort);
             _chrome.AttachManagedWindow(CurrentProfilePath, _settings.ChromePort);
+            await _chrome.ApplyConfiguredChromeWindowAsync(CurrentProfilePath, _settings.ChromePort);
             sw.Stop();
             _log.Info($"[PERF] CDP reconnect: {sw.ElapsedMilliseconds} ms");
             RefreshChromeStatus();
@@ -1383,6 +1416,7 @@ public sealed partial class MainForm : Form
                 await _chrome.ConnectAsync(_settings.ChromePort);
                 ThrowIfEmergencyStopRequested("after_connect");
                 _chrome.AttachManagedWindow(CurrentProfilePath, _settings.ChromePort);
+                await _chrome.ApplyConfiguredChromeWindowAsync(CurrentProfilePath, _settings.ChromePort);
             }
             catch (OperationCanceledException) when (respectEmergencyStop && IsManagerEmergencyStopActive())
             {
@@ -1398,6 +1432,7 @@ public sealed partial class MainForm : Form
                 await _chrome.ConnectAsync(_settings.ChromePort);
                 ThrowIfEmergencyStopRequested("after_launch_connect");
                 _chrome.AttachManagedWindow(CurrentProfilePath, _settings.ChromePort);
+                await _chrome.ApplyConfiguredChromeWindowAsync(CurrentProfilePath, _settings.ChromePort);
             }
         }
         ThrowIfEmergencyStopRequested("before_refresh");

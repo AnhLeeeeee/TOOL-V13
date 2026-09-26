@@ -7,7 +7,7 @@ public sealed partial class AutomationEngine
     // Không xác nhận mất đăng nhập chỉ từ một lần popup. TikTok có thể rơi vào trạng thái
     // tạm thời; chỉ khi popup login quay lại sau nhiều lần Click/Dán/Enter liên tiếp mới
     // giao quyền xử lý cho luồng runtime-login recovery có sẵn của Manager.
-    const int RuntimeLoginModalConfirmationsRequired = 3;
+    const int RuntimeLoginModalConfirmationsRequired = 2;
     const int RuntimeLoginSuspectTransitionRetryMs = 1000;
 
     int _runtimeLoginModalStreak;
@@ -197,7 +197,7 @@ public sealed partial class AutomationEngine
     }
 
     /// <summary>
-    /// Sau lần popup 1/3 hoặc 2/3, chuyển LIVE để modal biến mất rồi cho workflow thực hiện
+    /// Sau lần popup 1/2, chuyển LIVE để modal biến mất rồi cho workflow thực hiện
     /// Click/Dán/Enter ở LIVE khác. Streak vẫn được giữ xuyên qua chuyển LIVE/F5.
     /// </summary>
     async Task<bool> HandlePendingRuntimeLoginSuspectTransitionAsync(CancellationToken ct)

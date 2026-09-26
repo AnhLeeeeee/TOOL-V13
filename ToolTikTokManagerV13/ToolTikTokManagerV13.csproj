@@ -26,4 +26,8 @@
     <ProjectReference Include="..\ToolTikTokWorkerV13\ToolTikTokWorkerV13.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Update="license_server.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

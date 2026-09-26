@@ -100,23 +100,12 @@ public static class VersionRollbackGuard
         bool failClosedOnDowngrade = true,
         CancellationToken cancellationToken = default)
     {
-        // SAFE BYPASS: khi versionControl.enabled=false, cơ chế kiểm soát phiên bản
-        // hoàn toàn không hoạt động: không đọc/ghi HighestVersionEver, không gọi server,
-        // không tạo/chặn theo record local. Tool tiếp tục chạy như trước khi có VersionGuard.
+        // LOCAL GUARD LUÔN BẬT:
+        // - luôn đọc/ghi HighestVersionEver để bản mới đã chạy thì bản thấp hơn bị chặn;
+        // - serverControlEnabled chỉ quyết định có gọi API ngoại lệ rollback từ xa hay không.
+        // Nhờ vậy nếu Git/Supabase tạm lỗi, mốc phiên bản local vẫn còn hiệu lực.
         if (!serverControlEnabled)
-        {
             SetLastServerPolicy(null);
-            return new VersionGuardDecision
-            {
-                AllowRun = true,
-                CurrentVersion = currentVersion ?? "",
-                HighestVersionEver = "",
-                Reason = "Version control disabled; bypassed.",
-                RecordUpdated = false,
-                ServerPolicyApplied = false,
-                DowngradeMode = ModeDeny
-            };
-        }
 
         var current = ParseVersion(currentVersion);
         if (current is null)

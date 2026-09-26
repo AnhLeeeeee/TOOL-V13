@@ -5,6 +5,8 @@ namespace ToolTikTokV11.Services;
 public sealed partial class AutomationEngine
 {
     const int CommentRestrictionPollMs = 100;
+    const int CommentRestrictionConfirmIntervalMs = 300;
+    const int CommentRestrictionConfirmationsRequired = 3;
     const int CommentRestrictionRetryCooldownMs = 1000;
 
     bool _postEnterCommentRestrictionPending;
@@ -26,6 +28,8 @@ public sealed partial class AutomationEngine
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var successfulProbeCount = 0;
+        var commentBannedVisibleStreak = 0;
+        var commentBannedLiveKey = "";
 
         while (_running && !ct.IsCancellationRequested && sw.ElapsedMilliseconds < EnterReactionScanMs)
         {
@@ -59,20 +63,65 @@ public sealed partial class AutomationEngine
 
             if (marker.StartsWith("COMMENT_BANNED|", StringComparison.Ordinal))
             {
-                // Một phản hồi sau Enter không phải login-modal phá chuỗi xác nhận mất login.
-                ResetRuntimeLoginModalConfirmation($"{pointName}: phát hiện cấm bình luận thay vì popup login");
+                // COMMENT_BANNED chỉ có giá trị ngay sau lần Enter hiện tại và phải thực sự
+                // hiển thị liên tiếp 3 lần trên CÙNG LIVE. Một DOM node ẩn/stale hoặc toast
+                // thoáng qua không còn đủ quyền ép chuyển LIVE.
+                var liveIdentity = await GetCurrentLiveIdentityAsync(ct);
+                var liveKey = GetLivePageChangeKey(liveIdentity);
+                if (string.IsNullOrWhiteSpace(liveKey))
+                    liveKey = TrimIdentityForLog(liveIdentity, 160);
 
-                _step = restartStep;
-                _postEnterCommentRestrictionPending = true;
-                _postEnterCommentRestrictionContext = pointName;
-                MaybeArmViewerChainModeForCommentRestriction($"toast cấm bình luận sau Enter tại {pointName}");
+                if (commentBannedVisibleStreak > 0
+                    && !string.Equals(commentBannedLiveKey, liveKey, StringComparison.Ordinal))
+                {
+                    _log.Info(
+                        $"[COMMENT_BANNED_CONFIRM_RESET] point={pointName} previous={commentBannedVisibleStreak}/{CommentRestrictionConfirmationsRequired} " +
+                        $"reason=LIVE_CHANGED oldKey={commentBannedLiveKey} newKey={liveKey}");
+                    commentBannedVisibleStreak = 0;
+                    commentBannedLiveKey = "";
+                }
 
-                _log.Warn($"[COMMENT_RESTRICTION_DETECTED] point={pointName} marker={marker} action=SWITCH_LIVE restartStep={restartStep}");
-                ReportProblem("COMMENT_RESTRICTION_DETECTED", pointName,
-                    "TikTok báo ‘Bạn hiện bị cấm bình luận’. Khóa workflow và chuyển LIVE; nội dung hiện tại sẽ được thử lại ở LIVE mới.",
-                    throttleSeconds: 5);
-                SetStatus("BỊ CẤM BÌNH LUẬN", $"{pointName}: đã phát hiện toast → chuyển LIVE.");
-                return true;
+                if (commentBannedVisibleStreak == 0)
+                    commentBannedLiveKey = liveKey;
+
+                commentBannedVisibleStreak++;
+                _log.Warn(
+                    $"[COMMENT_BANNED_CONFIRM] point={pointName} confirmation={commentBannedVisibleStreak}/{CommentRestrictionConfirmationsRequired} " +
+                    $"liveKey={commentBannedLiveKey} marker={marker}");
+
+                if (commentBannedVisibleStreak >= CommentRestrictionConfirmationsRequired)
+                {
+                    // Một phản hồi sau Enter không phải login-modal phá chuỗi xác nhận mất login.
+                    ResetRuntimeLoginModalConfirmation($"{pointName}: xác nhận cấm bình luận {CommentRestrictionConfirmationsRequired}/{CommentRestrictionConfirmationsRequired}");
+
+                    _step = restartStep;
+                    _postEnterCommentRestrictionPending = true;
+                    _postEnterCommentRestrictionContext = pointName;
+                    MaybeArmViewerChainModeForCommentRestriction($"toast cấm bình luận đã xác nhận sau Enter tại {pointName}");
+
+                    _log.Warn(
+                        $"[COMMENT_RESTRICTION_DETECTED] point={pointName} marker={marker} " +
+                        $"confirmations={commentBannedVisibleStreak}/{CommentRestrictionConfirmationsRequired} action=SWITCH_LIVE restartStep={restartStep}");
+                    ReportProblem("COMMENT_RESTRICTION_DETECTED", pointName,
+                        "TikTok báo ‘Bạn hiện bị cấm bình luận’ và đã hiển thị liên tiếp 3 lần sau Enter. Khóa workflow và chuyển LIVE; nội dung hiện tại sẽ được thử lại ở LIVE mới.",
+                        throttleSeconds: 5);
+                    SetStatus("BỊ CẤM BÌNH LUẬN", $"{pointName}: toast visible 3/3 → chuyển LIVE.");
+                    return true;
+                }
+
+                var confirmRemaining = EnterReactionScanMs - (int)Math.Min(int.MaxValue, sw.ElapsedMilliseconds);
+                if (confirmRemaining <= 0) break;
+                await Task.Delay(Math.Min(CommentRestrictionConfirmIntervalMs, confirmRemaining), ct);
+                continue;
+            }
+
+            if (commentBannedVisibleStreak > 0)
+            {
+                _log.Info(
+                    $"[COMMENT_BANNED_CONFIRM_RESET] point={pointName} previous={commentBannedVisibleStreak}/{CommentRestrictionConfirmationsRequired} " +
+                    "reason=NOT_VISIBLE_ON_NEXT_CONFIRM");
+                commentBannedVisibleStreak = 0;
+                commentBannedLiveKey = "";
             }
 
             var remaining = EnterReactionScanMs - (int)Math.Min(int.MaxValue, sw.ElapsedMilliseconds);

@@ -1,4 +1,4 @@
-using ToolTikTokV12.Utils;
+﻿using ToolTikTokV12.Utils;
 using System.Text.Json;
 using System.Xml.XPath;
 using ToolTikTokV11.Models;
@@ -294,6 +294,7 @@ public sealed partial class AutomationEngine
         _consecutiveLowViewerLives = 0;
         _lastLowViewerLiveKey = "";
         _recommendedViewerPickIndex = 0;
+        _lowPairSourceCycleCount = 0;
         _recentViewerValue = -1;
         _recentViewerLiveKey = "";
         _recentViewerAtUtc = DateTime.MinValue;
@@ -2192,76 +2193,74 @@ public sealed partial class AutomationEngine
         if (IsViewerChainModeActive())
         {
             // Low-streak là giới hạn cứng cao hơn Chain Mode: chỉ cần đủ số LIVE thấp liên tiếp
-            // thì phải rời chuỗi hiện tại và lấy một cửa vào mới từ LIVE đề xuất. Không reset
-            // streak về 0 rồi tiếp tục ArrowDown như logic cũ.
+            // thì phải rời chuỗi hiện tại và lấy một cửa vào mới.
             _log.Warn(
                 $"[VIEWER_CHAIN_MODE_LOW_STREAK_LIMIT] source={source} streak={streak} " +
-                $"transitions={_viewerChainTransitions}/{ViewerChainModeMaxTransitions} action=END_CHAIN_AND_SCAN_RECOMMENDED");
+                $"transitions={_viewerChainTransitions}/{ViewerChainModeMaxTransitions} action=END_CHAIN_AND_CHANGE_SOURCE");
             CompleteViewerChainMode($"đã gặp {streak} LIVE thấp liên tiếp");
         }
 
-        // Đủ ngưỡng LIVE thấp liên tiếp: quét lại sidebar trước. Chỉ hard-reset /live khi sidebar
-        // không có LIVE đề xuất nào > ngưỡng (và không thuộc Live cũ active).
-        SetStatus("QUÉT LẠI LIVE ĐỀ XUẤT", $"{streak} LIVE thấp liên tiếp • tìm LIVE > {_s.Viewer.Threshold} trước khi reset");
-        _log.Warn($"[VIEWER_FEED_RESET_PRECHECK_RECOMMENDED] source={source} streak={streak} threshold={_s.Viewer.Threshold}");
-        if (await TryOpenBestRecommendedViewerLiveAsync(source + " / trước hard-reset", ct))
+        // Mỗi cặp 2 LIVE thấp khác nhau được tính đúng 1 lượt đổi nguồn.
+        // Lượt 1..4 ưu tiên sidebar; lượt 5 bắt buộc Search. Search thành công reset về 0/5.
+        var sourceCycle = RegisterLowPairSourceCycle(source, streak);
+
+        // Cặp LIVE thấp này đã được tiêu thụ thành một lượt nguồn. Reset streak ngay để
+        // nếu đổi nguồn thất bại, phải gặp thêm 2 LIVE thấp KHÁC mới thử đổi nguồn lần nữa.
+        ResetLowViewerStreak($"đã tính lượt đổi nguồn {sourceCycle}/{LowPairCyclesBeforeForcedSearch}");
+
+        if (sourceCycle >= LowPairCyclesBeforeForcedSearch)
+        {
+            SetStatus("TÌM LIVE BẰNG SEARCH",
+                $"Đủ {sourceCycle}/{LowPairCyclesBeforeForcedSearch} lượt 2 LIVE thấp • bắt buộc đổi đầu vào bằng Search");
+            _log.Warn(
+                $"[LIVE_SOURCE_SWITCH] source={source} lowPairCycle={sourceCycle}/{LowPairCyclesBeforeForcedSearch} " +
+                "action=SEARCH_FORCED sidebar=SKIP");
+
+            if (await TryOpenRuntimeKeywordSearchSourceAsync(
+                    source + $" / đủ {LowPairCyclesBeforeForcedSearch} lượt 2 LIVE thấp",
+                    forced: true,
+                    ct: ct))
+            {
+                return true;
+            }
+
+            // Search bắt buộc nhưng chưa tìm được đầu vào. Giữ counter ở 5/5 để
+            // lần đổi nguồn kế tiếp vẫn tiếp tục bắt buộc Search, không quay về sidebar.
+            _log.Warn(
+                $"[LIVE_SOURCE_SEARCH_REQUIRED_PENDING] source={source} " +
+                $"lowPairCycle={_lowPairSourceCycleCount}/{LowPairCyclesBeforeForcedSearch} action=CONTINUE_CHAIN_AND_RETRY_SEARCH_NEXT_PAIR");
+            return false;
+        }
+
+        // Lượt 1..4: ưu tiên sidebar LIVE đề xuất theo round-robin hiện tại.
+        SetStatus("QUÉT LẠI LIVE ĐỀ XUẤT",
+            $"{streak} LIVE thấp liên tiếp • lượt nguồn {sourceCycle}/{LowPairCyclesBeforeForcedSearch} • tìm LIVE > {_s.Viewer.Threshold}");
+        _log.Warn(
+            $"[LIVE_SOURCE_SWITCH] source={source} lowPairCycle={sourceCycle}/{LowPairCyclesBeforeForcedSearch} " +
+            $"action=SIDEBAR_FIRST threshold={_s.Viewer.Threshold}");
+
+        if (await TryOpenBestRecommendedViewerLiveAsync(source + " / đổi chuỗi bằng sidebar", ct))
             return true;
 
-        _consecutiveLowViewerLives = 0; // Hard-reset chỉ xảy ra sau khi sidebar không có LIVE phù hợp.
-        _lastLowViewerLiveKey = "";
-        SetStatus("LÀM MỚI ĐỀ XUẤT LIVE", $"{streak} LIVE liên tiếp ≤ {_s.Viewer.Threshold} người → sidebar không phù hợp → tải lại /live");
-        _log.Warn($"[VIEWER_FEED_RESET_START] source={source} streak={streak} threshold={_s.Viewer.Threshold} action=navigate:/live reason=no-suitable-sidebar-live");
+        // Sidebar không có LIVE phù hợp: KHÔNG hard-reset /live nữa vì cùng nguồn đề xuất
+        // thường không thay đổi. Chuyển thẳng sang Search từ khóa để lấy cửa vào chuỗi mới.
+        _log.Warn(
+            $"[LIVE_SOURCE_SIDEBAR_EMPTY] source={source} lowPairCycle={sourceCycle}/{LowPairCyclesBeforeForcedSearch} " +
+            "action=SEARCH_FALLBACK noNavigateLiveReset=true");
 
-        try
+        if (await TryOpenRuntimeKeywordSearchSourceAsync(
+                source + " / sidebar không có LIVE phù hợp",
+                forced: false,
+                ct: ct))
         {
-            await _chrome.ResetTikTokLiveRecommendationFeedAsync(ct);
-            await StopIfFatalTikTokRestrictionAsync($"sau reset nguồn đề xuất Viewer: {source}", ct);
-            if (!await WaitForLivePageReadyAsync($"sau reset nguồn đề xuất Viewer: {source}", ct))
-            {
-                _log.Warn($"[VIEWER_FEED_RESET_PAGE_NOT_READY] source={source} action=RETURN_FALSE_NO_EXTRA_F5");
-                return false;
-            }
-            ResetPeriodicDue("Viewer low-streak hard reset /live", cancelCandidate: true);
-            ResetPageMaintenanceDue("Viewer low-streak hard reset /live");
-            ResetInputGuardConsecutive("sau reset nguồn đề xuất Viewer");
-
-            if (await TryOpenBestRecommendedViewerLiveAsync(source + " / sau reset /live", ct))
-                return true;
-
-            var (value, raw) = await ReadViewerWithRetryAsync(source + " / sau reset /live", ct);
-            if (value < 0)
-            {
-                _log.Warn($"[VIEWER_FEED_RESET_DONE] source={source} result=viewer-unreadable; sẽ tiếp tục chuyển LIVE bình thường.");
-                return false;
-            }
-
-            _log.Info($"[VIEWER_FEED_RESET_VIEWER] source={source} value={value} threshold={_s.Viewer.Threshold} raw={raw}");
-            if (value > _s.Viewer.Threshold)
-            {
-                ResetLowViewerStreak("LIVE đầu tiên sau reset /live đã đủ người");
-                await ArmLiveTargetStabilizationAsync(
-                    $"{source} / LIVE đầu tiên sau reset /live",
-                    value,
-                    ct);
-                _log.Warn($"[VIEWER_FEED_RESET_RECOVERED] source={source} value={value} > threshold={_s.Viewer.Threshold}; khóa ngắn để InputGuard ổn định rồi xác minh lại.");
-                return true;
-            }
-
-            // LIVE đầu tiên của nguồn đề xuất mới vẫn thấp: bắt đầu một streak mới từ 1,
-            // không reset /live ngay lần nữa.
-            RecordLowViewerLive(source + " / LIVE đầu tiên sau reset /live", value);
-            _log.Warn($"[VIEWER_FEED_RESET_DONE] source={source} result=still-low value={value}; streak mới={_consecutiveLowViewerLives}/{ViewerLowStreakFeedResetThreshold}.");
-            return false;
+            return true;
         }
-        catch (OperationCanceledException) { throw; }
-        catch (Exception ex)
-        {
-            ReportProblem("VIEWER_FEED_RESET_FAILED", "Người xem",
-                $"Đã có {streak} LIVE thấp liên tiếp nhưng chưa tải lại được /live: {ex.Message}. Sẽ tiếp tục tìm LIVE và chỉ thử hard-reset lại sau {ViewerLowStreakFeedResetThreshold} LIVE thấp mới.",
-                error: IsLikelyCdpIssue(ex), throttleSeconds: 15);
-            _log.Warn($"[VIEWER_FEED_RESET_FAILED] source={source} reason={ex.Message}");
-            return false;
-        }
+
+        _log.Warn(
+            $"[LIVE_SOURCE_SEARCH_FALLBACK_MISS] source={source} " +
+            $"lowPairCycle={_lowPairSourceCycleCount}/{LowPairCyclesBeforeForcedSearch} " +
+            "action=CONTINUE_ARROW_CHAIN noNavigateLiveReset=true");
+        return false;
     }
 
     async Task<(int value, string raw)> ReadViewerAsync(CancellationToken ct)
