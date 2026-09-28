@@ -1804,6 +1804,12 @@ public sealed partial class MainForm : Form
             }
             return;
         }
+
+        // Manager đang chạy chuỗi Tên/ảnh -> VIDEO. Không được Search LIVE hay
+        // khởi động AutomationEngine trước chuỗi này. Intent Start được ghi lại và
+        // Worker sẽ tự thử lại khi Manager gửi setup_release.
+        if (DeferStartForManagedAccountSetup("before_start", suppressDialogs)) return;
+
         _startStopCommandInFlight = true;
         UpdateRunControlButtons();
         try
@@ -1812,6 +1818,7 @@ public sealed partial class MainForm : Form
             ThrowIfEmergencyStopRequested("before_ensure_chrome");
             await EnsureChromeAsync(respectEmergencyStop: true);
             ThrowIfEmergencyStopRequested("after_ensure_chrome");
+            if (DeferStartForManagedAccountSetup("after_ensure_chrome", suppressDialogs)) return;
 
             // V13.5: giữ nguyên LIVE hiện tại nếu các XPath thao tác chính đã có.
             // CdpPage.Url là metadata được chụp tại lúc attach và KHÔNG tự cập nhật khi user
@@ -1822,6 +1829,7 @@ public sealed partial class MainForm : Form
                 await GetFreshStartupCurrentUrlAsync("before-live-probe"));
             var alreadyOnReadyLive = await IsCurrentLiveReadyForStartAsync();
             ThrowIfEmergencyStopRequested("after_live_ready_probe");
+            if (DeferStartForManagedAccountSetup("after_live_ready_probe", suppressDialogs)) return;
             if (alreadyOnReadyLive)
             {
                 _startupPreparationState = "READY";
@@ -1852,6 +1860,7 @@ public sealed partial class MainForm : Form
                     _log.Info("[TIKTOK_STARTUP_NEED_LIVE] currentUrlIsLive=false action=SEARCH_LIVE_FIRST");
                     await PrepareTikTokProfileStartupAsync(openLiveWhenReady: false);
                     ThrowIfEmergencyStopRequested("after_prepare_tiktok_home_for_search");
+                    if (DeferStartForManagedAccountSetup("after_prepare_home_for_search", suppressDialogs)) return;
                     if (!string.Equals(_startupPreparationState, "READY", StringComparison.OrdinalIgnoreCase))
                     {
                         var detail = GetTikTokStartupGateDetail();
@@ -1860,8 +1869,10 @@ public sealed partial class MainForm : Form
                         return;
                     }
 
+                    if (DeferStartForManagedAccountSetup("before_startup_live_search", suppressDialogs)) return;
                     searchStartupSucceeded = await TryStartupLiveSearchAsync();
                     ThrowIfEmergencyStopRequested("after_startup_live_search");
+                    if (DeferStartForManagedAccountSetup("after_startup_live_search", suppressDialogs)) return;
                 }
 
                 if (!searchStartupSucceeded)
@@ -1871,6 +1882,7 @@ public sealed partial class MainForm : Form
                         : "[TIKTOK_STARTUP_NEED_LIVE] currentUrlIsLive=false action=PREPARE_TIKTOK_LIVE");
                     await PrepareTikTokProfileStartupAsync();
                     ThrowIfEmergencyStopRequested("after_prepare_tiktok_startup");
+                    if (DeferStartForManagedAccountSetup("after_prepare_tiktok_startup", suppressDialogs)) return;
                     if (!string.Equals(_startupPreparationState, "READY", StringComparison.OrdinalIgnoreCase))
                     {
                         var detail = GetTikTokStartupGateDetail();
@@ -1883,6 +1895,7 @@ public sealed partial class MainForm : Form
 
             if (!await ValidateCoreXpathsBeforeStartAsync(suppressDialogs)) return;
             ThrowIfEmergencyStopRequested("after_xpath_validation");
+            if (DeferStartForManagedAccountSetup("after_xpath_validation", suppressDialogs)) return;
 
             // ValidateCoreXpaths có thể mất một khoảng thời gian; refresh thêm lần cuối để
             // AutomationEngine.Start nhận đúng URL hiện tại. Viewer Gate phía engine vẫn chạy
@@ -1892,6 +1905,7 @@ public sealed partial class MainForm : Form
             {
                 _log.Warn($"[TIKTOK_STARTUP_FINAL_METADATA_REFRESH_WARN] reason={ShortText(ex.Message, 140)}");
             }
+            if (DeferStartForManagedAccountSetup("before_engine_start", suppressDialogs)) return;
             _engine.Start(_settings, GetAutomationContents());
         }
         catch (OperationCanceledException ex)

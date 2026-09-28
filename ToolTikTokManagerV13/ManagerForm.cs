@@ -34,6 +34,10 @@ public sealed partial class ManagerForm : Form
         public WorkerSnapshot? LastSnapshot { get; set; }
         public string LastConfirmedRuntimeState { get; set; } = RuntimeStateUnknown;
         public DateTime LastConfirmedRuntimeStateUtc { get; set; } = DateTime.MinValue;
+        // Chỉ cập nhật khi Manager nhận được một lệnh START/RESUME thành công hoặc
+        // Tự bù xác nhận runtime khỏe. Dùng để phân biệt một FAULT_10M request cũ
+        // với profile đã được mở/chạy lại thành công sau thời điểm request được tạo.
+        public DateTime LastRunActivationUtc { get; set; } = DateTime.MinValue;
         public bool RuntimeRecoveryInProgress { get; set; }
         public int ConsecutiveStatusPollFailures { get; set; }
         public string LastStatusPollFailure { get; set; } = "";
@@ -236,7 +240,7 @@ public sealed partial class ManagerForm : Form
         toolbarRow1.Controls.Add(Button("🤖 + Auto Profile", (_, _) => ShowAutoProfileDialog(), UiButtonKind.Primary));
         toolbarRow1.Controls.Add(Button("🗂 Kho tài khoản", (_, _) => ShowAccountPoolDialog(), UiButtonKind.Neutral));
         toolbarRow1.Controls.Add(Button("🧩 Cấu hình mặc định", (_, _) => ShowDefaultConfigDialog(), UiButtonKind.Neutral));
-        toolbarRow1.Controls.Add(Button("🖼 Tên ảnh TikTok", (_, _) => ShowTikTokIdentityDialog(), UiButtonKind.Neutral));
+        toolbarRow1.Controls.Add(Button("🖼 Tên ảnh, video TikTok", (_, _) => ShowTikTokIdentityDialog(), UiButtonKind.Neutral));
         toolbarRow1.Controls.Add(Button("💬 Tin nhắn TikTok", (_, _) => ShowTikTokMessageReplyDialog(), UiButtonKind.Neutral));
 
         var toolbarRow2 = ToolbarRow();
@@ -307,7 +311,7 @@ public sealed partial class ManagerForm : Form
             {
                 "Mở profile" => (Color.FromArgb(232, 242, 255), Color.FromArgb(35, 91, 152)),
                 "Profile" or "+ Auto Profile" => (Color.FromArgb(238, 246, 255), Color.FromArgb(35, 91, 152)),
-                "Kho tài khoản" or "Cấu hình mặc định" or "Tên ảnh TikTok" or "Tên & ảnh TikTok" or "Tin nhắn TikTok" => (Color.FromArgb(242, 246, 251), Color.FromArgb(55, 76, 103)),
+                "Kho tài khoản" or "Cấu hình mặc định" or "Tên ảnh TikTok" or "Tên & ảnh TikTok" or "Tên ảnh, video TikTok" or "Tin nhắn TikTok" => (Color.FromArgb(242, 246, 251), Color.FromArgb(55, 76, 103)),
                 "Delete" or "Stop All" => (Color.FromArgb(255, 239, 239), Color.FromArgb(171, 62, 62)),
                 "Auto Run" => (Color.FromArgb(234, 248, 238), Color.FromArgb(36, 119, 66)),
                 _ => (UiTheme.Card, Color.FromArgb(42, 57, 76))
@@ -911,6 +915,15 @@ public sealed partial class ManagerForm : Form
             ctx.Profile.Name,
             "before_worker_start");
         var pipe = PipeName(ctx.Profile.Name);
+
+        // Arm trước khi spawn Worker để ngay cả khi người dùng bấm Start rất sớm,
+        // Worker cũng không được chạy Search LIVE/Automation trước Tên/ảnh -> VIDEO.
+        // Nếu AutoOnReady không bật/không có nguồn Excel thì không tạo hold.
+        if (ShouldArmManagedAccountSetupHold())
+            ArmManagedAccountSetupHold(ctx, "before_worker_start");
+        else
+            ClearManagedAccountSetupHold(ctx, "before_worker_start_not_needed");
+
         var args = $"--worker --embedded --profile {Quote(ctx.Profile.Name)} --profile-path {Quote(ctx.Profile.ProfilePath)} --cdp-port {ctx.Profile.CdpPort} --data-root {Quote(dataRoot)} --pipe-name {Quote(pipe)}";
         var process = new Process
         {
@@ -1169,13 +1182,15 @@ public sealed partial class ManagerForm : Form
             // failure into a fresh Worker's legitimate STOPPED snapshot.
             if (command.Equals("status", StringComparison.OrdinalIgnoreCase)
                 || command.Equals("message_reply_status", StringComparison.OrdinalIgnoreCase)
-                || command.Equals("message_reply_log", StringComparison.OrdinalIgnoreCase))
+                || command.Equals("message_reply_log", StringComparison.OrdinalIgnoreCase)
+                || command.Equals("video_delete_status", StringComparison.OrdinalIgnoreCase))
             {
                 if (ctx.Worker is null || ctx.Worker.HasExited)
                     throw new InvalidOperationException($"Worker process is not running for profile '{ctx.Profile.Name}'.");
                 return await SendPipeAsync(ctx.Profile.Name, command, effectiveTimeout);
             }
-            if (command.Equals("message_reply_stop", StringComparison.OrdinalIgnoreCase)
+            if ((command.Equals("message_reply_stop", StringComparison.OrdinalIgnoreCase)
+                 || command.Equals("video_delete_stop", StringComparison.OrdinalIgnoreCase))
                 && (ctx.Worker is null || ctx.Worker.HasExited))
                 return "not_running";
 
@@ -1700,10 +1715,10 @@ public sealed partial class ManagerForm : Form
                     var snapshot = JsonSerializer.Deserialize<WorkerSnapshot>(raw, WorkerSnapshotJson)
                                    ?? new WorkerSnapshot();
                     var runState = NormalizeRuntimeState(snapshot.RunState);
-                    if (runState != RuntimeStateStopped || snapshot.MessageReplyRunning)
+                    if (runState != RuntimeStateStopped || snapshot.MessageReplyRunning || snapshot.VideoDeleteRunning)
                     {
                         _log.Info(
-                            $"[DEFAULT_CONFIG_SYNC_DEFER] profile={ctx.Profile.Name} revision={state.Revision} reason={reason} runtime={runState} messageReply={snapshot.MessageReplyRunning}");
+                            $"[DEFAULT_CONFIG_SYNC_DEFER] profile={ctx.Profile.Name} revision={state.Revision} reason={reason} runtime={runState} messageReply={snapshot.MessageReplyRunning} videoDelete={snapshot.VideoDeleteRunning}");
                         return;
                     }
                 }
@@ -2722,8 +2737,12 @@ public sealed partial class ManagerForm : Form
             BackgroundColor = ModernDialog.Canvas,
             BorderStyle = BorderStyle.None,
             AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None,
-            ScrollBars = ScrollBars.Both
+            ScrollBars = ScrollBars.Both,
+            ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing,
+            ColumnHeadersHeight = 34
         };
+        grid.RowTemplate.Height = 28;
+        grid.DefaultCellStyle.Padding = new Padding(2, 0, 2, 0);
 
         // Chỉ thay đổi HIỂN THỊ Kho tài khoản.
         // Mật khẩu/2FA vẫn được đọc và lưu trong Excel như cũ, nhưng không đưa lên bảng.
@@ -2731,7 +2750,7 @@ public sealed partial class ManagerForm : Form
         {
             Name = "row",
             HeaderText = "Dòng",
-            Width = 46,
+            Width = 42,
             Frozen = true,
             DefaultCellStyle = new DataGridViewCellStyle
             {
@@ -2744,7 +2763,7 @@ public sealed partial class ManagerForm : Form
         {
             Name = "assigned",
             HeaderText = "Profile",
-            Width = 92,
+            Width = 72,
             Frozen = true,
             DefaultCellStyle = new DataGridViewCellStyle
             {
@@ -2768,49 +2787,68 @@ public sealed partial class ManagerForm : Form
         {
             Name = "user",
             HeaderText = "Tài khoản",
-            Width = 245
+            Width = 190
         });
         grid.Columns.Add(new DataGridViewTextBoxColumn
         {
             Name = "note",
             HeaderText = "Ghi chú",
-            Width = 165
+            Width = 125
+        });
+        grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            Name = "video",
+            HeaderText = "VIDEO",
+            Width = 90
         });
         grid.Columns.Add(new DataGridViewTextBoxColumn
         {
             Name = "identity",
             HeaderText = "Tên/ảnh",
-            Width = 100
+            Width = 92
         });
         grid.Columns.Add(new DataGridViewTextBoxColumn
         {
             Name = "autoProfile",
             HeaderText = "Auto Profile",
-            Width = 115
+            Width = 102
         });
         grid.Columns.Add(new DataGridViewTextBoxColumn
         {
             Name = "reuseQueue",
             HeaderText = "Chờ dùng lại",
-            Width = 155
+            Width = 120
+        });
+        grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            Name = "timeLogin",
+            HeaderText = "TimeLogin",
+            Width = 132,
+            DefaultCellStyle = new DataGridViewCellStyle
+            {
+                Alignment = DataGridViewContentAlignment.MiddleCenter,
+                ForeColor = Color.FromArgb(62, 78, 96)
+            }
         });
         grid.Columns.Add(new DataGridViewTextBoxColumn
         {
             Name = "reuseReason",
             HeaderText = "Lý do chờ",
-            Width = 205
+            MinimumWidth = 165,
+            AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
+            FillWeight = 100
         });
         LogGridSchema(
             grid,
             "AccountPoolGrid",
-            "row", "assigned", "user", "note", "identity",
-            "autoProfile", "reuseQueue", "reuseReason");
+            "row", "assigned", "user", "note", "video", "identity",
+            "autoProfile", "reuseQueue", "timeLogin", "reuseReason");
 
         var detailInfo = new Label
         {
             Dock = DockStyle.Bottom,
-            Height = 70,
-            Padding = new Padding(16, 8, 16, 8),
+            Height = 74,
+            Padding = new Padding(14, 7, 14, 7),
             AutoEllipsis = false,
             ForeColor = Color.FromArgb(46, 65, 88),
             BackColor = Color.FromArgb(247, 250, 253),
@@ -2820,6 +2858,10 @@ public sealed partial class ManagerForm : Form
 
         List<TikTokAccountPoolItem> items = new();
         Dictionary<string, TikTokAccountPoolService.TikTokAccountAutoState> autoStates =
+            new(StringComparer.OrdinalIgnoreCase);
+        Dictionary<string, string> videoResults =
+            new(StringComparer.OrdinalIgnoreCase);
+        Dictionary<string, string> timeLoginResults =
             new(StringComparer.OrdinalIgnoreCase);
         DateTime lastSourceWriteUtc = DateTime.MinValue;
         DateTime lastReuseQueueScanUtc = DateTime.MinValue;
@@ -2859,6 +2901,11 @@ public sealed partial class ManagerForm : Form
 
             autoStates.TryGetValue(item.Id, out var autoState);
             var identityResults = _accountPoolService.GetIdentityResults();
+
+            var videoText =
+                videoResults.TryGetValue(item.Username, out var videoResult)
+                    ? videoResult
+                    : "—";
 
             var noteText =
                 string.IsNullOrWhiteSpace(item.Note)
@@ -2900,9 +2947,15 @@ public sealed partial class ManagerForm : Form
                         ? reason
                         : "CHƯA QUÉT";
 
+            var timeLoginText =
+                timeLoginResults.TryGetValue(item.Username, out var timeLogin)
+                    && !string.IsNullOrWhiteSpace(timeLogin)
+                        ? timeLogin.Trim()
+                        : "—";
+
             detailInfo.Text =
-                $"Profile {(assignedProfile.Length == 0 ? "—" : assignedProfile)}  •  {item.Username}  •  Dòng {item.SourceRow}\n"
-                + $"Ghi chú: {noteText}    |    Tên/ảnh: {identityText}    |    Auto Profile: {autoProfileText}    |    Chờ: {reuseText}    |    Lý do: {reuseReasonText}";
+                $"Profile {(assignedProfile.Length == 0 ? "—" : assignedProfile)}  •  {item.Username}  •  Dòng {item.SourceRow}  •  TimeLogin: {timeLoginText}\n"
+                + $"Ghi chú: {noteText}    |    VIDEO: {videoText}    |    Tên/ảnh: {identityText}    |    Auto Profile: {autoProfileText}    |    Chờ: {reuseText}    |    Lý do: {reuseReasonText}";
         }
 
         void RefreshGrid()
@@ -2926,6 +2979,26 @@ public sealed partial class ManagerForm : Form
                     StringComparer.OrdinalIgnoreCase);
             }
 
+            try
+            {
+                videoResults = _accountPoolService.GetVideoResults();
+            }
+            catch
+            {
+                videoResults = new Dictionary<string, string>(
+                    StringComparer.OrdinalIgnoreCase);
+            }
+
+            try
+            {
+                timeLoginResults = _accountPoolService.GetTimeLoginResults();
+            }
+            catch
+            {
+                timeLoginResults = new Dictionary<string, string>(
+                    StringComparer.OrdinalIgnoreCase);
+            }
+
             grid.Rows.Clear();
             var identityResults = _accountPoolService.GetIdentityResults();
             var reuseQueue = GetReusableProfileQueueSnapshot();
@@ -2941,6 +3014,9 @@ public sealed partial class ManagerForm : Form
                     item.AssignedProfile,
                     item.Username,
                     item.Note,
+                    videoResults.TryGetValue(item.Username, out var videoResult)
+                        ? videoResult
+                        : "",
                     identityResults.TryGetValue(item.Username, out var identityResult)
                         ? identityResult
                         : "",
@@ -2952,6 +3028,9 @@ public sealed partial class ManagerForm : Form
                         ? reuseItem.IsManual
                             ? $"#{reuseItem.Position} · THỦ CÔNG"
                             : $"#{reuseItem.Position} · {FormatReusableRuntime(reuseItem.TotalRuntime)}"
+                        : "",
+                    timeLoginResults.TryGetValue(item.Username, out var timeLoginValue)
+                        ? timeLoginValue
                         : "",
                     string.IsNullOrWhiteSpace(item.AssignedProfile)
                         ? "CHƯA GÁN PROFILE"
@@ -2972,6 +3051,27 @@ public sealed partial class ManagerForm : Form
                 {
                     row.Cells["note"].Style.BackColor = Color.MistyRose;
                     row.Cells["note"].Style.ForeColor = Color.Firebrick;
+                }
+
+                var videoText =
+                    videoResults.TryGetValue(item.Username, out var videoState)
+                        ? videoState.Trim()
+                        : "";
+
+                if (videoText.Equals("DONE|DONE", StringComparison.OrdinalIgnoreCase))
+                {
+                    row.Cells["video"].Style.BackColor = Color.Honeydew;
+                    row.Cells["video"].Style.ForeColor = Color.DarkGreen;
+                }
+                else if (videoText.Contains("FAIL", StringComparison.OrdinalIgnoreCase))
+                {
+                    row.Cells["video"].Style.BackColor = Color.MistyRose;
+                    row.Cells["video"].Style.ForeColor = Color.Firebrick;
+                }
+                else if (videoText.Length > 0)
+                {
+                    row.Cells["video"].Style.BackColor = Color.FromArgb(245, 247, 250);
+                    row.Cells["video"].Style.ForeColor = Color.DimGray;
                 }
 
                 var identityText =
@@ -3853,9 +3953,9 @@ public sealed partial class ManagerForm : Form
         using var form = new Form
         {
             Text = $"Tài khoản TikTok — {profileContext.Profile.Name}",
-            Width = 600,
+            Width = 760,
             Height = 600,
-            MinimumSize = new Size(560, 520),
+            MinimumSize = new Size(700, 520),
             StartPosition = FormStartPosition.CenterParent,
             FormBorderStyle = FormBorderStyle.Sizable,
             MinimizeBox = false,
@@ -3951,10 +4051,12 @@ public sealed partial class ManagerForm : Form
         contentHost.Controls.Add(root);
 
         var choosePool = new Button { Text = "Chọn từ kho", Size = new Size(124, 42) };
+        var loginNow = new Button { Text = "Đăng nhập ngay", Size = new Size(142, 42) };
         var save = new Button { Text = "Lưu thay đổi", Size = new Size(132, 42) };
         var clear = new Button { Text = "Xóa đăng nhập", Size = new Size(130, 42) };
         var cancel = new Button { Text = "Hủy", DialogResult = DialogResult.Cancel, Size = new Size(100, 42) };
         ModernDialog.StylePrimaryButton(save);
+        ModernDialog.StyleSecondaryButton(loginNow);
         ModernDialog.StyleSecondaryButton(choosePool);
         ModernDialog.StyleSecondaryButton(clear);
         ModernDialog.StyleSecondaryButton(cancel);
@@ -3975,6 +4077,7 @@ public sealed partial class ManagerForm : Form
         };
         buttons.Controls.Add(cancel);
         buttons.Controls.Add(save);
+        buttons.Controls.Add(loginNow);
         buttons.Controls.Add(clear);
         buttons.Controls.Add(choosePool);
         footer.Controls.Add(buttons);
@@ -3994,22 +4097,180 @@ public sealed partial class ManagerForm : Form
             totp.Text = selected.TotpSecret;
         };
 
-        save.Click += (_, _) =>
+        bool PersistAuthChanges()
         {
             try
             {
                 if ((user.Text.Trim().Length == 0) != (pass.Text.Length == 0))
                     throw new InvalidOperationException("Hãy nhập đủ tài khoản và mật khẩu.");
-                _tiktokAuthService.Save(dataRoot, user.Text.Trim(), pass.Text, totp.Text, auto.Checked);
+
+                _tiktokAuthService.Save(
+                    dataRoot,
+                    user.Text.Trim(),
+                    pass.Text,
+                    totp.Text,
+                    auto.Checked);
+
                 if (!string.IsNullOrWhiteSpace(pendingPoolId))
-                    _accountPoolService.Assign(pendingPoolId, profileContext.Profile.Name);
-                _log.Info($"[TIKTOK_AUTH_SAVED] profile={profileContext.Profile.Name} usernameConfigured={user.Text.Trim().Length > 0} totpConfigured={totp.Text.Trim().Length > 0}");
-                form.DialogResult = DialogResult.OK;
-                form.Close();
+                {
+                    _accountPoolService.Assign(
+                        pendingPoolId,
+                        profileContext.Profile.Name);
+                    pendingPoolId = null;
+                }
+
+                _log.Info(
+                    $"[TIKTOK_AUTH_SAVED] profile={profileContext.Profile.Name} usernameConfigured={user.Text.Trim().Length > 0} totpConfigured={totp.Text.Trim().Length > 0}");
+                return true;
             }
             catch (Exception ex)
             {
-                ModernDialog.ShowMessage(form, ex.Message, "Không lưu được", MessageBoxIcon.Warning);
+                ModernDialog.ShowMessage(
+                    form,
+                    ex.Message,
+                    "Không lưu được",
+                    MessageBoxIcon.Warning);
+                return false;
+            }
+        }
+
+        loginNow.Click += async (_, _) =>
+        {
+            if (!PersistAuthChanges())
+                return;
+
+            if (string.IsNullOrWhiteSpace(user.Text.Trim())
+                || string.IsNullOrEmpty(pass.Text))
+            {
+                ModernDialog.ShowMessage(
+                    form,
+                    "Hãy nhập tài khoản và mật khẩu trước khi bấm Đăng nhập ngay.",
+                    "Đăng nhập TikTok",
+                    MessageBoxIcon.Information);
+                return;
+            }
+
+            if (profileContext.Opening)
+            {
+                ModernDialog.ShowMessage(
+                    form,
+                    $"Profile {profileContext.Profile.Name} đang có thao tác mở/khôi phục khác. Hãy chờ thao tác đó hoàn tất rồi thử lại.",
+                    "Đăng nhập TikTok",
+                    MessageBoxIcon.Information);
+                return;
+            }
+
+            profileContext.Opening = true;
+            loginNow.Enabled = false;
+            save.Enabled = false;
+            clear.Enabled = false;
+            choosePool.Enabled = false;
+            cancel.Enabled = false;
+            form.UseWaitCursor = true;
+
+            try
+            {
+                SetStatus(
+                    profileContext,
+                    "Đăng nhập thủ công — đang dừng automation và gọi luồng đăng nhập hiện có...",
+                    Color.DarkOrange);
+
+                try
+                {
+                    var stopReply = await SendCommandAsync(
+                        profileContext,
+                        "stop",
+                        TimeSpan.FromSeconds(8));
+                    _log.Info(
+                        $"[MANUAL_RELOGIN_STOP] profile={profileContext.Profile.Name} reply={stopReply}");
+                }
+                catch (Exception ex)
+                {
+                    _log.Warn(
+                        $"[MANUAL_RELOGIN_STOP_WARN] profile={profileContext.Profile.Name} error={ex.Message}");
+                }
+
+                var reply = await SendCommandAsync(
+                    profileContext,
+                    "runtime_relogin_auto",
+                    TimeSpan.FromSeconds(180));
+
+                _log.Warn(
+                    $"[MANUAL_RELOGIN_RESULT] profile={profileContext.Profile.Name} reply={reply}");
+
+                var (message, icon, statusColor) = reply.Trim().ToLowerInvariant() switch
+                {
+                    "opened" => (
+                        "Đăng nhập TikTok đã hoàn tất. Tool chỉ đăng nhập, không tự Bắt đầu automation.",
+                        MessageBoxIcon.Information,
+                        Color.DarkGreen),
+                    "account_banned" => (
+                        "Luồng đăng nhập xác nhận tài khoản bị cấm/đình chỉ/không tồn tại.",
+                        MessageBoxIcon.Warning,
+                        Color.Firebrick),
+                    "captcha_required" => (
+                        "TikTok đang yêu cầu CAPTCHA. Chrome được giữ nguyên để bạn xử lý.",
+                        MessageBoxIcon.Information,
+                        Color.DarkOrange),
+                    "totp_required" => (
+                        "TikTok yêu cầu 2FA nhưng profile chưa có secret TOTP hợp lệ.",
+                        MessageBoxIcon.Warning,
+                        Color.DarkOrange),
+                    "login_failed" => (
+                        "Đăng nhập chưa thành công sau thời gian chờ. Chưa tự kết luận BAN.",
+                        MessageBoxIcon.Warning,
+                        Color.DarkOrange),
+                    _ => (
+                        $"Luồng đăng nhập trả về: {reply}. Xem log Worker/Manager để biết chi tiết.",
+                        MessageBoxIcon.Information,
+                        Color.DarkOrange)
+                };
+
+                SetStatus(
+                    profileContext,
+                    reply.Equals("opened", StringComparison.OrdinalIgnoreCase)
+                        ? "Đăng nhập thủ công thành công — chưa Start automation."
+                        : $"Đăng nhập thủ công: {reply}",
+                    statusColor);
+
+                ModernDialog.ShowMessage(
+                    form,
+                    message,
+                    "Đăng nhập TikTok",
+                    icon);
+            }
+            catch (Exception ex)
+            {
+                _log.Error(
+                    $"[MANUAL_RELOGIN_ERROR] profile={profileContext.Profile.Name} error={ex}");
+                SetStatus(
+                    profileContext,
+                    "Đăng nhập thủ công lỗi: " + ex.Message,
+                    Color.Firebrick);
+                ModernDialog.ShowMessage(
+                    form,
+                    ex.Message,
+                    "Không đăng nhập được",
+                    MessageBoxIcon.Warning);
+            }
+            finally
+            {
+                profileContext.Opening = false;
+                loginNow.Enabled = true;
+                save.Enabled = true;
+                clear.Enabled = true;
+                choosePool.Enabled = true;
+                cancel.Enabled = true;
+                form.UseWaitCursor = false;
+            }
+        };
+
+        save.Click += (_, _) =>
+        {
+            if (PersistAuthChanges())
+            {
+                form.DialogResult = DialogResult.OK;
+                form.Close();
             }
         };
         clear.Click += (_, _) =>
@@ -5815,6 +6076,7 @@ public sealed partial class ManagerForm : Form
         public string RuntimeAuthState { get; set; } = "";
         public string RuntimeAuthDetail { get; set; } = "";
         public bool MessageReplyRunning { get; set; }
+        public bool VideoDeleteRunning { get; set; }
     }
 
     sealed class ChromeViewResolutionReply

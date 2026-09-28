@@ -21,7 +21,9 @@ public sealed partial class ManagerForm
         string Message,
         bool ChangedName = false,
         bool Transient = false,
-        bool Deferred = false);
+        bool Deferred = false,
+        bool TerminalCleanupDeferred = false,
+        string DeferredCleanupDetail = "");
 
     static readonly TimeSpan NameGuardTransientRetryDelay = TimeSpan.FromSeconds(15);
     static readonly TimeSpan NameGuardManagerProbeTimeout = TimeSpan.FromSeconds(45);
@@ -85,14 +87,77 @@ public sealed partial class ManagerForm
             return "emergency_stopped";
         }
 
+        // Chặn Worker Start/LIVE ngay từ đầu chuỗi. Hold này không thay đổi logic
+        // Tên/ảnh: nó chỉ bảo đảm Chrome không bị luồng chính tranh quyền trong lúc
+        // Tên/ảnh -> VIDEO đang chạy.
+        ArmManagedAccountSetupHold(ctx, "start_with_name_guard");
+
+        // VIDEO chỉ được thử một lượt trong cùng một lệnh Start. Tên/ảnh có thể retry
+        // tối đa 3 lượt theo logic cũ, nhưng VIDEO không được lặp lại chỉ vì Name Guard
+        // đang chờ ổn định. Quan trọng: VIDEO luôn nằm SAU lần xử lý Tên/ảnh đầu tiên
+        // và TRƯỚC khi gửi Start cho Worker.
+        var videoAttemptedForThisStart = false;
+
         // Lỗi kỹ thuật tạm thời của Name Guard (DOM/CDP/IPC chậm) không được biến
         // ngay thành một profile bù hỏng. Giữ nguyên Chrome/Worker và thử lại cùng
         // profile tối đa 3 lượt, cách nhau 15 giây. Chỉ lỗi cứng mới BLOCK ngay.
         for (var attempt = 1; attempt <= NameGuardTransientStartMaxAttempts; attempt++)
         {
-            var guard = await EnsureNameGuardBeforeStartAsync(ctx);
+            // Với lệnh Start, trì hoãn cleanup đóng Chrome/Worker của lỗi cứng hoặc
+            // NAME_SYNC_PENDING cho tới SAU VIDEO. Như vậy thứ tự luôn là:
+            // TÊN/ẢNH -> VIDEO -> quyết định Start theo đúng kết quả Tên/ảnh.
+            var guard = await EnsureNameGuardBeforeStartAsync(
+                ctx,
+                deferTerminalCleanup: true);
+
+            string guardUsername = "";
+            try
+            {
+                var account = await ResolveNameGuardAccountAsync(ctx);
+                guardUsername = (account.Username ?? "").Trim();
+            }
+            catch { }
+
+            if (!videoAttemptedForThisStart)
+            {
+                videoAttemptedForThisStart = true;
+                try
+                {
+                    _log.Info(
+                        $"[PRESTART_SEQUENCE_VIDEO_BEGIN] profile={ctx.Profile.Name} account={guardUsername} " +
+                        $"nameAllowed={guard.Allowed} nameTransient={guard.Transient} nameDeferred={guard.Deferred}");
+                    await EnsureAutoVideoBeforeStartAsync(ctx);
+                }
+                catch (Exception ex)
+                {
+                    // VIDEO là bước phụ: lỗi không được thay đổi quyết định Start của
+                    // Tên/ảnh. Chỉ ghi log rồi đi tiếp tới nhánh Name Guard hiện có.
+                    _log.Warn(
+                        $"[PRESTART_SEQUENCE_VIDEO_FAILOPEN] profile={ctx.Profile.Name} account={guardUsername} " +
+                        $"error={ex.Message}");
+                }
+            }
+
+            // Nếu Name Guard cần cleanup/queue đóng profile, chỉ thực hiện sau khi
+            // VIDEO đã có cơ hội chạy. Sau đó các nhánh Allowed/Deferred/Transient
+            // bên dưới vẫn giữ nguyên ý nghĩa của logic Tên/ảnh hiện tại.
+            try
+            {
+                await FinalizeDeferredNameGuardOutcomeAsync(ctx, guardUsername, guard);
+            }
+            catch (Exception ex)
+            {
+                _log.Warn(
+                    $"[NAME_GUARD_DEFERRED_FINALIZE_WARN] profile={ctx.Profile.Name} account={guardUsername} " +
+                    $"error={ex.Message}");
+            }
+
             if (guard.Allowed)
             {
+                // Tên/ảnh đã cho phép và VIDEO đã kết thúc/skip/fail-open. Chỉ lúc
+                // này mới nhả hold để Worker được phép vào Search LIVE/Automation.
+                await ReleaseManagedAccountSetupHoldAsync(ctx, "name_guard_allowed_after_video");
+
                 var reply = await SendCommandAsync(
                     ctx,
                     command,
@@ -104,9 +169,8 @@ public sealed partial class ManagerForm
                 return reply;
             }
 
-            // NAME_SYNC_PENDING là trạng thái chủ động DEFER: Name Guard đã đóng
-            // sạch runtime để chờ TikTok đồng bộ tên. Tuyệt đối không retry nội bộ
-            // rồi mở lại chính profile này trong cùng một suất bù.
+            // NAME_SYNC_PENDING là trạng thái chủ động DEFER. Cleanup/queue đã được
+            // thực hiện ở FinalizeDeferredNameGuardOutcomeAsync sau VIDEO.
             if (guard.Deferred)
             {
                 if (!suppressStatus)
@@ -171,7 +235,9 @@ public sealed partial class ManagerForm
             "name_sync_pending",
             StringComparison.OrdinalIgnoreCase);
 
-    async Task<NameGuardResult> EnsureNameGuardBeforeStartAsync(ProfileContext ctx)
+    async Task<NameGuardResult> EnsureNameGuardBeforeStartAsync(
+        ProfileContext ctx,
+        bool deferTerminalCleanup = false)
     {
         var state = LoadIdentityToolState();
         if (!state.UpdateName)
@@ -265,7 +331,12 @@ public sealed partial class ManagerForm
                     "chrome_not_connected_before_probe");
             }
 
-            return await ProcessNameGuardOnceAsync(ctx, username, state, names);
+            return await ProcessNameGuardOnceAsync(
+                ctx,
+                username,
+                state,
+                names,
+                deferTerminalCleanup);
         }
         catch (Exception ex)
         {
@@ -289,7 +360,8 @@ public sealed partial class ManagerForm
         ProfileContext ctx,
         string username,
         IdentityToolState state,
-        IReadOnlyList<string> names)
+        IReadOnlyList<string> names,
+        bool deferTerminalCleanup = false)
     {
         // 1) Lấy href Hồ sơ -> điều hướng -> poll tên. Không F5.
         var probe = await ProbeNameGuardFastAsync(ctx, username, names);
@@ -437,6 +509,18 @@ public sealed partial class ManagerForm
                         : "identity_update_retryable_dom_or_cdp");
             }
 
+            if (deferTerminalCleanup)
+            {
+                _log.Warn(
+                    $"[NAME_GUARD_FAIL_DEFER_CLEANUP] profile={ctx.Profile.Name} account={username} " +
+                    $"reason={reason}");
+                return new NameGuardResult(
+                    false,
+                    reason,
+                    TerminalCleanupDeferred: true,
+                    DeferredCleanupDetail: reason);
+            }
+
             await FailNameGuardAndCloseAsync(ctx, username, reason);
             return new NameGuardResult(false, reason);
         }
@@ -469,6 +553,21 @@ public sealed partial class ManagerForm
                   $"source={verifiedProbe?.Source ?? "-"}; message={verifiedProbe?.Message ?? "-"}"
                 : $"TikTok đã Save/Confirm nhưng tên trên Hồ sơ vẫn chưa cập nhật. " +
                   $"currentName='{seenName}', target='{targetName}'.";
+
+            if (deferTerminalCleanup)
+            {
+                _log.Warn(
+                    $"[NAME_GUARD_NAME_SYNC_DEFER_CLEANUP] profile={ctx.Profile.Name} account={username} " +
+                    $"detail={detail}");
+                return new NameGuardResult(
+                    false,
+                    "Tên đã Save nhưng TikTok chưa đồng bộ trên Hồ sơ; chờ xử lý sau VIDEO.",
+                    ChangedName: reply.NameChanged,
+                    Transient: true,
+                    Deferred: true,
+                    TerminalCleanupDeferred: true,
+                    DeferredCleanupDetail: detail);
+            }
 
             await QueueNameGuardNameSyncPendingAndCloseAsync(ctx, username, detail);
             return new NameGuardResult(
@@ -610,6 +709,34 @@ public sealed partial class ManagerForm
                 Message = ex.Message
             };
         }
+    }
+
+    async Task FinalizeDeferredNameGuardOutcomeAsync(
+        ProfileContext ctx,
+        string username,
+        NameGuardResult result)
+    {
+        if (!result.TerminalCleanupDeferred || result.Allowed)
+            return;
+
+        username = (username ?? "").Trim();
+        var detail = string.IsNullOrWhiteSpace(result.DeferredCleanupDetail)
+            ? result.Message
+            : result.DeferredCleanupDetail;
+
+        if (result.Deferred)
+        {
+            _log.Warn(
+                $"[NAME_GUARD_DEFERRED_FINALIZE_AFTER_VIDEO] profile={ctx.Profile.Name} account={username} " +
+                $"mode=NAME_SYNC_PENDING detail={detail}");
+            await QueueNameGuardNameSyncPendingAndCloseAsync(ctx, username, detail);
+            return;
+        }
+
+        _log.Warn(
+            $"[NAME_GUARD_DEFERRED_FINALIZE_AFTER_VIDEO] profile={ctx.Profile.Name} account={username} " +
+            $"mode=FAIL_CLOSE reason={detail}");
+        await FailNameGuardAndCloseAsync(ctx, username, detail);
     }
 
     bool IsNameGuardWorkerAlive(ProfileContext ctx)

@@ -127,6 +127,13 @@ public sealed partial class MainForm
         public string[] AllowedDisplayNames { get; set; } = Array.Empty<string>();
     }
 
+    sealed class ManagedVideoDeleteRequest
+    {
+        public string Username { get; set; } = "";
+        public string DeleteMode { get; set; } = "all";
+    }
+
+
     public Task<string> HandleManagedCommandAsync(string rawCommand)
     {
         var raw = (rawCommand ?? "").Trim();
@@ -144,13 +151,17 @@ public sealed partial class MainForm
         if (command == "message_reply_status") return Task.FromResult(BuildManagedMessageReplyStatusResponse());
         if (command == "message_reply_log") return Task.FromResult(BuildManagedMessageReplyLogResponse());
         if (command == "message_reply_stop") return Task.FromResult(StopManagedMessageReply());
+        if (command == "video_delete_status") return Task.FromResult(BuildManagedVideoDeleteStatusResponse());
+        if (command == "video_delete_stop") return Task.FromResult(StopManagedVideoDelete());
+        if (command == "video_upload_status") return Task.FromResult(BuildManagedVideoUploadStatusResponse());
+        if (command == "video_upload_stop") return Task.FromResult(StopManagedVideoUpload());
 
         return InvokeManagedOnUiAsync(async () =>
         {
             switch (command)
             {
                 case "reload_config":
-                    if (_engine.Running || IsMessageReplyRunning) return "busy_running";
+                    if (_engine.Running || IsMessageReplyRunning || IsVideoOperationRunning) return "busy_running";
                     _settings = _settingsService.Load();
                     ApplyManagedStartupOverrides();
                     ApplySelectedProfileToSettings(logSelection: false);
@@ -219,18 +230,25 @@ public sealed partial class MainForm
                 case "start":
                     if (IsManagerEmergencyStopActive()) return "emergency_stopped";
                     if (IsMessageReplyRunning) return "message_reply_running";
+                    if (IsVideoOperationRunning) return "video_delete_running";
+                    if (DeferStartForManagedAccountSetup("ipc_start", suppressDialogs: false)) return "setup_deferred";
                     await StartAsync();
                     return _engine.Running ? "started" : "not_started";
                 case "start_auto":
                     if (IsManagerEmergencyStopActive()) return "emergency_stopped";
                     if (IsMessageReplyRunning) return "message_reply_running";
+                    if (IsVideoOperationRunning) return "video_delete_running";
+                    if (DeferStartForManagedAccountSetup("ipc_start_auto", suppressDialogs: true)) return "setup_deferred";
                     await StartAsync(suppressDialogs: true);
                     return _engine.Running ? "started" : "not_started";
+                case "setup_release":
+                    return ReleaseManagedAccountSetupHold();
                 case "pause":
                     if (_engine.Running && !_engine.Paused) _engine.TogglePause();
                     return _engine.Paused ? "paused" : "not_paused";
                 case "resume":
                     if (IsManagerEmergencyStopActive()) return "emergency_stopped";
+                    if (IsVideoOperationRunning) return "video_delete_running";
                     if (_engine.Running && _engine.Paused) _engine.TogglePause();
                     return _engine.Running && !_engine.Paused ? "running" : "not_running";
                 case "stop":
@@ -242,16 +260,20 @@ public sealed partial class MainForm
                     // thật sự unwind. Nếu quá hạn, Manager sẽ fallback kill CHỈ Worker
                     // (không kill process tree) để giữ nguyên Chrome.
                     StopManagedMessageReply();
+                    StopManagedVideoDelete();
+                    StopManagedVideoUpload();
                     _engine.Stop("Dừng khẩn cấp từ Manager");
                     var fullyStopped = await _engine.WaitForStopAsync(TimeSpan.FromSeconds(2.5));
                     return fullyStopped ? "stopped" : "stop_pending";
                 }
                 case "launch":
+                    if (IsVideoOperationRunning) return "video_delete_running";
                     await LaunchChromeAsync();
                     if (!_chrome.Connected) return "not_opened";
                     return MapManagedLaunchState();
                 case "launch_auto":
                     if (IsManagerEmergencyStopActive()) return "emergency_stopped";
+                    if (IsVideoOperationRunning) return "video_delete_running";
                     // Auto Profile không giữ cả hàng đợi 15 phút khi gặp CAPTCHA.
                     // Chrome vẫn được giữ nguyên để người dùng xử lý thủ công sau.
                     await LaunchChromeAsync(stopOnCaptcha: true, suppressDialogs: true);
@@ -260,6 +282,7 @@ public sealed partial class MainForm
                 case "runtime_relogin_auto":
                     if (IsManagerEmergencyStopActive()) return "emergency_stopped";
                     if (IsMessageReplyRunning) return "message_reply_running";
+                    if (IsVideoOperationRunning) return "video_delete_running";
 
                     // runtime_login_lost đã được Worker xác nhận bằng popup đăng nhập
                     // lặp 3/3 sau Enter. Ở recovery này KHÔNG được tin lại cookie/session
@@ -355,12 +378,15 @@ public sealed partial class MainForm
                     return _chrome.Connected ? "connected" : "disconnected";
                 case "close_chrome":
                     StopManagedMessageReply();
+                    StopManagedVideoDelete();
+                    StopManagedVideoUpload();
                     return await CloseChromeAsync();
                 case "message_reply_start":
                     if (IsManagerEmergencyStopActive()) return "emergency_stopped";
                     return await StartManagedMessageReplyAsync(commandPayload);
                 case "identity_ready":
                 {
+                    if (IsVideoOperationRunning) return "video_delete_running";
                     if (!_chrome.Connected) return "not_connected";
                     try
                     {
@@ -378,6 +404,8 @@ public sealed partial class MainForm
                 }
                 case "identity_name_probe":
                 {
+                    if (IsVideoOperationRunning)
+                        return JsonSerializer.Serialize(new { ok = false, currentName = "", matched = false, currentHandle = "", source = "", message = "Profile đang xóa video TikTok." });
                     try
                     {
                         if (!_chrome.Connected)
@@ -417,6 +445,8 @@ public sealed partial class MainForm
                     {
                         if (IsMessageReplyRunning)
                             throw new InvalidOperationException("Profile đang xử lý Tin nhắn TikTok. Hãy dừng mục Tin nhắn trước khi cập nhật tên/ảnh.");
+                        if (IsVideoOperationRunning)
+                            throw new InvalidOperationException("Profile đang xử lý xóa video TikTok. Hãy chờ xóa video hoàn tất rồi cập nhật tên/ảnh.");
                         if (string.IsNullOrWhiteSpace(commandPayload))
                             throw new InvalidOperationException("Thiếu payload đổi tên/ảnh TikTok.");
                         var json = Encoding.UTF8.GetString(Convert.FromBase64String(commandPayload));
@@ -467,6 +497,10 @@ public sealed partial class MainForm
                         });
                     }
                 }
+                case "delete_tiktok_videos":
+                    return await StartManagedVideoDeleteAsync(commandPayload);
+                case "upload_tiktok_video":
+                    return await StartManagedVideoUploadAsync(commandPayload);
                 case "view_chrome":
                 {
                     var profilePath = _startupOptions.ProfilePath;
@@ -489,6 +523,8 @@ public sealed partial class MainForm
                     return "shown";
                 case "shutdown":
                     StopManagedMessageReply();
+                    StopManagedVideoDelete();
+                    StopManagedVideoUpload();
                     _managedShutdownRequested = true;
                     BeginInvoke(new Action(Close));
                     return "bye";
@@ -631,6 +667,7 @@ public sealed partial class MainForm
             ,RuntimeAuthState = _engine.RuntimeLoginLostConfirmed ? "LOGOUT_CONFIRMED" : "NORMAL"
             ,RuntimeAuthDetail = _engine.RuntimeLoginLostDetail
             ,MessageReplyRunning = IsMessageReplyRunning
+            ,VideoDeleteRunning = IsVideoOperationRunning
         });
     }
 

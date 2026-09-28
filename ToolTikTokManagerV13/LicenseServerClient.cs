@@ -8,12 +8,11 @@ namespace ToolTikTokManagerV13;
 /// <summary>
 /// Kết nối Manager với QITool License Server (Supabase Edge Functions).
 ///
-/// Bản vá này chạy ở SHADOW MODE:
+/// Kết nối QITool theo chế độ hybrid an toàn:
 /// - register thiết bị khi Manager khởi động;
 /// - heartbeat định kỳ khi Manager đang mở;
-/// - chỉ ghi log trạng thái server, KHÔNG thay đổi quyền chạy hiện tại của Tool.
-///
-/// Nhờ vậy có thể kiểm tra dữ liệu/Online/Offline trên web trước khi bật khóa từ xa.
+/// - chỉ áp dụng remote lock khi server trả explicit status=blocked + allowed=false
+///   và được xác nhận lại lần 2; mọi lỗi mạng/trạng thái khác đều fail-open.
 /// </summary>
 internal sealed class LicenseServerClient : IDisposable
 {
@@ -151,6 +150,25 @@ internal sealed class LicenseServerClient : IDisposable
         return result;
     }
 
+    public async Task<LicenseServerDecision> CheckAdminAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var payload = new
+        {
+            deviceId = _deviceId,
+            deviceHash = _deviceHash,
+            version = _version
+        };
+
+        var result = await PostAsync(
+            "device-admin-check",
+            payload,
+            cancellationToken).ConfigureAwait(false);
+
+        LogDecision("ADMIN_CHECK", result);
+        return result;
+    }
+
     public async Task<LicenseServerDecision> HeartbeatAsync(
         int profileCount = 0,
         CancellationToken cancellationToken = default)
@@ -173,12 +191,87 @@ internal sealed class LicenseServerClient : IDisposable
         return result;
     }
 
-    public async Task RunHeartbeatLoopAsync(CancellationToken cancellationToken)
+    public static bool IsExplicitBlocked(LicenseServerDecision? decision)
     {
+        if (decision is null || !decision.Reachable)
+            return false;
+
+        // Fail-open tuyệt đối với mọi trạng thái khác. Chỉ coi là khóa khi server
+        // trả về ĐỒNG THỜI status=blocked và allowed=false.
+        // pending/expired/unreachable/http lỗi/response thiếu field KHÔNG được khóa Tool.
+        return decision.Allowed is false
+               && string.Equals(
+                   (decision.Status ?? string.Empty).Trim(),
+                   "blocked",
+                   StringComparison.OrdinalIgnoreCase);
+    }
+
+    async Task<bool> ConfirmExplicitBlockAsync(
+        LicenseServerDecision firstDecision,
+        CancellationToken cancellationToken)
+    {
+        if (!IsExplicitBlocked(firstDecision))
+            return false;
+
+        Log(
+            $"[LICENSE_SERVER_BLOCK_SIGNAL] phase=first status={OneLine(firstDecision.Status)} " +
+            $"allowed={FormatBool(firstDecision.Allowed)} action=confirm_again_before_lock");
+
+        // Xác nhận lại bằng request độc lập để tránh một response tạm/stale làm khóa nhầm.
+        try
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(1200), cancellationToken)
+                .ConfigureAwait(false);
+
+            var secondDecision = await HeartbeatAsync(0, cancellationToken)
+                .ConfigureAwait(false);
+
+            var confirmed = IsExplicitBlocked(secondDecision);
+            Log(
+                $"[LICENSE_SERVER_BLOCK_CONFIRM] confirmed={confirmed} " +
+                $"status={OneLine(secondDecision.Status)} allowed={FormatBool(secondDecision.Allowed)} " +
+                $"reachable={secondDecision.Reachable} http={secondDecision.HttpStatus}");
+
+            return confirmed;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // Không xác nhận được lần 2 => KHÔNG khóa.
+            Log($"[LICENSE_SERVER_BLOCK_CONFIRM_FAIL_OPEN] detail={OneLine(ex.Message)}");
+            return false;
+        }
+    }
+
+    public async Task RunHeartbeatLoopAsync(
+        CancellationToken cancellationToken,
+        Func<LicenseServerDecision, Task>? onConfirmedExplicitBlock = null)
+    {
+        async Task<bool> HandleHeartbeatDecisionAsync(LicenseServerDecision decision)
+        {
+            if (onConfirmedExplicitBlock is null || !IsExplicitBlocked(decision))
+                return false;
+
+            if (!await ConfirmExplicitBlockAsync(decision, cancellationToken).ConfigureAwait(false))
+                return false;
+
+            Log(
+                $"[LICENSE_SERVER_REMOTE_LOCK_CONFIRMED] status={OneLine(decision.Status)} " +
+                $"allowed={FormatBool(decision.Allowed)} action=notify_manager");
+
+            await onConfirmedExplicitBlock(decision).ConfigureAwait(false);
+            return true;
+        }
+
         // Gửi ngay 1 heartbeat khi Manager vừa mở để web lên Online nhanh.
         try
         {
-            await HeartbeatAsync(0, cancellationToken).ConfigureAwait(false);
+            var initial = await HeartbeatAsync(0, cancellationToken).ConfigureAwait(false);
+            if (await HandleHeartbeatDecisionAsync(initial).ConfigureAwait(false))
+                return;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -186,6 +279,7 @@ internal sealed class LicenseServerClient : IDisposable
         }
         catch (Exception ex)
         {
+            // Mạng/Supabase lỗi không được làm Manager chết.
             Log($"[LICENSE_SERVER_HEARTBEAT_ERROR] phase=initial detail={OneLine(ex.Message)}");
         }
 
@@ -196,7 +290,9 @@ internal sealed class LicenseServerClient : IDisposable
             {
                 try
                 {
-                    await HeartbeatAsync(0, cancellationToken).ConfigureAwait(false);
+                    var decision = await HeartbeatAsync(0, cancellationToken).ConfigureAwait(false);
+                    if (await HandleHeartbeatDecisionAsync(decision).ConfigureAwait(false))
+                        return;
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
@@ -204,7 +300,7 @@ internal sealed class LicenseServerClient : IDisposable
                 }
                 catch (Exception ex)
                 {
-                    // Mạng/Supabase lỗi không được làm Manager chết trong shadow mode.
+                    // Mạng/Supabase lỗi không được làm Manager chết.
                     Log($"[LICENSE_SERVER_HEARTBEAT_ERROR] detail={OneLine(ex.Message)}");
                 }
             }
@@ -255,6 +351,7 @@ internal sealed class LicenseServerClient : IDisposable
                 Allowed: parsed?.Allowed,
                 Status: (parsed?.Status ?? "").Trim(),
                 IsNew: parsed?.IsNew,
+                IsAdmin: parsed?.IsAdmin,
                 Reason: (parsed?.Reason ?? parsed?.Error ?? "").Trim(),
                 Raw: OneLine(responseText, 500));
         }
@@ -271,6 +368,7 @@ internal sealed class LicenseServerClient : IDisposable
                 Allowed: null,
                 Status: "unreachable",
                 IsNew: null,
+                IsAdmin: null,
                 Reason: ex.Message,
                 Raw: "");
         }
@@ -279,10 +377,10 @@ internal sealed class LicenseServerClient : IDisposable
     static void LogDecision(string phase, LicenseServerDecision decision)
     {
         Log(
-            $"[LICENSE_SERVER_{phase}] mode=shadow reachable={decision.Reachable} " +
+            $"[LICENSE_SERVER_{phase}] mode=hybrid_safe_lock reachable={decision.Reachable} " +
             $"http={decision.HttpStatus} ok={decision.Ok} allowed={FormatBool(decision.Allowed)} " +
             $"status={OneLine(decision.Status)} isNew={FormatBool(decision.IsNew)} " +
-            $"reason={OneLine(decision.Reason)}");
+            $"isAdmin={FormatBool(decision.IsAdmin)} reason={OneLine(decision.Reason)}");
     }
 
     static string FormatBool(bool? value)
@@ -335,6 +433,9 @@ internal sealed class LicenseServerClient : IDisposable
         [JsonPropertyName("isNew")]
         public bool? IsNew { get; set; }
 
+        [JsonPropertyName("isAdmin")]
+        public bool? IsAdmin { get; set; }
+
         [JsonPropertyName("reason")]
         public string? Reason { get; set; }
 
@@ -350,5 +451,6 @@ internal sealed record LicenseServerDecision(
     bool? Allowed,
     string Status,
     bool? IsNew,
+    bool? IsAdmin,
     string Reason,
     string Raw);

@@ -31,6 +31,7 @@ public static class VersionRollbackGuard
     static readonly JsonSerializerOptions JsonRead = new() { PropertyNameCaseInsensitive = true };
     static readonly JsonSerializerOptions JsonWrite = new() { WriteIndented = true };
     static readonly object Sync = new();
+    static bool _adminBypass;
 
     static ServerVersionPolicy? _lastServerPolicy;
     static DateTime? _lastServerPolicyFetchedUtc;
@@ -87,6 +88,17 @@ public static class VersionRollbackGuard
         }
     }
 
+    public static bool AdminBypassActive
+    {
+        get { lock (Sync) return _adminBypass; }
+    }
+
+    public static void SetAdminBypass(bool enabled)
+    {
+        lock (Sync) _adminBypass = enabled;
+        AppendAudit($"[VERSION_GUARD_ADMIN_BYPASS] enabled={enabled}");
+    }
+
     public static DateTime? LastServerPolicyFetchedUtc
     {
         get { lock (Sync) return _lastServerPolicyFetchedUtc; }
@@ -100,6 +112,23 @@ public static class VersionRollbackGuard
         bool failClosedOnDowngrade = true,
         CancellationToken cancellationToken = default)
     {
+        if (AdminBypassActive)
+        {
+            var parsedAdminVersion = ParseVersion(currentVersion);
+            var normalizedAdminVersion = parsedAdminVersion is null ? (currentVersion ?? "") : FormatVersion(parsedAdminVersion);
+            AppendAudit($"[VERSION_GUARD_ADMIN_ALLOW] current={Safe(normalizedAdminVersion)} device={Safe(deviceId)}");
+            return new VersionGuardDecision
+            {
+                AllowRun = true,
+                CurrentVersion = normalizedAdminVersion,
+                HighestVersionEver = "",
+                Reason = "QITool ADMIN: bỏ qua toàn bộ giới hạn phiên bản.",
+                RecordUpdated = false,
+                ServerPolicyApplied = true,
+                DowngradeMode = ModeAllowAllOld
+            };
+        }
+
         // LOCAL GUARD LUÔN BẬT:
         // - luôn đọc/ghi HighestVersionEver để bản mới đã chạy thì bản thấp hơn bị chặn;
         // - serverControlEnabled chỉ quyết định có gọi API ngoại lệ rollback từ xa hay không.
@@ -263,6 +292,22 @@ public static class VersionRollbackGuard
         string action = "update_check",
         CancellationToken cancellationToken = default)
     {
+        if (AdminBypassActive)
+        {
+            var adminPolicy = new ServerVersionPolicy
+            {
+                Enabled = true,
+                Mode = ModeAllowAllOld,
+                AllowedVersions = new List<string>(),
+                HighestVersionEver = "",
+                AllowCurrentVersion = true,
+                Message = "QITool ADMIN: cho phép mọi phiên bản.",
+                PolicyVersion = "admin-local"
+            };
+            SetLastServerPolicy(adminPolicy);
+            return adminPolicy;
+        }
+
         if (!serverControlEnabled || string.IsNullOrWhiteSpace(serverPolicyUrl))
         {
             SetLastServerPolicy(null);
@@ -290,6 +335,8 @@ public static class VersionRollbackGuard
     public static bool IsDowngradeInstallAllowed(string targetVersion, string currentVersion, out string reason)
     {
         reason = "";
+        if (AdminBypassActive)
+            return true;
         var target = ParseVersion(targetVersion);
         var current = ParseVersion(currentVersion);
         if (target is null || current is null)

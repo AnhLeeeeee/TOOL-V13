@@ -68,6 +68,15 @@ public sealed partial class ManagerForm
         public int JitterSeconds { get; set; } = 30;
     }
 
+    sealed class AutoProfileBehaviorSettings
+    {
+        public int Version { get; set; } = 1;
+
+        // Mặc định OFF để update không tự thay đổi hành vi cũ. Khi bật, + Auto Profile
+        // gọi lại đúng pipeline VIDEO hiện có ngay sau Tên/ảnh và trước Start/LIVE.
+        public bool AutoVideoEnabled { get; set; }
+    }
+
     enum AutoProfileCooldownKind
     {
         Normal,
@@ -188,6 +197,45 @@ public sealed partial class ManagerForm
         catch (Exception ex)
         {
             _log.Warn($"[AUTO_PROFILE_COOLDOWN_SAVE_WARN] {ex.Message}");
+        }
+    }
+
+    string AutoProfileBehaviorSettingsPath =>
+        Path.Combine(_baseDir, "manager_auto_profile_behavior.json");
+
+    AutoProfileBehaviorSettings LoadAutoProfileBehaviorSettings()
+    {
+        var fallback = new AutoProfileBehaviorSettings();
+        try
+        {
+            if (!File.Exists(AutoProfileBehaviorSettingsPath))
+                return fallback;
+
+            var json = File.ReadAllText(AutoProfileBehaviorSettingsPath, Encoding.UTF8);
+            var loaded = JsonSerializer.Deserialize<AutoProfileBehaviorSettings>(json) ?? fallback;
+            loaded.Version = 1;
+            return loaded;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"[AUTO_PROFILE_BEHAVIOR_LOAD_WARN] {ex.Message}");
+            return fallback;
+        }
+    }
+
+    void SaveAutoProfileBehaviorSettings(AutoProfileBehaviorSettings settings)
+    {
+        try
+        {
+            settings.Version = 1;
+            var json = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
+            var temp = AutoProfileBehaviorSettingsPath + ".tmp";
+            File.WriteAllText(temp, json, new UTF8Encoding(false));
+            File.Move(temp, AutoProfileBehaviorSettingsPath, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"[AUTO_PROFILE_BEHAVIOR_SAVE_WARN] {ex.Message}");
         }
     }
 
@@ -476,6 +524,7 @@ public sealed partial class ManagerForm
                 out _));
 
         var cooldownSettings = LoadAutoProfileCooldownSettings();
+        var behaviorSettings = LoadAutoProfileBehaviorSettings();
 
         var form = new Form
         {
@@ -631,6 +680,19 @@ public sealed partial class ManagerForm
             AutoSize = true,
             Margin = new Padding(0, 8, 14, 0)
         };
+        var autoVideo = new CheckBox
+        {
+            Text = "Tự xử lý VIDEO",
+            Checked = behaviorSettings.AutoVideoEnabled,
+            AutoSize = true,
+            Margin = new Padding(0, 8, 14, 0)
+        };
+        autoVideo.CheckedChanged += (_, _) =>
+        {
+            behaviorSettings.AutoVideoEnabled = autoVideo.Checked;
+            SaveAutoProfileBehaviorSettings(behaviorSettings);
+        };
+
         var autoStart = new CheckBox
         {
             Text = "Tự Bắt đầu tool sau khi hoàn tất",
@@ -732,6 +794,7 @@ public sealed partial class ManagerForm
         config.SetColumnSpan(retryPaused, 2);
         var options = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = true, Margin = Padding.Empty };
         options.Controls.Add(autoRename);
+        options.Controls.Add(autoVideo);
         options.Controls.Add(autoStart);
         options.Controls.Add(availableLabel);
         options.Controls.Add(vmHint);
@@ -814,6 +877,7 @@ public sealed partial class ManagerForm
             resumeIncomplete.Enabled = enabled;
             retryPaused.Enabled = enabled;
             autoRename.Enabled = enabled;
+            autoVideo.Enabled = enabled;
             autoStart.Enabled = enabled;
             normalCooldownMinutes.Enabled = enabled;
             loginCooldownMinutes.Enabled = enabled;
@@ -1260,6 +1324,7 @@ public sealed partial class ManagerForm
                                 outcome = await ProcessAutoProfileQueueItemAsync(
                                     item,
                                     autoRename: true,
+                                    autoVideo: false,
                                     autoStart: false,
                                     isPaused: () => paused,
                                     ct: runCts.Token,
@@ -1609,11 +1674,12 @@ public sealed partial class ManagerForm
                         {
                             outcome = await ProcessAutoProfileQueueItemAsync(
                                 item,
-                                autoRename.Checked,
-                                autoStart.Checked,
-                                () => paused,
-                                runCts.Token,
-                                (stepText, resultText, color) => UpdateGridRow(item, stepText, resultText, color),
+                                autoRename: autoRename.Checked,
+                                autoVideo: autoVideo.Checked,
+                                autoStart: autoStart.Checked,
+                                isPaused: () => paused,
+                                ct: runCts.Token,
+                                ui: (stepText, resultText, color) => UpdateGridRow(item, stepText, resultText, color),
                                 // +Auto Profile chính: sau khi Save Tên/ảnh thành công phải probe tên thật.
                                 // Nếu tên vẫn chưa đổi/khớp sau 3 lần thì KHÔNG tính thành công,
                                 // KHÔNG Start tool; giữ PROCESSING để có thể xử lý lại.
@@ -2197,6 +2263,7 @@ public sealed partial class ManagerForm
     async Task<AutoProfileProcessOutcome> ProcessAutoProfileQueueItemAsync(
         AutoProfileQueueItem item,
         bool autoRename,
+        bool autoVideo,
         bool autoStart,
         Func<bool> isPaused,
         CancellationToken ct,
@@ -2400,6 +2467,29 @@ public sealed partial class ManagerForm
                 AutoProfileNote("Chrome/đăng nhập đang được xác minh; CAPTCHA sẽ dừng riêng profile này."), ct);
 
             await EnsureAutoProfileLoggedInAsync(ctx, item, ct);
+
+            // TIMELOGIN là mốc cố định của lần đăng nhập thành công đầu tiên
+            // trong luồng tạo/hoàn tất Auto Profile. Nếu Excel đã có giá trị thì
+            // EnsureTimeLogin giữ nguyên, tuyệt đối không ghi đè khi relogin/mở lại.
+            try
+            {
+                var timeLogin = await RunAccountPoolIoAsync(
+                    () => _accountPoolService.EnsureTimeLogin(
+                        item.Account.Username,
+                        DateTime.Now),
+                    ct);
+
+                _log.Info(
+                    $"[AUTO_PROFILE_TIMELOGIN] profile={item.ProfileName} account={item.Account.Username} value={timeLogin}");
+            }
+            catch (Exception ex)
+            {
+                // TIMELOGIN chỉ là dữ liệu theo dõi; lỗi ghi Excel không được chặn
+                // Tên/Ảnh, VIDEO hay Start/LIVE của profile đã login thành công.
+                _log.Warn(
+                    $"[AUTO_PROFILE_TIMELOGIN_WARN] profile={item.ProfileName} account={item.Account.Username} error={ex.Message}");
+            }
+
             await SetAutoCheckpointWithRetryAsync(item.Account.Id, "LOGIN_OK", step,
                 AutoProfileNote("Đăng nhập TikTok đã xác nhận bằng session."), ct);
             ui("LOGIN_OK", "Đăng nhập thành công; chờ thêm 3 giây cho trang ổn định...", Color.DarkGreen);
@@ -2519,6 +2609,88 @@ public sealed partial class ManagerForm
                     RenameSucceeded: true,
                     IdentityVerified: false,
                     IdentityExcelDone: identityExcelDone);
+            }
+
+            // +Auto Profile có công tắc VIDEO riêng, độc lập với AutoOnReady chung.
+            // Nếu bật, gọi lại đúng pipeline VIDEO hiện có ngay sau Tên/ảnh. Nếu tắt,
+            // không chạy VIDEO; chỉ nhả startup HOLD do Worker tạo để Start/LIVE không bị kẹt.
+            // Mọi đường đều fail-open và HOLD luôn được nhả trong finally để không tái phát
+            // lỗi ACCOUNT_SETUP_WAIT/deadlock cũ.
+            if (autoVideo)
+            {
+                await WaitAutoProfilePausePointAsync(isPaused, ct);
+                step = "VIDEO";
+
+                var holdReasonBeforeVideo = GetManagedAccountSetupHoldReason(ctx);
+                var ownsVideoHold = false;
+                if (!IsManagedAccountSetupHoldActive(ctx))
+                {
+                    ArmManagedAccountSetupHold(ctx, "auto_profile_video_pipeline");
+                    ownsVideoHold = true;
+                    holdReasonBeforeVideo = "auto_profile_video_pipeline";
+                }
+                else if (holdReasonBeforeVideo.Equals("before_worker_start", StringComparison.OrdinalIgnoreCase)
+                         || holdReasonBeforeVideo.Equals("auto_profile_video_pipeline", StringComparison.OrdinalIgnoreCase))
+                {
+                    // before_worker_start là HOLD startup của chính profile này; Auto Profile
+                    // nhận trách nhiệm hoàn tất VIDEO rồi nhả HOLD.
+                    ownsVideoHold = true;
+                }
+
+                try
+                {
+                    ui(step, "Đang xử lý VIDEO theo cấu hình hiện tại...", Color.RoyalBlue);
+                    await SetAutoCheckpointWithRetryAsync(item.Account.Id, "VIDEO", step,
+                        AutoProfileNote("Đang chạy pipeline VIDEO sau Tên/ảnh và trước Start/LIVE."), ct);
+
+                    await EnsureAutoVideoBeforeStartAsync(
+                        ctx,
+                        force: true,
+                        trigger: "auto_profile");
+                    ui(step, "VIDEO đã xử lý xong/bỏ qua theo cấu hình; tiếp tục Start/LIVE.", Color.DarkGreen);
+                    _log.Info(
+                        $"[AUTO_PROFILE_VIDEO_STAGE_DONE] profile={item.ProfileName} account={item.Account.Username} " +
+                        $"hold={holdReasonBeforeVideo} marker={_autoVideoHandledReadyAccount.ContainsKey(ctx.Profile.Name)}");
+                }
+                catch (OperationCanceledException)
+                {
+                    // Dừng batch vẫn phải đi qua finally để nhả HOLD; sau đó trả cancellation
+                    // lên caller để giữ đúng semantics Dừng hiện tại.
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    // VIDEO là best-effort theo policy hiện có: lỗi không được chặn Start/LIVE.
+                    _log.Warn(
+                        $"[AUTO_PROFILE_VIDEO_STAGE_FAILOPEN] profile={item.ProfileName} account={item.Account.Username} error={ex.Message}");
+                    ui(step, "VIDEO lỗi/cảnh báo — bỏ qua và tiếp tục Start/LIVE.", Color.DarkOrange);
+                }
+                finally
+                {
+                    if (ownsVideoHold)
+                    {
+                        await ReleaseManagedAccountSetupHoldAsync(
+                            ctx,
+                            "auto_profile_video_stage_done");
+                    }
+                }
+            }
+            else
+            {
+                // Nếu AutoOnReady chung đã arm HOLD trước khi Worker mở nhưng người dùng
+                // tắt Tự xử lý VIDEO trong +Auto Profile, nhả HOLD tại đây để giữ đúng
+                // hành vi: LOGIN -> Tên/ảnh -> Start/LIVE, không chạy VIDEO ngầm.
+                var holdReason = GetManagedAccountSetupHoldReason(ctx);
+                if (holdReason.Equals("before_worker_start", StringComparison.OrdinalIgnoreCase)
+                    || holdReason.Equals("auto_profile_video_pipeline", StringComparison.OrdinalIgnoreCase))
+                {
+                    _log.Info(
+                        $"[AUTO_PROFILE_VIDEO_STAGE_SKIP] profile={item.ProfileName} account={item.Account.Username} " +
+                        $"enabled=false hold={holdReason} action=RELEASE_OWN_HOLD_NO_VIDEO");
+                    await ReleaseManagedAccountSetupHoldAsync(
+                        ctx,
+                        "auto_profile_video_disabled");
+                }
             }
 
             if (autoStart)
@@ -3125,6 +3297,61 @@ public sealed partial class ManagerForm
                     "PAUSED_IDENTITY_NOT_DONE",
                     "START_TOOL",
                     "Chặn Bắt đầu: cột Tên/ảnh trong Excel chưa xác nhận DONE.");
+        }
+
+        // Auto Profile mới đã hoàn tất LOGIN -> Tên/ảnh ở ngay phía trước. Hold
+        // "before_worker_start" là hold do chính Worker startup tạo ra để ngăn LIVE
+        // chen vào giữa setup; vì vậy KHÔNG được ngồi chờ hold này tự biến mất.
+        // Chính Auto Profile phải tiếp tục VIDEO -> HOLD_OFF -> start_auto.
+        //
+        // Chỉ khi hold đang thuộc một pipeline KHÁC (ví dụ AutoOnReady đang xử lý)
+        // mới chờ nó kết thúc. Watchdog giảm từ 12' xuống 5' để tránh treo lâu;
+        // timeout vẫn fail-open như policy cũ và VIDEO không quyết định Start.
+        var setupHoldReason = GetManagedAccountSetupHoldReason(ctx);
+        if (setupHoldReason.Equals("before_worker_start", StringComparison.OrdinalIgnoreCase))
+        {
+            _log.Info(
+                $"[AUTO_PROFILE_SETUP_CONTINUE] profile={ctx.Profile.Name} account={item.Account.Username} " +
+                "hold=before_worker_start action=RUN_VIDEO_THEN_RELEASE");
+
+            try
+            {
+                await EnsureAutoVideoBeforeStartAsync(ctx);
+            }
+            catch (Exception ex)
+            {
+                // VIDEO là best-effort: lỗi không được chặn tool chính.
+                _log.Warn(
+                    $"[AUTO_PROFILE_SETUP_VIDEO_FAILOPEN] profile={ctx.Profile.Name} account={item.Account.Username} " +
+                    $"error={ex.Message}");
+            }
+            finally
+            {
+                // Dù VIDEO DONE/FAIL/SKIP, phải nhả hold trước start_auto.
+                await ReleaseManagedAccountSetupHoldAsync(
+                    ctx,
+                    "auto_profile_after_video");
+            }
+        }
+        else if (IsManagedAccountSetupHoldActive(ctx))
+        {
+            _log.Info(
+                $"[AUTO_PROFILE_SETUP_WAIT_OTHER_HOLD] profile={ctx.Profile.Name} account={item.Account.Username} " +
+                $"hold={setupHoldReason} timeoutMin=5");
+
+            var setupReleased = await WaitForManagedAccountSetupReleaseAsync(
+                ctx,
+                TimeSpan.FromMinutes(5),
+                ct);
+            if (!setupReleased)
+            {
+                _log.Warn(
+                    $"[AUTO_PROFILE_SETUP_WAIT_FAILOPEN] profile={ctx.Profile.Name} account={item.Account.Username} " +
+                    $"hold={setupHoldReason} timeoutMin=5 action=RELEASE_AND_START");
+                await ReleaseManagedAccountSetupHoldAsync(
+                    ctx,
+                    "auto_profile_setup_wait_5m_timeout_failopen");
+            }
         }
 
         string last = "";

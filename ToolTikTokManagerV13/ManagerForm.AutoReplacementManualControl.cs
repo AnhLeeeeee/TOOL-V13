@@ -98,7 +98,8 @@ public sealed partial class ManagerForm
         return command switch
         {
             "status" or "message_reply_status" or "message_reply_log"
-                or "message_reply_stop" or "stop" or "pause" or "show"
+                or "message_reply_stop" or "video_delete_status" or "video_delete_stop"
+                or "stop" or "pause" or "show"
                 or "view_chrome" or "close_chrome" => false,
             _ => true
         };

@@ -1073,6 +1073,8 @@ public sealed partial class ManagerForm
                         await OpenProfileAsync(ctx);
                         if (stopRequested) break;
                         try { await RefreshStatusAsync(ctx); } catch { }
+                        if (ctx.LastSnapshot?.VideoDeleteRunning == true)
+                            throw new InvalidOperationException("Profile đang xóa video TikTok. Hãy chờ xóa video hoàn tất rồi chạy Tin nhắn.");
                         var runState = GetLastConfirmedRuntimeState(ctx);
                         if (runState is "RUNNING" or "PAUSED")
                         {
@@ -1279,6 +1281,7 @@ public sealed partial class ManagerForm
             if (!string.Equals(GetLastConfirmedRuntimeState(ctx), "RUNNING", StringComparison.OrdinalIgnoreCase)) continue;
             if (!string.Equals(snapshot.Chrome, "CONNECTED", StringComparison.OrdinalIgnoreCase)) continue;
             if (snapshot.MessageReplyRunning) continue;
+            if (snapshot.VideoDeleteRunning) continue;
             if (_messageReplyProfilesInFlight.Contains(ctx.Profile.Name)) continue;
             if (_autoIdentityInFlight.Contains(ctx.Profile.Name)) continue;
 

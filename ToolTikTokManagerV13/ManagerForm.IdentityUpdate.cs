@@ -18,6 +18,16 @@ public sealed partial class ManagerForm
         public bool RandomNames { get; set; }
         public bool AvoidLastAvatar { get; set; } = true;
         public Dictionary<string, string> LastAvatarByProfile { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+        public string VideoFolder { get; set; } = "";
+        public string VideoCaptionText { get; set; } = "";
+        public string VideoSelectionMode { get; set; } = "random";
+        public bool VideoRandomCaption { get; set; } = true;
+        public bool AvoidLastVideo { get; set; } = true;
+        public bool VideoOncePerRun { get; set; } = true;
+        public bool VideoDeleteEnabled { get; set; } = true;
+        public bool VideoUploadEnabled { get; set; }
+        public string VideoDeleteMode { get; set; } = "all";
+        public Dictionary<string, string> LastVideoByAccount { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     }
 
     sealed class IdentityUpdateReply
@@ -33,10 +43,46 @@ public sealed partial class ManagerForm
         public string Error { get; set; } = "";
     }
 
+    sealed class VideoDeleteReply
+    {
+        public bool Running { get; set; }
+        public string Stage { get; set; } = "";
+        public bool Completed { get; set; }
+        public bool Ok { get; set; }
+        public int InitialCount { get; set; }
+        public int DeletedCount { get; set; }
+        public int RemainingCount { get; set; } = -1;
+        public bool VerifiedEmpty { get; set; }
+        public string Message { get; set; } = "";
+        public string Error { get; set; } = "";
+    }
+
+    sealed class VideoUploadReply
+    {
+        public bool Running { get; set; }
+        public string Stage { get; set; } = "";
+        public bool Completed { get; set; }
+        public bool Ok { get; set; }
+        public bool Posted { get; set; }
+        public bool PrivacyUpdated { get; set; }
+        public bool ProfileVerified { get; set; }
+        public bool DeleteFallbackAttempted { get; set; }
+        public bool DeleteFallbackSucceeded { get; set; }
+        public int DeleteFallbackDeletedCount { get; set; }
+        public int DeleteFallbackRemainingCount { get; set; } = -1;
+        public string DeleteFallbackError { get; set; } = "";
+        public string VideoPath { get; set; } = "";
+        public string PostedHref { get; set; } = "";
+        public string Message { get; set; } = "";
+        public string Error { get; set; } = "";
+    }
+
     sealed record IdentityPreview(ProfileContext Context, string DisplayName, string AvatarPath, string Bio);
+    sealed record VideoUploadPreview(ProfileContext Context, string VideoPath, string Caption);
 
     string IdentityToolStatePath => Path.Combine(_baseDir, "tiktok_identity_tool.json");
     readonly HashSet<string> _autoIdentityHandledSession = new(StringComparer.OrdinalIgnoreCase);
+    readonly Dictionary<string, string> _autoVideoHandledReadyAccount = new(StringComparer.OrdinalIgnoreCase);
     readonly HashSet<string> _autoIdentityInFlight = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, DateTime> _autoIdentityNextProbeUtc = new(StringComparer.OrdinalIgnoreCase);
     readonly SemaphoreSlim _autoIdentityQueueGate = new(1, 1);
@@ -59,6 +105,18 @@ public sealed partial class ManagerForm
             AvoidLastAvatar = state.AvoidLastAvatar,
             LastAvatarByProfile = new Dictionary<string, string>(
                 state.LastAvatarByProfile ?? new(),
+                StringComparer.OrdinalIgnoreCase),
+            VideoFolder = state.VideoFolder,
+            VideoCaptionText = state.VideoCaptionText,
+            VideoSelectionMode = state.VideoSelectionMode,
+            VideoRandomCaption = state.VideoRandomCaption,
+            AvoidLastVideo = state.AvoidLastVideo,
+            VideoOncePerRun = state.VideoOncePerRun,
+            VideoDeleteEnabled = state.VideoDeleteEnabled,
+            VideoUploadEnabled = state.VideoUploadEnabled,
+            VideoDeleteMode = state.VideoDeleteMode,
+            LastVideoByAccount = new Dictionary<string, string>(
+                state.LastVideoByAccount ?? new(),
                 StringComparer.OrdinalIgnoreCase)
         };
 
@@ -93,6 +151,11 @@ public sealed partial class ManagerForm
             var state = JsonSerializer.Deserialize<IdentityToolState>(File.ReadAllText(IdentityToolStatePath));
             if (state is null) return new IdentityToolState();
             state.LastAvatarByProfile = new Dictionary<string, string>(state.LastAvatarByProfile ?? new(), StringComparer.OrdinalIgnoreCase);
+            state.LastVideoByAccount = new Dictionary<string, string>(state.LastVideoByAccount ?? new(), StringComparer.OrdinalIgnoreCase);
+            if (string.IsNullOrWhiteSpace(state.VideoSelectionMode)) state.VideoSelectionMode = "random";
+            if (!string.Equals(state.VideoDeleteMode, "newest", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(state.VideoDeleteMode, "all", StringComparison.OrdinalIgnoreCase))
+                state.VideoDeleteMode = "all";
 
             lock (_identityToolStateCacheLock)
             {
@@ -169,6 +232,17 @@ public sealed partial class ManagerForm
         if (previousRunState != "RUNNING" && previousRunState != "PAUSED") return;
         try
         {
+            // Nếu pipeline không thực sự phải dừng automation (ví dụ Tên/ảnh và VIDEO
+            // đều đã DONE), không gửi Start lặp vào một Worker đang chạy.
+            try { await RefreshStatusAsync(ctx); } catch { }
+            var currentRunState = GetLastConfirmedRuntimeState(ctx);
+            if (currentRunState == previousRunState)
+            {
+                _log.Info(
+                    $"[AUTO_IDENTITY_RESUME_NOT_NEEDED] profile={ctx.Profile.Name} state={currentRunState}");
+                return;
+            }
+
             var started = await SendCommandAsync(ctx, "start", TimeSpan.FromSeconds(35));
             if (!string.Equals(started, "started", StringComparison.OrdinalIgnoreCase))
             {
@@ -311,12 +385,13 @@ public sealed partial class ManagerForm
 
         var state = LoadIdentityToolState();
         var previews = new Dictionary<string, IdentityPreview>(StringComparer.OrdinalIgnoreCase);
+        var videoPreviews = new Dictionary<string, VideoUploadPreview>(StringComparer.OrdinalIgnoreCase);
         var updateResults = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var contexts = _contexts.Values.OrderBy(x => x.Profile.Name, NaturalProfileNameOrder).ToList();
 
         using var form = new Form
         {
-            Text = "Đổi tên & ảnh đại diện TikTok",
+            Text = "Tên, ảnh & video TikTok",
             Width = 1120,
             Height = 820,
             MinimumSize = new Size(920, 680),
@@ -330,27 +405,74 @@ public sealed partial class ManagerForm
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 5,
+            RowCount = 6,
             Padding = new Padding(16),
             BackColor = ModernDialog.Canvas
         };
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 72F));
         // Khu cấu hình có viewport cuộn riêng để Tiểu sử/Tự động luôn truy cập được
         // trên màn hình thấp hoặc Windows DPI > 100%, không cần maximize dialog.
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 270F));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 50F));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
         var intro = new Label
         {
             AutoSize = true,
             MaximumSize = new Size(1000, 0),
-            Text = "Mục này chạy độc lập với automation LIVE. Chọn profile, nhập danh sách tên và/hoặc chọn thư mục ảnh, xem trước rồi mới bấm Cập nhật. Profile đang chạy automation sẽ được dừng trước khi đổi hồ sơ.",
+            Text = "Tên, ảnh và video chạy độc lập với automation LIVE. Chọn thẻ cần xử lý, xem trước rồi mới thực hiện. Profile đang chạy automation sẽ được dừng an toàn trước khi cập nhật.",
             ForeColor = Color.FromArgb(55, 76, 103),
-            Margin = new Padding(0, 0, 0, 12)
+            Margin = new Padding(0, 0, 0, 8)
         };
+
+        var tabTextColor = Color.FromArgb(42, 57, 76);
+        var tabSelectedBackColor = Color.FromArgb(232, 242, 255);
+        var tabSelectedTextColor = Color.FromArgb(28, 67, 111);
+        var tabBorderColor = Color.FromArgb(205, 214, 224);
+
+        Button SectionTab(string text)
+        {
+            var button = new Button
+            {
+                Text = text,
+                Dock = DockStyle.Fill,
+                FlatStyle = FlatStyle.Flat,
+                BackColor = UiTheme.Card,
+                ForeColor = tabTextColor,
+                TextAlign = ContentAlignment.MiddleCenter,
+                Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
+                Cursor = Cursors.Hand,
+                UseVisualStyleBackColor = false,
+                Margin = Padding.Empty
+            };
+            button.FlatAppearance.BorderColor = tabBorderColor;
+            button.FlatAppearance.BorderSize = 1;
+            button.FlatAppearance.MouseOverBackColor = Color.FromArgb(239, 245, 252);
+            button.FlatAppearance.MouseDownBackColor = Color.FromArgb(225, 236, 248);
+            return button;
+        }
+
+        var sectionTabs = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 1,
+            Margin = new Padding(0, 4, 0, 8),
+            Padding = Padding.Empty,
+            BackColor = ModernDialog.Canvas
+        };
+        sectionTabs.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
+        sectionTabs.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
+        sectionTabs.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+        var identityTab = SectionTab("TÊN & ẢNH");
+        var videoTab = SectionTab("VIDEO");
+        identityTab.Margin = new Padding(0, 0, 7, 0);
+        videoTab.Margin = new Padding(7, 0, 0, 0);
+        sectionTabs.Controls.Add(identityTab, 0, 0);
+        sectionTabs.Controls.Add(videoTab, 1, 0);
 
         var config = new TableLayoutPanel
         {
@@ -399,14 +521,14 @@ public sealed partial class ManagerForm
         ModernDialog.StyleTextInput(bio);
         var autoOnReady = new CheckBox
         {
-            Text = "Tự xử lý khi tài khoản đăng nhập xong và chưa DONE trong Excel",
+            Text = "Tự xử lý sau đăng nhập: Tên/ảnh → Video → chạy tool",
             Checked = state.AutoOnReady,
             AutoSize = true,
             Margin = new Padding(8, 8, 0, 0)
         };
         var autoHint = new Label
         {
-            Text = "Mỗi lần mở Chrome chỉ kiểm tra/đổi một lượt. Tên đúng hoặc đổi thành công = DONE; lỗi/cooldown = FAIL và đóng Chrome, không tự lặp.",
+            Text = "Tên/ảnh giữ nguyên logic DONE hiện tại. Sau đó VIDEO đọc cột VIDEO (XÓA|ĐĂNG); vế DONE được bỏ qua, FAIL được thử lại ở lần đăng nhập sau.",
             AutoSize = true,
             ForeColor = Color.DimGray,
             Margin = new Padding(8, 8, 0, 0)
@@ -542,32 +664,370 @@ public sealed partial class ManagerForm
         tools.Controls.Add(clearAll);
         tools.Controls.Add(randomize);
 
+        // ------------------------------------------------------------
+        // THẺ VIDEO — đã nối logic XÓA video/bài cũ; phần đăng video mới sẽ nối sau.
+        // ------------------------------------------------------------
+        var videoConfig = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            ColumnCount = 4,
+            RowCount = 6,
+            Margin = new Padding(0, 0, 0, 12)
+        };
+        videoConfig.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 155));
+        videoConfig.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 55F));
+        videoConfig.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
+        videoConfig.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 45F));
+
+        var enableDelete = new CheckBox
+        {
+            Text = "XÓA VIDEO CŨ",
+            Checked = state.VideoDeleteEnabled,
+            AutoSize = true,
+            Font = new Font("Segoe UI", 9F, FontStyle.Bold),
+            Margin = new Padding(0, 8, 22, 6)
+        };
+        var enableUpload = new CheckBox
+        {
+            Text = "ĐĂNG VIDEO MỚI",
+            Checked = state.VideoUploadEnabled,
+            AutoSize = true,
+            Font = new Font("Segoe UI", 9F, FontStyle.Bold),
+            Margin = new Padding(0, 8, 8, 6)
+        };
+        var videoActionPanel = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false, Margin = Padding.Empty };
+        videoActionPanel.Controls.Add(enableDelete);
+        videoActionPanel.Controls.Add(enableUpload);
+
+        var deleteNewest = new RadioButton { Text = "Xóa video mới nhất", Checked = string.Equals(state.VideoDeleteMode, "newest", StringComparison.OrdinalIgnoreCase), AutoSize = true, Margin = new Padding(0, 6, 18, 4) };
+        var deleteAll = new RadioButton { Text = "Xóa tất cả video", Checked = !string.Equals(state.VideoDeleteMode, "newest", StringComparison.OrdinalIgnoreCase), AutoSize = true, Margin = new Padding(0, 6, 0, 4) };
+        var deleteModePanel = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false, Margin = Padding.Empty };
+        deleteModePanel.Controls.Add(deleteNewest);
+        deleteModePanel.Controls.Add(deleteAll);
+
+        var videoFolder = new TextBox { ReadOnly = true, Dock = DockStyle.Fill, Text = state.VideoFolder ?? "" };
+        ModernDialog.StyleTextInput(videoFolder);
+        var browseVideo = new Button { Text = "Chọn thư mục", Width = 138, Height = 36 };
+        ModernDialog.StyleSecondaryButton(browseVideo);
+
+        var videoRandom = new RadioButton { Text = "Random", Checked = !string.Equals(state.VideoSelectionMode, "sequence", StringComparison.OrdinalIgnoreCase) && !string.Equals(state.VideoSelectionMode, "fixed", StringComparison.OrdinalIgnoreCase), AutoSize = true, Margin = new Padding(0, 6, 18, 4) };
+        var videoSequence = new RadioButton { Text = "Lần lượt", Checked = string.Equals(state.VideoSelectionMode, "sequence", StringComparison.OrdinalIgnoreCase), AutoSize = true, Margin = new Padding(0, 6, 18, 4) };
+        var videoFixed = new RadioButton { Text = "Một video cố định", Checked = string.Equals(state.VideoSelectionMode, "fixed", StringComparison.OrdinalIgnoreCase), AutoSize = true, Margin = new Padding(0, 6, 0, 4) };
+        var chooseModePanel = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false, Margin = Padding.Empty };
+        chooseModePanel.Controls.Add(videoRandom);
+        chooseModePanel.Controls.Add(videoSequence);
+        chooseModePanel.Controls.Add(videoFixed);
+
+        var videoCaption = new TextBox
+        {
+            Multiline = true,
+            ScrollBars = ScrollBars.Vertical,
+            Height = 68,
+            Dock = DockStyle.Fill,
+            Text = state.VideoCaptionText ?? ""
+        };
+        ModernDialog.StyleTextInput(videoCaption);
+        var randomCaption = new CheckBox { Text = "Random caption", Checked = state.VideoRandomCaption, AutoSize = true, Margin = new Padding(0, 6, 18, 4) };
+        var avoidLastVideo = new CheckBox { Text = "Tránh video vừa dùng", Checked = state.AvoidLastVideo, AutoSize = true, Margin = new Padding(0, 6, 18, 4) };
+        var videoOnce = new CheckBox { Text = "Chỉ thực hiện 1 lần trong mỗi lượt chạy", Checked = state.VideoOncePerRun, AutoSize = true, Margin = new Padding(0, 6, 0, 4) };
+        var videoOptionsPanel = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = true, Margin = Padding.Empty };
+        videoOptionsPanel.Controls.Add(randomCaption);
+        videoOptionsPanel.Controls.Add(avoidLastVideo);
+        videoOptionsPanel.Controls.Add(videoOnce);
+
+        videoConfig.Controls.Add(videoActionPanel, 0, 0);
+        videoConfig.SetColumnSpan(videoActionPanel, 4);
+        videoConfig.Controls.Add(new Label { Text = "Chế độ xóa", AutoSize = true, Margin = new Padding(0, 9, 8, 4) }, 0, 1);
+        videoConfig.Controls.Add(deleteModePanel, 1, 1);
+        videoConfig.SetColumnSpan(deleteModePanel, 3);
+        videoConfig.Controls.Add(new Label { Text = "Nguồn video", AutoSize = true, Margin = new Padding(0, 9, 8, 4) }, 0, 2);
+        videoConfig.Controls.Add(videoFolder, 1, 2);
+        videoConfig.Controls.Add(browseVideo, 2, 2);
+        videoConfig.SetColumnSpan(videoFolder, 1);
+        videoConfig.Controls.Add(new Label { Text = "", AutoSize = true }, 3, 2);
+        videoConfig.Controls.Add(new Label { Text = "Cách chọn video", AutoSize = true, Margin = new Padding(0, 9, 8, 4) }, 0, 3);
+        videoConfig.Controls.Add(chooseModePanel, 1, 3);
+        videoConfig.SetColumnSpan(chooseModePanel, 3);
+        videoConfig.Controls.Add(new Label { Text = "Caption", AutoSize = true, Margin = new Padding(0, 9, 8, 4) }, 0, 4);
+        videoConfig.Controls.Add(videoCaption, 1, 4);
+        videoConfig.SetColumnSpan(videoCaption, 3);
+        videoConfig.Controls.Add(new Label { Text = "Tùy chọn", AutoSize = true, Margin = new Padding(0, 9, 8, 4) }, 0, 5);
+        videoConfig.Controls.Add(videoOptionsPanel, 1, 5);
+        videoConfig.SetColumnSpan(videoOptionsPanel, 3);
+
+        var videoConfigViewport = new Panel
+        {
+            Dock = DockStyle.Fill,
+            AutoScroll = true,
+            Margin = new Padding(0, 0, 0, 8),
+            Padding = new Padding(0, 0, 8, 0),
+            BackColor = ModernDialog.Canvas,
+            Visible = false
+        };
+        videoConfigViewport.Controls.Add(videoConfig);
+
+        var videoBody = new SplitContainer
+        {
+            Dock = DockStyle.Fill,
+            Orientation = Orientation.Vertical,
+            Visible = false
+        };
+        var videoGrid = new DataGridView
+        {
+            Dock = DockStyle.Fill,
+            AllowUserToAddRows = false,
+            AllowUserToDeleteRows = false,
+            AllowUserToResizeRows = false,
+            RowHeadersVisible = false,
+            AutoGenerateColumns = false,
+            SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+            MultiSelect = false,
+            BackgroundColor = Color.White,
+            BorderStyle = BorderStyle.FixedSingle,
+            EnableHeadersVisualStyles = false,
+            ColumnHeadersHeight = 34,
+            RowTemplate = { Height = 31 }
+        };
+        videoGrid.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(231, 239, 249);
+        videoGrid.ColumnHeadersDefaultCellStyle.Font = new Font("Segoe UI", 9F, FontStyle.Bold);
+        videoGrid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "VideoUse", HeaderText = "Chọn", Width = 55 });
+        videoGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "VideoProfile", HeaderText = "Profile", Width = 110, ReadOnly = true });
+        videoGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "VideoPreview", HeaderText = "Video dự kiến", Width = 260, ReadOnly = true });
+        videoGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "VideoDeleteMode", HeaderText = "Thao tác", Width = 215, ReadOnly = true });
+        videoGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "VideoResult", HeaderText = "Kết quả", AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill, MinimumWidth = 190, ReadOnly = true });
+        foreach (var ctx in contexts)
+        {
+            var rowIndex = videoGrid.Rows.Add(ReferenceEquals(ctx, selected), ctx.Profile.Name, "—", "Xóa: tất cả | Đăng: tắt", "Chưa chạy");
+            videoGrid.Rows[rowIndex].Tag = ctx;
+        }
+        videoBody.Panel1.Controls.Add(videoGrid);
+
+        var videoPreviewPanel = new Panel { Dock = DockStyle.Fill, Padding = new Padding(12), BackColor = Color.FromArgb(245, 248, 252) };
+        var videoPreviewTitle = new Label
+        {
+            Dock = DockStyle.Top,
+            Height = 44,
+            Text = "Xem trước video",
+            Font = new Font("Segoe UI", 10F, FontStyle.Bold),
+            ForeColor = Color.FromArgb(42, 57, 76),
+            TextAlign = ContentAlignment.MiddleLeft
+        };
+        var videoPreviewHint = new Label
+        {
+            Dock = DockStyle.Top,
+            Height = 150,
+            Text = "XÓA và ĐĂNG là hai thao tác độc lập.\r\n\r\nNếu XÓA lỗi, tool ghi lỗi rồi bỏ qua để sang bước ĐĂNG. Nếu ĐĂNG cũng lỗi, tool bỏ qua và trả profile về luồng hiện tại; không giữ profile ở trạng thái bận. Logic ĐĂNG sẽ được nối ở bước sau.",
+            ForeColor = Color.DimGray,
+            AutoEllipsis = true
+        };
+        videoPreviewPanel.Controls.Add(videoPreviewHint);
+        videoPreviewPanel.Controls.Add(videoPreviewTitle);
+        videoBody.Panel2.Controls.Add(videoPreviewPanel);
+
+        void FitVideoSplitter()
+        {
+            if (videoBody.IsDisposed) return;
+            var width = videoBody.ClientSize.Width;
+            var available = width - videoBody.SplitterWidth;
+            if (available < 420) return;
+            var panel2Min = Math.Min(210, Math.Max(140, available / 4));
+            var panel1Min = Math.Min(620, Math.Max(300, available - panel2Min - 80));
+            if (panel1Min + panel2Min > available) return;
+            videoBody.Panel2MinSize = panel2Min;
+            videoBody.Panel1MinSize = panel1Min;
+            var max = width - videoBody.Panel2MinSize - videoBody.SplitterWidth;
+            var preferred = (int)Math.Round(width * 0.76);
+            videoBody.SplitterDistance = Math.Clamp(preferred, videoBody.Panel1MinSize, max);
+        }
+
+        var videoTools = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, WrapContents = false, Margin = new Padding(0, 8, 0, 6), Visible = false };
+        var videoSelectAll = new Button { Text = "Chọn tất cả", Width = 112, Height = 36 };
+        var videoClearAll = new Button { Text = "Bỏ chọn", Width = 100, Height = 36 };
+        var videoRandomize = new Button { Text = "Random lại", Width = 112, Height = 36, Enabled = false };
+        ModernDialog.StyleSecondaryButton(videoSelectAll);
+        ModernDialog.StyleSecondaryButton(videoClearAll);
+        ModernDialog.StyleSecondaryButton(videoRandomize);
+        videoTools.Controls.Add(videoSelectAll);
+        videoTools.Controls.Add(videoClearAll);
+        videoTools.Controls.Add(videoRandomize);
+
+        var activeSection = 0;
+
         var footer = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, FlowDirection = FlowDirection.RightToLeft, WrapContents = false, Padding = new Padding(0, 10, 0, 0) };
         var close = new Button { Text = "Đóng", Width = 104, Height = 42, DialogResult = DialogResult.Cancel };
+        var stopBatch = new Button { Text = "Dừng", Width = 104, Height = 42, Enabled = false };
         var apply = new Button { Text = "Cập nhật đã chọn", Width = 164, Height = 42 };
         var updateInProgress = false;
+        var batchStopRequested = false;
+        CancellationTokenSource? manualVideoBatchStopCts = null;
         ModernDialog.StyleSecondaryButton(close);
+        ModernDialog.StyleSecondaryButton(stopBatch);
         ModernDialog.StylePrimaryButton(apply);
         footer.Controls.Add(close);
+        footer.Controls.Add(stopBatch);
         footer.Controls.Add(apply);
 
+        var configHost = new Panel { Dock = DockStyle.Fill, Margin = Padding.Empty, BackColor = ModernDialog.Canvas };
+        configHost.Controls.Add(configViewport);
+        configHost.Controls.Add(videoConfigViewport);
+        var bodyHost = new Panel { Dock = DockStyle.Fill, Margin = Padding.Empty, BackColor = ModernDialog.Canvas };
+        bodyHost.Controls.Add(body);
+        bodyHost.Controls.Add(videoBody);
+        var toolsHost = new Panel { Dock = DockStyle.Fill, Margin = Padding.Empty, BackColor = ModernDialog.Canvas };
+        toolsHost.Controls.Add(tools);
+        toolsHost.Controls.Add(videoTools);
+
         root.Controls.Add(intro, 0, 0);
-        root.Controls.Add(configViewport, 0, 1);
-        root.Controls.Add(body, 0, 2);
-        root.Controls.Add(tools, 0, 3);
-        root.Controls.Add(footer, 0, 4);
+        root.Controls.Add(sectionTabs, 0, 1);
+        root.Controls.Add(configHost, 0, 2);
+        root.Controls.Add(bodyHost, 0, 3);
+        root.Controls.Add(toolsHost, 0, 4);
+        root.Controls.Add(footer, 0, 5);
         form.Controls.Add(root);
         form.CancelButton = close;
+
+        void UpdateSectionTabs()
+        {
+            var tabs = new[] { identityTab, videoTab };
+            for (var i = 0; i < tabs.Length; i++)
+            {
+                var active = activeSection == i;
+                tabs[i].BackColor = active ? tabSelectedBackColor : UiTheme.Card;
+                tabs[i].ForeColor = active ? tabSelectedTextColor : tabTextColor;
+                tabs[i].FlatAppearance.BorderColor = active ? ActiveProfileColor : tabBorderColor;
+                tabs[i].FlatAppearance.BorderSize = active ? 2 : 1;
+            }
+        }
+
+        void ShowSection(int section)
+        {
+            activeSection = Math.Clamp(section, 0, 1);
+            var identityVisible = activeSection == 0;
+
+            configViewport.Visible = identityVisible;
+            body.Visible = identityVisible;
+            tools.Visible = identityVisible;
+            videoConfigViewport.Visible = !identityVisible;
+            videoBody.Visible = !identityVisible;
+            videoTools.Visible = !identityVisible;
+
+            if (identityVisible)
+            {
+                configViewport.BringToFront();
+                body.BringToFront();
+                tools.BringToFront();
+                intro.Text = "Mục này chạy độc lập với automation LIVE. Chọn profile, nhập danh sách tên và/hoặc chọn thư mục ảnh, xem trước rồi mới bấm Cập nhật. Profile đang chạy automation sẽ được dừng trước khi đổi hồ sơ.";
+                apply.Text = "Cập nhật đã chọn";
+                apply.Enabled = !updateInProgress;
+            }
+            else
+            {
+                videoConfigViewport.BringToFront();
+                videoBody.BringToFront();
+                videoTools.BringToFront();
+                intro.Text = "Thẻ VIDEO tách riêng XÓA và ĐĂNG. Có thể bật một hoặc cả hai. Lỗi ở bước XÓA/ĐĂNG chỉ được ghi nhận rồi bỏ qua; profile phải được trả về luồng hiện tại thay vì bị treo.";
+                apply.Text = "Thực hiện đã chọn";
+                apply.Enabled = !updateInProgress;
+                FitVideoSplitter();
+            }
+
+            UpdateSectionTabs();
+        }
+
+        identityTab.Click += (_, _) => ShowSection(0);
+        videoTab.Click += (_, _) => ShowSection(1);
+        stopBatch.Click += (_, _) =>
+        {
+            if (!updateInProgress || batchStopRequested) return;
+
+            batchStopRequested = true;
+            stopBatch.Enabled = false;
+            stopBatch.Text = "Đang dừng...";
+            try { manualVideoBatchStopCts?.Cancel(); } catch { }
+            _log.Info($"[MANUAL_BATCH_STOP_REQUEST] section={(activeSection == 1 ? "VIDEO" : "IDENTITY")}");
+        };
+        videoSelectAll.Click += (_, _) =>
+        {
+            foreach (DataGridViewRow row in videoGrid.Rows) row.Cells["VideoUse"].Value = true;
+        };
+        videoClearAll.Click += (_, _) =>
+        {
+            foreach (DataGridViewRow row in videoGrid.Rows) row.Cells["VideoUse"].Value = false;
+        };
+        videoGrid.CurrentCellDirtyStateChanged += (_, _) =>
+        {
+            if (videoGrid.IsCurrentCellDirty)
+                videoGrid.CommitEdit(DataGridViewDataErrorContexts.Commit);
+        };
+        videoGrid.SelectionChanged += (_, _) => ShowVideoRowPreview();
+        browseVideo.Click += (_, _) =>
+        {
+            using var picker = new FolderBrowserDialog { Description = "Chọn thư mục chứa video TikTok" };
+            if (Directory.Exists(videoFolder.Text)) picker.SelectedPath = videoFolder.Text;
+            if (picker.ShowDialog(form) != DialogResult.OK) return;
+            videoFolder.Text = picker.SelectedPath;
+            SaveVideoUiState();
+            RebuildVideoPreview();
+        };
+        videoRandomize.Click += (_, _) => RebuildVideoPreview();
+        videoRandom.CheckedChanged += (_, _) => { if (videoRandom.Checked) { SaveVideoUiState(); RebuildVideoPreview(); } };
+        videoSequence.CheckedChanged += (_, _) => { if (videoSequence.Checked) { SaveVideoUiState(); RebuildVideoPreview(); } };
+        videoFixed.CheckedChanged += (_, _) => { if (videoFixed.Checked) { SaveVideoUiState(); RebuildVideoPreview(); } };
+        randomCaption.CheckedChanged += (_, _) => { SaveVideoUiState(); RebuildVideoPreview(); };
+        avoidLastVideo.CheckedChanged += (_, _) => { SaveVideoUiState(); RebuildVideoPreview(); };
+        videoOnce.CheckedChanged += (_, _) => SaveVideoUiState();
+        videoCaption.TextChanged += (_, _) => { SaveVideoUiState(); RebuildVideoPreview(); };
+        void RefreshVideoActionState()
+        {
+            var deleteText = !enableDelete.Checked
+                ? "Xóa: tắt"
+                : deleteAll.Checked ? "Xóa: tất cả" : "Xóa: mới nhất";
+            var uploadText = enableUpload.Checked ? "Đăng: bật" : "Đăng: tắt";
+            foreach (DataGridViewRow row in videoGrid.Rows)
+                row.Cells["VideoDeleteMode"].Value = $"{deleteText} | {uploadText}";
+
+            deleteNewest.Enabled = enableDelete.Checked;
+            deleteAll.Enabled = enableDelete.Checked;
+
+            videoFolder.Enabled = enableUpload.Checked;
+            browseVideo.Enabled = enableUpload.Checked;
+            videoRandom.Enabled = enableUpload.Checked;
+            videoSequence.Enabled = enableUpload.Checked;
+            videoFixed.Enabled = enableUpload.Checked;
+            videoCaption.Enabled = enableUpload.Checked;
+            randomCaption.Enabled = enableUpload.Checked;
+            avoidLastVideo.Enabled = enableUpload.Checked;
+            videoOnce.Enabled = enableDelete.Checked || enableUpload.Checked;
+            videoRandomize.Enabled = enableUpload.Checked;
+
+            videoPreviewHint.Text = enableUpload.Checked
+                ? "XÓA và ĐĂNG chạy độc lập theo kiểu best-effort. ĐĂNG đi thẳng URL TikTok Studio, gán file trực tiếp, không mở hộp chọn file Windows; 2 mục Kiểm tra được giữ TẮT. Nếu một bước lỗi, tool ghi lỗi rồi bỏ qua để trả profile về luồng hiện tại."
+                : "Phần XÓA chạy độc lập và có timeout an toàn cho VPS chậm. Nếu xóa lỗi/timeout, tool ghi lỗi, dọn trạng thái và trả profile về luồng hiện tại; không giữ Worker ở trạng thái bận.";
+            RebuildVideoPreview();
+        }
+        enableDelete.CheckedChanged += (_, _) => { SaveVideoUiState(); RefreshVideoActionState(); };
+        enableUpload.CheckedChanged += (_, _) => { SaveVideoUiState(); RefreshVideoActionState(); RebuildVideoPreview(); };
+        deleteNewest.CheckedChanged += (_, _) => { if (deleteNewest.Checked) SaveVideoUiState(); RefreshVideoActionState(); };
+        deleteAll.CheckedChanged += (_, _) => { if (deleteAll.Checked) SaveVideoUiState(); RefreshVideoActionState(); };
+
+        RefreshVideoActionState();
 
         form.Shown += (_, _) =>
         {
             FitIdentitySplitter();
+            FitVideoSplitter();
             // Bảo đảm viewport biết toàn bộ chiều cao config sau scale DPI.
             configViewport.AutoScrollMinSize = new Size(0, Math.Max(config.PreferredSize.Height + 8, 300));
+            videoConfigViewport.AutoScrollMinSize = new Size(0, Math.Max(videoConfig.PreferredSize.Height + 8, 300));
+            ShowSection(0);
         };
         body.SizeChanged += (_, _) => FitIdentitySplitter();
+        videoBody.SizeChanged += (_, _) => FitVideoSplitter();
         config.SizeChanged += (_, _) =>
             configViewport.AutoScrollMinSize = new Size(0, Math.Max(config.PreferredSize.Height + 8, 300));
+        videoConfig.SizeChanged += (_, _) =>
+            videoConfigViewport.AutoScrollMinSize = new Size(0, Math.Max(videoConfig.PreferredSize.Height + 8, 300));
 
         static List<string> ReadNames(TextBox box) => box.Lines
             .Select(x => x.Trim())
@@ -583,6 +1043,138 @@ public sealed partial class ManagerForm
                 .Where(x => allowed.Contains(Path.GetExtension(x)))
                 .OrderBy(x => Path.GetFileName(x), StringComparer.OrdinalIgnoreCase)
                 .ToList();
+        }
+
+        static List<string> ReadVideos(string videoSourceFolder)
+        {
+            if (string.IsNullOrWhiteSpace(videoSourceFolder) || !Directory.Exists(videoSourceFolder)) return new();
+            var allowed = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ".mp4", ".mov", ".webm", ".m4v", ".avi", ".mkv", ".mpeg", ".mpg", ".mpe", ".ogm"
+            };
+            return Directory.EnumerateFiles(videoSourceFolder, "*.*", SearchOption.TopDirectoryOnly)
+                .Where(x => allowed.Contains(Path.GetExtension(x)))
+                .OrderBy(x => Path.GetFileName(x), StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        static List<string> ReadVideoCaptions(TextBox box) => box.Lines
+            .Select(x => x.Trim())
+            .Where(x => x.Length > 0)
+            .ToList();
+
+        string ResolveVideoAccountKey(ProfileContext ctx)
+        {
+            try
+            {
+                var dataRoot = _profileService.ResolveDataRoot(ctx.Profile);
+                var username = (_tiktokAuthService.Load(dataRoot).Username ?? "").Trim();
+                if (!string.IsNullOrWhiteSpace(username)) return username.TrimStart('@').ToLowerInvariant();
+            }
+            catch { }
+            return "profile:" + ctx.Profile.Name.ToLowerInvariant();
+        }
+
+        void SaveVideoUiState()
+        {
+            // Giữ đồng bộ cả phần TÊN & ẢNH để việc chỉnh VIDEO không ghi đè
+            // các thay đổi người dùng vừa nhập nhưng chưa bấm Cập nhật.
+            state.NamesText = names.Text;
+            state.ImageFolder = folder.Text;
+            state.UpdateName = updateName.Checked;
+            state.UpdateAvatar = updateAvatar.Checked;
+            state.BioText = bio.Text.Trim();
+            state.UpdateBio = updateBio.Checked;
+            state.AutoOnReady = autoOnReady.Checked;
+            state.RandomNames = randomNames.Checked;
+            state.AvoidLastAvatar = avoidLast.Checked;
+
+            state.VideoFolder = videoFolder.Text.Trim();
+            state.VideoCaptionText = videoCaption.Text;
+            state.VideoSelectionMode = videoFixed.Checked ? "fixed" : videoSequence.Checked ? "sequence" : "random";
+            state.VideoRandomCaption = randomCaption.Checked;
+            state.AvoidLastVideo = avoidLastVideo.Checked;
+            state.VideoOncePerRun = videoOnce.Checked;
+            state.VideoDeleteEnabled = enableDelete.Checked;
+            state.VideoUploadEnabled = enableUpload.Checked;
+            state.VideoDeleteMode = deleteNewest.Checked ? "newest" : "all";
+            SaveIdentityToolState(state);
+        }
+
+        void ShowVideoRowPreview()
+        {
+            if (videoGrid.CurrentRow?.Tag is not ProfileContext ctx || !videoPreviews.TryGetValue(ctx.Profile.Name, out var preview))
+            {
+                videoPreviewHint.Text = enableUpload.Checked
+                    ? "Chọn một dòng để xem video dự kiến. XÓA và ĐĂNG chạy độc lập theo kiểu best-effort."
+                    : "Phần XÓA chạy độc lập và có timeout an toàn; lỗi xóa không được giữ Worker ở trạng thái bận.";
+                return;
+            }
+
+            var fileText = string.IsNullOrWhiteSpace(preview.VideoPath) ? "(chưa chọn)" : Path.GetFileName(preview.VideoPath);
+            var captionText = string.IsNullOrWhiteSpace(preview.Caption) ? "(trống)" : preview.Caption;
+            videoPreviewHint.Text = $"Profile: {ctx.Profile.Name}\r\nVideo: {fileText}\r\nCaption: {captionText}\r\n\r\nĐăng: đi thẳng URL TikTok Studio, gán file trực tiếp, giữ 2 mục Kiểm tra ở TẮT, đăng rồi đổi quyền riêng tư sang Mọi người.";
+        }
+
+        void RebuildVideoPreview()
+        {
+            videoGrid.EndEdit();
+            videoPreviews.Clear();
+            var videos = ReadVideos(videoFolder.Text);
+            var captions = ReadVideoCaptions(videoCaption);
+            var shuffled = videos.OrderBy(_ => Random.Shared.Next()).ToList();
+            var randomCursor = 0;
+            var fixedVideo = videos.Count == 0 ? "" : videos[Random.Shared.Next(videos.Count)];
+            var selectedIndex = 0;
+
+            foreach (DataGridViewRow row in videoGrid.Rows)
+            {
+                if (row.Tag is not ProfileContext ctx) continue;
+                string picked = "";
+                if (enableUpload.Checked && videos.Count > 0)
+                {
+                    if (videoFixed.Checked)
+                    {
+                        picked = fixedVideo;
+                    }
+                    else if (videoSequence.Checked)
+                    {
+                        picked = videos[selectedIndex % videos.Count];
+                    }
+                    else
+                    {
+                        if (randomCursor >= shuffled.Count)
+                        {
+                            shuffled = videos.OrderBy(_ => Random.Shared.Next()).ToList();
+                            randomCursor = 0;
+                        }
+                        picked = shuffled[randomCursor++];
+                    }
+
+                    if (avoidLastVideo.Checked && videos.Count > 1)
+                    {
+                        var accountKey = ResolveVideoAccountKey(ctx);
+                        if (state.LastVideoByAccount.TryGetValue(accountKey, out var last)
+                            && !string.IsNullOrWhiteSpace(last)
+                            && string.Equals(Path.GetFullPath(last), Path.GetFullPath(picked), StringComparison.OrdinalIgnoreCase))
+                        {
+                            var replacement = videos.FirstOrDefault(x => !string.Equals(Path.GetFullPath(x), Path.GetFullPath(last), StringComparison.OrdinalIgnoreCase));
+                            if (!string.IsNullOrWhiteSpace(replacement)) picked = replacement;
+                        }
+                    }
+                }
+
+                string caption = "";
+                if (captions.Count == 1) caption = captions[0];
+                else if (captions.Count > 1) caption = randomCaption.Checked
+                    ? captions[Random.Shared.Next(captions.Count)]
+                    : captions[selectedIndex % captions.Count];
+
+                videoPreviews[ctx.Profile.Name] = new VideoUploadPreview(ctx, picked, caption);
+                row.Cells["VideoPreview"].Value = string.IsNullOrWhiteSpace(picked) ? "—" : Path.GetFileName(picked);
+                selectedIndex++;
+            }
+            ShowVideoRowPreview();
         }
 
         void DisposePreviewImage()
@@ -707,6 +1299,406 @@ public sealed partial class ManagerForm
 
         apply.Click += async (_, _) =>
         {
+            if (activeSection == 1)
+            {
+                try
+                {
+                    videoGrid.EndEdit();
+                    var selectedVideoRows = videoGrid.Rows.Cast<DataGridViewRow>()
+                        .Where(r => r.Tag is ProfileContext
+                            && Convert.ToBoolean(r.Cells["VideoUse"].Value ?? false))
+                        .ToList();
+
+                    if (selectedVideoRows.Count == 0)
+                    {
+                        ModernDialog.ShowMessage(form, "Hãy chọn ít nhất một profile.", "Video TikTok", MessageBoxIcon.Information);
+                        return;
+                    }
+
+                    if (!enableDelete.Checked && !enableUpload.Checked)
+                    {
+                        ModernDialog.ShowMessage(form, "Hãy bật ít nhất một thao tác: XÓA VIDEO CŨ hoặc ĐĂNG VIDEO MỚI.", "Video TikTok", MessageBoxIcon.Information);
+                        return;
+                    }
+
+                    if (enableUpload.Checked)
+                    {
+                        SaveVideoUiState();
+                        var availableVideos = ReadVideos(videoFolder.Text);
+                        if (availableVideos.Count == 0)
+                        {
+                            ModernDialog.ShowMessage(form, "Thư mục nguồn chưa có video hợp lệ. Hãy chọn thư mục có MP4/MOV/WEBM...", "Video TikTok", MessageBoxIcon.Information);
+                            return;
+                        }
+                        var missingPreview = selectedVideoRows.FirstOrDefault(r =>
+                            r.Tag is ProfileContext c
+                            && (!videoPreviews.TryGetValue(c.Profile.Name, out var p)
+                                || string.IsNullOrWhiteSpace(p.VideoPath)
+                                || !File.Exists(p.VideoPath)));
+                        if (missingPreview is not null)
+                        {
+                            ModernDialog.ShowMessage(form, "Có profile chưa được gán video dự kiến. Bấm Random lại hoặc kiểm tra thư mục nguồn.", "Video TikTok", MessageBoxIcon.Warning);
+                            return;
+                        }
+                    }
+
+                    var deleteMode = enableDelete.Checked
+                        ? (deleteAll.Checked ? "all" : "newest")
+                        : "none";
+
+                    if (enableDelete.Checked)
+                    {
+                        var modeText = deleteMode == "all" ? "XÓA TẤT CẢ video/bài cũ" : "XÓA video/bài mới nhất";
+                        var confirm = $"Sẽ {modeText} trên {selectedVideoRows.Count} profile đã chọn.\n\n"
+                            + "Nếu bước XÓA lỗi hoặc timeout, tool sẽ ghi lỗi rồi bỏ qua bước xóa để tiếp tục bước ĐĂNG (nếu được bật), sau đó trả profile về luồng hiện tại.\n\n"
+                            + "XÓA VIDEO KHÔNG THỂ HOÀN TÁC. Tiếp tục?";
+                        if (ModernDialog.ShowConfirm(form, confirm, "Xác nhận xóa video TikTok") != DialogResult.Yes)
+                            return;
+                    }
+
+                    updateInProgress = true;
+                    batchStopRequested = false;
+                    manualVideoBatchStopCts?.Dispose();
+                    manualVideoBatchStopCts = new CancellationTokenSource();
+                    apply.Enabled = false;
+                    stopBatch.Text = "Dừng";
+                    stopBatch.Enabled = true;
+                    close.Enabled = false;
+                    identityTab.Enabled = false;
+                    videoTab.Enabled = false;
+                    videoSelectAll.Enabled = false;
+                    videoClearAll.Enabled = false;
+                    videoGrid.Enabled = false;
+
+                    var success = 0;
+                    var failed = 0;
+                    var skipped = 0;
+                    // Chỉ sống trong đúng lần bấm "Thực hiện đã chọn" này.
+                    // Bấm chạy lại lần sau sẽ tạo HashSet mới, nên cùng tài khoản vẫn được phép xử lý lại.
+                    var processedVideoAccountsThisRun = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    var startedVideoProfiles = 0;
+                    foreach (var row in selectedVideoRows)
+                    {
+                        if (batchStopRequested) break;
+                        if (row.Tag is not ProfileContext ctx) continue;
+                        startedVideoProfiles++;
+
+                        var runAccountKey = ResolveVideoAccountKey(ctx);
+                        if (videoOnce.Checked && !processedVideoAccountsThisRun.Add(runAccountKey))
+                        {
+                            skipped++;
+                            row.Cells["VideoResult"].Value = "Bỏ qua: tài khoản đã xử lý trong lượt chạy này";
+                            SetRowColorIfAttached(row, Color.DimGray);
+                            _log.Info($"[VIDEO_ONCE_PER_RUN_SKIP] profile={ctx.Profile.Name} account={runAccountKey}");
+                            continue;
+                        }
+
+                        row.Cells["VideoResult"].Value = "Đang chuẩn bị / dừng automation...";
+                        SetRowColorIfAttached(row, Color.DarkOrange);
+                        form.Refresh();
+
+                        try
+                        {
+                            var parts = new List<string>();
+                            var profileHadError = false;
+                            var skipUploadBecauseLoginRequired = false;
+                            var studioDeleteFallbackNeeded = false;
+                            var deletePartIndex = -1;
+                            // Trạng thái cuối dùng để ghi cột VIDEO trong Excel cho batch chạy tay.
+                            // Dùng cùng chuẩn OFF/FAIL/DONE với Auto VIDEO để hai luồng không lệch nhau.
+                            var manualDeleteStatus = enableDelete.Checked ? "FAIL" : "OFF";
+                            var manualUploadStatus = enableUpload.Checked ? "FAIL" : "OFF";
+
+                            if (enableDelete.Checked)
+                            {
+                                deletePartIndex = parts.Count;
+                                try
+                                {
+                                    var reply = await DeleteTikTokVideosAsync(ctx, deleteMode, progress =>
+                                    {
+                                        var text = string.IsNullOrWhiteSpace(progress.Message)
+                                            ? progress.Stage
+                                            : progress.Message;
+                                        if (!string.IsNullOrWhiteSpace(text))
+                                            row.Cells["VideoResult"].Value = "Xóa: " + text;
+                                        SetRowColorIfAttached(row, Color.DarkOrange);
+                                        videoGrid.Refresh();
+                                    }, cancellationToken: manualVideoBatchStopCts!.Token);
+
+                                    if (reply.Ok)
+                                    {
+                                        manualDeleteStatus = "DONE";
+                                        parts.Add($"Xóa: OK ({reply.DeletedCount})");
+                                    }
+                                    else if (IsVideoLoginRequired(reply))
+                                    {
+                                        profileHadError = true;
+                                        skipUploadBecauseLoginRequired = true;
+                                        parts.Add("Xóa: bỏ qua (mất login)");
+                                        _log.Warn(
+                                            $"[VIDEO_DELETE_LOGIN_REQUIRED_SKIP_UPLOAD] profile={ctx.Profile.Name} " +
+                                            $"stage={reply.Stage} error={reply.Error}");
+                                    }
+                                    else
+                                    {
+                                        var detail = string.IsNullOrWhiteSpace(reply.Error) ? "lỗi không xác định" : reply.Error;
+                                        studioDeleteFallbackNeeded = enableUpload.Checked;
+                                        if (studioDeleteFallbackNeeded)
+                                        {
+                                            parts.Add($"Xóa: chờ fallback Studio (đã xóa {reply.DeletedCount})");
+                                            _log.Warn($"[VIDEO_DELETE_PRIMARY_FAIL_FALLBACK_ARMED] profile={ctx.Profile.Name} deleted={reply.DeletedCount} error={detail}");
+                                        }
+                                        else
+                                        {
+                                            profileHadError = true;
+                                            parts.Add($"Xóa: lỗi sau {reply.DeletedCount} bài");
+                                            _log.Warn($"[VIDEO_DELETE_BEST_EFFORT_SKIP] profile={ctx.Profile.Name} deleted={reply.DeletedCount} error={detail}");
+                                        }
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    studioDeleteFallbackNeeded = enableUpload.Checked;
+                                    if (studioDeleteFallbackNeeded)
+                                    {
+                                        parts.Add("Xóa: chờ fallback Studio");
+                                        _log.Warn($"[VIDEO_DELETE_PRIMARY_EXCEPTION_FALLBACK_ARMED] profile={ctx.Profile.Name} error={ex.Message}");
+                                    }
+                                    else
+                                    {
+                                        profileHadError = true;
+                                        parts.Add("Xóa: lỗi");
+                                        _log.Warn($"[VIDEO_DELETE_MANAGER_FAILED] profile={ctx.Profile.Name} error={ex.Message}");
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                parts.Add("Xóa: bỏ qua");
+                            }
+
+                            if (batchStopRequested)
+                            {
+                                skipped++;
+                                parts.Add("Đăng: bỏ qua (đã dừng)");
+                                row.Cells["VideoResult"].Value = string.Join(" | ", parts) + " | Đã dừng theo yêu cầu";
+                                SetRowColorIfAttached(row, Color.DarkOrange);
+                                _log.Info($"[MANUAL_VIDEO_BATCH_STOPPED] profile={ctx.Profile.Name} stage=after_delete remaining={Math.Max(0, selectedVideoRows.Count - startedVideoProfiles)}");
+                                break;
+                            }
+
+                            // Fail-open: lỗi XÓA thông thường không chặn bước ĐĂNG.
+                            // Riêng LOGIN_REQUIRED thì bỏ luôn phần ĐĂNG để trả Chrome ngay cho
+                            // logic đăng nhập hiện tại của tool; thử upload khi đã mất login chỉ
+                            // làm tốn thời gian và có thể sinh thêm popup/timeout không cần thiết.
+                            if (enableUpload.Checked && skipUploadBecauseLoginRequired)
+                            {
+                                profileHadError = true;
+                                parts.Add("Đăng: bỏ qua (mất login)");
+                                _log.Warn(
+                                    $"[VIDEO_UPLOAD_SKIP_LOGIN_REQUIRED] profile={ctx.Profile.Name} account={runAccountKey}");
+                            }
+                            else if (enableUpload.Checked)
+                            {
+                                var accountKey = runAccountKey;
+                                if (!videoPreviews.TryGetValue(ctx.Profile.Name, out var preview)
+                                    || string.IsNullOrWhiteSpace(preview.VideoPath)
+                                    || !File.Exists(preview.VideoPath))
+                                {
+                                    profileHadError = true;
+                                    parts.Add("Đăng: thiếu file");
+                                    _log.Warn($"[VIDEO_UPLOAD_PREVIEW_MISSING] profile={ctx.Profile.Name}");
+                                }
+                                else
+                                {
+                                    try
+                                    {
+                                        var uploadReply = await UploadTikTokVideoAsync(ctx, preview.VideoPath, preview.Caption, progress =>
+                                        {
+                                            var text = string.IsNullOrWhiteSpace(progress.Message) ? progress.Stage : progress.Message;
+                                            if (!string.IsNullOrWhiteSpace(text))
+                                                row.Cells["VideoResult"].Value = "Đăng: " + text;
+                                            SetRowColorIfAttached(row, Color.DarkOrange);
+                                            videoGrid.Refresh();
+                                        },
+                                        studioDeleteFallback: studioDeleteFallbackNeeded,
+                                        cancellationToken: manualVideoBatchStopCts!.Token);
+
+                                        if (studioDeleteFallbackNeeded && deletePartIndex >= 0)
+                                        {
+                                            if (uploadReply.DeleteFallbackSucceeded)
+                                            {
+                                                manualDeleteStatus = "DONE";
+                                                parts[deletePartIndex] = uploadReply.DeleteFallbackDeletedCount > 0
+                                                    ? $"Xóa: DONE (fallback Studio, {uploadReply.DeleteFallbackDeletedCount} video cũ)"
+                                                    : "Xóa: DONE (fallback Studio, đã chỉ còn 1 video)";
+                                                studioDeleteFallbackNeeded = false;
+                                                _log.Info($"[VIDEO_DELETE_FALLBACK_NOTE_DONE] profile={ctx.Profile.Name} deleted={uploadReply.DeleteFallbackDeletedCount} remaining={uploadReply.DeleteFallbackRemainingCount}");
+                                            }
+                                            else if (uploadReply.DeleteFallbackAttempted)
+                                            {
+                                                profileHadError = true;
+                                                parts[deletePartIndex] = "Xóa: lỗi (fallback Studio chưa hoàn tất)";
+                                                studioDeleteFallbackNeeded = false;
+                                                _log.Warn($"[VIDEO_DELETE_FALLBACK_NOTE_FAIL] profile={ctx.Profile.Name} deleted={uploadReply.DeleteFallbackDeletedCount} remaining={uploadReply.DeleteFallbackRemainingCount} error={uploadReply.DeleteFallbackError}");
+                                            }
+                                        }
+
+                                        if (batchStopRequested || string.Equals(uploadReply.Stage, "USER_STOPPED", StringComparison.OrdinalIgnoreCase))
+                                        {
+                                            if (uploadReply.Posted)
+                                            {
+                                                state.LastVideoByAccount[accountKey] = preview.VideoPath;
+                                                SaveIdentityToolState(state);
+                                            }
+                                            skipped++;
+                                            parts.Add(uploadReply.Posted ? "Đăng: đã dừng sau khi bài đã lên" : "Đăng: đã dừng");
+                                            row.Cells["VideoResult"].Value = string.Join(" | ", parts) + " | Đã dừng theo yêu cầu";
+                                            SetRowColorIfAttached(row, Color.DarkOrange);
+                                            _log.Info($"[MANUAL_VIDEO_BATCH_STOPPED] profile={ctx.Profile.Name} stage=upload remaining={Math.Max(0, selectedVideoRows.Count - startedVideoProfiles)} posted={uploadReply.Posted}");
+                                            break;
+                                        }
+
+                                        if (uploadReply.Posted)
+                                        {
+                                            state.LastVideoByAccount[accountKey] = preview.VideoPath;
+                                            SaveIdentityToolState(state);
+                                        }
+
+                                        var manualUploadDone = uploadReply.Ok
+                                            && uploadReply.Posted
+                                            && uploadReply.PrivacyUpdated
+                                            && uploadReply.ProfileVerified;
+                                        manualUploadStatus = manualUploadDone ? "DONE" : "FAIL";
+
+                                        if (manualUploadDone)
+                                        {
+                                            parts.Add("Đăng: OK | Mọi người | đã thấy trên profile");
+                                        }
+                                        else if (uploadReply.Posted)
+                                        {
+                                            profileHadError = true;
+                                            parts.Add($"Đăng: đã lên | Public={(uploadReply.PrivacyUpdated ? "OK" : "lỗi")} | Profile={(uploadReply.ProfileVerified ? "OK" : "chưa xác nhận")}");
+                                            _log.Warn($"[VIDEO_UPLOAD_PARTIAL] profile={ctx.Profile.Name} public={uploadReply.PrivacyUpdated} verified={uploadReply.ProfileVerified} error={uploadReply.Error}");
+                                        }
+                                        else
+                                        {
+                                            profileHadError = true;
+                                            parts.Add("Đăng: lỗi");
+                                            _log.Warn($"[VIDEO_UPLOAD_BEST_EFFORT_SKIP] profile={ctx.Profile.Name} error={uploadReply.Error}");
+                                        }
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        profileHadError = true;
+                                        parts.Add("Đăng: lỗi");
+                                        _log.Warn($"[VIDEO_UPLOAD_MANAGER_FAILED] profile={ctx.Profile.Name} error={ex.Message}");
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                parts.Add("Đăng: bỏ qua");
+                            }
+
+                            if (studioDeleteFallbackNeeded && deletePartIndex >= 0)
+                            {
+                                profileHadError = true;
+                                parts[deletePartIndex] = "Xóa: lỗi (fallback Studio chưa chạy)";
+                                _log.Warn($"[VIDEO_DELETE_FALLBACK_NOT_REACHED] profile={ctx.Profile.Name} reason=upload_not_completed");
+                            }
+
+                            // Batch VIDEO chạy tay trước đây chỉ cập nhật cột Kết quả trên giao diện,
+                            // nên dù XÓA/ĐĂNG đã thành công thì cột VIDEO trong Excel vẫn trống.
+                            // Ghi lại đúng kết quả cuối bằng CHÍNH helper của Auto VIDEO, có retry +
+                            // đọc lại Excel xác minh để không báo DONE giả. Lỗi ghi Excel chỉ là cảnh báo,
+                            // không được biến một lượt đăng video thành lỗi hay chặn trả PRF về luồng hiện tại.
+                            try
+                            {
+                                var excelAccount = await ResolveNameGuardAccountAsync(ctx);
+                                var excelUsername = (excelAccount.Username ?? "").Trim();
+                                if (excelUsername.Length == 0)
+                                {
+                                    _log.Warn(
+                                        $"[MANUAL_VIDEO_EXCEL_SKIP] profile={ctx.Profile.Name} " +
+                                        $"status={ComposeVideoStatus(manualDeleteStatus, manualUploadStatus)} reason=account_not_resolved");
+                                }
+                                else
+                                {
+                                    var excelWrite = await WriteVideoStatusVerifiedAsync(
+                                        excelUsername,
+                                        ctx.Profile.Name,
+                                        manualDeleteStatus,
+                                        manualUploadStatus,
+                                        CancellationToken.None);
+
+                                    if (excelWrite.Ok)
+                                    {
+                                        _log.Info(
+                                            $"[MANUAL_VIDEO_EXCEL_DONE] profile={ctx.Profile.Name} account={excelUsername} " +
+                                            $"status={excelWrite.Status}");
+                                    }
+                                    else
+                                    {
+                                        _log.Warn(
+                                            $"[MANUAL_VIDEO_EXCEL_WARN] profile={ctx.Profile.Name} account={excelUsername} " +
+                                            $"status={excelWrite.Status} error={excelWrite.Error}");
+                                    }
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                _log.Warn(
+                                    $"[MANUAL_VIDEO_EXCEL_WARN] profile={ctx.Profile.Name} " +
+                                    $"status={ComposeVideoStatus(manualDeleteStatus, manualUploadStatus)} error={ex.Message}");
+                            }
+
+                            if (profileHadError) failed++; else success++;
+                            row.Cells["VideoResult"].Value = string.Join(" | ", parts) + " | Đã trả về luồng hiện tại";
+                            SetRowColorIfAttached(row, profileHadError ? Color.DarkOrange : Color.DarkGreen);
+                        }
+                        catch (Exception ex)
+                        {
+                            failed++;
+                            row.Cells["VideoResult"].Value = "Lỗi video đã được bỏ qua: " + ex.Message;
+                            SetRowColorIfAttached(row, Color.DarkOrange);
+                            _log.Warn($"[VIDEO_BEST_EFFORT_MANAGER_FAILED] profile={ctx.Profile.Name} error={ex.Message}");
+                        }
+                    }
+
+                    var remainingVideoProfiles = Math.Max(0, selectedVideoRows.Count - startedVideoProfiles);
+                    var videoSummary = batchStopRequested
+                        ? $"Đã dừng theo yêu cầu. Đã bắt đầu: {startedVideoProfiles}/{selectedVideoRows.Count}; còn chưa chạy: {remainingVideoProfiles}. Thành công: {success}; bỏ qua/dừng: {skipped}; có lỗi đã bỏ qua: {failed}.\n\nProfile đang thao tác được dừng bằng lệnh VIDEO riêng và được trả về luồng hiện tại; tool không lấy thêm profile mới."
+                        : $"Đã xử lý xong. Thành công: {success}; bỏ qua trong lượt: {skipped}; có lỗi đã bỏ qua: {failed}.\n\nXÓA/ĐĂNG đều chạy best-effort: lỗi ở bước nào được ghi nhận rồi bỏ qua, profile vẫn được trả về luồng hiện tại.";
+                    ModernDialog.ShowMessage(
+                        form,
+                        videoSummary,
+                        "Video TikTok",
+                        failed == 0 && !batchStopRequested ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+                }
+                catch (Exception ex)
+                {
+                    ModernDialog.ShowMessage(form, ex.Message, "Video TikTok", MessageBoxIcon.Error);
+                }
+                finally
+                {
+                    updateInProgress = false;
+                    try { manualVideoBatchStopCts?.Dispose(); } catch { }
+                    manualVideoBatchStopCts = null;
+                    batchStopRequested = false;
+                    stopBatch.Text = "Dừng";
+                    stopBatch.Enabled = false;
+                    close.Enabled = true;
+                    identityTab.Enabled = true;
+                    videoTab.Enabled = true;
+                    videoSelectAll.Enabled = true;
+                    videoClearAll.Enabled = true;
+                    videoGrid.Enabled = true;
+                    ShowSection(activeSection);
+                }
+                return;
+            }
+
             try
             {
                 grid.EndEdit();
@@ -755,16 +1747,24 @@ public sealed partial class ManagerForm
                 if (ModernDialog.ShowConfirm(form, confirm, "Xác nhận cập nhật TikTok") != DialogResult.Yes) return;
 
                 updateInProgress = true;
+                batchStopRequested = false;
                 apply.Enabled = false;
+                stopBatch.Text = "Dừng";
+                stopBatch.Enabled = true;
                 randomize.Enabled = false;
+                identityTab.Enabled = false;
+                videoTab.Enabled = false;
                 close.Enabled = false;
                 var success = 0;
                 var skipped = 0;
                 var failed = 0;
                 var excelWarnings = 0;
+                var startedIdentityProfiles = 0;
                 foreach (var row in selectedRows)
                 {
+                    if (batchStopRequested) break;
                     if (row.Tag is not ProfileContext ctx || !previews.TryGetValue(ctx.Profile.Name, out var preview)) continue;
+                    startedIdentityProfiles++;
                     updateResults[ctx.Profile.Name] = "Đang xử lý...";
                     TrySetGridCellValue(row, resultColumn, updateResults[ctx.Profile.Name], "ShowTikTokIdentityDialog.Apply");
                     var profileCell = TryGetGridCell(row, profileColumn, "ShowTikTokIdentityDialog.Apply");
@@ -788,6 +1788,16 @@ public sealed partial class ManagerForm
                             SetRowColorIfAttached(row, Color.DarkOrange);
                             skipped++;
                             _log.Warn($"[MANUAL_IDENTITY_SLOT_TIMEOUT] profile={ctx.Profile.Name} waited=45s");
+                            continue;
+                        }
+
+                        if (batchStopRequested)
+                        {
+                            skipped++;
+                            updateResults[ctx.Profile.Name] = "Đã dừng trước khi cập nhật";
+                            TrySetGridCellValue(row, resultColumn, updateResults[ctx.Profile.Name], "ShowTikTokIdentityDialog.Apply");
+                            SetRowColorIfAttached(row, Color.DarkOrange);
+                            _log.Info($"[MANUAL_IDENTITY_BATCH_STOPPED] profile={ctx.Profile.Name} stage=before_update");
                             continue;
                         }
 
@@ -884,6 +1894,12 @@ public sealed partial class ManagerForm
                         if (manualIdentitySlotAcquired)
                             _autoIdentityInFlight.Remove(ctx.Profile.Name);
                     }
+
+                    if (batchStopRequested)
+                    {
+                        _log.Info($"[MANUAL_IDENTITY_BATCH_STOPPED] profile={ctx.Profile.Name} remaining={Math.Max(0, selectedRows.Count - startedIdentityProfiles)} mode=after_current_profile");
+                        break;
+                    }
                 }
 
                 if (form.IsDisposed) return;
@@ -892,18 +1908,28 @@ public sealed partial class ManagerForm
                     .Take(8)
                     .Select(item => $"{item.Key}: {item.Value}")
                     .ToList();
-                var summary = $"Hoàn tất.\nThành công: {success}\nBỏ qua: {skipped}\nLỗi: {failed}\nCảnh báo ghi Excel: {excelWarnings}";
+                var remainingIdentityProfiles = Math.Max(0, selectedRows.Count - startedIdentityProfiles);
+                var summary = batchStopRequested
+                    ? $"Đã dừng theo yêu cầu.\nĐã bắt đầu: {startedIdentityProfiles}/{selectedRows.Count}\nCòn chưa chạy: {remainingIdentityProfiles}\nThành công: {success}\nBỏ qua: {skipped}\nLỗi: {failed}\nCảnh báo ghi Excel: {excelWarnings}"
+                    : $"Hoàn tất.\nThành công: {success}\nBỏ qua: {skipped}\nLỗi: {failed}\nCảnh báo ghi Excel: {excelWarnings}";
                 if (failedDetails.Count > 0) summary += "\n\n" + string.Join("\n", failedDetails);
-                summary += "\n\nProfile lỗi không làm dừng các profile còn lại.";
+                summary += batchStopRequested
+                    ? "\n\nTên/ảnh dừng sau khi profile đang xử lý hoàn tất; tool không lấy thêm profile mới."
+                    : "\n\nProfile lỗi không làm dừng các profile còn lại.";
                 ModernDialog.ShowMessage(form, summary, "Tên & ảnh TikTok", failed == 0 && excelWarnings == 0 ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
             }
             finally
             {
                 updateInProgress = false;
+                batchStopRequested = false;
                 if (!form.IsDisposed)
                 {
-                    apply.Enabled = true;
+                    stopBatch.Text = "Dừng";
+                    stopBatch.Enabled = false;
+                    apply.Enabled = activeSection == 0;
                     randomize.Enabled = true;
+                    identityTab.Enabled = true;
+                    videoTab.Enabled = true;
                     close.Enabled = true;
                 }
             }
@@ -913,7 +1939,7 @@ public sealed partial class ManagerForm
         {
             if (!updateInProgress || e.CloseReason != CloseReason.UserClosing) return;
             e.Cancel = true;
-            ModernDialog.ShowMessage(form, "Manager đang cập nhật profile. Hãy chờ thao tác hiện tại hoàn tất rồi đóng cửa sổ.", "Tên & ảnh TikTok", MessageBoxIcon.Information);
+            ModernDialog.ShowMessage(form, "Manager đang cập nhật profile. Hãy chờ thao tác hiện tại hoàn tất rồi đóng cửa sổ.", "Tên, ảnh & video TikTok", MessageBoxIcon.Information);
         };
 
         form.FormClosed += (_, _) =>
@@ -927,6 +1953,15 @@ public sealed partial class ManagerForm
             state.AutoOnReady = autoOnReady.Checked;
             state.RandomNames = randomNames.Checked;
             state.AvoidLastAvatar = avoidLast.Checked;
+            state.VideoFolder = videoFolder.Text.Trim();
+            state.VideoCaptionText = videoCaption.Text;
+            state.VideoSelectionMode = videoFixed.Checked ? "fixed" : videoSequence.Checked ? "sequence" : "random";
+            state.VideoRandomCaption = randomCaption.Checked;
+            state.AvoidLastVideo = avoidLastVideo.Checked;
+            state.VideoOncePerRun = videoOnce.Checked;
+            state.VideoDeleteEnabled = enableDelete.Checked;
+            state.VideoUploadEnabled = enableUpload.Checked;
+            state.VideoDeleteMode = deleteNewest.Checked ? "newest" : "all";
             SaveIdentityToolState(state);
             DisposePreviewImage();
         };
@@ -945,6 +1980,8 @@ public sealed partial class ManagerForm
             throw new InvalidOperationException("Profile đang được mục Tin nhắn TikTok xử lý. Hãy dừng/đợi Tin nhắn hoàn tất rồi cập nhật tên/ảnh.");
         await OpenProfileAsync(ctx);
         try { await RefreshStatusAsync(ctx); } catch { }
+        if (ctx.LastSnapshot?.VideoDeleteRunning == true)
+            throw new InvalidOperationException("Profile đang xóa video TikTok. Hãy chờ xóa video hoàn tất rồi cập nhật tên/ảnh.");
         var previousRunState = GetLastConfirmedRuntimeState(ctx);
         var shouldResume = resumeAutomation && (previousRunState is "RUNNING" or "PAUSED");
         if (previousRunState is "RUNNING" or "PAUSED")
@@ -1017,6 +2054,1217 @@ public sealed partial class ManagerForm
         }
     }
 
+    async Task<VideoDeleteReply> DeleteTikTokVideosAsync(
+        ProfileContext ctx,
+        string deleteMode,
+        Action<VideoDeleteReply>? onProgress = null,
+        bool resumeAutomation = true,
+        CancellationToken cancellationToken = default)
+    {
+        if (_messageReplyProfilesInFlight.Contains(ctx.Profile.Name))
+            return new VideoDeleteReply { Ok = false, Completed = true, Error = "Profile đang được mục Tin nhắn TikTok xử lý. Hãy dừng/đợi Tin nhắn hoàn tất rồi xóa video." };
+
+        await OpenProfileAsync(ctx);
+        try { await RefreshStatusAsync(ctx); } catch { }
+        if (ctx.LastSnapshot?.VideoDeleteRunning == true)
+            return new VideoDeleteReply { Ok = false, Completed = true, Error = "Profile này đang có một lượt xóa video chạy." };
+
+        var previousRunState = GetLastConfirmedRuntimeState(ctx);
+        var shouldResume = resumeAutomation
+            && (previousRunState is "RUNNING" or "PAUSED");
+
+        try
+        {
+            if (shouldResume)
+            {
+                try
+                {
+                    _log.Info($"[VIDEO_DELETE_STOP_AUTOMATION] profile={ctx.Profile.Name} previous={previousRunState}");
+                    await SendCommandAsync(ctx, "stop", TimeSpan.FromSeconds(15));
+                }
+                catch (Exception ex)
+                {
+                    _log.Warn($"[VIDEO_DELETE_STOP_AUTOMATION_WARN] profile={ctx.Profile.Name} error={ex.Message}");
+                }
+            }
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                _log.Info($"[VIDEO_DELETE_USER_STOP] profile={ctx.Profile.Name} stage=before_start");
+                return new VideoDeleteReply { Ok = false, Completed = true, Stage = "USER_STOPPED", Error = "Đã dừng theo yêu cầu." };
+            }
+
+            if (!string.Equals(ctx.LastSnapshot?.Chrome, "CONNECTED", StringComparison.OrdinalIgnoreCase))
+            {
+                await OpenChromeForProfileAsync(ctx);
+                try { await RefreshStatusAsync(ctx); } catch { }
+            }
+            if (!string.Equals(ctx.LastSnapshot?.Chrome, "CONNECTED", StringComparison.OrdinalIgnoreCase))
+                return new VideoDeleteReply { Ok = false, Completed = true, Error = "Chrome chưa kết nối. Tool bỏ qua bước xóa và sẽ trả profile về luồng hiện tại." };
+
+            var username = "";
+            try
+            {
+                var dataRoot = _profileService.ResolveDataRoot(ctx.Profile);
+                username = _tiktokAuthService.Load(dataRoot).Username;
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"[VIDEO_DELETE_USERNAME_READ] profile={ctx.Profile.Name} error={ex.Message}");
+            }
+
+            var request = JsonSerializer.Serialize(new
+            {
+                Username = username,
+                DeleteMode = deleteMode
+            });
+            var payload = Convert.ToBase64String(Encoding.UTF8.GetBytes(request));
+            _log.Info($"[VIDEO_DELETE_MANAGER_START] profile={ctx.Profile.Name} mode={deleteMode} username={username}");
+
+            // Worker nhận START và chạy nền. Timeout START rộng hơn để VPS chậm vẫn có thời gian dừng LIVE,
+            // kiểm tra login và chuẩn bị CDP mà không bị Manager kết luận lỗi quá sớm.
+            var startReply = await SendCommandAsync(
+                ctx,
+                "delete_tiktok_videos|" + payload,
+                TimeSpan.FromSeconds(35));
+
+            if (!string.Equals(startReply, "started", StringComparison.OrdinalIgnoreCase))
+            {
+                var reason = startReply switch
+                {
+                    "emergency_stopped" => "Tool đang ở trạng thái Dừng khẩn cấp.",
+                    "already_running" => "Profile này đang có một lượt xóa video chạy.",
+                    "message_reply_running" => "Profile đang xử lý Tin nhắn TikTok.",
+                    "automation_running" => "Automation LIVE của profile vẫn đang chạy nên Worker chưa cho phép xóa video.",
+                    "chrome_not_connected" => "Chrome chưa kết nối.",
+                    "not_logged_in" => "TikTok chưa đăng nhập.",
+                    "invalid_payload" => "Dữ liệu lệnh xóa video không hợp lệ.",
+                    _ => "Worker không bắt đầu được xóa video: " + startReply
+                };
+                return new VideoDeleteReply { Ok = false, Completed = true, Error = reason };
+            }
+
+            // Hai lớp watchdog:
+            // - hard deadline 10 phút để không có lượt nào chạy vô hạn;
+            // - inactivity 6 phút: chỉ kích hoạt khi status vẫn sống nhưng không có tiến triển.
+            // Đây là khoảng chờ cố ý rộng cho VPS chậm.
+            var hardDeadline = DateTime.UtcNow.AddMinutes(10);
+            var lastProgressUtc = DateTime.UtcNow;
+            VideoDeleteReply? latest = null;
+            var consecutiveStatusFailures = 0;
+            var lastStage = "";
+            var lastMessage = "";
+            var lastDeleted = -1;
+            var lastRemaining = int.MinValue;
+
+            while (DateTime.UtcNow < hardDeadline)
+            {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    try { await SendCommandAsync(ctx, "video_delete_stop", TimeSpan.FromSeconds(8)); } catch { }
+                    _log.Info($"[VIDEO_DELETE_USER_STOP] profile={ctx.Profile.Name} stage={latest?.Stage} deleted={latest?.DeletedCount ?? 0} wait_cleanup=true");
+
+                    // Worker dừng theo CancellationToken rồi chạy cleanup riêng trước khi hạ cờ busy.
+                    // Chờ cleanup hoàn tất để finally bên Manager chỉ resume automation sau khi
+                    // thao tác VIDEO đã thực sự nhường profile, tránh race start <-> STOPPING.
+                    var stopDeadline = DateTime.UtcNow.AddSeconds(30);
+                    while (DateTime.UtcNow < stopDeadline)
+                    {
+                        await Task.Delay(400);
+                        try
+                        {
+                            var stopRaw = await SendCommandAsync(ctx, "video_delete_status", TimeSpan.FromSeconds(5));
+                            var stopped = JsonSerializer.Deserialize<VideoDeleteReply>(
+                                stopRaw,
+                                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                            if (stopped is not null)
+                            {
+                                latest = stopped;
+                                try { onProgress?.Invoke(stopped); } catch { }
+                                if (stopped.Completed)
+                                {
+                                    _log.Info($"[VIDEO_DELETE_USER_STOP_CLEAN] profile={ctx.Profile.Name} stage={stopped.Stage} deleted={stopped.DeletedCount}");
+                                    return stopped;
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+
+                    _log.Warn($"[VIDEO_DELETE_USER_STOP_CLEAN_TIMEOUT] profile={ctx.Profile.Name} waited=30s");
+                    return new VideoDeleteReply
+                    {
+                        Ok = false,
+                        Completed = true,
+                        Stage = "USER_STOPPED",
+                        InitialCount = latest?.InitialCount ?? 0,
+                        DeletedCount = latest?.DeletedCount ?? 0,
+                        RemainingCount = latest?.RemainingCount ?? -1,
+                        Error = "Đã dừng theo yêu cầu; Worker chưa xác nhận cleanup xong trong 30 giây."
+                    };
+                }
+
+                await Task.Delay(900);
+                string raw;
+                try
+                {
+                    raw = await SendCommandAsync(ctx, "video_delete_status", TimeSpan.FromSeconds(8));
+                }
+                catch (Exception ex)
+                {
+                    consecutiveStatusFailures++;
+                    _log.Warn($"[VIDEO_DELETE_STATUS_RETRY] profile={ctx.Profile.Name} failure={consecutiveStatusFailures}/8 error={ex.Message}");
+                    if (consecutiveStatusFailures >= 8)
+                    {
+                        try { await SendCommandAsync(ctx, "video_delete_stop", TimeSpan.FromSeconds(8)); } catch { }
+                        return new VideoDeleteReply
+                        {
+                            Ok = false,
+                            Completed = true,
+                            Stage = "STATUS_LOST",
+                            InitialCount = latest?.InitialCount ?? 0,
+                            DeletedCount = latest?.DeletedCount ?? 0,
+                            RemainingCount = latest?.RemainingCount ?? -1,
+                            Error = "Mất liên lạc với Worker 8 lần liên tiếp. Tool đã bỏ qua bước xóa để tránh treo profile."
+                        };
+                    }
+                    continue;
+                }
+
+                consecutiveStatusFailures = 0;
+                latest = JsonSerializer.Deserialize<VideoDeleteReply>(
+                    raw,
+                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                if (latest is null) continue;
+
+                var changed = latest.Stage != lastStage
+                    || latest.Message != lastMessage
+                    || latest.DeletedCount != lastDeleted
+                    || latest.RemainingCount != lastRemaining;
+                if (changed)
+                {
+                    lastProgressUtc = DateTime.UtcNow;
+                    lastStage = latest.Stage;
+                    lastMessage = latest.Message;
+                    lastDeleted = latest.DeletedCount;
+                    lastRemaining = latest.RemainingCount;
+                }
+
+                try { onProgress?.Invoke(latest); } catch { }
+                if (latest.Completed)
+                {
+                    _log.Info($"[VIDEO_DELETE_MANAGER_RESULT] profile={ctx.Profile.Name} ok={latest.Ok} initial={latest.InitialCount} deleted={latest.DeletedCount} remaining={latest.RemainingCount} verifiedEmpty={latest.VerifiedEmpty} stage={latest.Stage} error={latest.Error}");
+                    return latest;
+                }
+
+                if (DateTime.UtcNow - lastProgressUtc > TimeSpan.FromMinutes(6))
+                {
+                    try { await SendCommandAsync(ctx, "video_delete_stop", TimeSpan.FromSeconds(8)); } catch { }
+                    return new VideoDeleteReply
+                    {
+                        Ok = false,
+                        Completed = true,
+                        Stage = "INACTIVITY_TIMEOUT",
+                        InitialCount = latest.InitialCount,
+                        DeletedCount = latest.DeletedCount,
+                        RemainingCount = latest.RemainingCount,
+                        Error = "Không có tiến triển mới trong 6 phút. Tool đã dừng/bỏ qua bước xóa để profile không bị treo."
+                    };
+                }
+            }
+
+            try { await SendCommandAsync(ctx, "video_delete_stop", TimeSpan.FromSeconds(8)); } catch { }
+            return new VideoDeleteReply
+            {
+                Ok = false,
+                Completed = true,
+                Stage = "HARD_TIMEOUT",
+                InitialCount = latest?.InitialCount ?? 0,
+                DeletedCount = latest?.DeletedCount ?? 0,
+                RemainingCount = latest?.RemainingCount ?? -1,
+                Error = "Lượt xóa vượt quá giới hạn an toàn 10 phút. Tool đã gửi yêu cầu dừng và bỏ qua bước xóa."
+            };
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"[VIDEO_DELETE_MANAGER_COMMAND_FAILED] profile={ctx.Profile.Name} error={ex.Message}");
+            return new VideoDeleteReply { Ok = false, Completed = true, Error = ex.Message };
+        }
+        finally
+        {
+            // Fail-open: dù xóa thành công, lỗi hay timeout thì không được để automation cũ bị dừng vĩnh viễn.
+            // Chỉ khôi phục nếu profile trước đó vốn đang RUNNING/PAUSED và người dùng chưa Dừng khẩn cấp.
+            if (shouldResume && !IsAutomationHalted && !_closing)
+            {
+                try
+                {
+                    _log.Info($"[VIDEO_DELETE_RESUME_AUTOMATION] profile={ctx.Profile.Name} previous={previousRunState}");
+                    await SendCommandAsync(ctx, "start", TimeSpan.FromSeconds(45));
+                    if (previousRunState == "PAUSED")
+                    {
+                        await Task.Delay(500);
+                        await SendCommandAsync(ctx, "pause", TimeSpan.FromSeconds(12));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _log.Warn($"[VIDEO_DELETE_RESUME_FAILED] profile={ctx.Profile.Name} previous={previousRunState} error={ex.Message}");
+                }
+            }
+            else
+            {
+                _log.Info($"[VIDEO_DELETE_RESUME_SKIP] profile={ctx.Profile.Name} previous={previousRunState} halted={IsAutomationHalted} closing={_closing}");
+            }
+        }
+    }
+
+    async Task<VideoUploadReply> UploadTikTokVideoAsync(
+        ProfileContext ctx,
+        string videoPath,
+        string caption,
+        Action<VideoUploadReply>? onProgress = null,
+        bool resumeAutomation = true,
+        bool studioDeleteFallback = false,
+        CancellationToken cancellationToken = default)
+    {
+        if (_messageReplyProfilesInFlight.Contains(ctx.Profile.Name))
+            return new VideoUploadReply { Ok = false, Completed = true, Error = "Profile đang được mục Tin nhắn TikTok xử lý. Hãy dừng/đợi Tin nhắn hoàn tất rồi đăng video." };
+
+        if (string.IsNullOrWhiteSpace(videoPath) || !File.Exists(videoPath))
+            return new VideoUploadReply { Ok = false, Completed = true, Error = "Không tìm thấy file video cần đăng." };
+
+        await OpenProfileAsync(ctx);
+        try { await RefreshStatusAsync(ctx); } catch { }
+        if (ctx.LastSnapshot?.VideoDeleteRunning == true)
+            return new VideoUploadReply { Ok = false, Completed = true, Error = "Profile này đang có một thao tác VIDEO khác chạy." };
+
+        var previousRunState = GetLastConfirmedRuntimeState(ctx);
+        var shouldResume = resumeAutomation
+            && (previousRunState is "RUNNING" or "PAUSED");
+
+        try
+        {
+            if (shouldResume)
+            {
+                try
+                {
+                    _log.Info($"[VIDEO_UPLOAD_STOP_AUTOMATION] profile={ctx.Profile.Name} previous={previousRunState}");
+                    await SendCommandAsync(ctx, "stop", TimeSpan.FromSeconds(15));
+                }
+                catch (Exception ex)
+                {
+                    _log.Warn($"[VIDEO_UPLOAD_STOP_AUTOMATION_WARN] profile={ctx.Profile.Name} error={ex.Message}");
+                }
+            }
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                _log.Info($"[VIDEO_UPLOAD_USER_STOP] profile={ctx.Profile.Name} stage=before_start");
+                return new VideoUploadReply { Ok = false, Completed = true, Stage = "USER_STOPPED", VideoPath = videoPath, Error = "Đã dừng theo yêu cầu." };
+            }
+
+            if (!string.Equals(ctx.LastSnapshot?.Chrome, "CONNECTED", StringComparison.OrdinalIgnoreCase))
+            {
+                await OpenChromeForProfileAsync(ctx);
+                try { await RefreshStatusAsync(ctx); } catch { }
+            }
+            if (!string.Equals(ctx.LastSnapshot?.Chrome, "CONNECTED", StringComparison.OrdinalIgnoreCase))
+                return new VideoUploadReply { Ok = false, Completed = true, Error = "Chrome chưa kết nối. Tool bỏ qua bước đăng và trả profile về luồng hiện tại." };
+
+            var username = "";
+            try
+            {
+                var dataRoot = _profileService.ResolveDataRoot(ctx.Profile);
+                username = _tiktokAuthService.Load(dataRoot).Username;
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"[VIDEO_UPLOAD_USERNAME_READ] profile={ctx.Profile.Name} error={ex.Message}");
+            }
+
+            var request = JsonSerializer.Serialize(new
+            {
+                Username = username,
+                VideoPath = videoPath,
+                Caption = caption ?? "",
+                StudioDeleteFallback = studioDeleteFallback
+            });
+            var payload = Convert.ToBase64String(Encoding.UTF8.GetBytes(request));
+            _log.Info($"[VIDEO_UPLOAD_MANAGER_START] profile={ctx.Profile.Name} file={Path.GetFileName(videoPath)} username={username} studioDeleteFallback={studioDeleteFallback}");
+
+            var startReply = await SendCommandAsync(
+                ctx,
+                "upload_tiktok_video|" + payload,
+                TimeSpan.FromSeconds(35));
+
+            if (!string.Equals(startReply, "started", StringComparison.OrdinalIgnoreCase))
+            {
+                var reason = startReply switch
+                {
+                    "emergency_stopped" => "Tool đang ở trạng thái Dừng khẩn cấp.",
+                    "already_running" => "Profile này đang có một lượt đăng video chạy.",
+                    "video_delete_running" => "Profile đang xử lý xóa video.",
+                    "message_reply_running" => "Profile đang xử lý Tin nhắn TikTok.",
+                    "automation_running" => "Automation LIVE của profile vẫn đang chạy nên Worker chưa cho phép đăng video.",
+                    "chrome_not_connected" => "Chrome chưa kết nối.",
+                    "not_logged_in" => "TikTok chưa đăng nhập.",
+                    "video_not_found" => "File video không tồn tại trên máy/VPS đang chạy Worker.",
+                    "invalid_payload" => "Dữ liệu lệnh đăng video không hợp lệ.",
+                    _ => "Worker không bắt đầu được đăng video: " + startReply
+                };
+                return new VideoUploadReply { Ok = false, Completed = true, Error = reason };
+            }
+
+            // Upload có thể chậm hơn xóa trên VPS/mạng yếu: hard-limit 15 phút,
+            // inactivity 7 phút. Khi hết hạn chỉ dừng phần ĐĂNG, không giữ profile bị treo.
+            var hardDeadline = DateTime.UtcNow.AddMinutes(15);
+            var lastProgressUtc = DateTime.UtcNow;
+            VideoUploadReply? latest = null;
+            var consecutiveStatusFailures = 0;
+            var lastStage = "";
+            var lastMessage = "";
+            var lastPostedHref = "";
+            var lastPosted = false;
+            var lastPrivacy = false;
+            var lastVerified = false;
+            var lastDeleteFallbackAttempted = false;
+            var lastDeleteFallbackSucceeded = false;
+            var lastDeleteFallbackDeletedCount = 0;
+
+            while (DateTime.UtcNow < hardDeadline)
+            {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    try { await SendCommandAsync(ctx, "video_upload_stop", TimeSpan.FromSeconds(8)); } catch { }
+                    _log.Info($"[VIDEO_UPLOAD_USER_STOP] profile={ctx.Profile.Name} stage={latest?.Stage} posted={latest?.Posted ?? false} wait_cleanup=true");
+
+                    var stopDeadline = DateTime.UtcNow.AddSeconds(30);
+                    while (DateTime.UtcNow < stopDeadline)
+                    {
+                        await Task.Delay(400);
+                        try
+                        {
+                            var stopRaw = await SendCommandAsync(ctx, "video_upload_status", TimeSpan.FromSeconds(5));
+                            var stopped = JsonSerializer.Deserialize<VideoUploadReply>(
+                                stopRaw,
+                                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                            if (stopped is not null)
+                            {
+                                latest = stopped;
+                                try { onProgress?.Invoke(stopped); } catch { }
+                                if (stopped.Completed)
+                                {
+                                    _log.Info($"[VIDEO_UPLOAD_USER_STOP_CLEAN] profile={ctx.Profile.Name} stage={stopped.Stage} posted={stopped.Posted}");
+                                    return stopped;
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+
+                    _log.Warn($"[VIDEO_UPLOAD_USER_STOP_CLEAN_TIMEOUT] profile={ctx.Profile.Name} waited=30s");
+                    return new VideoUploadReply
+                    {
+                        Ok = false,
+                        Completed = true,
+                        Stage = "USER_STOPPED",
+                        Posted = latest?.Posted ?? false,
+                        PrivacyUpdated = latest?.PrivacyUpdated ?? false,
+                        ProfileVerified = latest?.ProfileVerified ?? false,
+                        DeleteFallbackAttempted = latest?.DeleteFallbackAttempted ?? false,
+                        DeleteFallbackSucceeded = latest?.DeleteFallbackSucceeded ?? false,
+                        DeleteFallbackDeletedCount = latest?.DeleteFallbackDeletedCount ?? 0,
+                        DeleteFallbackRemainingCount = latest?.DeleteFallbackRemainingCount ?? -1,
+                        DeleteFallbackError = latest?.DeleteFallbackError ?? "",
+                        VideoPath = videoPath,
+                        PostedHref = latest?.PostedHref ?? "",
+                        Error = "Đã dừng theo yêu cầu; Worker chưa xác nhận cleanup xong trong 30 giây."
+                    };
+                }
+
+                await Task.Delay(950);
+                string raw;
+                try
+                {
+                    raw = await SendCommandAsync(ctx, "video_upload_status", TimeSpan.FromSeconds(8));
+                }
+                catch (Exception ex)
+                {
+                    consecutiveStatusFailures++;
+                    _log.Warn($"[VIDEO_UPLOAD_STATUS_RETRY] profile={ctx.Profile.Name} failure={consecutiveStatusFailures}/8 error={ex.Message}");
+                    if (consecutiveStatusFailures >= 8)
+                    {
+                        try { await SendCommandAsync(ctx, "video_upload_stop", TimeSpan.FromSeconds(8)); } catch { }
+                        return new VideoUploadReply
+                        {
+                            Ok = false,
+                            Completed = true,
+                            Stage = "STATUS_LOST",
+                            Posted = latest?.Posted ?? false,
+                            PrivacyUpdated = latest?.PrivacyUpdated ?? false,
+                            ProfileVerified = latest?.ProfileVerified ?? false,
+                            DeleteFallbackAttempted = latest?.DeleteFallbackAttempted ?? false,
+                            DeleteFallbackSucceeded = latest?.DeleteFallbackSucceeded ?? false,
+                            DeleteFallbackDeletedCount = latest?.DeleteFallbackDeletedCount ?? 0,
+                            DeleteFallbackRemainingCount = latest?.DeleteFallbackRemainingCount ?? -1,
+                            DeleteFallbackError = latest?.DeleteFallbackError ?? "",
+                            VideoPath = videoPath,
+                            PostedHref = latest?.PostedHref ?? "",
+                            Error = "Mất liên lạc với Worker 8 lần liên tiếp. Tool đã bỏ qua bước đăng để tránh treo profile."
+                        };
+                    }
+                    continue;
+                }
+
+                consecutiveStatusFailures = 0;
+                latest = JsonSerializer.Deserialize<VideoUploadReply>(
+                    raw,
+                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                if (latest is null) continue;
+
+                var changed = latest.Stage != lastStage
+                    || latest.Message != lastMessage
+                    || latest.PostedHref != lastPostedHref
+                    || latest.Posted != lastPosted
+                    || latest.PrivacyUpdated != lastPrivacy
+                    || latest.ProfileVerified != lastVerified
+                    || latest.DeleteFallbackAttempted != lastDeleteFallbackAttempted
+                    || latest.DeleteFallbackSucceeded != lastDeleteFallbackSucceeded
+                    || latest.DeleteFallbackDeletedCount != lastDeleteFallbackDeletedCount;
+                if (changed)
+                {
+                    lastProgressUtc = DateTime.UtcNow;
+                    lastStage = latest.Stage;
+                    lastMessage = latest.Message;
+                    lastPostedHref = latest.PostedHref;
+                    lastPosted = latest.Posted;
+                    lastPrivacy = latest.PrivacyUpdated;
+                    lastVerified = latest.ProfileVerified;
+                    lastDeleteFallbackAttempted = latest.DeleteFallbackAttempted;
+                    lastDeleteFallbackSucceeded = latest.DeleteFallbackSucceeded;
+                    lastDeleteFallbackDeletedCount = latest.DeleteFallbackDeletedCount;
+                }
+
+                try { onProgress?.Invoke(latest); } catch { }
+                if (latest.Completed)
+                {
+                    _log.Info($"[VIDEO_UPLOAD_MANAGER_RESULT] profile={ctx.Profile.Name} ok={latest.Ok} posted={latest.Posted} public={latest.PrivacyUpdated} verified={latest.ProfileVerified} stage={latest.Stage} href={latest.PostedHref} deleteFallbackAttempted={latest.DeleteFallbackAttempted} deleteFallbackOk={latest.DeleteFallbackSucceeded} deleteFallbackDeleted={latest.DeleteFallbackDeletedCount} error={latest.Error}");
+                    return latest;
+                }
+
+                if (DateTime.UtcNow - lastProgressUtc > TimeSpan.FromMinutes(7))
+                {
+                    try { await SendCommandAsync(ctx, "video_upload_stop", TimeSpan.FromSeconds(8)); } catch { }
+                    return new VideoUploadReply
+                    {
+                        Ok = false,
+                        Completed = true,
+                        Stage = "INACTIVITY_TIMEOUT",
+                        Posted = latest.Posted,
+                        PrivacyUpdated = latest.PrivacyUpdated,
+                        ProfileVerified = latest.ProfileVerified,
+                        DeleteFallbackAttempted = latest.DeleteFallbackAttempted,
+                        DeleteFallbackSucceeded = latest.DeleteFallbackSucceeded,
+                        DeleteFallbackDeletedCount = latest.DeleteFallbackDeletedCount,
+                        DeleteFallbackRemainingCount = latest.DeleteFallbackRemainingCount,
+                        DeleteFallbackError = latest.DeleteFallbackError,
+                        VideoPath = videoPath,
+                        PostedHref = latest.PostedHref,
+                        Error = "Không có tiến triển mới trong 7 phút. Tool đã dừng/bỏ qua bước đăng để profile không bị treo."
+                    };
+                }
+            }
+
+            try { await SendCommandAsync(ctx, "video_upload_stop", TimeSpan.FromSeconds(8)); } catch { }
+            return new VideoUploadReply
+            {
+                Ok = false,
+                Completed = true,
+                Stage = "HARD_TIMEOUT",
+                Posted = latest?.Posted ?? false,
+                PrivacyUpdated = latest?.PrivacyUpdated ?? false,
+                ProfileVerified = latest?.ProfileVerified ?? false,
+                DeleteFallbackAttempted = latest?.DeleteFallbackAttempted ?? false,
+                DeleteFallbackSucceeded = latest?.DeleteFallbackSucceeded ?? false,
+                DeleteFallbackDeletedCount = latest?.DeleteFallbackDeletedCount ?? 0,
+                DeleteFallbackRemainingCount = latest?.DeleteFallbackRemainingCount ?? -1,
+                DeleteFallbackError = latest?.DeleteFallbackError ?? "",
+                VideoPath = videoPath,
+                PostedHref = latest?.PostedHref ?? "",
+                Error = "Lượt đăng vượt quá giới hạn an toàn 15 phút. Tool đã gửi yêu cầu dừng và bỏ qua bước đăng."
+            };
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"[VIDEO_UPLOAD_MANAGER_COMMAND_FAILED] profile={ctx.Profile.Name} error={ex.Message}");
+            return new VideoUploadReply { Ok = false, Completed = true, VideoPath = videoPath, Error = ex.Message };
+        }
+        finally
+        {
+            if (shouldResume && !IsAutomationHalted && !_closing)
+            {
+                try
+                {
+                    _log.Info($"[VIDEO_UPLOAD_RESUME_AUTOMATION] profile={ctx.Profile.Name} previous={previousRunState}");
+                    await SendCommandAsync(ctx, "start", TimeSpan.FromSeconds(45));
+                    if (previousRunState == "PAUSED")
+                    {
+                        await Task.Delay(500);
+                        await SendCommandAsync(ctx, "pause", TimeSpan.FromSeconds(12));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _log.Warn($"[VIDEO_UPLOAD_RESUME_FAILED] profile={ctx.Profile.Name} previous={previousRunState} error={ex.Message}");
+                }
+            }
+            else
+            {
+                _log.Info($"[VIDEO_UPLOAD_RESUME_SKIP] profile={ctx.Profile.Name} previous={previousRunState} halted={IsAutomationHalted} closing={_closing}");
+            }
+        }
+    }
+
+    static string NormalizeConfiguredVideoSide(string? value, bool enabled)
+    {
+        if (!enabled)
+            return "OFF";
+
+        value = (value ?? "").Trim();
+        return value.Equals("DONE", StringComparison.OrdinalIgnoreCase)
+            ? "DONE"
+            : "FAIL";
+    }
+
+    static (string Delete, string Upload) ParseConfiguredVideoStatus(
+        string? value,
+        bool deleteEnabled,
+        bool uploadEnabled)
+    {
+        var parts = (value ?? "").Split('|');
+        var left = parts.Length > 0 ? parts[0] : "";
+        var right = parts.Length > 1 ? parts[1] : "";
+
+        return (
+            NormalizeConfiguredVideoSide(left, deleteEnabled),
+            NormalizeConfiguredVideoSide(right, uploadEnabled));
+    }
+
+    static string ComposeVideoStatus(string deleteStatus, string uploadStatus)
+        => $"{deleteStatus}|{uploadStatus}";
+
+    static bool IsVideoLoginRequired(VideoDeleteReply? reply)
+    {
+        if (reply is null) return false;
+        if (string.Equals(reply.Stage, "SKIPPED_LOGIN", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        var text = ((reply.Error ?? "") + " " + (reply.Message ?? "")).Trim();
+        if (text.Length == 0) return false;
+
+        return text.Contains("chưa đăng nhập", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("mất đăng nhập", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("login_required", StringComparison.OrdinalIgnoreCase);
+    }
+
+    async Task<(bool Ok, string Status, string Error)> WriteVideoStatusVerifiedAsync(
+        string username,
+        string profileName,
+        string deleteStatus,
+        string uploadStatus,
+        CancellationToken ct)
+    {
+        username = (username ?? "").Trim();
+        if (username.Length == 0)
+            return (false, "", "Không xác định được tài khoản để ghi VIDEO.");
+
+        var wanted = ComposeVideoStatus(deleteStatus, uploadStatus);
+        Exception? lastError = null;
+
+        // Dùng cùng pattern retry + đọc lại xác minh như Tên/ảnh để không báo DONE giả
+        // khi Excel đang được lưu/khóa tạm thời.
+        for (var attempt = 1; attempt <= 3; attempt++)
+        {
+            try
+            {
+                await RunAccountPoolIoAsync(
+                    () => _accountPoolService.MarkVideoResult(username, wanted),
+                    ct);
+
+                var actual = await RunAccountPoolIoAsync(
+                    () => _accountPoolService.GetVideoResult(username),
+                    ct);
+
+                if (!string.Equals(actual, wanted, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        $"Đã ghi nhưng đọc lại Excel thấy VIDEO='{actual}', cần '{wanted}'.");
+                }
+
+                _log.Info(
+                    $"[AUTO_VIDEO_EXCEL_VERIFIED] profile={profileName} account={username} " +
+                    $"status={wanted} attempt={attempt}/3");
+                return (true, wanted, "");
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+                _log.Warn(
+                    $"[AUTO_VIDEO_EXCEL_RETRY] profile={profileName} account={username} " +
+                    $"status={wanted} attempt={attempt}/3 error={ex.Message}");
+
+                if (attempt < 3)
+                    await Task.Delay(450 * attempt, ct);
+            }
+        }
+
+        return (false, wanted, lastError?.Message ?? "Không ghi được trạng thái VIDEO vào Excel.");
+    }
+
+    static List<string> ReadConfiguredVideoFiles(string folder)
+    {
+        if (string.IsNullOrWhiteSpace(folder) || !Directory.Exists(folder))
+            return new List<string>();
+
+        var allowed = new HashSet<string>(
+            new[] { ".mp4", ".mov", ".webm", ".m4v", ".avi", ".mkv", ".mpeg", ".mpg", ".mpe", ".ogm" },
+            StringComparer.OrdinalIgnoreCase);
+
+        return Directory
+            .EnumerateFiles(folder, "*.*", SearchOption.TopDirectoryOnly)
+            .Where(x => allowed.Contains(Path.GetExtension(x)))
+            .OrderBy(x => Path.GetFileName(x), StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    static List<string> ReadConfiguredVideoCaptions(string? text)
+        => (text ?? "")
+            .Replace("\r\n", "\n")
+            .Replace('\r', '\n')
+            .Split('\n')
+            .Select(x => x.Trim())
+            .Where(x => x.Length > 0)
+            .ToList();
+
+    VideoUploadPreview ResolveAutoVideoPreview(
+        ProfileContext ctx,
+        string username,
+        IdentityToolState state)
+    {
+        var videos = ReadConfiguredVideoFiles(state.VideoFolder);
+        if (videos.Count == 0)
+            return new VideoUploadPreview(ctx, "", "");
+
+        var orderedProfiles = _contexts.Values
+            .OrderBy(x => x.Profile.Name, NaturalProfileNameOrder)
+            .Select(x => x.Profile.Name)
+            .ToList();
+
+        var profileIndex = orderedProfiles.FindIndex(x =>
+            x.Equals(ctx.Profile.Name, StringComparison.OrdinalIgnoreCase));
+        if (profileIndex < 0)
+            profileIndex = 0;
+
+        string picked;
+        if (string.Equals(state.VideoSelectionMode, "fixed", StringComparison.OrdinalIgnoreCase))
+        {
+            // "Một video cố định": giữ ổn định giữa các lần chạy thay vì random lại
+            // mỗi lần AutoOnReady được gọi.
+            picked = videos[0];
+        }
+        else if (string.Equals(state.VideoSelectionMode, "sequence", StringComparison.OrdinalIgnoreCase))
+        {
+            picked = videos[profileIndex % videos.Count];
+        }
+        else
+        {
+            picked = videos[Random.Shared.Next(videos.Count)];
+        }
+
+        var accountKey = string.IsNullOrWhiteSpace(username)
+            ? "profile:" + ctx.Profile.Name.ToLowerInvariant()
+            : username.Trim().TrimStart('@').ToLowerInvariant();
+
+        if (state.AvoidLastVideo
+            && videos.Count > 1
+            && state.LastVideoByAccount.TryGetValue(accountKey, out var last)
+            && !string.IsNullOrWhiteSpace(last))
+        {
+            try
+            {
+                var lastFull = Path.GetFullPath(last);
+                var alternatives = videos
+                    .Where(x =>
+                    {
+                        try
+                        {
+                            return !string.Equals(
+                                Path.GetFullPath(x),
+                                lastFull,
+                                StringComparison.OrdinalIgnoreCase);
+                        }
+                        catch
+                        {
+                            return true;
+                        }
+                    })
+                    .ToList();
+
+                if (alternatives.Count > 0)
+                {
+                    picked = string.Equals(state.VideoSelectionMode, "random", StringComparison.OrdinalIgnoreCase)
+                        ? alternatives[Random.Shared.Next(alternatives.Count)]
+                        : alternatives[0];
+                }
+            }
+            catch { }
+        }
+
+        var captions = ReadConfiguredVideoCaptions(state.VideoCaptionText);
+        string caption = "";
+        if (captions.Count == 1)
+        {
+            caption = captions[0];
+        }
+        else if (captions.Count > 1)
+        {
+            caption = state.VideoRandomCaption
+                ? captions[Random.Shared.Next(captions.Count)]
+                : captions[profileIndex % captions.Count];
+        }
+
+        return new VideoUploadPreview(ctx, picked, caption);
+    }
+
+    async Task<bool> RunAutoVideoPipelineAsync(
+        ProfileContext ctx,
+        string username,
+        IdentityToolState state)
+    {
+        username = (username ?? "").Trim();
+        if (username.Length == 0)
+        {
+            _log.Warn($"[AUTO_VIDEO_SKIP_ACCOUNT] profile={ctx.Profile.Name} reason=username_empty");
+            return false;
+        }
+
+        // Nếu một lượt VIDEO khác (thủ công hoặc một gate khác) đã bắt đầu trước,
+        // tuyệt đối không tự ghi FAIL|FAIL vào Excel chỉ vì Worker đang bận.
+        // Defer cả pipeline cho chu kỳ READY hiện tại; lượt đang chạy giữ quyền xử lý.
+        try
+        {
+            await RefreshStatusAsync(ctx);
+        }
+        catch { }
+
+        if (ctx.LastSnapshot?.VideoDeleteRunning == true)
+        {
+            _log.Info(
+                $"[AUTO_VIDEO_BUSY_DEFER] profile={ctx.Profile.Name} account={username} " +
+                "action=KEEP_EXCEL_UNCHANGED_ALLOW_EXISTING_VIDEO_OP");
+            return false;
+        }
+
+        string rawStatus;
+        try
+        {
+            rawStatus = await RunAccountPoolIoAsync(
+                () => _accountPoolService.GetVideoResult(username),
+                CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            // Không đọc được Excel thì không tự đoán là FAIL, vì có thể tài khoản
+            // thực tế đã DONE|DONE. Bỏ qua VIDEO để tránh xóa/đăng lặp ngoài ý muốn.
+            _log.Warn(
+                $"[AUTO_VIDEO_EXCEL_READ_WARN] profile={ctx.Profile.Name} account={username} " +
+                $"action=SKIP_VIDEO_ALLOW_AUTOMATION error={ex.Message}");
+            return false;
+        }
+
+        var status = ParseConfiguredVideoStatus(
+            rawStatus,
+            state.VideoDeleteEnabled,
+            state.VideoUploadEnabled);
+
+        var deleteStatus = status.Delete;
+        var uploadStatus = status.Upload;
+
+        _log.Info(
+            $"[AUTO_VIDEO_STATUS] profile={ctx.Profile.Name} account={username} raw='{rawStatus}' " +
+            $"effective={ComposeVideoStatus(deleteStatus, uploadStatus)} " +
+            $"deleteEnabled={state.VideoDeleteEnabled} uploadEnabled={state.VideoUploadEnabled}");
+
+        // Đồng bộ OFF theo cấu hình hiện tại. Việc ghi lỗi không được chặn automation.
+        var initialWrite = await WriteVideoStatusVerifiedAsync(
+            username,
+            ctx.Profile.Name,
+            deleteStatus,
+            uploadStatus,
+            CancellationToken.None);
+        if (!initialWrite.Ok)
+        {
+            _log.Warn(
+                $"[AUTO_VIDEO_EXCEL_INITIAL_WARN] profile={ctx.Profile.Name} account={username} " +
+                $"status={initialWrite.Status} error={initialWrite.Error}");
+        }
+
+        if ((!state.VideoDeleteEnabled || deleteStatus == "DONE")
+            && (!state.VideoUploadEnabled || uploadStatus == "DONE"))
+        {
+            _log.Info(
+                $"[AUTO_VIDEO_SKIP_COMPLETE] profile={ctx.Profile.Name} account={username} " +
+                $"status={ComposeVideoStatus(deleteStatus, uploadStatus)}");
+            return true;
+        }
+
+        var runDelete = state.VideoDeleteEnabled && deleteStatus != "DONE";
+        var runUpload = state.VideoUploadEnabled && uploadStatus != "DONE";
+        var skipUploadBecauseLoginRequired = false;
+        var studioDeleteFallbackNeeded = false;
+        var forceDeleteAllAndRepost =
+            runDelete
+            && state.VideoUploadEnabled
+            && uploadStatus == "DONE";
+
+        // Người dùng đã chốt: FAIL|DONE phải xóa hết rồi đăng lại.
+        // Trước khi xóa, hạ vế ĐĂNG về FAIL để checkpoint không còn nói DONE
+        // nếu tool bị tắt sau khi video cũ đã bị xóa.
+        if (forceDeleteAllAndRepost)
+        {
+            uploadStatus = "FAIL";
+            runUpload = true;
+
+            var invalidate = await WriteVideoStatusVerifiedAsync(
+                username,
+                ctx.Profile.Name,
+                deleteStatus,
+                uploadStatus,
+                CancellationToken.None);
+            if (!invalidate.Ok)
+            {
+                _log.Warn(
+                    $"[AUTO_VIDEO_EXCEL_INVALIDATE_POST_WARN] profile={ctx.Profile.Name} account={username} " +
+                    $"error={invalidate.Error}");
+            }
+        }
+
+        if (runDelete)
+        {
+            try
+            {
+                var deleteMode = forceDeleteAllAndRepost
+                    ? "all"
+                    : string.Equals(
+                        state.VideoDeleteMode,
+                        "newest",
+                        StringComparison.OrdinalIgnoreCase)
+                        ? "newest"
+                        : "all";
+
+                _log.Info(
+                    $"[AUTO_VIDEO_DELETE_BEGIN] profile={ctx.Profile.Name} account={username} mode={deleteMode}");
+
+                var reply = await DeleteTikTokVideosAsync(
+                    ctx,
+                    deleteMode,
+                    resumeAutomation: false);
+
+                deleteStatus = reply.Ok ? "DONE" : "FAIL";
+                if (IsVideoLoginRequired(reply))
+                {
+                    skipUploadBecauseLoginRequired = true;
+                    _log.Warn(
+                        $"[AUTO_VIDEO_LOGIN_REQUIRED] profile={ctx.Profile.Name} account={username} " +
+                        $"stage={reply.Stage} action=SKIP_UPLOAD_RETURN_TO_EXISTING_LOGIN_FLOW error={reply.Error}");
+                }
+                else if (!reply.Ok && runUpload)
+                {
+                    studioDeleteFallbackNeeded = true;
+                    _log.Warn(
+                        $"[AUTO_VIDEO_DELETE_PRIMARY_FAIL_FALLBACK_ARMED] profile={ctx.Profile.Name} account={username} " +
+                        $"deleted={reply.DeletedCount} error={reply.Error}");
+                }
+
+                _log.Info(
+                    $"[AUTO_VIDEO_DELETE_RESULT] profile={ctx.Profile.Name} account={username} " +
+                    $"ok={reply.Ok} deleted={reply.DeletedCount} remaining={reply.RemainingCount} " +
+                    $"verifiedEmpty={reply.VerifiedEmpty} status={deleteStatus} stage={reply.Stage} error={reply.Error}");
+            }
+            catch (Exception ex)
+            {
+                deleteStatus = "FAIL";
+                studioDeleteFallbackNeeded = runUpload;
+                _log.Warn(
+                    $"[AUTO_VIDEO_DELETE_EXCEPTION] profile={ctx.Profile.Name} account={username} error={ex.Message} fallbackArmed={studioDeleteFallbackNeeded}");
+            }
+
+            var write = await WriteVideoStatusVerifiedAsync(
+                username,
+                ctx.Profile.Name,
+                deleteStatus,
+                uploadStatus,
+                CancellationToken.None);
+            if (!write.Ok)
+            {
+                _log.Warn(
+                    $"[AUTO_VIDEO_EXCEL_AFTER_DELETE_WARN] profile={ctx.Profile.Name} account={username} " +
+                    $"status={write.Status} error={write.Error}");
+            }
+        }
+
+        // Xóa lỗi thông thường vẫn phải thử ĐĂNG theo nguyên tắc fail-open đã chốt.
+        // Riêng khi XÓA đã xác định LOGIN_REQUIRED thì không thử upload nữa: giữ
+        // vế ĐĂNG ở trạng thái hiện tại (thường là FAIL), ghi checkpoint Excel và
+        // trả Chrome ngay cho logic login đang có của tool.
+        if (runUpload && skipUploadBecauseLoginRequired)
+        {
+            _log.Warn(
+                $"[AUTO_VIDEO_UPLOAD_SKIP_LOGIN_REQUIRED] profile={ctx.Profile.Name} account={username} " +
+                $"status={ComposeVideoStatus(deleteStatus, uploadStatus)}");
+        }
+        else if (runUpload)
+        {
+            var preview = ResolveAutoVideoPreview(ctx, username, state);
+
+            if (string.IsNullOrWhiteSpace(preview.VideoPath)
+                || !File.Exists(preview.VideoPath))
+            {
+                uploadStatus = "FAIL";
+                _log.Warn(
+                    $"[AUTO_VIDEO_UPLOAD_MISSING_FILE] profile={ctx.Profile.Name} account={username} " +
+                    $"folder='{state.VideoFolder}'");
+            }
+            else
+            {
+                try
+                {
+                    _log.Info(
+                        $"[AUTO_VIDEO_UPLOAD_BEGIN] profile={ctx.Profile.Name} account={username} " +
+                        $"file={Path.GetFileName(preview.VideoPath)}");
+
+                    var reply = await UploadTikTokVideoAsync(
+                        ctx,
+                        preview.VideoPath,
+                        preview.Caption,
+                        resumeAutomation: false,
+                        studioDeleteFallback: studioDeleteFallbackNeeded);
+
+                    if (studioDeleteFallbackNeeded)
+                    {
+                        if (reply.DeleteFallbackSucceeded)
+                        {
+                            deleteStatus = "DONE";
+                            studioDeleteFallbackNeeded = false;
+                            _log.Info(
+                                $"[AUTO_VIDEO_DELETE_FALLBACK_DONE] profile={ctx.Profile.Name} account={username} " +
+                                $"deleted={reply.DeleteFallbackDeletedCount} remaining={reply.DeleteFallbackRemainingCount} status=DONE");
+                        }
+                        else if (reply.DeleteFallbackAttempted)
+                        {
+                            studioDeleteFallbackNeeded = false;
+                            _log.Warn(
+                                $"[AUTO_VIDEO_DELETE_FALLBACK_FAIL] profile={ctx.Profile.Name} account={username} " +
+                                $"deleted={reply.DeleteFallbackDeletedCount} remaining={reply.DeleteFallbackRemainingCount} error={reply.DeleteFallbackError}");
+                        }
+                    }
+
+                    var uploadOk = reply.Ok
+                        && reply.Posted
+                        && reply.PrivacyUpdated
+                        && reply.ProfileVerified;
+
+                    uploadStatus = uploadOk ? "DONE" : "FAIL";
+
+                    if (reply.Posted)
+                    {
+                        var accountKey = username.Trim().TrimStart('@').ToLowerInvariant();
+                        state.LastVideoByAccount[accountKey] = preview.VideoPath;
+                        SaveIdentityToolState(state);
+                    }
+
+                    _log.Info(
+                        $"[AUTO_VIDEO_UPLOAD_RESULT] profile={ctx.Profile.Name} account={username} " +
+                        $"ok={reply.Ok} posted={reply.Posted} public={reply.PrivacyUpdated} " +
+                        $"verified={reply.ProfileVerified} status={uploadStatus} " +
+                        $"deleteFallbackAttempted={reply.DeleteFallbackAttempted} deleteFallbackOk={reply.DeleteFallbackSucceeded} error={reply.Error}");
+                }
+                catch (Exception ex)
+                {
+                    uploadStatus = "FAIL";
+                    _log.Warn(
+                        $"[AUTO_VIDEO_UPLOAD_EXCEPTION] profile={ctx.Profile.Name} account={username} error={ex.Message}");
+                }
+            }
+
+            var write = await WriteVideoStatusVerifiedAsync(
+                username,
+                ctx.Profile.Name,
+                deleteStatus,
+                uploadStatus,
+                CancellationToken.None);
+            if (!write.Ok)
+            {
+                _log.Warn(
+                    $"[AUTO_VIDEO_EXCEL_AFTER_UPLOAD_WARN] profile={ctx.Profile.Name} account={username} " +
+                    $"status={write.Status} error={write.Error}");
+            }
+        }
+
+        var finalStatus = ComposeVideoStatus(deleteStatus, uploadStatus);
+        var completed =
+            (!state.VideoDeleteEnabled || deleteStatus == "DONE")
+            && (!state.VideoUploadEnabled || uploadStatus == "DONE");
+
+        _log.Info(
+            $"[AUTO_VIDEO_PIPELINE_DONE] profile={ctx.Profile.Name} account={username} " +
+            $"status={finalStatus} completed={completed}");
+
+        return completed;
+    }
+
+    async Task<bool> WaitForExistingVideoOperationAsync(
+        ProfileContext ctx,
+        string username,
+        TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        var loggedWait = false;
+
+        while (DateTime.UtcNow < deadline)
+        {
+            try { await RefreshStatusAsync(ctx); } catch { }
+
+            if (ctx.LastSnapshot?.VideoDeleteRunning != true)
+            {
+                if (loggedWait)
+                {
+                    _log.Info(
+                        $"[AUTO_VIDEO_EXISTING_OP_FINISHED] profile={ctx.Profile.Name} account={username}");
+                }
+                return true;
+            }
+
+            if (!loggedWait)
+            {
+                loggedWait = true;
+                _log.Info(
+                    $"[AUTO_VIDEO_EXISTING_OP_WAIT] profile={ctx.Profile.Name} account={username} " +
+                    $"timeoutSec={timeout.TotalSeconds:0}");
+            }
+
+            await Task.Delay(750);
+        }
+
+        _log.Warn(
+            $"[AUTO_VIDEO_EXISTING_OP_TIMEOUT] profile={ctx.Profile.Name} account={username} " +
+            $"timeoutSec={timeout.TotalSeconds:0} action=FAILOPEN_ALLOW_NAME_GUARD_DECISION");
+        return false;
+    }
+
+    async Task EnsureAutoVideoBeforeStartAsync(
+        ProfileContext ctx,
+        bool force = false,
+        string trigger = "auto_on_ready")
+    {
+        var state = LoadIdentityToolState();
+        if (!state.AutoOnReady && !force)
+            return;
+
+        if (!state.VideoDeleteEnabled && !state.VideoUploadEnabled)
+        {
+            _log.Info(
+                $"[AUTO_VIDEO_PRESTART_SKIP_DISABLED] profile={ctx.Profile.Name} trigger={trigger} " +
+                $"force={force} delete={state.VideoDeleteEnabled} upload={state.VideoUploadEnabled}");
+            return;
+        }
+
+        string username = "";
+        try
+        {
+            var account = await ResolveNameGuardAccountAsync(ctx);
+            username = (account.Username ?? "").Trim();
+        }
+        catch (Exception ex)
+        {
+            _log.Warn(
+                $"[AUTO_VIDEO_PRESTART_ACCOUNT_WARN] profile={ctx.Profile.Name} error={ex.Message}");
+        }
+
+        if (username.Length == 0)
+            return;
+
+        if (_autoVideoHandledReadyAccount.TryGetValue(ctx.Profile.Name, out var handledUsername)
+            && handledUsername.Equals(username, StringComparison.OrdinalIgnoreCase))
+        {
+            _log.Info(
+                $"[AUTO_VIDEO_PRESTART_SKIP_SESSION] profile={ctx.Profile.Name} account={username}");
+            return;
+        }
+
+        // Nếu đã có một lượt VIDEO đang chạy trên chính Worker này, chờ nó kết thúc
+        // trước khi cho Start/LIVE đi tiếp. Timeout chỉ fail-open; VIDEO không bao giờ
+        // được phép khóa tool vô hạn.
+        var existingVideoFinished = await WaitForExistingVideoOperationAsync(
+            ctx,
+            username,
+            TimeSpan.FromMinutes(10));
+        if (!existingVideoFinished)
+        {
+            _autoVideoHandledReadyAccount[ctx.Profile.Name] = username;
+            return;
+        }
+
+        await _autoIdentityQueueGate.WaitAsync();
+        try
+        {
+            // Re-check sau khi chờ gate vì scheduler có thể vừa xử lý VIDEO xong.
+            if (_autoVideoHandledReadyAccount.TryGetValue(ctx.Profile.Name, out handledUsername)
+                && handledUsername.Equals(username, StringComparison.OrdinalIgnoreCase))
+            {
+                _log.Info(
+                    $"[AUTO_VIDEO_PRESTART_SKIP_AFTER_WAIT] profile={ctx.Profile.Name} account={username}");
+                return;
+            }
+
+            // Re-load sau khi lấy gate để nhận đúng cấu hình mới nhất nếu người dùng
+            // vừa thay đổi VIDEO trong lúc chờ. Với +Auto Profile force=true, không phụ
+            // thuộc AutoOnReady chung nhưng vẫn tôn trọng bật/tắt XÓA/ĐĂNG trong cấu hình VIDEO.
+            state = LoadIdentityToolState();
+            if (!state.AutoOnReady && !force)
+                return;
+            if (!state.VideoDeleteEnabled && !state.VideoUploadEnabled)
+            {
+                _log.Info(
+                    $"[AUTO_VIDEO_PRESTART_SKIP_DISABLED_AFTER_WAIT] profile={ctx.Profile.Name} account={username} " +
+                    $"trigger={trigger} force={force}");
+                _autoVideoHandledReadyAccount[ctx.Profile.Name] = username;
+                return;
+            }
+
+            _log.Info(
+                $"[AUTO_VIDEO_PRESTART_BEGIN] profile={ctx.Profile.Name} account={username} trigger={trigger} force={force}");
+            await RunAutoVideoPipelineAsync(ctx, username, state);
+            _autoVideoHandledReadyAccount[ctx.Profile.Name] = username;
+        }
+        catch (Exception ex)
+        {
+            // VIDEO là best-effort: lỗi ngoài dự kiến không được chặn Start/LIVE.
+            // Đánh dấu đã thử trong chu kỳ READY hiện tại để không lặp lỗi liên tục.
+            _autoVideoHandledReadyAccount[ctx.Profile.Name] = username;
+            _log.Warn(
+                $"[AUTO_VIDEO_PRESTART_FAILOPEN] profile={ctx.Profile.Name} account={username} error={ex.Message}");
+        }
+        finally
+        {
+            _autoIdentityQueueGate.Release();
+        }
+    }
+
     void InitializeIdentityAutoFlow()
     {
         _refreshTimer.Tick += (_, _) => ScheduleAutoIdentityForReadyProfiles();
@@ -1028,6 +3276,19 @@ public sealed partial class ManagerForm
         var state = LoadIdentityToolState();
         if (!state.AutoOnReady) return;
         if (string.IsNullOrWhiteSpace(_accountPoolService.CurrentSourcePath)) return;
+
+        // Một chu kỳ READY chỉ chạy VIDEO một lượt. Khi Chrome rời READY / mất kết nối,
+        // bỏ dấu phiên để lần đăng nhập READY kế tiếp (kể cả cùng tài khoản) có thể retry FAIL.
+        foreach (var candidate in _contexts.Values)
+        {
+            var snapshot = candidate.LastSnapshot;
+            if (snapshot is null
+                || !string.Equals(snapshot.Chrome, "CONNECTED", StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(snapshot.TikTokStartupState, "READY", StringComparison.OrdinalIgnoreCase))
+            {
+                _autoVideoHandledReadyAccount.Remove(candidate.Profile.Name);
+            }
+        }
 
         // Chỉ cho phép MỘT PRF Tên/ảnh chạy tại một thời điểm. Timer tick sau sẽ lấy
         // profile kế tiếp sau khi lượt hiện tại kết thúc.
@@ -1041,8 +3302,16 @@ public sealed partial class ManagerForm
                 if (snapshot is null) return false;
                 if (!string.Equals(snapshot.Chrome, "CONNECTED", StringComparison.OrdinalIgnoreCase)) return false;
                 if (snapshot.MessageReplyRunning || _messageReplyProfilesInFlight.Contains(candidate.Profile.Name)) return false;
+                if (snapshot.VideoDeleteRunning) return false;
                 if (!string.Equals(snapshot.TikTokStartupState, "READY", StringComparison.OrdinalIgnoreCase)) return false;
                 if (_autoIdentityHandledSession.Contains(candidate.Profile.Name)) return false;
+
+                // Nếu PRESTART (StartWithNameGuard) vừa xử lý VIDEO xong trong chính
+                // chu kỳ READY hiện tại thì scheduler AutoOnReady tuyệt đối không được
+                // mở một pipeline Tên/ảnh -> VIDEO thứ hai. Marker này được reset khi
+                // Chrome rời READY / mất kết nối ở đầu hàm, nên phiên đăng nhập sau vẫn retry.
+                if (_autoVideoHandledReadyAccount.ContainsKey(candidate.Profile.Name)) return false;
+
                 if (_autoIdentityNextProbeUtc.TryGetValue(candidate.Profile.Name, out var nextProbeUtc)
                     && DateTime.UtcNow < nextProbeUtc)
                     return false;
@@ -1063,56 +3332,165 @@ public sealed partial class ManagerForm
             var state = LoadIdentityToolState();
             if (!state.AutoOnReady) return;
 
-            var names = SplitIdentityNames(state.NamesText);
-            if (!state.UpdateName || names.Count == 0)
-            {
-                _autoIdentityHandledSession.Add(ctx.Profile.Name);
-                _log.Info($"[AUTO_IDENTITY_SKIP_NAME_CONFIG] profile={ctx.Profile.Name} không có danh sách tên để kiểm tra.");
-                return;
-            }
-
+            // Re-check SAU khi lấy queue gate. Có thể scheduler đã chọn profile này
+            // trước khi PRESTART kịp hoàn tất VIDEO; khi tới lượt chạy thật thì VIDEO
+            // đã xong và marker READY-session đã được đặt. Nếu không re-check ở đây,
+            // pipeline AutoOnReady sẽ arm HOLD lần 2 và chạy VIDEO lặp ngay sau release.
             var account = await ResolveNameGuardAccountAsync(ctx);
-            var username = account.Username;
-            if (string.IsNullOrWhiteSpace(username))
+            var username = (account.Username ?? "").Trim();
+            if (username.Length == 0)
             {
                 _autoIdentityHandledSession.Add(ctx.Profile.Name);
                 _log.Warn($"[AUTO_IDENTITY_SKIP_ACCOUNT] profile={ctx.Profile.Name} không xác định được tài khoản.");
                 return;
             }
 
-            var accountSessionKey = "account:" + username.ToLowerInvariant();
-            var alreadyDone = await RunAccountPoolIoAsync(
-                () => _accountPoolService.IsIdentityDone(username),
-                CancellationToken.None);
-            if (alreadyDone)
+            if (_autoVideoHandledReadyAccount.TryGetValue(ctx.Profile.Name, out var prestartHandledUsername)
+                && prestartHandledUsername.Equals(username, StringComparison.OrdinalIgnoreCase))
             {
-                _autoIdentityHandledSession.Add(ctx.Profile.Name);
-                _autoIdentityHandledSession.Add(accountSessionKey);
-                _log.Info($"[AUTO_IDENTITY_SKIP_DONE] profile={ctx.Profile.Name} account={username}");
+                _log.Info(
+                    $"[AUTO_IDENTITY_PIPELINE_SKIP_PRESTART_ALREADY_HANDLED] profile={ctx.Profile.Name} " +
+                    $"account={username} action=NO_SECOND_HOLD_NO_SECOND_VIDEO");
                 return;
             }
 
-            var previousRunState = GetLastConfirmedRuntimeState(ctx);
-            _log.Info($"[AUTO_IDENTITY_ONE_SHOT_BEGIN] profile={ctx.Profile.Name} account={username} previousRunState={previousRunState}");
+            // Giữ Worker ở Home/READY trong toàn bộ chuỗi Tên/ảnh -> VIDEO.
+            // Đây chỉ là gate điều phối, không thay đổi kết quả/logic Tên/ảnh.
+            ArmManagedAccountSetupHold(ctx, "auto_identity_video_pipeline");
 
-            var result = await ProcessNameGuardOnceAsync(ctx, username, state, names);
-            if (!result.Allowed)
+            var accountSessionKey = "account:" + username.ToLowerInvariant();
+            var previousRunState = GetLastConfirmedRuntimeState(ctx);
+            var names = SplitIdentityNames(state.NamesText);
+
+            // Tên/ảnh vẫn là điều kiện quyết định CUỐI CÙNG cho phép automation chạy.
+            // Tuy nhiên người dùng đã chốt thứ tự: TÊN/ẢNH -> VIDEO -> rồi mới áp
+            // kết quả Tên/ảnh theo logic cũ. Vì vậy cleanup terminal của Name Guard
+            // được trì hoãn cho tới sau VIDEO, nhưng bản thân logic kiểm tra/đổi tên
+            // không bị viết lại.
+            NameGuardResult identityResult = new(true, "Tên/ảnh không tham gia pipeline.");
+
+            if (state.UpdateName && names.Count > 0)
             {
-                if (result.Transient)
+                var alreadyDone = await RunAccountPoolIoAsync(
+                    () => _accountPoolService.IsIdentityDone(username),
+                    CancellationToken.None);
+
+                if (alreadyDone)
                 {
-                    // Lỗi kỹ thuật ở bước đọc tên/IPC: giữ nguyên Chrome/Worker.
-                    // Scheduler đã được hẹn retry, không được ghi FAIL/cleanup.
-                    _log.Warn($"[AUTO_IDENTITY_ONE_SHOT_TRANSIENT] profile={ctx.Profile.Name} account={username} reason={result.Message}");
-                    return;
+                    identityResult = new NameGuardResult(true, "Tên/ảnh đã DONE trong Excel.");
+                    _log.Info($"[AUTO_IDENTITY_SKIP_DONE] profile={ctx.Profile.Name} account={username}");
+                }
+                else
+                {
+                    _log.Info(
+                        $"[AUTO_IDENTITY_ONE_SHOT_BEGIN] profile={ctx.Profile.Name} account={username} " +
+                        $"previousRunState={previousRunState}");
+
+                    identityResult = await ProcessNameGuardOnceAsync(
+                        ctx,
+                        username,
+                        state,
+                        names,
+                        deferTerminalCleanup: true);
+
+                    if (identityResult.Allowed)
+                    {
+                        _log.Info(
+                            $"[AUTO_IDENTITY_ONE_SHOT_DONE] profile={ctx.Profile.Name} account={username} " +
+                            $"changed={identityResult.ChangedName}");
+                    }
+                    else if (identityResult.Transient)
+                    {
+                        _log.Warn(
+                            $"[AUTO_IDENTITY_ONE_SHOT_TRANSIENT_CONTINUE_VIDEO] profile={ctx.Profile.Name} " +
+                            $"account={username} deferred={identityResult.Deferred} reason={identityResult.Message}");
+                    }
+                    else
+                    {
+                        _log.Warn(
+                            $"[AUTO_IDENTITY_ONE_SHOT_FAIL_CONTINUE_VIDEO] profile={ctx.Profile.Name} " +
+                            $"account={username} reason={identityResult.Message}");
+                    }
+                }
+            }
+            else
+            {
+                // Không thay đổi logic Tên/ảnh khi người dùng tắt Cập nhật tên /
+                // chưa cấu hình danh sách tên; chỉ coi phần này là không tham gia pipeline.
+                _log.Info(
+                    $"[AUTO_IDENTITY_SKIP_NAME_CONFIG] profile={ctx.Profile.Name} account={username} " +
+                    $"updateName={state.UpdateName} names={names.Count}");
+            }
+
+            // VIDEO luôn được thử SAU Tên/ảnh, kể cả khi Tên/ảnh vừa FAIL/TRANSIENT.
+            // Nếu đã có một lượt VIDEO khác đang chạy thì chờ nó tối đa 10 phút;
+            // timeout chỉ fail-open và KHÔNG thay đổi kết quả Name Guard.
+            try
+            {
+                var existingVideoFinished = await WaitForExistingVideoOperationAsync(
+                    ctx,
+                    username,
+                    TimeSpan.FromMinutes(10));
+
+                if (existingVideoFinished)
+                {
+                    await RunAutoVideoPipelineAsync(ctx, username, state);
+                }
+                else
+                {
+                    _log.Warn(
+                        $"[AUTO_VIDEO_PIPELINE_TIMEOUT_FAILOPEN] profile={ctx.Profile.Name} account={username} " +
+                        "reason=existing_video_operation_timeout");
                 }
 
-                // Lỗi nghiệp vụ đã được ProcessNameGuardOnceAsync xử lý theo policy
-                // hiện có (ví dụ đổi tên thật sự thất bại/cooldown).
-                _log.Warn($"[AUTO_IDENTITY_ONE_SHOT_FAIL] profile={ctx.Profile.Name} account={username} reason={result.Message}");
+                _autoVideoHandledReadyAccount[ctx.Profile.Name] = username;
+            }
+            catch (Exception ex)
+            {
+                // VIDEO là bước phụ: mọi lỗi ngoài dự kiến chỉ ghi log; không được
+                // làm thay đổi quyết định cuối cùng của Tên/ảnh.
+                _autoVideoHandledReadyAccount[ctx.Profile.Name] = username;
+                _log.Warn(
+                    $"[AUTO_VIDEO_PIPELINE_FAILOPEN] profile={ctx.Profile.Name} " +
+                    $"account={username} error={ex.Message}");
+            }
+
+            // Tới đây VIDEO đã kết thúc/skip/fail-open. Bây giờ mới áp kết quả
+            // Tên/ảnh theo đúng policy hiện có. Nếu cần đóng/queue profile do lỗi cứng
+            // hoặc NAME_SYNC_PENDING, thực hiện cleanup cũ ở đây.
+            if (!identityResult.Allowed)
+            {
+                try
+                {
+                    await FinalizeDeferredNameGuardOutcomeAsync(ctx, username, identityResult);
+                }
+                catch (Exception ex)
+                {
+                    _log.Warn(
+                        $"[AUTO_IDENTITY_FINALIZE_AFTER_VIDEO_WARN] profile={ctx.Profile.Name} " +
+                        $"account={username} error={ex.Message}");
+                }
+
+                // Transient không terminal: RegisterNameGuardTransientFailure đã đặt
+                // lịch retry theo logic cũ. Hard fail/deferred: finalizer phía trên đã
+                // thực hiện cleanup/queue cũ. Trong mọi trường hợp Tên/ảnh chưa Allowed
+                // thì KHÔNG Resume/Start automation.
+                _log.Warn(
+                    $"[AUTO_IDENTITY_BLOCK_AUTOMATION_AFTER_VIDEO] profile={ctx.Profile.Name} " +
+                    $"account={username} transient={identityResult.Transient} deferred={identityResult.Deferred} " +
+                    $"reason={identityResult.Message}");
                 return;
             }
 
-            _log.Info($"[AUTO_IDENTITY_ONE_SHOT_DONE] profile={ctx.Profile.Name} account={username} changed={result.ChangedName}");
+            // Chỉ Tên/ảnh Allowed mới mở đường cho logic tool hiện tại. Kết quả VIDEO
+            // không tham gia điều kiện này: DONE hay FAIL đều được phép đi tiếp.
+            // Nhả hold SAU khi VIDEO đã kết thúc, rồi mới resume/start luồng chính.
+            await ReleaseManagedAccountSetupHoldAsync(ctx, "auto_identity_allowed_after_video");
+
+            _autoIdentityHandledSession.Add(ctx.Profile.Name);
+            _autoIdentityHandledSession.Add(accountSessionKey);
+            _autoIdentityNextProbeUtc.Remove(ctx.Profile.Name);
+
             await ResumeAutomationAfterIdentityDoneAsync(ctx, previousRunState);
         }
         catch (Exception ex)

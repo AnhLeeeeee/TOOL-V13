@@ -784,6 +784,7 @@ public sealed partial class ManagerForm
             outcome = await ProcessAutoProfileQueueItemAsync(
                 item,
                 autoRename: true,
+                autoVideo: false,
                 autoStart: false,
                 isPaused: () => false,
                 ct: token,

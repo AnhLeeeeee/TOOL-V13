@@ -2480,7 +2480,35 @@ public sealed partial class ChromeController : IAsyncDisposable
             if (!string.IsNullOrWhiteSpace(loginBan))
                 return BuildLoginAccountBannedResult(loginBan);
 
-            if (await HasTikTokSessionCookieAsync(ct))
+            // Cookie TikTok có thể còn tồn tại dù UI đã logout thật. Trước đây chỉ
+            // cần sessionid/sessionid_ss/sid_tt là startup trả READY, khiến profile
+            // mất login vẫn đi tiếp sang Search LIVE -> 0 card -> timeout -> đóng/mở.
+            //
+            // Startup bây giờ ưu tiên trạng thái UI thật. Chỉ khi UI KHÔNG xác nhận
+            // logout mới được phép dùng cookie làm tín hiệu phiên đăng nhập.
+            var loggedOutMarker = await ConfirmTikTokLoggedOutUiAsync(ct);
+            if (!string.IsNullOrWhiteSpace(loggedOutMarker))
+            {
+                var cookiePresent = await HasTikTokSessionCookieAsync(ct);
+                _log.Warn(
+                    $"[TIKTOK_STARTUP_LOGOUT_UI_CONFIRMED] marker={TrimForLog(loggedOutMarker, 220)} staleCookie={cookiePresent}");
+
+                if (!autoLogin || string.IsNullOrWhiteSpace(username) || string.IsNullOrEmpty(password))
+                {
+                    return new TikTokStartupResult(
+                        "LOGIN_REQUIRED",
+                        "TikTok đang hiển thị trạng thái chưa đăng nhập; profile chưa bật/tồn tại cấu hình đăng nhập tự động.",
+                        false,
+                        false);
+                }
+
+                // Khi UI đã xác nhận logout, xóa cookie TikTok stale trước khi gọi
+                // flow đăng nhập hiện có. Không xóa cookie website khác trong profile.
+                var deleted = await ClearTikTokCookiesAsync(ct);
+                _log.Warn(
+                    $"[TIKTOK_STARTUP_STALE_COOKIES_CLEARED] count={deleted} action=EXISTING_LOGIN_FLOW");
+            }
+            else if (await IsTikTokSessionActiveAsync(ct))
             {
                 return await FinalizeTikTokAuthenticatedAsync(
                     openLiveWhenReady,
@@ -2533,7 +2561,7 @@ public sealed partial class ChromeController : IAsyncDisposable
                 if (!string.IsNullOrWhiteSpace(loginBanAfterCaptcha))
                     return BuildLoginAccountBannedResult(loginBanAfterCaptcha);
 
-                if (await HasTikTokSessionCookieAsync(ct))
+                if (await IsTikTokSessionActiveAsync(ct))
                 {
                     return await FinalizeTikTokAuthenticatedAsync(
                         openLiveWhenReady,
@@ -2559,7 +2587,7 @@ public sealed partial class ChromeController : IAsyncDisposable
             {
                 await CaptureLoginPageDiagnosticAsync("login_form_not_found", ct);
 
-                if (await HasTikTokSessionCookieAsync(ct))
+                if (await IsTikTokSessionActiveAsync(ct))
                 {
                     return await FinalizeTikTokAuthenticatedAsync(
                         openLiveWhenReady,
@@ -2573,7 +2601,7 @@ public sealed partial class ChromeController : IAsyncDisposable
 
         // WaitForLoginFormAsync also notices a session cookie so the wait can
         // finish quickly during redirects. Re-check here before touching the form.
-        if (await HasTikTokSessionCookieAsync(ct))
+        if (await IsTikTokSessionActiveAsync(ct))
         {
             return await FinalizeTikTokAuthenticatedAsync(
                 openLiveWhenReady,
@@ -2599,7 +2627,7 @@ public sealed partial class ChromeController : IAsyncDisposable
         if (!string.IsNullOrWhiteSpace(loginBanAtTimeout))
             return BuildLoginAccountBannedResult(loginBanAtTimeout);
 
-        if (await HasTikTokSessionCookieAsync(ct))
+        if (await IsTikTokSessionActiveAsync(ct))
         {
             return await FinalizeTikTokAuthenticatedAsync(
                 openLiveWhenReady,
@@ -2632,9 +2660,9 @@ public sealed partial class ChromeController : IAsyncDisposable
             if (!string.IsNullOrWhiteSpace(loginBan))
                 return BuildLoginAccountBannedResult(loginBan);
 
-            if (await HasTikTokSessionCookieAsync(ct))
+            if (await IsTikTokSessionActiveAsync(ct))
             {
-                _log.Info("[TIKTOK_LOGIN_OK] sessionCookie=true");
+                _log.Info("[TIKTOK_LOGIN_OK] sessionCookie=true uiLogoutMarker=false");
                 return await FinalizeTikTokAuthenticatedAsync(
                     openLiveWhenReady,
                     "Đăng nhập thành công; đã mở TikTok LIVE và xử lý màn 'Nhấp để xem LIVE' nếu có.",
@@ -2721,9 +2749,9 @@ public sealed partial class ChromeController : IAsyncDisposable
 
             try
             {
-                if (await HasTikTokSessionCookieAsync(ct))
+                if (await IsTikTokSessionActiveAsync(ct))
                 {
-                    _log.Info("[TIKTOK_CAPTCHA_WAIT_DONE] reason=session-cookie");
+                    _log.Info("[TIKTOK_CAPTCHA_WAIT_DONE] reason=session-cookie-ui-active");
                     return true;
                 }
 
@@ -2895,8 +2923,182 @@ public sealed partial class ChromeController : IAsyncDisposable
         return r.TryGetProperty("value", out var v) ? v.GetString() ?? "" : "";
     }
 
-    public Task<bool> IsTikTokSessionActiveAsync(CancellationToken ct = default)
-        => HasTikTokSessionCookieAsync(ct);
+    public async Task<bool> IsTikTokSessionActiveAsync(CancellationToken ct = default)
+    {
+        if (!await HasTikTokSessionCookieAsync(ct))
+            return false;
+
+        // Với các probe runtime/identity, một marker logout đang HIỂN THỊ phải thắng
+        // cookie cũ. Chỉ đọc 1 lượt tại đây để không làm chậm các vòng poll; startup
+        // dùng ConfirmTikTokLoggedOutUiAsync 2/2 trước khi thực sự clear cookie/login.
+        try
+        {
+            var marker = await DetectTikTokLoggedOutUiMarkerAsync(ct);
+            if (!string.IsNullOrWhiteSpace(marker))
+            {
+                _log.Warn(
+                    $"[TIKTOK_SESSION_COOKIE_REJECTED_BY_UI] marker={TrimForLog(marker, 220)}");
+                return false;
+            }
+        }
+        catch (Exception ex) when (IsTransientDocumentContextError(ex))
+        {
+            // Document đang chuyển trang: không suy logout chỉ vì probe DOM lỗi.
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Xóa toàn bộ cookie thuộc tiktok.com nhưng không đụng cookie domain khác.
+    /// Dùng cho forced relogin khi UI đã xác nhận mất đăng nhập nhưng cookie cũ còn sót.
+    /// </summary>
+    public async Task<int> ClearTikTokCookiesAsync(CancellationToken ct = default)
+    {
+        var deleted = 0;
+        var result = await Cdp.CallAsync("Network.getAllCookies", new { }, ct);
+        if (!result.TryGetProperty("cookies", out var cookies)
+            || cookies.ValueKind != JsonValueKind.Array)
+        {
+            return 0;
+        }
+
+        foreach (var cookie in cookies.EnumerateArray())
+        {
+            var domain = cookie.TryGetProperty("domain", out var d)
+                ? d.GetString() ?? ""
+                : "";
+            if (!domain.Contains("tiktok.com", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var name = cookie.TryGetProperty("name", out var n)
+                ? n.GetString() ?? ""
+                : "";
+            if (string.IsNullOrWhiteSpace(name))
+                continue;
+
+            var path = cookie.TryGetProperty("path", out var p)
+                ? p.GetString() ?? "/"
+                : "/";
+
+            await Cdp.CallAsync(
+                "Network.deleteCookies",
+                new { name, domain, path },
+                ct);
+            deleted++;
+        }
+
+        return deleted;
+    }
+
+    async Task<string> ConfirmTikTokLoggedOutUiAsync(CancellationToken ct)
+    {
+        const int required = 2;
+        string lastMarker = "";
+
+        for (var pass = 1; pass <= required; pass++)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var marker = await DetectTikTokLoggedOutUiMarkerAsync(ct);
+            if (string.IsNullOrWhiteSpace(marker))
+                return "";
+
+            lastMarker = marker;
+            _log.Warn(
+                $"[TIKTOK_STARTUP_LOGOUT_UI_PROBE] confirmation={pass}/{required} marker={TrimForLog(marker, 220)}");
+
+            if (pass < required)
+                await Task.Delay(850, ct);
+        }
+
+        return lastMarker;
+    }
+
+    async Task<string> DetectTikTokLoggedOutUiMarkerAsync(CancellationToken ct)
+    {
+        // Không dùng body.Contains("Đăng nhập") vì modal/nút khác của TikTok có thể
+        // chứa cùng chữ. Chỉ nhận các marker trực tiếp đã quan sát ở profile logout:
+        // 1) modal "Đăng nhập để tìm kiếm nội dung phổ biến";
+        // 2) nút Đăng nhập lớn ở sidebar trái;
+        // 3) trang /login hoặc title "Đăng nhập | TikTok".
+        var result = await EvalAsync("""
+(() => {
+  const norm = (value) => String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/đ/g, 'd')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const visible = (el) => {
+    if (!el || el.nodeType !== 1) return false;
+    const r = el.getBoundingClientRect?.();
+    if (!r || r.width < 8 || r.height < 8 || r.bottom <= 0 || r.right <= 0
+        || r.top >= innerHeight || r.left >= innerWidth) return false;
+    const s = getComputedStyle(el);
+    return s.display !== 'none'
+      && s.visibility !== 'hidden'
+      && Number(s.opacity || 1) > 0.05;
+  };
+
+  const title = norm(document.title || '');
+  const path = String(location.pathname || '').toLowerCase();
+  if (path.startsWith('/login'))
+    return 'LOGIN_PATH|' + path.slice(0,120);
+  if (title === 'dang nhap | tiktok' || title === 'log in | tiktok')
+    return 'LOGIN_TITLE|' + title;
+
+  const modalPhrase = (text) => {
+    const t = norm(text);
+    return t.includes('dang nhap de tim kiem noi dung pho bien')
+      || t.includes('log in to search popular content')
+      || t.includes('log in to discover popular content');
+  };
+
+  for (const el of document.querySelectorAll('[role="dialog"],[aria-modal="true"]')) {
+    if (!visible(el)) continue;
+    const text = norm(el.innerText || el.textContent || '');
+    if (!modalPhrase(text)) continue;
+    const r = el.getBoundingClientRect();
+    return `LOGIN_SEARCH_MODAL|text=${text.slice(0,150)}|x=${Math.round(r.left)}|y=${Math.round(r.top)}`;
+  }
+
+  // Fallback khi TikTok đổi role/class của modal: tìm heading/đoạn chữ chính xác.
+  for (const el of document.querySelectorAll('h1,h2,h3,h4,div,span,p')) {
+    if (!visible(el)) continue;
+    const text = norm(el.innerText || el.textContent || '');
+    if (text.length === 0 || text.length > 180 || !modalPhrase(text)) continue;
+    const r = el.getBoundingClientRect();
+    const cx = r.left + r.width / 2;
+    if (cx >= innerWidth * 0.22 && cx <= innerWidth * 0.78)
+      return `LOGIN_SEARCH_TEXT|text=${text.slice(0,150)}|x=${Math.round(r.left)}|y=${Math.round(r.top)}`;
+  }
+
+  // Trạng thái logout có thể không hiện modal nhưng vẫn có nút Đăng nhập lớn
+  // trong sidebar trái. Yêu cầu text EXACT + vị trí bên trái để không nhầm nút
+  // "Đăng nhập" trong modal hoặc nội dung giữa trang.
+  for (const el of document.querySelectorAll('button,a,[role="button"]')) {
+    if (!visible(el)) continue;
+    const text = norm(el.innerText || el.textContent || el.getAttribute('aria-label') || '');
+    if (text !== 'dang nhap' && text !== 'log in') continue;
+    const r = el.getBoundingClientRect();
+    const centerX = r.left + r.width / 2;
+    const leftSidebar = centerX <= innerWidth * 0.22 && r.width >= 70 && r.height >= 28;
+    if (!leftSidebar) continue;
+    return `LOGIN_SIDEBAR_BUTTON|text=${text}|x=${Math.round(r.left)}|y=${Math.round(r.top)}|w=${Math.round(r.width)}|h=${Math.round(r.height)}`;
+  }
+
+  return '';
+})()
+""", ct: ct);
+
+        return result.TryGetProperty("value", out var value)
+               && value.ValueKind == JsonValueKind.String
+            ? (value.GetString() ?? "").Trim()
+            : "";
+    }
 
     async Task<bool> HasTikTokSessionCookieAsync(CancellationToken ct)
     {
@@ -2942,7 +3144,7 @@ public sealed partial class ChromeController : IAsyncDisposable
 })()
 """, ct: ct);
             if (r.TryGetProperty("value", out var value) && value.ValueKind == JsonValueKind.True) return true;
-            if (await HasTikTokSessionCookieAsync(ct)) return true;
+            if (await IsTikTokSessionActiveAsync(ct)) return true;
             await Task.Delay(300, ct);
         }
         return false;

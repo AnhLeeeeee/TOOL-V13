@@ -44,6 +44,7 @@ public static class DeviceAccessService
     static readonly object Sync = new();
 
     static DeviceAccessDecision? _lastDecision;
+    static bool _adminBypass;
 
     public sealed class DeviceAccessDecision
     {
@@ -57,6 +58,12 @@ public static class DeviceAccessService
         public bool VersionControlEnabled { get; init; }
         public string VersionPolicyUrl { get; init; } = "";
         public bool VersionPolicyFailClosedOnDowngrade { get; init; } = true;
+
+        // Chỉ true khi đây thực sự là thiết bị/cài đặt mới đang PENDING thuần túy.
+        // Các trường hợp fingerprint mismatch, copy dữ liệu kích hoạt, blocked policy...
+        // tuyệt đối không được dùng QITool để bypass.
+        public bool CloudApprovalEligible { get; init; }
+        public string DenyCode { get; init; } = "";
     }
 
     sealed class DeviceIdentity
@@ -100,6 +107,45 @@ public static class DeviceAccessService
         get { lock (Sync) return _lastDecision; }
     }
 
+    public static bool AdminBypassActive
+    {
+        get { lock (Sync) return _adminBypass; }
+    }
+
+    /// <summary>
+    /// QITool ADMIN là quyền dành riêng cho máy quản trị của chủ Tool.
+    /// Khi được server xác nhận, bỏ toàn bộ gate chạy/update trong process hiện tại.
+    /// Không ghi quyền admin vào device.json; mỗi lần mở Tool phải được server xác nhận lại.
+    /// </summary>
+    public static void SetAdminBypass(string baseDir, bool enabled, string source = "qitool_admin")
+    {
+        lock (Sync)
+        {
+            _adminBypass = enabled;
+            if (enabled && _lastDecision is not null)
+            {
+                var d = _lastDecision;
+                _lastDecision = new DeviceAccessDecision
+                {
+                    AllowRun = true,
+                    AllowUpdate = true,
+                    DeviceId = d.DeviceId,
+                    Reason = "QITool ADMIN: bỏ qua giới hạn thiết bị và cập nhật.",
+                    Activated = d.Activated,
+                    RemotePolicyApplied = d.RemotePolicyApplied,
+                    ActivationSource = d.ActivationSource,
+                    VersionControlEnabled = d.VersionControlEnabled,
+                    VersionPolicyUrl = d.VersionPolicyUrl,
+                    VersionPolicyFailClosedOnDowngrade = d.VersionPolicyFailClosedOnDowngrade,
+                    CloudApprovalEligible = false,
+                    DenyCode = ""
+                };
+            }
+        }
+
+        AppendAudit(baseDir, $"[DEVICE_ACCESS_ADMIN_BYPASS] enabled={enabled} source={SafeOneLine(source)}");
+    }
+
     public static string AuditLogPath => AuditPath;
 
     public static string GetDeviceId(string baseDir)
@@ -134,6 +180,7 @@ public static class DeviceAccessService
     public static DeviceAccessDecision EvaluateLocalAccess(string baseDir, string currentVersion)
     {
         var identity = EnsureIdentity(baseDir, allowGrandfatherMigration: true, out var reason);
+        var cloudApprovalEligible = IsCloudApprovalEligible(baseDir, identity);
         var decision = new DeviceAccessDecision
         {
             AllowRun = identity.Activated,
@@ -145,7 +192,9 @@ public static class DeviceAccessService
             ActivationSource = identity.ActivationSource,
             VersionControlEnabled = false,
             VersionPolicyUrl = "",
-            VersionPolicyFailClosedOnDowngrade = true
+            VersionPolicyFailClosedOnDowngrade = true,
+            CloudApprovalEligible = cloudApprovalEligible,
+            DenyCode = identity.Activated ? "" : cloudApprovalEligible ? "pending_new_device" : "local_identity_rejected"
         };
         lock (Sync) _lastDecision = decision;
         AppendAudit(baseDir,
@@ -164,6 +213,10 @@ public static class DeviceAccessService
         var allowRun = localAllowed;
         var allowUpdate = localAllowed;
         var reason = localReason;
+        var cloudApprovalEligible = IsCloudApprovalEligible(baseDir, identity);
+        var denyCode = localAllowed
+            ? ""
+            : cloudApprovalEligible ? "pending_new_device" : "local_identity_rejected";
         var remoteApplied = false;
         var versionControlEnabled = false;
         var versionPolicyUrl = "";
@@ -182,6 +235,8 @@ public static class DeviceAccessService
             {
                 allowRun = false;
                 allowUpdate = false;
+                cloudApprovalEligible = false;
+                denyCode = "blocked_by_policy";
                 reason = string.IsNullOrWhiteSpace(policy.BlockMessage)
                     ? "Thiết bị này đã bị khóa."
                     : policy.BlockMessage.Trim();
@@ -199,6 +254,8 @@ public static class DeviceAccessService
                     TryWriteMigrationConsumedMarker(baseDir, identity, "remote_allowlist");
                     allowRun = true;
                     allowUpdate = true;
+                    cloudApprovalEligible = false;
+                    denyCode = "";
                     reason = "Thiết bị đã được duyệt từ danh sách cho phép.";
                 }
 
@@ -206,6 +263,8 @@ public static class DeviceAccessService
                 {
                     allowRun = false;
                     allowUpdate = false;
+                    cloudApprovalEligible = false;
+                    denyCode = "not_in_legacy_allowlist";
                     reason = string.IsNullOrWhiteSpace(policy.BlockMessage)
                         ? "Thiết bị không nằm trong danh sách cho phép."
                         : policy.BlockMessage.Trim();
@@ -215,6 +274,15 @@ public static class DeviceAccessService
                     allowUpdate = false;
                 }
             }
+        }
+
+        if (AdminBypassActive)
+        {
+            allowRun = true;
+            allowUpdate = true;
+            cloudApprovalEligible = false;
+            denyCode = "";
+            reason = "QITool ADMIN: bỏ qua giới hạn thiết bị và cập nhật.";
         }
 
         var decision = new DeviceAccessDecision
@@ -228,7 +296,9 @@ public static class DeviceAccessService
             ActivationSource = identity.ActivationSource,
             VersionControlEnabled = versionControlEnabled,
             VersionPolicyUrl = versionPolicyUrl,
-            VersionPolicyFailClosedOnDowngrade = versionPolicyFailClosed
+            VersionPolicyFailClosedOnDowngrade = versionPolicyFailClosed,
+            CloudApprovalEligible = cloudApprovalEligible,
+            DenyCode = allowRun ? "" : denyCode
         };
 
         lock (Sync) _lastDecision = decision;
@@ -236,8 +306,73 @@ public static class DeviceAccessService
             $"[DEVICE_ACCESS_STARTUP] id={identity.DeviceId} version={currentVersion} activated={identity.Activated} " +
             $"source={SafeOneLine(identity.ActivationSource)} allowRun={allowRun} allowUpdate={allowUpdate} " +
             $"remote={remoteApplied} versionControl={versionControlEnabled} versionPolicyUrl={SafeOneLine(versionPolicyUrl)} " +
-            $"reason={SafeOneLine(reason)}");
+            $"cloudEligible={cloudApprovalEligible} denyCode={SafeOneLine(denyCode)} reason={SafeOneLine(reason)}");
         return decision;
+    }
+
+    /// <summary>
+    /// Chuyển một thiết bị PENDING thuần túy sang activated sau khi QITool server trả allowed.
+    /// Phương thức này tự kiểm tra lại fingerprint + DeviceId + marker để không biến cloud approval
+    /// thành đường bypass cho dữ liệu kích hoạt bị copy/mismatch.
+    /// </summary>
+    public static bool TryActivateFromCloudApproval(
+        string baseDir,
+        string expectedDeviceId,
+        out string reason)
+    {
+        try
+        {
+            Directory.CreateDirectory(DeviceAccessRoot);
+            var identity = LoadIdentity();
+            if (identity is null || string.IsNullOrWhiteSpace(identity.DeviceId))
+            {
+                reason = "Không tìm thấy nhận diện thiết bị local.";
+                return false;
+            }
+
+            if (!string.Equals(identity.DeviceId, (expectedDeviceId ?? "").Trim(), StringComparison.OrdinalIgnoreCase))
+            {
+                reason = "Mã thiết bị local đã thay đổi; không áp dụng duyệt cloud.";
+                return false;
+            }
+
+            var fingerprint = ComputeMachineFingerprint();
+            if (!FixedEquals(identity.FingerprintHash, fingerprint))
+            {
+                reason = "Fingerprint thiết bị không khớp; không áp dụng duyệt cloud.";
+                return false;
+            }
+
+            if (identity.Activated)
+            {
+                reason = "Thiết bị đã được kích hoạt local.";
+                return true;
+            }
+
+            if (!IsCloudApprovalEligible(baseDir, identity))
+            {
+                reason = "Thiết bị không thuộc nhóm máy mới PENDING an toàn để duyệt bằng QITool.";
+                return false;
+            }
+
+            identity.Activated = true;
+            identity.ActivationSource = "qitool_cloud_approval";
+            identity.ActivatedUtc = DateTime.UtcNow;
+            identity.LastSeenUtc = DateTime.UtcNow;
+            SaveIdentity(identity);
+            TryWriteMigrationConsumedMarker(baseDir, identity, identity.ActivationSource);
+
+            reason = "Thiết bị mới đã được kích hoạt từ QITool.";
+            AppendAudit(baseDir,
+                $"[DEVICE_QITOOL_ACTIVATED] id={identity.DeviceId} source={identity.ActivationSource}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            reason = "Không thể ghi kích hoạt QITool: " + ex.Message;
+            AppendAudit(baseDir, $"[DEVICE_QITOOL_ACTIVATE_FAIL] detail={SafeOneLine(ex.Message)}");
+            return false;
+        }
     }
 
     /// <summary>
@@ -249,6 +384,25 @@ public static class DeviceAccessService
         string currentVersion,
         CancellationToken cancellationToken = default)
     {
+        if (AdminBypassActive && LastDecision is { } adminDecision)
+        {
+            return new DeviceAccessDecision
+            {
+                AllowRun = true,
+                AllowUpdate = true,
+                DeviceId = adminDecision.DeviceId,
+                Reason = "QITool ADMIN: bỏ qua giới hạn thiết bị và cập nhật.",
+                Activated = adminDecision.Activated,
+                RemotePolicyApplied = adminDecision.RemotePolicyApplied,
+                ActivationSource = adminDecision.ActivationSource,
+                VersionControlEnabled = adminDecision.VersionControlEnabled,
+                VersionPolicyUrl = adminDecision.VersionPolicyUrl,
+                VersionPolicyFailClosedOnDowngrade = adminDecision.VersionPolicyFailClosedOnDowngrade,
+                CloudApprovalEligible = false,
+                DenyCode = ""
+            };
+        }
+
         return await EvaluateStartupAsync(baseDir, currentVersion, cancellationToken).ConfigureAwait(false);
     }
 
@@ -272,7 +426,7 @@ public static class DeviceAccessService
 
             // device.json bị copy từ máy khác: không cho dùng ID đã kích hoạt của máy cũ.
             TryArchiveMismatchedIdentity(identity);
-            identity = CreatePendingIdentity(fingerprint);
+            identity = CreatePendingIdentity(fingerprint, "fingerprint_mismatch_pending");
             SaveIdentity(identity);
             reason = "Dữ liệu kích hoạt thuộc máy khác; thiết bị hiện tại chưa được cấp quyền.";
             AppendAudit(baseDir, $"[DEVICE_FINGERPRINT_MISMATCH] newId={identity.DeviceId}");
@@ -284,6 +438,8 @@ public static class DeviceAccessService
         if (allowGrandfatherMigration)
         {
             var consumed = File.Exists(MigrationConsumedPath(baseDir));
+            if (consumed)
+                identity.ActivationSource = "migration_consumed_pending";
             var upgradeMarker = File.Exists(UpgradeMarkerPath(baseDir));
             string evidence = string.Empty;
             var legacyEvidence = !consumed && HasGrandfatherEvidence(baseDir, out evidence);
@@ -313,16 +469,43 @@ public static class DeviceAccessService
         return identity;
     }
 
-    static DeviceIdentity CreatePendingIdentity(string fingerprint)
+    static DeviceIdentity CreatePendingIdentity(string fingerprint, string activationSource = "pending")
         => new()
         {
             DeviceId = NewDeviceId(),
             FingerprintHash = fingerprint,
             Activated = false,
-            ActivationSource = "pending",
+            ActivationSource = string.IsNullOrWhiteSpace(activationSource) ? "pending" : activationSource.Trim(),
             CreatedUtc = DateTime.UtcNow,
             LastSeenUtc = DateTime.UtcNow
         };
+
+    static bool IsCloudApprovalEligible(string baseDir, DeviceIdentity identity)
+    {
+        if (identity.Activated)
+            return false;
+
+        var source = (identity.ActivationSource ?? "").Trim();
+
+        // Máy mới PENDING bình thường: cho QITool duyệt nếu thư mục chưa mang marker
+        // kích hoạt cũ. Đây là luồng cài mới sạch.
+        if (string.Equals(source, "pending", StringComparison.OrdinalIgnoreCase))
+            return !File.Exists(MigrationConsumedPath(baseDir));
+
+        // Trường hợp máy đã từng thử/cài Tool trước khi có Hybrid:
+        // device.json có thể bị tạo lại trong khi .device_access_migrated vẫn còn,
+        // nên source trở thành migration_consumed_pending. Trước đây nhánh này bị
+        // chặn tuyệt đối khiến QITool đã bấm Cho phép vẫn không vào được.
+        //
+        // Cho phép QITool kích hoạt trường hợp này là an toàn vì server phải trả
+        // allowed cho ĐÚNG DeviceId + fingerprint hiện tại. Việc chỉ copy thư mục
+        // sang máy khác không tự mở khóa nếu chưa được admin duyệt trên QITool.
+        if (string.Equals(source, "migration_consumed_pending", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // fingerprint_mismatch_pending và mọi nguồn không rõ vẫn fail-closed.
+        return false;
+    }
 
     static bool HasGrandfatherEvidence(string baseDir, out string evidence)
     {

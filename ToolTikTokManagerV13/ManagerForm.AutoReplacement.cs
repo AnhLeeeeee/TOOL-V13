@@ -44,10 +44,17 @@ public sealed partial class ManagerForm
 
         public string LastError { get; set; } = "";
 
-        // Mỗi profile bù chỉ được mở/thử tối đa 1 lần trong cùng một suất bù.
-        // Danh sách này sống xuyên suốt các RETRY của chính request để profile
-        // vừa kiểm tra tên/chạy lỗi không bị mở lại liên tục khi TikTok chưa kịp đồng bộ.
+        // Mỗi profile bù chỉ được mở/thử tối đa 1 lần trong một vòng vét PRF chờ.
+        // Khi một CREATE thật đã thất bại, danh sách này vẫn được giữ trong suốt
+        // cooldown để Wake sớm chỉ thử NGUỒN CHỜ MỚI. Đúng lúc cooldown CREATE hết,
+        // Auto Replace xóa danh sách và bắt đầu một vòng vét TOÀN BỘ PRF chờ mới
+        // trước khi được phép CREATE profile tiếp theo.
         public List<string> AttemptedProfiles { get; set; } = new();
+
+        // Một CREATE thật vừa thất bại và đã đăng ký cooldown. Khi deadline CREATE
+        // đến hạn, request phải reset AttemptedProfiles để vét lại toàn bộ hàng chờ
+        // đúng một lượt trước khi cân nhắc tiêu account mới lần nữa.
+        public bool ReuseSweepBeforeNextCreatePending { get; set; }
 
         // Request sinh từ thiếu suất sau Start All không có profile nguồn cần cleanup.
         // Request AutoClose bình thường luôn giữ true.
@@ -1146,6 +1153,13 @@ public sealed partial class ManagerForm
                 // bắt đầu vòng mới bằng cách vét lại toàn bộ PRF chờ.
                 MarkAutoReplacementCreateLimitReuseRoundDue(request);
 
+                // Một CREATE thật thất bại phải quay RA tầng ngoài sau cooldown.
+                // Chỉ khi deadline CREATE đã đến mới reset AttemptedProfiles, nhờ vậy:
+                // - trong lúc cooldown, PRF chờ MỚI xuất hiện vẫn có thể Wake và được thử ngay;
+                // - profile vừa lỗi không bị mở lại sớm;
+                // - đúng lúc sắp được phép CREATE tiếp theo, toàn bộ hàng chờ được vét lại 1 lượt.
+                PrepareAutoReplacementReuseSweepBeforeNextCreateIfDue(request);
+
                 SetAutoReplacementUiPhase(
                     "XỬ LÝ SUẤT",
                     request.Reason,
@@ -1174,6 +1188,14 @@ public sealed partial class ManagerForm
                         $"[AUTO_REPLACE_HARD_STOP_AFTER_OPERATION_GATE] id={request.Id} generation={execution.Generation}");
                     return;
                 }
+
+                // FAULT_10M có thể đã được xếp hàng, nhưng trong lúc request chờ gate
+                // chính profile nguồn lại được Capacity/Reuse mở và xác nhận RUNNING khỏe.
+                // Request cũ khi đó đã stale: tuyệt đối không được source-cleanup rồi
+                // đóng chính runtime vừa hồi phục (ca 170). BAN/TIME không áp dụng luật
+                // này vì đó là kết thúc vòng đời và vẫn phải đóng dù profile có bị mở lại.
+                if (SuppressStaleFaultReplacementIfSourceRecovered(request))
+                    continue;
 
                 // CLEANUP BARRIER: request do AutoClose sinh ra phải chờ profile cũ sạch thật.
                 // Request CAPACITY_RECONCILE chỉ đại diện cho một slot bị thiếu sau Start All,
@@ -2059,14 +2081,25 @@ public sealed partial class ManagerForm
 
     static bool IsNameSyncPendingOutcome(AutoProfileProcessOutcome outcome)
     {
+        // Trường hợp chuẩn sau khi Manager verify: Save Tên/ảnh đã thành công nhưng
+        // tên thực tế vẫn chưa khớp sau 3 probe. Đây chính là NAME_SYNC_PENDING:
+        // giữ PRF trong hàng chờ để quét lại sau, đồng thời cooldown resolver sẽ
+        // xếp outcome này vào nhóm "Login / tên chưa đổi".
+        if (outcome.Status.Equals("PAUSED_NAME_NOT_CHANGED", StringComparison.OrdinalIgnoreCase)
+            && outcome.Step.Equals("READY_PENDING_NAME", StringComparison.OrdinalIgnoreCase)
+            && outcome.RenameSucceeded
+            && !outcome.IdentityVerified)
+        {
+            return true;
+        }
+
         if (!outcome.Step.Equals("RENAME", StringComparison.OrdinalIgnoreCase))
             return false;
 
-        // CAPTCHA/config là lỗi cần xử lý riêng, không phải trường hợp TikTok
-        // Save xong nhưng tên cập nhật chậm. COOLDOWN cũng KHÔNG phải name-sync:
-        // TikTok đã từ chối thao tác đổi tên nên sweep chỉ-PROBE sẽ không bao giờ
-        // tự sửa được. Để COOLDOWN quay về lane reuse thường; Name Guard sẽ thử
-        // thao tác tên lại ở một lượt mở sau.
+        // Giữ tương thích cho các outcome PAUSED_RENAME cũ/khác. CAPTCHA/config là
+        // lỗi cần xử lý riêng, không phải trường hợp TikTok Save xong nhưng tên cập
+        // nhật chậm. COOLDOWN cũng KHÔNG phải name-sync: TikTok đã từ chối thao tác
+        // đổi tên nên sweep chỉ-PROBE sẽ không bao giờ tự sửa được.
         if (!outcome.Status.StartsWith("PAUSED_RENAME", StringComparison.OrdinalIgnoreCase))
             return false;
 
@@ -2202,8 +2235,10 @@ public sealed partial class ManagerForm
                     return false;
 
                 // NAME_SYNC_PENDING đã được vét ở tầng ngoài TRƯỚC khi vào hàm này.
-                // Không recovery xen kẽ lúc đang tạo mới để tránh vừa tạo xong lại mở
-                // chính profile đó kiểm tra tên trong cùng một suất bù.
+                // Sau một CREATE thật thất bại, hàm này sẽ RETURN ra tầng ngoài thay vì
+                // CREATE liên tiếp account kế tiếp. Request chờ đúng cooldown, reset vòng
+                // attempted rồi vét lại toàn bộ PRF chờ trước khi được vào đây lần nữa.
+                // Chỉ các candidate SKIP trước khi mở runtime mới được phép continue nội bộ.
                 var startName = DetectNextAutoProfileName();
 
                 if (TryGetAutoReplacementCreateLimitBlock(
@@ -2340,7 +2375,8 @@ public sealed partial class ManagerForm
                 executionToken.ThrowIfCancellationRequested();
 
                 // Re-check + reserve quota ngay sát CREATE thật. Đây là chốt chống
-                // một lần gọi TryCreateReplacementAsync tự loop hàng chục account.
+                // CREATE vượt quota; ngoài ra sau đúng 1 profile CREATE thật bị lỗi,
+                // hàm sẽ return ra tầng ngoài để cooldown + vét lại toàn bộ PRF chờ.
                 if (!TryReserveAutoReplacementCreateAttempt(
                         request,
                         item.ProfileName,
@@ -2367,7 +2403,7 @@ public sealed partial class ManagerForm
                 try
                 {
                     _log.Info(
-                        $"[AUTO_REPLACE_CREATE_BEGIN] closed={request.ClosedProfileName} profile={item.ProfileName} account={item.Account.Username} attempt={attempt} mode=until_success_or_limit");
+                        $"[AUTO_REPLACE_CREATE_BEGIN] closed={request.ClosedProfileName} profile={item.ProfileName} account={item.Account.Username} attempt={attempt} mode=one_created_profile_then_reuse_sweep");
 
                     WriteAutoActivityLog(
                         action: "MỞ PROFILE BÙ",
@@ -2376,7 +2412,7 @@ public sealed partial class ManagerForm
                         reason: request.Reason,
                         replacementProfile: item.ProfileName,
                         result: "BẮT ĐẦU",
-                        detail: $"Lần thử {attempt}; tiếp tục đến khi có 1 profile RUNNING khỏe, hết kho hoặc chạm giới hạn tạo.");
+                        detail: $"Lần thử {attempt}; mỗi profile CREATE thật lỗi sẽ dừng lượt này, chờ cooldown rồi vét lại toàn bộ PRF chờ trước khi CREATE tiếp.");
 
                     SetAutoReplacementUiPhase(
                         "TẠO PRF MỚI",
@@ -2386,6 +2422,7 @@ public sealed partial class ManagerForm
                     var outcome = await ProcessAutoProfileQueueItemAsync(
                         item,
                         autoRename: true,
+                        autoVideo: LoadAutoProfileBehaviorSettings().AutoVideoEnabled,
                         autoStart: true,
                         isPaused: static () => false,
                         ct: executionToken,
@@ -2398,7 +2435,15 @@ public sealed partial class ManagerForm
 
                             _log.Info(
                                 $"[AUTO_REPLACE_CREATE_PROGRESS] profile={item.ProfileName} step={step} result={result}");
-                        });
+                        },
+                        // Auto Replace dùng đúng một tầng verify ở Manager: Worker chỉ Save/Confirm
+                        // rồi trả về; Manager probe tên thực tế tối đa 3 lần. Nếu Save đã thành công
+                        // nhưng tên chưa khớp thì trả PAUSED_NAME_NOT_CHANGED để dùng cooldown
+                        // "Login / tên chưa đổi" và vẫn đưa PRF vào lane chờ NAME_SYNC_PENDING.
+                        verifyIdentityAfterRename: true,
+                        writeIdentityDoneToExcel: true,
+                        tolerateIdentityValidationFailure: true,
+                        requireIdentityMatchForSuccess: true);
 
                     if (IsManualCloseSuppressed(item.ProfileName))
                     {
@@ -2471,7 +2516,11 @@ public sealed partial class ManagerForm
                                 item.ProfileName,
                                 request.Id,
                                 "created_started_but_not_healthy");
-                            continue;
+                            ArmAutoReplacementReuseSweepBeforeNextCreate(
+                                request,
+                                item.ProfileName,
+                                "created_started_but_not_healthy");
+                            return false;
                         }
 
                         // Profile tạo mới chỉ được coi là ĐÃ TREO sau khi RUNNING khỏe.
@@ -2504,8 +2553,8 @@ public sealed partial class ManagerForm
                         // Skipped có 2 nghĩa:
                         // 1) SKIPPED_EXCEL/ACTIVE_GUARD xảy ra trước khi mở runtime => chỉ bỏ qua.
                         // 2) Paused=true là LOGIN/CAPTCHA/2FA/Worker/START... lỗi sau khi profile
-                        //    đã có thể mở Chrome + Worker. Với Tự thay phải đóng runtime này trước
-                        //    khi thử account tiếp theo, NHƯNG KHÔNG xóa/retire profile non-BAN.
+                        //    đã có thể mở Chrome + Worker. Với Tự thay phải đóng runtime này trước,
+                        //    giữ profile non-BAN, cooldown rồi vét lại hàng chờ trước CREATE kế tiếp.
                         if (!outcome.Paused)
                         {
                             _log.Info(
@@ -2543,7 +2592,7 @@ public sealed partial class ManagerForm
 
                         // TikTok đôi lúc đã nhận Save tên nhưng trang Hồ sơ chưa phản ánh ngay.
                         // Giữ PRF trong CHÍNH "Chờ dùng lại" với lane NAME_SYNC_PENDING;
-                        // lượt bù bình thường vẫn tiếp tục account mới, recovery chỉ vét sau.
+                        // sau cooldown, PRF này cùng toàn bộ hàng chờ sẽ được vét lại trước CREATE mới.
                         if (IsNameSyncPendingOutcome(outcome))
                         {
                             QueueReusableProfileNameSyncPending(
@@ -2558,7 +2607,11 @@ public sealed partial class ManagerForm
                             item.ProfileName,
                             request.Id,
                             "paused_nonban");
-                        continue;
+                        ArmAutoReplacementReuseSweepBeforeNextCreate(
+                            request,
+                            item.ProfileName,
+                            "paused_nonban");
+                        return false;
                     }
 
                     if (IsAutoReplacementRuntimeStabilizationEligible(outcome))
@@ -2610,7 +2663,11 @@ public sealed partial class ManagerForm
                                     item.ProfileName,
                                     request.Id,
                                     "stabilize_name_sync_pending");
-                                continue;
+                                ArmAutoReplacementReuseSweepBeforeNextCreate(
+                                    request,
+                                    item.ProfileName,
+                                    "stabilize_name_sync_pending");
+                                return false;
                             }
 
                             if (stabilization.Healthy)
@@ -2699,6 +2756,11 @@ public sealed partial class ManagerForm
                         item.ProfileName,
                         request.Id,
                         "outcome_fail");
+                    ArmAutoReplacementReuseSweepBeforeNextCreate(
+                        request,
+                        item.ProfileName,
+                        "outcome_fail");
+                    return false;
                 }
                 catch (OperationCanceledException)
                     when (executionToken.IsCancellationRequested
@@ -2772,6 +2834,11 @@ public sealed partial class ManagerForm
                         item.ProfileName,
                         request.Id,
                         "exception:" + ex.GetType().Name);
+                    ArmAutoReplacementReuseSweepBeforeNextCreate(
+                        request,
+                        item.ProfileName,
+                        "exception:" + ex.GetType().Name);
+                    return false;
                 }
                 finally
                 {
@@ -2817,6 +2884,8 @@ public sealed partial class ManagerForm
         DateTime? healthySinceUtc = null;
         string lastFault = "";
         var recoveryAttempt = 0;
+        var setupHoldWasActive = false;
+        var graceResetAfterSetupStart = false;
 
         // PRF vừa tạo/login vẫn có grace dài như cũ. Riêng PRF Chờ dùng lại
         // đã tồn tại từ trước chỉ được cửa sổ ngắn để mở Worker/Chrome + RUNNING;
@@ -2830,7 +2899,7 @@ public sealed partial class ManagerForm
             $"policy={(isReusableProfileOpen ? "REUSE_FAST" : "CREATED_GRACE")} " +
             $"stable={healthyStableSeconds}s grace={healthyConfirmTimeoutSeconds}s");
 
-        while (!_closing && DateTime.UtcNow < deadlineUtc)
+        while (!_closing)
         {
             // Candidate có thể bị BAN/TIME trong chính cửa sổ ổn định 10 phút.
             // Không được recovery/reopen nó nữa, đặc biệt khi job xóa đã được arm.
@@ -2867,6 +2936,41 @@ public sealed partial class ManagerForm
 
             executionToken.ThrowIfCancellationRequested();
 
+            // Thời gian Tên/ảnh -> VIDEO đang giữ ACCOUNT_SETUP_HOLD không được tính
+            // vào stabilize grace. Vẫn giữ nguyên poll/recovery hiện có; chỉ chặn việc
+            // deadline cũ làm TIMEOUT/cleanup một PRF vừa setup xong. Khi hold được nhả,
+            // bắt đầu lại trọn vẹn grace 45s (hoặc grace tương ứng của policy hiện tại).
+            var setupHoldActive = IsManagedAccountSetupHoldActive(ctx);
+            if (setupHoldActive)
+            {
+                if (!setupHoldWasActive)
+                {
+                    _log.Info(
+                        $"[AUTO_REPLACE_STABILIZE_SETUP_HOLD] id={request.Id} profile={ctx.Profile.Name} source={source} " +
+                        $"gracePaused=true grace={healthyConfirmTimeoutSeconds}s");
+                }
+
+                setupHoldWasActive = true;
+                healthySinceUtc = null;
+            }
+            else
+            {
+                if (setupHoldWasActive)
+                {
+                    deadlineUtc = DateTime.UtcNow.AddSeconds(healthyConfirmTimeoutSeconds);
+                    setupHoldWasActive = false;
+                    graceResetAfterSetupStart = true;
+                    healthySinceUtc = null;
+
+                    _log.Info(
+                        $"[AUTO_REPLACE_STABILIZE_GRACE_RESET] id={request.Id} profile={ctx.Profile.Name} source={source} " +
+                        $"reason=account_setup_hold_released grace={healthyConfirmTimeoutSeconds}s deadline={deadlineUtc:O}");
+                }
+
+                if (DateTime.UtcNow >= deadlineUtc)
+                    break;
+            }
+
             var pollOk = false;
             try
             {
@@ -2902,9 +3006,10 @@ public sealed partial class ManagerForm
                 var stableFor = nowUtc - healthySinceUtc.Value;
                 if (stableFor >= TimeSpan.FromSeconds(healthyStableSeconds))
                 {
+                    ctx.LastRunActivationUtc = DateTime.UtcNow;
                     _log.Info(
                         $"[AUTO_REPLACE_STABILIZE_OK] id={request.Id} profile={ctx.Profile.Name} source={source} " +
-                        $"stable={stableFor:c} recoveryAttempts={recoveryAttempt}");
+                        $"stable={stableFor:c} recoveryAttempts={recoveryAttempt} activation={ctx.LastRunActivationUtc:O}");
                     return new AutoReplacementStabilizationResult(
                         true, false, false,
                         $"RUNNING khỏe {stableFor:c}.");
@@ -3018,6 +3123,26 @@ public sealed partial class ManagerForm
                             return new AutoReplacementStabilizationResult(
                                 false, false, true,
                                 "Name Guard block cứng; không tiếp tục grace runtime.");
+                        }
+
+                        // StartWithNameGuardAsync tự Arm HOLD ở đầu và chỉ nhả HOLD sau
+                        // Tên/ảnh -> VIDEO trước khi gửi start_auto. Toàn bộ chuỗi này có
+                        // thể nằm trong một await nên vòng stabilize không quan sát được
+                        // cạnh ON/OFF ở phía trên. Reset đúng một lần sau lần Start hợp lệ
+                        // đầu tiên để grace thực sự bắt đầu sau setup, không phải từ lúc mở PRF.
+                        if (!graceResetAfterSetupStart
+                            && !IsNameGuardTransientStartReply(reply)
+                            && !string.Equals(reply, "emergency_stopped", StringComparison.OrdinalIgnoreCase)
+                            && !IsManagedAccountSetupHoldActive(ctx))
+                        {
+                            deadlineUtc = DateTime.UtcNow.AddSeconds(healthyConfirmTimeoutSeconds);
+                            graceResetAfterSetupStart = true;
+                            setupHoldWasActive = false;
+                            healthySinceUtc = null;
+
+                            _log.Info(
+                                $"[AUTO_REPLACE_STABILIZE_GRACE_RESET] id={request.Id} profile={ctx.Profile.Name} source={source} " +
+                                $"reason=start_with_name_guard_completed grace={healthyConfirmTimeoutSeconds}s deadline={deadlineUtc:O}");
                         }
 
                         _log.Info(
@@ -3189,6 +3314,84 @@ public sealed partial class ManagerForm
             $"[AUTO_REPLACE_PROFILE_COOLDOWN] profile={profileName} retry={retryUtc:O} reason={reason}");
     }
 
+    void ArmAutoReplacementReuseSweepBeforeNextCreate(
+        AutoReplacementRequest request,
+        string profileName,
+        string source)
+    {
+        var armed = false;
+
+        lock (_autoReplacementQueueLock)
+        {
+            var live = _autoReplacementQueue.FirstOrDefault(x =>
+                x.Id.Equals(request.Id, StringComparison.OrdinalIgnoreCase));
+
+            var target = live ?? request;
+            if (!target.ReuseSweepBeforeNextCreatePending)
+            {
+                target.ReuseSweepBeforeNextCreatePending = true;
+                armed = true;
+            }
+
+            if (live is not null)
+                SaveAutoReplacementQueueUnsafe();
+        }
+
+        if (armed)
+        {
+            _log.Info(
+                $"[AUTO_REPLACE_CREATE_REUSE_SWEEP_ARMED] id={request.Id} closed={request.ClosedProfileName} " +
+                $"profile={profileName} source={source} action=SWEEP_ALL_REUSE_AFTER_CREATE_COOLDOWN");
+        }
+    }
+
+    void PrepareAutoReplacementReuseSweepBeforeNextCreateIfDue(
+        AutoReplacementRequest request)
+    {
+        var nowUtc = DateTime.UtcNow;
+        var clearedAttempted = 0;
+        DateTime? createDeadlineUtc = null;
+        var started = false;
+
+        lock (_autoReplacementQueueLock)
+        {
+            var live = _autoReplacementQueue.FirstOrDefault(x =>
+                x.Id.Equals(request.Id, StringComparison.OrdinalIgnoreCase));
+
+            var target = live ?? request;
+            if (!target.ReuseSweepBeforeNextCreatePending)
+                return;
+
+            createDeadlineUtc = target.CreateNotBeforeUtc;
+
+            // WakeAutoReplacementForReusableSupply có thể đánh thức request sớm trong
+            // cooldown. Khi đó GIỮ AttemptedProfiles để chỉ nguồn chờ mới được thử.
+            // Chỉ reset toàn bộ đúng khi deadline CREATE đã đến hạn.
+            if (createDeadlineUtc.HasValue
+                && createDeadlineUtc.Value > nowUtc)
+            {
+                return;
+            }
+
+            target.AttemptedProfiles ??= new List<string>();
+            clearedAttempted = target.AttemptedProfiles.Count;
+            target.AttemptedProfiles.Clear();
+            target.ReuseSweepBeforeNextCreatePending = false;
+            started = true;
+
+            if (live is not null)
+                SaveAutoReplacementQueueUnsafe();
+        }
+
+        if (started)
+        {
+            _log.Info(
+                $"[AUTO_REPLACE_CREATE_REUSE_SWEEP_ROUND_BEGIN] id={request.Id} closed={request.ClosedProfileName} " +
+                $"clearedAttempted={clearedAttempted} createDeadline={createDeadlineUtc:O} " +
+                "action=RETRY_ALL_REUSE_BEFORE_NEXT_CREATE");
+        }
+    }
+
     bool HasAutoReplacementProfileBeenAttempted(
         AutoReplacementRequest request,
         string profileName)
@@ -3286,6 +3489,77 @@ public sealed partial class ManagerForm
             reason: request.Reason,
             result: "BỎ QUA - TARGET ĐÃ GIẢM",
             detail: $"source={source}; target={gate.TargetSlots}; occupied={gate.OccupiedSlots}. Manual close/target change đã làm suất này không còn cần thiết.");
+
+        return true;
+    }
+
+    bool SuppressStaleFaultReplacementIfSourceRecovered(
+        AutoReplacementRequest request)
+    {
+        if (!request.RequiresSourceCleanup
+            || !string.Equals(
+                NormalizeAutoCloseReason(request.Reason),
+                "FAULT_10M",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var profileName = (request.ClosedProfileName ?? "").Trim();
+        if (profileName.Length == 0
+            || !_contexts.TryGetValue(profileName, out var ctx))
+        {
+            return false;
+        }
+
+        // Nếu profile vừa đi vào một vòng đời cứng mới (BAN/TIME/Tự xóa) thì
+        // request FAULT cũ không được phép gỡ retired của vòng đời mới đó.
+        if (_autoCloseInProgressProfiles.Contains(profileName)
+            || IsProfileRetireDeleteBlockedForOpen(profileName))
+        {
+            return false;
+        }
+
+        // Activation marker CHỈ được ghi bởi START/RESUME thành công hoặc một lượt
+        // Stabilize xác nhận khỏe. Vì vậy marker sau QueuedUtc là bằng chứng profile
+        // đã có một đời runtime mới sau khi FAULT request cũ được sinh ra.
+        // Cho phép một tolerance nhỏ vì Capacity/Reuse có thể xác nhận START ngay
+        // trước khi callback FAULT cũ kịp persist request. Một activation cách queue
+        // vài giây vẫn thuộc cùng đời runtime mới; activation cũ hàng phút/giờ thì không.
+        var activationFreshEnough = request.QueuedUtc - TimeSpan.FromSeconds(10);
+        if (ctx.LastRunActivationUtc == DateTime.MinValue
+            || ctx.LastRunActivationUtc <= activationFreshEnough)
+        {
+            return false;
+        }
+
+        var nowUtc = DateTime.UtcNow;
+        var state = GetEffectiveRuntimeState(ctx);
+        if (!IsAutoCloseHealthyRunning(ctx, state, nowUtc))
+            return false;
+
+        RemoveAutoReplacementRequest(request.Id);
+        ClearAutoReplacementUiPhase(request.Id);
+
+        // FAULT_10M chỉ là soft-retire. Khi runtime đã thật sự hồi phục thì gỡ cờ
+        // retired để profile đang khỏe không bị các vòng supply sau coi là profile chết.
+        _autoReplacementRetiredProfiles.Remove(profileName);
+        MarkProfileSupplyState(
+            profileName,
+            "used",
+            "fault_request_stale_runtime_recovered");
+
+        _log.Warn(
+            $"[AUTO_REPLACE_STALE_FAULT_SUPPRESSED] id={request.Id} profile={profileName} " +
+            $"queued={request.QueuedUtc:O} activation={ctx.LastRunActivationUtc:O} state={state} action=KEEP_HEALTHY_RUNTIME");
+
+        WriteAutoActivityLog(
+            action: "SUẤT BÙ",
+            profile: profileName,
+            reason: request.Reason,
+            result: "BỎ QUA - REQUEST CŨ",
+            detail:
+                $"FAULT_10M được tạo lúc {request.QueuedUtc:O}, nhưng profile đã được Start/Resume lại và RUNNING khỏe lúc {ctx.LastRunActivationUtc:O}; giữ runtime hiện tại, không cleanup/đóng lại.");
 
         return true;
     }

@@ -2498,7 +2498,18 @@ public sealed partial class ManagerForm
                 token = _runStrategyCts.Token;
             }
 
-            if (targetSlots <= 0 || DateTime.UtcNow < nextRotationUtc)
+            if (targetSlots <= 0)
+                return;
+
+            // TIME là luật vòng đời cứng và phải thắng chiến lược Giờ vàng.
+            // Kiểm tra ngay trong scheduler Giờ vàng, trước cooldown/rotation, để một
+            // profile đủ tổng runtime vẫn bị đóng dù PrimeFresh đang giữ đủ target.
+            // AutoClose watchdog riêng vẫn giữ nguyên; gate _autoCloseInProgressProfiles
+            // ngăn hai luồng đóng trùng cùng profile.
+            if (await TryRunStrategyLifetimeCloseBeforeGoldenLogicAsync(token))
+                return;
+
+            if (DateTime.UtcNow < nextRotationUtc)
                 return;
 
             if (!CanRunStrategyRotateNow())
@@ -2594,6 +2605,62 @@ public sealed partial class ManagerForm
         {
             _runStrategyTickBusy = false;
         }
+    }
+
+    async Task<bool> TryRunStrategyLifetimeCloseBeforeGoldenLogicAsync(
+        CancellationToken token)
+    {
+        if (!_autoCloseSettings.CloseOnRunTime)
+            return false;
+
+        var threshold = TimeSpan.FromHours(_autoCloseSettings.RunHours);
+        var active = GetRunStrategyActiveContexts();
+
+        foreach (var ctx in active)
+        {
+            token.ThrowIfCancellationRequested();
+
+            var profileName = ctx.Profile.Name;
+            if (_autoCloseInProgressProfiles.Contains(profileName)
+                || IsRuntimeLoginRecoveryInProgress(profileName)
+                || _autoReplacementClaimedProfiles.Contains(profileName)
+                || _autoReplacementCleanupProfiles.Contains(profileName)
+                || ctx.Opening)
+            {
+                continue;
+            }
+
+            var state = GetEffectiveRuntimeState(ctx);
+            if (state == RuntimeStatePaused)
+                continue;
+
+            // Chỉ can thiệp profile đang thuộc phiên chạy thật; profile chỉ mở để xem
+            // nhưng chưa Start không bị TIME-close chỉ vì có runtime lịch sử cũ.
+            var expectedToRun =
+                _autoCloseExpectedRunningProfiles.Contains(profileName)
+                || IsAutoCloseTimeEligibleAfterManagerRestart(ctx, state);
+            if (!expectedToRun)
+                continue;
+
+            var total = ReadStatisticsRuntime(ctx).Total;
+            if (total < threshold)
+                continue;
+
+            _log.Warn(
+                $"[RUN_STRATEGY_TIME_PREEMPT] profile={profileName} total={total:c} threshold={threshold:c} " +
+                $"state={state} phase={GetRunStrategyPhase(GetToolNow(), _runStrategySettings)} action=AUTO_CLOSE_BEFORE_GOLDEN_LOGIC");
+
+            await AutoCloseProfileAsync(
+                ctx,
+                $"TIME_{_autoCloseSettings.RunHours}H",
+                $"Đạt tổng thời gian chạy {_autoCloseSettings.RunHours} giờ (tổng={total:c}) trong phiên Giờ vàng; TIME ưu tiên cao hơn chiến lược Giờ vàng.",
+                source: "run_strategy_time_priority");
+
+            // Mỗi tick chỉ đóng một profile để giữ cleanup/Excel/replacement tuần tự.
+            return true;
+        }
+
+        return false;
     }
 
     bool CanRunStrategyRotateNow()

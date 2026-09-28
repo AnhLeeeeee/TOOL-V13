@@ -146,6 +146,15 @@ public sealed partial class ManagerForm
         if (confirmedState.Length > 0)
         {
             ConfirmRuntimeState(ctx, confirmedState, $"worker_command:{normalizedCommand}");
+
+            if (confirmedState == RuntimeStateRunning
+                && normalizedCommand is "start" or "start_auto" or "resume")
+            {
+                ctx.LastRunActivationUtc = DateTime.UtcNow;
+                _log.Info(
+                    $"[RUNTIME_ACTIVATION_MARK] profile={ctx.Profile.Name} source=worker_command:{normalizedCommand} at={ctx.LastRunActivationUtc:O}");
+            }
+
             NotifyAutoCloseRuntimeCommand(
                 ctx,
                 normalizedCommand,

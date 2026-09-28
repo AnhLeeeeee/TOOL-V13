@@ -86,9 +86,12 @@ public sealed class TikTokAccountPoolService
         int Note,
         int Assigned,
         int IdentityDone,
+        int VideoStatus,
+        int TimeLogin,
         int SuspiciousNote,
         int SuspiciousAssigned,
-        int SuspiciousIdentity);
+        int SuspiciousIdentity,
+        int SuspiciousVideo);
 
     static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -483,6 +486,207 @@ public sealed class TikTokAccountPoolService
 
         throw new InvalidOperationException(
             $"Không tìm thấy tài khoản {username} trong file Excel để ghi Tên/ảnh={result}.");
+    }
+
+    public Dictionary<string, string> GetVideoResults()
+    {
+        var result =
+            new Dictionary<string, string>(
+                StringComparer.OrdinalIgnoreCase);
+
+        var path = CurrentSourcePath;
+
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+            return result;
+
+        var rows = ReadSourceRows(path);
+        var columns = ResolveSourceColumns(
+            rows,
+            allocateManagedColumns: false);
+
+        if (columns.HeaderRow < 0 || columns.VideoStatus < 0)
+            return result;
+
+        for (var i = columns.HeaderRow + 1; i < rows.Count; i++)
+        {
+            var row = rows[i];
+            var user = GetCell(row, columns.User).Trim();
+
+            if (user.Length == 0)
+                continue;
+
+            var value =
+                NormalizeVideoStatusValue(
+                    GetCell(row, columns.VideoStatus));
+
+            if (value.Length > 0)
+                result[user] = value;
+        }
+
+        return result;
+    }
+
+    public string GetVideoResult(string username)
+        => GetVideoResults().TryGetValue(
+               (username ?? "").Trim(),
+               out var value)
+            ? value
+            : "";
+
+    public void MarkVideoResult(
+        string username,
+        string result)
+    {
+        username = (username ?? "").Trim();
+
+        if (username.Length == 0)
+            throw new InvalidOperationException(
+                "Username trống; không thể ghi trạng thái VIDEO.");
+
+        result = NormalizeVideoStatusValue(result);
+
+        if (result.Length == 0)
+            throw new InvalidOperationException(
+                "VIDEO chỉ cho phép DONE, FAIL hoặc OFF ở từng vế, ví dụ DONE|FAIL.");
+
+        var path = CurrentSourcePath;
+
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+            throw new InvalidOperationException(
+                "Kho tài khoản chưa có file Excel nguồn; không thể ghi trạng thái VIDEO.");
+
+        var rows = ReadSourceRows(path);
+        var columns = ResolveSourceColumns(
+            rows,
+            allocateManagedColumns: false);
+
+        if (columns.HeaderRow < 0)
+            throw new InvalidOperationException(
+                "Không tìm thấy hàng tiêu đề trong file Excel.");
+
+        for (var i = columns.HeaderRow + 1; i < rows.Count; i++)
+        {
+            var user = GetCell(rows[i], columns.User).Trim();
+
+            if (!user.Equals(
+                    username,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            SetVideoStatusCell(
+                path,
+                i + 1,
+                result);
+
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"Không tìm thấy tài khoản {username} trong file Excel để ghi VIDEO={result}.");
+    }
+
+    public Dictionary<string, string> GetTimeLoginResults()
+    {
+        var result =
+            new Dictionary<string, string>(
+                StringComparer.OrdinalIgnoreCase);
+
+        var path = CurrentSourcePath;
+
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+            return result;
+
+        var rows = ReadSourceRows(path);
+        var columns = ResolveSourceColumns(
+            rows,
+            allocateManagedColumns: false);
+
+        if (columns.HeaderRow < 0 || columns.TimeLogin < 0)
+            return result;
+
+        for (var i = columns.HeaderRow + 1; i < rows.Count; i++)
+        {
+            var user = GetCell(rows[i], columns.User).Trim();
+            if (user.Length == 0)
+                continue;
+
+            var value = GetCell(rows[i], columns.TimeLogin).Trim();
+            if (value.Length > 0)
+                result[user] = value;
+        }
+
+        return result;
+    }
+
+    public string EnsureTimeLogin(
+        string username,
+        DateTime localTime)
+    {
+        username = (username ?? "").Trim();
+
+        if (username.Length == 0)
+            throw new InvalidOperationException(
+                "Username trống; không thể ghi TIMELOGIN.");
+
+        var path = CurrentSourcePath;
+
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+            throw new InvalidOperationException(
+                "Kho tài khoản chưa có file Excel nguồn; không thể ghi TIMELOGIN.");
+
+        var rows = ReadSourceRows(path);
+        var columns = ResolveSourceColumns(
+            rows,
+            allocateManagedColumns: false);
+
+        if (columns.HeaderRow < 0)
+            throw new InvalidOperationException(
+                "Không tìm thấy hàng tiêu đề trong file Excel.");
+
+        for (var i = columns.HeaderRow + 1; i < rows.Count; i++)
+        {
+            var user = GetCell(rows[i], columns.User).Trim();
+            if (!user.Equals(username, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            if (columns.TimeLogin >= 0)
+            {
+                var existing = GetCell(rows[i], columns.TimeLogin).Trim();
+                if (existing.Length > 0)
+                    return existing;
+            }
+
+            var value = localTime.ToString(
+                "HH:mm dd/MM/yyyy",
+                CultureInfo.InvariantCulture);
+
+            SetTimeLoginCell(
+                path,
+                i + 1,
+                value);
+
+            // Đọc lại đúng Excel vừa ghi để TIMELOGIN không báo thành công giả.
+            var verifyRows = ReadSourceRows(path);
+            var verifyColumns = ResolveSourceColumns(
+                verifyRows,
+                allocateManagedColumns: false);
+
+            if (verifyColumns.TimeLogin >= 0
+                && i < verifyRows.Count)
+            {
+                var actual = GetCell(verifyRows[i], verifyColumns.TimeLogin).Trim();
+                if (actual.Length > 0)
+                    return actual;
+            }
+
+            throw new InvalidOperationException(
+                $"Đã ghi TIMELOGIN cho {username} nhưng đọc lại Excel chưa thấy giá trị.");
+        }
+
+        throw new InvalidOperationException(
+            $"Không tìm thấy tài khoản {username} trong file Excel để ghi TIMELOGIN.");
     }
 
     public List<TikTokAccountPoolItem> Load()
@@ -1604,6 +1808,8 @@ public sealed class TikTokAccountPoolService
             var emptyNoteColumn = allocateManagedColumns ? 3 : -1;
             var emptyAssignedColumn = allocateManagedColumns ? 4 : -1;
             var emptyDoneColumn = allocateManagedColumns ? 5 : -1;
+            var emptyVideoColumn = allocateManagedColumns ? 6 : -1;
+            var emptyTimeLoginColumn = allocateManagedColumns ? 7 : -1;
 
             return new SourceColumnLayout(
                 0,
@@ -1613,6 +1819,9 @@ public sealed class TikTokAccountPoolService
                 emptyNoteColumn,
                 emptyAssignedColumn,
                 emptyDoneColumn,
+                emptyVideoColumn,
+                emptyTimeLoginColumn,
+                -1,
                 -1,
                 -1,
                 -1);
@@ -1699,6 +1908,32 @@ public sealed class TikTokAccountPoolService
                 doneCandidates,
                 out var suspiciousDone);
 
+        var videoCandidates = FindHeaders(
+            headers,
+            "video",
+            "video status",
+            "video trạng thái",
+            "video trang thai",
+            "trạng thái video",
+            "trang thai video");
+
+        var videoStatus =
+            ChooseVideoStatusColumn(
+                rows,
+                headerRow,
+                videoCandidates,
+                out var suspiciousVideo);
+
+        var timeLogin = FindHeader(
+            headers,
+            "timelogin",
+            "time login",
+            "time_login",
+            "ngày đăng nhập",
+            "ngay dang nhap",
+            "giờ đăng nhập",
+            "gio dang nhap");
+
         if (allocateManagedColumns)
         {
             var lastUsed =
@@ -1724,6 +1959,45 @@ public sealed class TikTokAccountPoolService
             {
                 identityDone = ++lastUsed;
             }
+            else
+            {
+                lastUsed = Math.Max(lastUsed, identityDone);
+            }
+
+            if (videoStatus < 0
+                || videoStatus == assigned
+                || videoStatus == note
+                || videoStatus == identityDone)
+            {
+                videoStatus = ++lastUsed;
+            }
+            else
+            {
+                lastUsed = Math.Max(lastUsed, videoStatus);
+            }
+
+            if (timeLogin < 0
+                || timeLogin == user
+                || timeLogin == password
+                || timeLogin == totp
+                || timeLogin == note
+                || timeLogin == assigned
+                || timeLogin == identityDone
+                || timeLogin == videoStatus)
+            {
+                var excluded = new HashSet<int>
+                {
+                    user, password, totp, note, assigned, identityDone, videoStatus
+                };
+
+                timeLogin = FindFirstCompletelyBlankColumn(
+                    rows,
+                    headerRow,
+                    excluded);
+
+                if (timeLogin < 0)
+                    timeLogin = ++lastUsed;
+            }
         }
 
         return new SourceColumnLayout(
@@ -1734,9 +2008,12 @@ public sealed class TikTokAccountPoolService
             note,
             assigned,
             identityDone,
+            videoStatus,
+            timeLogin,
             suspiciousNote,
             suspiciousAssigned,
-            suspiciousDone);
+            suspiciousDone,
+            suspiciousVideo);
     }
 
     static int ChooseNoteColumn(
@@ -1839,6 +2116,50 @@ public sealed class TikTokAccountPoolService
         }
 
         return -1;
+    }
+
+    static int ChooseVideoStatusColumn(
+        List<List<string>> rows,
+        int headerRow,
+        IReadOnlyList<int> candidates,
+        out int suspicious)
+    {
+        suspicious = -1;
+
+        if (candidates.Count == 0)
+            return -1;
+
+        foreach (var col in candidates.Reverse())
+        {
+            if (LooksLikeVideoStatusColumn(
+                    rows,
+                    headerRow,
+                    col))
+            {
+                return col;
+            }
+
+            suspicious = col;
+        }
+
+        return -1;
+    }
+
+    static bool LooksLikeVideoStatusColumn(
+        List<List<string>> rows,
+        int headerRow,
+        int col)
+    {
+        var values = DataValues(
+            rows,
+            headerRow,
+            col);
+
+        if (values.Count == 0)
+            return true;
+
+        return values.All(v =>
+            NormalizeVideoStatusValue(v).Length > 0);
     }
 
     static bool LooksLikeEmailColumn(
@@ -1976,6 +2297,43 @@ public sealed class TikTokAccountPoolService
         return "";
     }
 
+    static string NormalizeVideoStatusValue(string? value)
+    {
+        value = (value ?? "").Trim();
+        if (value.Length == 0)
+            return "";
+
+        var parts = value.Split('|');
+        if (parts.Length != 2)
+            return "";
+
+        static string NormalizePart(string text)
+        {
+            text = (text ?? "").Trim();
+
+            if (text.Equals("DONE", StringComparison.OrdinalIgnoreCase))
+                return "DONE";
+
+            if (text.Equals("FAIL", StringComparison.OrdinalIgnoreCase)
+                || text.Equals("FAILED", StringComparison.OrdinalIgnoreCase)
+                || text.Equals("ERROR", StringComparison.OrdinalIgnoreCase))
+                return "FAIL";
+
+            if (text.Equals("OFF", StringComparison.OrdinalIgnoreCase)
+                || text.Equals("DISABLED", StringComparison.OrdinalIgnoreCase))
+                return "OFF";
+
+            return "";
+        }
+
+        var left = NormalizePart(parts[0]);
+        var right = NormalizePart(parts[1]);
+
+        return left.Length > 0 && right.Length > 0
+            ? left + "|" + right
+            : "";
+    }
+
     static bool IsDoneValue(string? value)
     {
         value = (value ?? "").Trim();
@@ -2066,6 +2424,38 @@ public sealed class TikTokAccountPoolService
                 @"\s+",
                 " ")
             .Trim();
+    }
+
+    static int FindFirstCompletelyBlankColumn(
+        List<List<string>> rows,
+        int headerRow,
+        IReadOnlySet<int> excluded)
+    {
+        var lastUsed = LastUsedColumn(rows);
+
+        // A/B/C thường là tài khoản/mật khẩu/2FA. Ưu tiên tận dụng một cột
+        // trống từ D trở đi để TIMELOGIN không làm phình cấu trúc Excel.
+        for (var col = 3; col <= lastUsed; col++)
+        {
+            if (excluded.Contains(col))
+                continue;
+
+            var blank = true;
+
+            for (var rowIndex = Math.Max(0, headerRow); rowIndex < rows.Count; rowIndex++)
+            {
+                if (string.IsNullOrWhiteSpace(GetCell(rows[rowIndex], col)))
+                    continue;
+
+                blank = false;
+                break;
+            }
+
+            if (blank)
+                return col;
+        }
+
+        return -1;
     }
 
     static int LastUsedColumn(
@@ -2592,6 +2982,345 @@ public sealed class TikTokAccountPoolService
             path);
     }
 
+    static void SetVideoStatusCell(
+        string path,
+        int sourceRow,
+        string value)
+    {
+        var ext =
+            Path
+                .GetExtension(path)
+                .ToLowerInvariant();
+
+        if (ext is ".csv" or ".txt")
+        {
+            var lines =
+                File
+                    .ReadAllLines(
+                        path,
+                        Encoding.UTF8)
+                    .ToList();
+
+            var separator =
+                DetectSeparator(lines);
+
+            if (lines.Count == 0)
+                lines.Add(
+                    "Tài khoản"
+                    + separator
+                    + "Mật khẩu"
+                    + separator
+                    + "2FA");
+
+            var rows =
+                lines
+                    .Select(line =>
+                        SplitDelimited(
+                            line,
+                            separator))
+                    .ToList();
+
+            var columns =
+                ResolveSourceColumns(
+                    rows,
+                    allocateManagedColumns: true);
+
+            EnsureDelimitedManagedHeaders(
+                lines,
+                separator,
+                rows,
+                columns);
+
+            while (lines.Count < sourceRow)
+                lines.Add("");
+
+            var cells =
+                SplitDelimited(
+                    lines[sourceRow - 1],
+                    separator);
+
+            EnsureCellCount(
+                cells,
+                MaxManagedColumn(columns) + 1);
+
+            cells[columns.VideoStatus] =
+                value ?? "";
+
+            lines[sourceRow - 1] =
+                string.Join(
+                    separator,
+                    cells.Select(x =>
+                        EscapeDelimited(
+                            x,
+                            separator)));
+
+            AtomicWrite(
+                path,
+                string.Join(
+                    Environment.NewLine,
+                    lines));
+
+            return;
+        }
+
+        if (ext != ".xlsx")
+            throw new InvalidOperationException(
+                "Chỉ hỗ trợ file .xlsx, .csv hoặc .txt.");
+
+        var rowsBeforeWrite =
+            ReadXlsx(path);
+
+        var columnsXlsx =
+            ResolveSourceColumns(
+                rowsBeforeWrite,
+                allocateManagedColumns: true);
+
+        using var source =
+            new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite
+                | FileShare.Delete);
+
+        using var memory =
+            new MemoryStream();
+
+        source.CopyTo(memory);
+        memory.Position = 0;
+
+        string sheetName;
+        XDocument sheetDoc;
+
+        using (var zip =
+               new ZipArchive(
+                   memory,
+                   ZipArchiveMode.Update,
+                   leaveOpen: true))
+        {
+            var sheetEntry =
+                ResolveFirstSheet(zip)
+                ?? throw new InvalidOperationException(
+                    "File Excel không có worksheet.");
+
+            sheetName =
+                sheetEntry.FullName;
+
+            using (var stream =
+                   sheetEntry.Open())
+            {
+                sheetDoc =
+                    XDocument.Load(stream);
+            }
+
+            sheetEntry.Delete();
+
+            XNamespace ns =
+                sheetDoc.Root?.Name.Namespace
+                ?? "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+
+            var sheetData =
+                sheetDoc
+                    .Descendants(ns + "sheetData")
+                    .FirstOrDefault()
+                ?? throw new InvalidOperationException(
+                    "Worksheet không có sheetData.");
+
+            EnsureXlsxManagedHeaders(
+                sheetData,
+                ns,
+                rowsBeforeWrite,
+                columnsXlsx);
+
+            var row =
+                GetOrCreateRow(
+                    sheetData,
+                    ns,
+                    sourceRow);
+
+            SetInlineCell(
+                row,
+                ns,
+                ColumnName(
+                    columnsXlsx.VideoStatus)
+                + sourceRow,
+                value ?? "");
+
+            ReorderCells(row, ns);
+            ReorderRows(sheetData, ns);
+
+            var newEntry =
+                zip.CreateEntry(
+                    sheetName,
+                    CompressionLevel.Optimal);
+
+            using var outStream =
+                newEntry.Open();
+
+            sheetDoc.Save(outStream);
+        }
+
+        memory.Position = 0;
+
+        var temp =
+            path + ".tooltmp";
+
+        using (var output =
+               new FileStream(
+                   temp,
+                   FileMode.Create,
+                   FileAccess.Write,
+                   FileShare.None))
+        {
+            memory.CopyTo(output);
+        }
+
+        ReplaceFileFromTemp(
+            temp,
+            path);
+    }
+
+    static void SetTimeLoginCell(
+        string path,
+        int sourceRow,
+        string value)
+    {
+        var ext = Path.GetExtension(path).ToLowerInvariant();
+
+        if (ext is ".csv" or ".txt")
+        {
+            var lines = File.ReadAllLines(path, Encoding.UTF8).ToList();
+            var separator = DetectSeparator(lines);
+
+            if (lines.Count == 0)
+                lines.Add("Tài khoản" + separator + "Mật khẩu" + separator + "2FA");
+
+            var rows = lines
+                .Select(line => SplitDelimited(line, separator))
+                .ToList();
+
+            var columns = ResolveSourceColumns(
+                rows,
+                allocateManagedColumns: true);
+
+            EnsureDelimitedManagedHeaders(
+                lines,
+                separator,
+                rows,
+                columns);
+
+            while (lines.Count < sourceRow)
+                lines.Add("");
+
+            var cells = SplitDelimited(
+                lines[sourceRow - 1],
+                separator);
+
+            EnsureCellCount(
+                cells,
+                MaxManagedColumn(columns) + 1);
+
+            cells[columns.TimeLogin] = value ?? "";
+
+            lines[sourceRow - 1] = string.Join(
+                separator,
+                cells.Select(x => EscapeDelimited(x, separator)));
+
+            AtomicWrite(
+                path,
+                string.Join(Environment.NewLine, lines));
+            return;
+        }
+
+        if (ext != ".xlsx")
+            throw new InvalidOperationException(
+                "Chỉ hỗ trợ file .xlsx, .csv hoặc .txt.");
+
+        var rowsBeforeWrite = ReadXlsx(path);
+        var columnsXlsx = ResolveSourceColumns(
+            rowsBeforeWrite,
+            allocateManagedColumns: true);
+
+        using var source = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete);
+
+        using var memory = new MemoryStream();
+        source.CopyTo(memory);
+        memory.Position = 0;
+
+        string sheetName;
+        XDocument sheetDoc;
+
+        using (var zip = new ZipArchive(
+                   memory,
+                   ZipArchiveMode.Update,
+                   leaveOpen: true))
+        {
+            var sheetEntry = ResolveFirstSheet(zip)
+                ?? throw new InvalidOperationException(
+                    "File Excel không có worksheet.");
+
+            sheetName = sheetEntry.FullName;
+            using (var stream = sheetEntry.Open())
+                sheetDoc = XDocument.Load(stream);
+
+            sheetEntry.Delete();
+
+            XNamespace ns = sheetDoc.Root?.Name.Namespace
+                ?? "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+
+            var sheetData = sheetDoc
+                .Descendants(ns + "sheetData")
+                .FirstOrDefault()
+                ?? throw new InvalidOperationException(
+                    "Worksheet không có sheetData.");
+
+            EnsureXlsxManagedHeaders(
+                sheetData,
+                ns,
+                rowsBeforeWrite,
+                columnsXlsx);
+
+            var row = GetOrCreateRow(
+                sheetData,
+                ns,
+                sourceRow);
+
+            SetInlineCell(
+                row,
+                ns,
+                ColumnName(columnsXlsx.TimeLogin) + sourceRow,
+                value ?? "");
+
+            ReorderCells(row, ns);
+            ReorderRows(sheetData, ns);
+
+            var newEntry = zip.CreateEntry(
+                sheetName,
+                CompressionLevel.Optimal);
+
+            using var outStream = newEntry.Open();
+            sheetDoc.Save(outStream);
+        }
+
+        memory.Position = 0;
+        var temp = path + ".tooltmp";
+
+        using (var output = new FileStream(
+                   temp,
+                   FileMode.Create,
+                   FileAccess.Write,
+                   FileShare.None))
+        {
+            memory.CopyTo(output);
+        }
+
+        ReplaceFileFromTemp(temp, path);
+    }
+
     static void EnsureDelimitedManagedHeaders(
         List<string> lines,
         char separator,
@@ -2648,6 +3377,14 @@ public sealed class TikTokAccountPoolService
         header[columns.IdentityDone] =
             "Tên/ảnh";
 
+        header[columns.VideoStatus] =
+            columns.SuspiciousVideo >= 0
+                ? "VIDEO trạng thái"
+                : "VIDEO";
+
+        header[columns.TimeLogin] =
+            "TIMELOGIN";
+
         lines[columns.HeaderRow] =
             string.Join(
                 separator,
@@ -2701,6 +3438,22 @@ public sealed class TikTokAccountPoolService
             ColumnName(columns.IdentityDone)
             + headerNumber,
             "Tên/ảnh");
+
+        SetInlineCell(
+            headerRow,
+            ns,
+            ColumnName(columns.VideoStatus)
+            + headerNumber,
+            columns.SuspiciousVideo >= 0
+                ? "VIDEO trạng thái"
+                : "VIDEO");
+
+        SetInlineCell(
+            headerRow,
+            ns,
+            ColumnName(columns.TimeLogin)
+            + headerNumber,
+            "TIMELOGIN");
 
         ReorderCells(
             headerRow,
@@ -2891,7 +3644,9 @@ public sealed class TikTokAccountPoolService
             columns.Totp,
             columns.Note,
             columns.Assigned,
-            columns.IdentityDone
+            columns.IdentityDone,
+            columns.VideoStatus,
+            columns.TimeLogin
         }.Max();
     }
 
