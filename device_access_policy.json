@@ -1,6 +1,6 @@
 {
   "enabled": true,
-  "policyVersion": "2",
+  "policyVersion": "3",
   "enforceAllowList": false,
   "allowedDeviceIds": [
     "TT-3DCD4-24C16-64433-55DB7"
@@ -10,7 +10,7 @@
   "blockMessage": "Thiết bị này chưa được cấp quyền sử dụng Tool.",
   "versionControl": {
     "enabled": true,
-    "policyUrl": "",
+    "policyUrl": "https://gfeqtnaoaefdoshtkxsg.supabase.co/functions/v1/version-policy",
     "failClosedOnDowngrade": true
   }
 }
