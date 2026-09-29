@@ -15,7 +15,12 @@ public sealed record DomBox(double X, double Y, double Width, double Height);
 public sealed record CdpVersionInfo(string Browser, string WebSocketDebuggerUrl);
 public sealed record ManagedChromeCloseResult(bool WasRunning, bool Closed, IReadOnlyList<int> RemainingPids, bool CdpReady, string Method);
 public sealed record ManagedChromeWindowResolution(int CachedPid, int ResolvedPid, long WindowHandle, string Reason);
-public sealed record TikTokStartupResult(string State, string Message, bool LoggedIn, bool LiveOpened);
+public sealed record TikTokStartupResult(
+    string State,
+    string Message,
+    bool LoggedIn,
+    bool LiveOpened,
+    bool LoginPerformed = false);
 public sealed record TikTokRecommendedLiveCandidate(string Href, string Username, string ViewerText, string Label);
 public sealed record TikTokProfileIdentityUpdateResult(bool NameChanged, bool AvatarChanged, bool BioChanged, bool NameCooldown, bool AlreadyConfigured, bool Skipped, string Message);
 public enum ChromeWindowState { NotFound, Visible, Minimized }
@@ -2576,7 +2581,13 @@ public sealed partial class ChromeController : IAsyncDisposable
                         return new TikTokStartupResult("TOTP_REQUIRED", "TikTok yêu cầu mã 2FA nhưng profile chưa lưu secret TOTP.", false, false);
 
                     await FillAndSubmitTotpAsync(totpSecret, ct);
-                    var afterTotp = await WaitForTikTokLoginCompletionAsync(totpSecret, TimeSpan.FromSeconds(45), openLiveWhenReady, stopOnCaptcha, ct);
+                    var afterTotp = await WaitForTikTokLoginCompletionAsync(
+                        totpSecret,
+                        TimeSpan.FromSeconds(45),
+                        openLiveWhenReady,
+                        stopOnCaptcha,
+                        false,
+                        ct);
                     if (afterTotp is not null) return afterTotp;
                 }
 
@@ -2618,7 +2629,13 @@ public sealed partial class ChromeController : IAsyncDisposable
         _loginBanDetectionArmed = true;
         _log.Info("[TIKTOK_LOGIN_BAN_GATE] armed=true reason=current-account-submitted");
 
-        var completion = await WaitForTikTokLoginCompletionAsync(totpSecret, TimeSpan.FromSeconds(45), openLiveWhenReady, stopOnCaptcha, ct);
+        var completion = await WaitForTikTokLoginCompletionAsync(
+            totpSecret,
+            TimeSpan.FromSeconds(45),
+            openLiveWhenReady,
+            stopOnCaptcha,
+            true,
+            ct);
         if (completion is not null) return completion;
 
         await CaptureLoginPageDiagnosticAsync("after_submit_timeout", ct);
@@ -2633,7 +2650,8 @@ public sealed partial class ChromeController : IAsyncDisposable
                 openLiveWhenReady,
                 "Đăng nhập thành công; đã mở TikTok LIVE.",
                 "Đăng nhập thành công; đã về trang chủ TikTok, chưa vào LIVE.",
-                ct);
+                ct,
+                true);
         }
 
         return new TikTokStartupResult("LOGIN_FAILED", "Đăng nhập TikTok chưa thành công sau thời gian chờ.", false, false);
@@ -2644,6 +2662,7 @@ public sealed partial class ChromeController : IAsyncDisposable
         TimeSpan activeLoginTimeout,
         bool openLiveWhenReady,
         bool stopOnCaptcha,
+        bool loginPerformed,
         CancellationToken ct)
     {
         var loginDeadline = DateTime.UtcNow + activeLoginTimeout;
@@ -2667,7 +2686,8 @@ public sealed partial class ChromeController : IAsyncDisposable
                     openLiveWhenReady,
                     "Đăng nhập thành công; đã mở TikTok LIVE và xử lý màn 'Nhấp để xem LIVE' nếu có.",
                     "Đăng nhập thành công; đã về trang chủ TikTok, chưa vào LIVE.",
-                    ct);
+                    ct,
+                    loginPerformed);
             }
 
             if (await DetectCaptchaAsync(ct))
@@ -2717,18 +2737,19 @@ public sealed partial class ChromeController : IAsyncDisposable
         bool openLiveWhenReady,
         string liveMessage,
         string homeMessage,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool loginPerformed = false)
     {
         _loginBanDetectionArmed = false;
 
         if (openLiveWhenReady)
         {
             await OpenTikTokLiveReadyAsync(ct);
-            return new TikTokStartupResult("READY", liveMessage, true, true);
+            return new TikTokStartupResult("READY", liveMessage, true, true, loginPerformed);
         }
 
         await OpenTikTokHomeReadyAsync(ct);
-        return new TikTokStartupResult("READY", homeMessage, true, false);
+        return new TikTokStartupResult("READY", homeMessage, true, false, loginPerformed);
     }
 
     async Task OpenTikTokHomeReadyAsync(CancellationToken ct)

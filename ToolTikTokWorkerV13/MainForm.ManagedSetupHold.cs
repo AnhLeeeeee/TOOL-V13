@@ -67,6 +67,39 @@ public sealed partial class MainForm
         return true;
     }
 
+
+    string CancelManagedAccountSetupHold()
+    {
+        try
+        {
+            var dataRoot = (_startupOptions.DataRoot ?? "").Trim();
+            if (dataRoot.Length > 0)
+            {
+                var path = Path.Combine(dataRoot, ManagedAccountSetupHoldFileName);
+                if (File.Exists(path)) File.Delete(path);
+                try
+                {
+                    var temp = path + ".tmp";
+                    if (File.Exists(temp)) File.Delete(temp);
+                }
+                catch { }
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"[ACCOUNT_SETUP_CANCEL_DELETE_WARN] {ex.Message}");
+        }
+
+        // Khác setup_release: hủy intent Start đã defer, tuyệt đối không chạy lại.
+        var deferred = _managedSetupDeferredStartRequested;
+        _managedSetupDeferredStartRequested = false;
+        _managedSetupDeferredStartSuppressDialogs = true;
+        _managedSetupLastDeferredPhase = "";
+
+        _log.Warn($"[ACCOUNT_SETUP_CANCELLED] deferredStart={deferred} action=NO_REPLAY");
+        return "cancelled";
+    }
+
     string ReleaseManagedAccountSetupHold()
     {
         try

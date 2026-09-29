@@ -1080,6 +1080,50 @@ public sealed partial class ManagerForm
             lastError);
     }
 
+    async Task<bool> IsQIToolUpdateBlockedAsync(DeviceAccessService.DeviceAccessDecision access)
+    {
+        // ADMIN Full Bypass: không bao giờ chặn update trên máy quản trị.
+        if (DeviceAccessService.AdminBypassActive)
+        {
+            _log.Info($"[QITOOL_UPDATE_POLICY_BYPASS] id={access.DeviceId} reason=admin_bypass");
+            return false;
+        }
+
+        // Chỉ QITool flag mới được xử lý ở đây. Nếu QITool không cấu hình / mất mạng /
+        // lỗi HTTP / response thiếu field => fail-open, tuyệt đối không tự chặn update.
+        try
+        {
+            using var licenseServer = LicenseServerClient.TryCreate(
+                _baseDir,
+                access.DeviceId,
+                DeviceAccessService.GetFingerprintHash(),
+                AppVersionInfo.Current);
+
+            if (licenseServer is null)
+            {
+                _log.Info($"[QITOOL_UPDATE_POLICY_FAIL_OPEN] id={access.DeviceId} reason=license_client_unavailable");
+                return false;
+            }
+
+            var decision = await licenseServer.CheckUpdatePolicyAsync();
+            var blocked = LicenseServerClient.IsExplicitUpdateBlocked(decision);
+
+            _log.Info(
+                $"[QITOOL_UPDATE_POLICY] id={access.DeviceId} blocked={blocked} " +
+                $"reachable={decision.Reachable} http={decision.HttpStatus} ok={decision.Ok} " +
+                $"identityMatched={decision.IdentityMatched?.ToString() ?? "unknown"} " +
+                $"isAdmin={decision.IsAdmin?.ToString() ?? "unknown"} " +
+                $"updateBlocked={decision.UpdateBlocked?.ToString() ?? "unknown"}");
+
+            return blocked;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"[QITOOL_UPDATE_POLICY_FAIL_OPEN] id={access.DeviceId} reason=exception detail={ex.Message}");
+            return false;
+        }
+    }
+
     async Task<bool> EnsureDeviceUpdateAllowedAsync(bool showWhenCurrent)
     {
         DeviceAccessService.DeviceAccessDecision access;
@@ -1108,6 +1152,37 @@ public sealed partial class ManagerForm
                 $"Thiết bị này không còn được cấp quyền sử dụng Tool.\n\nMã thiết bị: {access.DeviceId}",
                 "Quyền thiết bị", MessageBoxIcon.Warning);
             BeginInvoke(new Action(Close));
+            return false;
+        }
+
+        // QITool update block là lớp bổ sung, fail-open tuyệt đối.
+        // Chỉ blocked khi server trả explicit updateBlocked=true cho đúng Device ID + fingerprint.
+        if (access.AllowUpdate && await IsQIToolUpdateBlockedAsync(access))
+        {
+            _latestUpdate = null;
+            _availableVersions.Clear();
+            RefreshVersionSelector();
+
+            if (_dashboardUpdateStatus is not null && !_dashboardUpdateStatus.IsDisposed)
+            {
+                _dashboardUpdateStatus.Text = $"Phiên bản hiện tại: V{ManagerDisplayVersion} — đã kiểm tra cập nhật.";
+                _dashboardUpdateStatus.ForeColor = Color.FromArgb(55, 76, 103);
+            }
+
+            RefreshSelectedVersionAction();
+
+            // Giữ hành vi kín như legacy BlockedUpdateDeviceIds:
+            // máy khách chỉ thấy không có bản mới, không thấy lý do quản trị.
+            if (showWhenCurrent)
+            {
+                ModernDialog.ShowMessage(
+                    this,
+                    $"Bạn đang dùng V{ManagerDisplayVersion}. Không có bản cập nhật mới.",
+                    "Trình quản lý phiên bản",
+                    MessageBoxIcon.Information);
+            }
+
+            _log.Info($"[QITOOL_UPDATE_BLOCK_APPLIED] id={access.DeviceId} current={ManagerDisplayVersion}");
             return false;
         }
 
@@ -1612,6 +1687,24 @@ public sealed partial class ManagerForm
                 throw new InvalidDataException($"SHA-256 không khớp. Expected={expectedHash}; Actual={actual}");
 
             File.Move(temp, destination, true);
+
+            // Kiểm tra lại ngay trước khi dừng Worker / mở Setup.
+            // Nếu chủ máy vừa bấm "Chặn cập nhật" trong lúc download, không được chạy bộ cài.
+            if (!await EnsureDeviceUpdateAllowedAsync(showWhenCurrent: false))
+            {
+                try
+                {
+                    if (File.Exists(destination))
+                        File.Delete(destination);
+                }
+                catch { }
+
+                _log.Warn(
+                    $"[VERSION_INSTALL_ABORTED_BY_UPDATE_POLICY] from={ManagerDisplayVersion} " +
+                    $"to={manifest.Version} action=keep_current_version");
+                return;
+            }
+
             await StopWorkersForVersionInstallAsync();
 
             string backupPath = "";

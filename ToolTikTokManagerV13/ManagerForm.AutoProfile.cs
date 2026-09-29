@@ -2468,27 +2468,10 @@ public sealed partial class ManagerForm
 
             await EnsureAutoProfileLoggedInAsync(ctx, item, ct);
 
-            // TIMELOGIN là mốc cố định của lần đăng nhập thành công đầu tiên
-            // trong luồng tạo/hoàn tất Auto Profile. Nếu Excel đã có giá trị thì
-            // EnsureTimeLogin giữ nguyên, tuyệt đối không ghi đè khi relogin/mở lại.
-            try
-            {
-                var timeLogin = await RunAccountPoolIoAsync(
-                    () => _accountPoolService.EnsureTimeLogin(
-                        item.Account.Username,
-                        DateTime.Now),
-                    ct);
-
-                _log.Info(
-                    $"[AUTO_PROFILE_TIMELOGIN] profile={item.ProfileName} account={item.Account.Username} value={timeLogin}");
-            }
-            catch (Exception ex)
-            {
-                // TIMELOGIN chỉ là dữ liệu theo dõi; lỗi ghi Excel không được chặn
-                // Tên/Ảnh, VIDEO hay Start/LIVE của profile đã login thành công.
-                _log.Warn(
-                    $"[AUTO_PROFILE_TIMELOGIN_WARN] profile={item.ProfileName} account={item.Account.Username} error={ex.Message}");
-            }
+            // Time Login KHÔNG ghi vô điều kiện ở đây. SendCommandAsync(launch_auto)
+            // chỉ gọi helper khi status Worker xác nhận LoginPerformedThisLaunch=true.
+            // Vì vậy PRF đã có session READY nhưng ô Time Login trống sẽ không bị
+            // ghi giả bằng thời gian hiện tại.
 
             await SetAutoCheckpointWithRetryAsync(item.Account.Id, "LOGIN_OK", step,
                 AutoProfileNote("Đăng nhập TikTok đã xác nhận bằng session."), ct);
@@ -2611,12 +2594,11 @@ public sealed partial class ManagerForm
                     IdentityExcelDone: identityExcelDone);
             }
 
-            // +Auto Profile có công tắc VIDEO riêng, độc lập với AutoOnReady chung.
-            // Nếu bật, gọi lại đúng pipeline VIDEO hiện có ngay sau Tên/ảnh. Nếu tắt,
-            // không chạy VIDEO; chỉ nhả startup HOLD do Worker tạo để Start/LIVE không bị kẹt.
-            // Mọi đường đều fail-open và HOLD luôn được nhả trong finally để không tái phát
-            // lỗi ACCOUNT_SETUP_WAIT/deadlock cũ.
-            if (autoVideo)
+            // +Auto Profile có công tắc VIDEO riêng cho trường hợp CHỈ xử lý account
+            // nhưng chưa Auto Start. Khi autoStart=ON, VIDEO được dời về PRE-START
+            // ngay trước start_auto để luôn đọc Excel mới nhất và tránh chạy hai lần.
+            // Mọi đường VIDEO đều fail-open; kết quả VIDEO không được quyền chặn Tool chính.
+            if (autoVideo && !autoStart)
             {
                 await WaitAutoProfilePausePointAsync(isPaused, ct);
                 step = "VIDEO";
@@ -2675,11 +2657,10 @@ public sealed partial class ManagerForm
                     }
                 }
             }
-            else
+            else if (!autoStart)
             {
-                // Nếu AutoOnReady chung đã arm HOLD trước khi Worker mở nhưng người dùng
-                // tắt Tự xử lý VIDEO trong +Auto Profile, nhả HOLD tại đây để giữ đúng
-                // hành vi: LOGIN -> Tên/ảnh -> Start/LIVE, không chạy VIDEO ngầm.
+                // autoStart=OFF và Tự xử lý VIDEO=OFF: đây là lượt setup độc lập,
+                // không có PRE-START phía sau. Nhả startup HOLD và không chạy VIDEO.
                 var holdReason = GetManagedAccountSetupHoldReason(ctx);
                 if (holdReason.Equals("before_worker_start", StringComparison.OrdinalIgnoreCase)
                     || holdReason.Equals("auto_profile_video_pipeline", StringComparison.OrdinalIgnoreCase))
@@ -2691,6 +2672,18 @@ public sealed partial class ManagerForm
                         ctx,
                         "auto_profile_video_disabled");
                 }
+            }
+            else
+            {
+                // autoStart=ON (bất kể checkbox Tự xử lý VIDEO của stage độc lập):
+                // không chạy VIDEO ở stage riêng này để tránh thử hai lần
+                // liên tiếp trong cùng lượt. PRE-START ngay trước start_auto sẽ chịu trách
+                // nhiệm đọc Excel và xử lý VIDEO đúng một lượt, độc lập AutoOnReady.
+                // Giữ nguyên startup HOLD (nếu có) để Worker chưa vào LIVE trước khi
+                // StartAutoProfileWorkerWithRetryAsync hoàn tất PRE-START VIDEO.
+                _log.Info(
+                    $"[AUTO_PROFILE_VIDEO_DEFER_TO_PRESTART] profile={item.ProfileName} account={item.Account.Username} " +
+                    $"autoVideo={autoVideo} autoStart={autoStart} hold={GetManagedAccountSetupHoldReason(ctx)}");
             }
 
             if (autoStart)
@@ -2850,6 +2843,29 @@ public sealed partial class ManagerForm
         }
         finally
         {
+            // Nếu Auto Profile thoát ở giữa pipeline (exception/cancel/pause/name chưa đổi...)
+            // thì startup HOLD của chính flow này không được tồn tại vĩnh viễn. Dùng
+            // setup_cancel thay vì setup_release để KHÔNG phát lại Start intent đã defer.
+            if (ctx is not null)
+            {
+                try
+                {
+                    var leftoverHold = GetManagedAccountSetupHoldReason(ctx);
+                    if (leftoverHold.Equals("before_worker_start", StringComparison.OrdinalIgnoreCase)
+                        || leftoverHold.Equals("auto_profile_video_pipeline", StringComparison.OrdinalIgnoreCase))
+                    {
+                        await CancelManagedAccountSetupHoldAsync(
+                            ctx,
+                            $"auto_profile_finally_{step}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _log.Warn(
+                        $"[AUTO_PROFILE_SETUP_HOLD_FINALIZE_WARN] profile={item.ProfileName} step={step} error={ex.Message}");
+                }
+            }
+
             // Chỉ khóa scheduler Tên/ảnh nền trong lúc Auto Profile đang điều phối profile này.
             _autoIdentityInFlight.Remove(item.ProfileName);
         }
@@ -3308,30 +3324,15 @@ public sealed partial class ManagerForm
         // mới chờ nó kết thúc. Watchdog giảm từ 12' xuống 5' để tránh treo lâu;
         // timeout vẫn fail-open như policy cũ và VIDEO không quyết định Start.
         var setupHoldReason = GetManagedAccountSetupHoldReason(ctx);
-        if (setupHoldReason.Equals("before_worker_start", StringComparison.OrdinalIgnoreCase))
+        var ownsStartupHold = setupHoldReason.Equals(
+            "before_worker_start",
+            StringComparison.OrdinalIgnoreCase);
+
+        if (ownsStartupHold)
         {
             _log.Info(
                 $"[AUTO_PROFILE_SETUP_CONTINUE] profile={ctx.Profile.Name} account={item.Account.Username} " +
-                "hold=before_worker_start action=RUN_VIDEO_THEN_RELEASE");
-
-            try
-            {
-                await EnsureAutoVideoBeforeStartAsync(ctx);
-            }
-            catch (Exception ex)
-            {
-                // VIDEO là best-effort: lỗi không được chặn tool chính.
-                _log.Warn(
-                    $"[AUTO_PROFILE_SETUP_VIDEO_FAILOPEN] profile={ctx.Profile.Name} account={item.Account.Username} " +
-                    $"error={ex.Message}");
-            }
-            finally
-            {
-                // Dù VIDEO DONE/FAIL/SKIP, phải nhả hold trước start_auto.
-                await ReleaseManagedAccountSetupHoldAsync(
-                    ctx,
-                    "auto_profile_after_video");
-            }
+                "hold=before_worker_start action=RUN_PRESTART_VIDEO_THEN_RELEASE");
         }
         else if (IsManagedAccountSetupHoldActive(ctx))
         {
@@ -3351,6 +3352,37 @@ public sealed partial class ManagerForm
                 await ReleaseManagedAccountSetupHoldAsync(
                     ctx,
                     "auto_profile_setup_wait_5m_timeout_failopen");
+            }
+        }
+
+        // MỖI lượt autoStart đều phải check VIDEO ngay trước start_auto, độc lập
+        // AutoOnReady và không dùng cache READY để skip đọc Excel. VIDEO chỉ là
+        // best-effort: DONE/FAIL/SKIP/exception đều phải đi tiếp tới start_auto.
+        try
+        {
+            await EnsureAutoVideoBeforeStartAsync(
+                ctx,
+                force: true,
+                trigger: "auto_profile_prestart");
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn(
+                $"[AUTO_PROFILE_SETUP_VIDEO_FAILOPEN] profile={ctx.Profile.Name} account={item.Account.Username} " +
+                $"error={ex.Message} action=CONTINUE_START_AUTO");
+        }
+        finally
+        {
+            if (ownsStartupHold)
+            {
+                // Dù VIDEO DONE/FAIL/SKIP, phải nhả hold trước start_auto.
+                await ReleaseManagedAccountSetupHoldAsync(
+                    ctx,
+                    "auto_profile_after_prestart_video");
             }
         }
 

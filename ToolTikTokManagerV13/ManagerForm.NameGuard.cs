@@ -126,7 +126,10 @@ public sealed partial class ManagerForm
                     _log.Info(
                         $"[PRESTART_SEQUENCE_VIDEO_BEGIN] profile={ctx.Profile.Name} account={guardUsername} " +
                         $"nameAllowed={guard.Allowed} nameTransient={guard.Transient} nameDeferred={guard.Deferred}");
-                    await EnsureAutoVideoBeforeStartAsync(ctx);
+                    await EnsureAutoVideoBeforeStartAsync(
+                        ctx,
+                        force: true,
+                        trigger: "start_with_name_guard");
                 }
                 catch (Exception ex)
                 {

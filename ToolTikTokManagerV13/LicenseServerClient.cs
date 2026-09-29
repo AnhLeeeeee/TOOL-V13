@@ -169,6 +169,38 @@ internal sealed class LicenseServerClient : IDisposable
         return result;
     }
 
+    public async Task<LicenseServerDecision> CheckUpdatePolicyAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var payload = new
+        {
+            deviceId = _deviceId,
+            deviceHash = _deviceHash,
+            version = _version
+        };
+
+        var result = await PostAsync(
+            "device-admin-check",
+            payload,
+            cancellationToken).ConfigureAwait(false);
+
+        LogDecision("UPDATE_POLICY", result);
+        return result;
+    }
+
+    public static bool IsExplicitUpdateBlocked(LicenseServerDecision? decision)
+    {
+        if (decision is null || !decision.Reachable || !decision.Ok)
+            return false;
+
+        // Chỉ chặn update khi QITool xác nhận ĐÚNG thiết bị (Device ID + fingerprint),
+        // cờ updateBlocked=true và máy không phải ADMIN.
+        // Mọi lỗi mạng/HTTP/response thiếu field/identity mismatch đều fail-open.
+        return decision.IdentityMatched is true
+               && decision.UpdateBlocked is true
+               && decision.IsAdmin is not true;
+    }
+
     public async Task<LicenseServerDecision> HeartbeatAsync(
         int profileCount = 0,
         CancellationToken cancellationToken = default)
@@ -352,6 +384,8 @@ internal sealed class LicenseServerClient : IDisposable
                 Status: (parsed?.Status ?? "").Trim(),
                 IsNew: parsed?.IsNew,
                 IsAdmin: parsed?.IsAdmin,
+                IdentityMatched: parsed?.IdentityMatched,
+                UpdateBlocked: parsed?.UpdateBlocked,
                 Reason: (parsed?.Reason ?? parsed?.Error ?? "").Trim(),
                 Raw: OneLine(responseText, 500));
         }
@@ -369,6 +403,8 @@ internal sealed class LicenseServerClient : IDisposable
                 Status: "unreachable",
                 IsNew: null,
                 IsAdmin: null,
+                IdentityMatched: null,
+                UpdateBlocked: null,
                 Reason: ex.Message,
                 Raw: "");
         }
@@ -380,7 +416,8 @@ internal sealed class LicenseServerClient : IDisposable
             $"[LICENSE_SERVER_{phase}] mode=hybrid_safe_lock reachable={decision.Reachable} " +
             $"http={decision.HttpStatus} ok={decision.Ok} allowed={FormatBool(decision.Allowed)} " +
             $"status={OneLine(decision.Status)} isNew={FormatBool(decision.IsNew)} " +
-            $"isAdmin={FormatBool(decision.IsAdmin)} reason={OneLine(decision.Reason)}");
+            $"isAdmin={FormatBool(decision.IsAdmin)} identityMatched={FormatBool(decision.IdentityMatched)} " +
+            $"updateBlocked={FormatBool(decision.UpdateBlocked)} reason={OneLine(decision.Reason)}");
     }
 
     static string FormatBool(bool? value)
@@ -436,6 +473,12 @@ internal sealed class LicenseServerClient : IDisposable
         [JsonPropertyName("isAdmin")]
         public bool? IsAdmin { get; set; }
 
+        [JsonPropertyName("identityMatched")]
+        public bool? IdentityMatched { get; set; }
+
+        [JsonPropertyName("updateBlocked")]
+        public bool? UpdateBlocked { get; set; }
+
         [JsonPropertyName("reason")]
         public string? Reason { get; set; }
 
@@ -452,5 +495,7 @@ internal sealed record LicenseServerDecision(
     string Status,
     bool? IsNew,
     bool? IsAdmin,
+    bool? IdentityMatched,
+    bool? UpdateBlocked,
     string Reason,
     string Raw);

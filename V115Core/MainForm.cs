@@ -84,6 +84,7 @@ public sealed partial class MainForm : Form
     Color _chromePageStateColor = Color.DimGray;
     bool _chromeStatusPinned;
     string _startupPreparationState = "IDLE";
+    bool _loginPerformedThisStartup;
     bool _wasChromeConnected;
     bool _shutdownStarted;
     bool _shutdownComplete;
@@ -1240,6 +1241,11 @@ public sealed partial class MainForm : Form
 
     async Task LaunchChromeAsync(bool stopOnCaptcha = false, bool suppressDialogs = false)
     {
+        // LoginPerformedThisLaunch phải chỉ phản ánh đúng hành động launch hiện tại.
+        // Reset ngay cả khi launch bị bỏ qua vì engine đang chạy để không rò tín hiệu
+        // true từ một lần login trước sang lệnh Manager tiếp theo.
+        _loginPerformedThisStartup = false;
+
         if (_engine.Running)
         {
             if (!suppressDialogs) MessageBox.Show("Hãy Dừng tool trước khi mở lại Chrome để tránh cắt ngang một vòng xử lý.", "Chrome V13", MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -1274,6 +1280,10 @@ public sealed partial class MainForm : Form
         bool stopOnCaptcha = false,
         bool? forceAutoLogin = null)
     {
+        // Tín hiệu được reset ở đầu mỗi hành động launch/start của Worker và được
+        // cộng dồn qua các lần Prepare trong CÙNG hành động. StartAsync có thể gọi
+        // Prepare hai lần (Home -> fallback LIVE); nếu login xảy ra ở lần đầu thì
+        // lần Prepare thứ hai không được phép xóa mất tín hiệu đó.
         try
         {
             _startupPreparationState = "PREPARING";
@@ -1286,6 +1296,13 @@ public sealed partial class MainForm : Form
                 forceAutoLogin ?? auth.AutoLogin,
                 openLiveWhenReady, stopOnCaptcha);
             _startupPreparationState = result.State;
+            _loginPerformedThisStartup |= result.LoginPerformed;
+
+            if (result.LoginPerformed)
+            {
+                _log.Info(
+                    "[TIKTOK_LOGIN_PERFORMED_THIS_STARTUP] value=true source=credential_flow_success");
+            }
 
             switch (result.State)
             {
@@ -1325,6 +1342,8 @@ public sealed partial class MainForm : Form
         catch (Exception ex)
         {
             _startupPreparationState = "ERROR";
+            // Không xóa tín hiệu login đã thành công ở một Prepare trước trong cùng
+            // hành động. Nếu chưa từng login thì giá trị đã được reset=false ở entry.
             SetChromeStatus("Trạng thái Chrome: 🟠 Lỗi chuẩn bị TikTok", Color.DarkOrange, $"TikTok: 🟠 {ShortText(ex.Message, 90)}", Color.DarkOrange);
             _log.Error("[TIKTOK_STARTUP_ERROR] " + ex);
         }
@@ -1780,6 +1799,11 @@ public sealed partial class MainForm : Form
 
     async Task StartAsync(bool suppressDialogs = false)
     {
+        // Một lệnh start/start_auto là một action độc lập đối với Time Login.
+        // Reset trước mọi early-return; các Prepare bên dưới sẽ OR=true nếu chính
+        // action này thực sự phải nhập credential và login thành công.
+        _loginPerformedThisStartup = false;
+
         void ThrowIfEmergencyStopRequested(string phase)
         {
             if (!IsManagerEmergencyStopActive())

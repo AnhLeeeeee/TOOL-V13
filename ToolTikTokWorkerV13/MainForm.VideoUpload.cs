@@ -45,6 +45,7 @@ public sealed partial class MainForm
         public string VideoPath { get; set; } = "";
         public string Caption { get; set; } = "";
         public bool StudioDeleteFallback { get; set; }
+        public bool StudioCleanupOnly { get; set; }
     }
 
     async Task<string> StartManagedVideoUploadAsync(string commandPayload)
@@ -77,7 +78,8 @@ public sealed partial class MainForm
             return "invalid_payload";
         }
 
-        if (string.IsNullOrWhiteSpace(request.VideoPath) || !File.Exists(request.VideoPath))
+        if (!request.StudioCleanupOnly
+            && (string.IsNullOrWhiteSpace(request.VideoPath) || !File.Exists(request.VideoPath)))
             return "video_not_found";
 
         if (!await _chrome.EnsureTikTokIdentitySessionReadyAsync())
@@ -106,17 +108,25 @@ public sealed partial class MainForm
         {
             try
             {
-                var result = await _chrome.UploadTikTokVideoAsync(
-                    request.Username,
-                    request.VideoPath,
-                    request.Caption,
-                    request.StudioDeleteFallback,
-                    progress =>
-                    {
-                        lock (_videoUploadSync)
-                            _videoUploadProgress = progress;
-                    },
-                    cts.Token);
+                var result = request.StudioCleanupOnly
+                    ? await _chrome.CleanupTikTokStudioOldPostsKeepingFirstAsync(
+                        progress =>
+                        {
+                            lock (_videoUploadSync)
+                                _videoUploadProgress = progress;
+                        },
+                        cts.Token)
+                    : await _chrome.UploadTikTokVideoAsync(
+                        request.Username,
+                        request.VideoPath,
+                        request.Caption,
+                        request.StudioDeleteFallback,
+                        progress =>
+                        {
+                            lock (_videoUploadSync)
+                                _videoUploadProgress = progress;
+                        },
+                        cts.Token);
 
                 lock (_videoUploadSync)
                 {

@@ -179,11 +179,35 @@ public sealed partial class ManagerForm
                 return;
             }
 
-            // 5) Login/session OK -> Start lại đúng logic automation cũ.
+            // 5) Login/session OK -> trước khi Start lại phải kiểm tra VIDEO theo
+            // trạng thái Excel hiện tại. VIDEO luôn fail-open: DONE/FAIL/SKIP/lỗi
+            // kỹ thuật đều không được phép chặn start_auto.
+            try
+            {
+                await EnsureAutoVideoBeforeStartAsync(
+                    ctx,
+                    force: true,
+                    trigger: "runtime_relogin_prestart");
+            }
+            catch (Exception ex)
+            {
+                _log.Warn(
+                    $"[RUNTIME_LOGIN_RECOVERY_VIDEO_FAILOPEN] profile={profileName} " +
+                    $"error={ex.Message} action=CONTINUE_START_AUTO");
+            }
+
+            // 6) Start lại đúng logic automation cũ.
             var startReply = await SendCommandAsync(
                 ctx,
                 "start_auto",
                 TimeSpan.FromSeconds(95));
+
+            // LOGIN đã được runtime_relogin_auto xác nhận thành công ("opened").
+            // Chỉ sau khi đã gửi start_auto mới thử ghi TIMELOGIN để lỗi/chậm Excel
+            // không làm trì hoãn việc khởi động lại automation.
+            // Helper là fail-open: không tìm thấy đúng account / Excel lỗi / ghi lỗi
+            // chỉ ghi log, tuyệt đối không đổi kết quả recovery.
+            await TryEnsureRuntimeTimeLoginAsync(ctx);
 
             if (string.Equals(startReply, "started", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(startReply, "running", StringComparison.OrdinalIgnoreCase))

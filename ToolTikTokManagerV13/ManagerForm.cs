@@ -1172,6 +1172,9 @@ public sealed partial class ManagerForm : Form
             || command.Equals("start_auto", StringComparison.OrdinalIgnoreCase))
             await ApplyManagerDefaultConfigToExistingProfileOnOpenAsync(ctx, "before_start");
 
+        string? completedResponse = null;
+        var ensureTimeLoginAfterManagedAction = false;
+
         await ctx.CommandGate.WaitAsync();
         try
         {
@@ -1201,9 +1204,61 @@ public sealed partial class ManagerForm : Form
                 command,
                 response,
                 explicitUserStartIntent);
-            return response;
+
+            completedResponse = response;
+
+            // Time Login chỉ được ghi khi Worker báo chính hành động vừa rồi thực sự
+            // đi qua credential-flow và login thành công. Bao phủ cả:
+            //   launch / launch_auto: mở PRF đang logout -> auto login
+            //   start / start_auto: Chrome đã mở nhưng login chỉ phát sinh khi Start
+            // Không suy luận từ opened/started; response chỉ xác nhận action đã thật sự chạy.
+            var probeLoginSignal =
+                ((command.Equals("launch", StringComparison.OrdinalIgnoreCase)
+                  || command.Equals("launch_auto", StringComparison.OrdinalIgnoreCase))
+                 && response.Equals("opened", StringComparison.OrdinalIgnoreCase))
+                || ((command.Equals("start", StringComparison.OrdinalIgnoreCase)
+                     || command.Equals("start_auto", StringComparison.OrdinalIgnoreCase))
+                    && (response.Equals("started", StringComparison.OrdinalIgnoreCase)
+                        || response.Equals("not_started", StringComparison.OrdinalIgnoreCase)));
+
+            if (probeLoginSignal)
+            {
+                try
+                {
+                    var rawStatus = await SendPipeAsync(
+                        ctx.Profile.Name,
+                        "status",
+                        TimeSpan.FromSeconds(2));
+                    var actionSnapshot = JsonSerializer.Deserialize<WorkerSnapshot>(
+                        rawStatus,
+                        WorkerSnapshotJson);
+
+                    if (actionSnapshot is not null)
+                    {
+                        ctx.LastSnapshot = actionSnapshot;
+                        ensureTimeLoginAfterManagedAction = actionSnapshot.LoginPerformedThisLaunch;
+
+                        _log.Info(
+                            $"[TIMELOGIN_ACTION_SIGNAL] profile={ctx.Profile.Name} command={command} response={response} " +
+                            $"performed={actionSnapshot.LoginPerformedThisLaunch} startup={actionSnapshot.TikTokStartupState}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Telemetry Time Login tuyệt đối không được làm launch/start lỗi.
+                    _log.Warn(
+                        $"[TIMELOGIN_ACTION_SIGNAL_WARN] profile={ctx.Profile.Name} command={command} error={ex.Message}");
+                }
+            }
         }
         finally { ctx.CommandGate.Release(); }
+
+        // Ghi Excel ngoài CommandGate để lỗi/chậm I/O không giữ IPC của profile.
+        // Helper tự giữ giá trị Time Login cũ và fail-open khi không xác định được account.
+        if (ensureTimeLoginAfterManagedAction)
+            await TryEnsureRuntimeTimeLoginAsync(ctx);
+
+        return completedResponse ?? "";
     }
 
     async Task<string> SendCloseChromeCommandAsync(ProfileContext ctx)
@@ -6073,6 +6128,7 @@ public sealed partial class ManagerForm : Form
         public bool F5Enabled { get; set; }
         public int F5RemainingSec { get; set; } = -1;
         public string TikTokStartupState { get; set; } = "";
+        public bool LoginPerformedThisLaunch { get; set; }
         public string RuntimeAuthState { get; set; } = "";
         public string RuntimeAuthDetail { get; set; } = "";
         public bool MessageReplyRunning { get; set; }

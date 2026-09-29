@@ -243,6 +243,8 @@ public sealed partial class MainForm
                     return _engine.Running ? "started" : "not_started";
                 case "setup_release":
                     return ReleaseManagedAccountSetupHold();
+                case "setup_cancel":
+                    return CancelManagedAccountSetupHold();
                 case "pause":
                     if (_engine.Running && !_engine.Paused) _engine.TogglePause();
                     return _engine.Paused ? "paused" : "not_paused";
@@ -283,6 +285,10 @@ public sealed partial class MainForm
                     if (IsManagerEmergencyStopActive()) return "emergency_stopped";
                     if (IsMessageReplyRunning) return "message_reply_running";
                     if (IsVideoOperationRunning) return "video_delete_running";
+
+                    // Đây là một hành động login độc lập; xóa tín hiệu cũ trước khi
+                    // forced-login để status sau lệnh chỉ phản ánh đúng lượt recovery này.
+                    _loginPerformedThisStartup = false;
 
                     // runtime_login_lost đã được Worker xác nhận bằng popup đăng nhập
                     // lặp 3/3 sau Enter. Ở recovery này KHÔNG được tin lại cookie/session
@@ -664,6 +670,7 @@ public sealed partial class MainForm
             F5Enabled = periodic.Enabled,
             F5RemainingSec = f5RemainingSec
             ,TikTokStartupState = _startupPreparationState
+            ,LoginPerformedThisLaunch = _loginPerformedThisStartup
             ,RuntimeAuthState = _engine.RuntimeLoginLostConfirmed ? "LOGOUT_CONFIRMED" : "NORMAL"
             ,RuntimeAuthDetail = _engine.RuntimeLoginLostDetail
             ,MessageReplyRunning = IsMessageReplyRunning

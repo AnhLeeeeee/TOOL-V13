@@ -162,6 +162,26 @@ public sealed partial class ManagerForm
         }
     }
 
+    async Task CancelManagedAccountSetupHoldAsync(ProfileContext ctx, string reason)
+    {
+        // Dùng cho đường lỗi/pause/return không được phép Start: xóa HOLD nhưng KHÔNG
+        // phát lại Start intent mà Worker đã defer trong lúc setup.
+        ClearManagedAccountSetupHold(ctx, reason);
+
+        try
+        {
+            if (ctx.Worker is not null && !ctx.Worker.HasExited)
+            {
+                var reply = await SendPipeAsync(ctx.Profile.Name, "setup_cancel", TimeSpan.FromSeconds(5));
+                _log.Info($"[ACCOUNT_SETUP_CANCEL_IPC] profile={ctx.Profile.Name} reason={reason} reply={reply}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"[ACCOUNT_SETUP_CANCEL_IPC_WARN] profile={ctx.Profile.Name} reason={reason} error={ex.Message}");
+        }
+    }
+
     async Task<bool> WaitForManagedAccountSetupReleaseAsync(
         ProfileContext ctx,
         TimeSpan timeout,

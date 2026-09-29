@@ -48,6 +48,8 @@ public sealed partial class MainForm
         [
             "[TIKTOK_LOGIN",
             "[TIKTOK_STARTUP",
+            "[AUTO_VIDEO_",
+            "[VIDEO_",
             "[CHROME_CLOSE",
             "[CAPTCHA",
             "[CDP_SESSION",

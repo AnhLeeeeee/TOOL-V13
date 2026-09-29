@@ -2325,12 +2325,14 @@ public sealed partial class ManagerForm
         Action<VideoUploadReply>? onProgress = null,
         bool resumeAutomation = true,
         bool studioDeleteFallback = false,
+        bool studioCleanupOnly = false,
         CancellationToken cancellationToken = default)
     {
         if (_messageReplyProfilesInFlight.Contains(ctx.Profile.Name))
             return new VideoUploadReply { Ok = false, Completed = true, Error = "Profile đang được mục Tin nhắn TikTok xử lý. Hãy dừng/đợi Tin nhắn hoàn tất rồi đăng video." };
 
-        if (string.IsNullOrWhiteSpace(videoPath) || !File.Exists(videoPath))
+        if (!studioCleanupOnly
+            && (string.IsNullOrWhiteSpace(videoPath) || !File.Exists(videoPath)))
             return new VideoUploadReply { Ok = false, Completed = true, Error = "Không tìm thấy file video cần đăng." };
 
         await OpenProfileAsync(ctx);
@@ -2387,10 +2389,20 @@ public sealed partial class ManagerForm
                 Username = username,
                 VideoPath = videoPath,
                 Caption = caption ?? "",
-                StudioDeleteFallback = studioDeleteFallback
+                StudioDeleteFallback = studioDeleteFallback,
+                StudioCleanupOnly = studioCleanupOnly
             });
             var payload = Convert.ToBase64String(Encoding.UTF8.GetBytes(request));
-            _log.Info($"[VIDEO_UPLOAD_MANAGER_START] profile={ctx.Profile.Name} file={Path.GetFileName(videoPath)} username={username} studioDeleteFallback={studioDeleteFallback}");
+            if (studioCleanupOnly)
+            {
+                _log.Info(
+                    $"[VIDEO_DELETE_FALLBACK_MANAGER_START] profile={ctx.Profile.Name} username={username} " +
+                    "mode=cleanup_only keep=row1 delete=row2_plus");
+            }
+            else
+            {
+                _log.Info($"[VIDEO_UPLOAD_MANAGER_START] profile={ctx.Profile.Name} file={Path.GetFileName(videoPath)} username={username} studioDeleteFallback={studioDeleteFallback}");
+            }
 
             var startReply = await SendCommandAsync(
                 ctx,
@@ -2548,7 +2560,18 @@ public sealed partial class ManagerForm
                 try { onProgress?.Invoke(latest); } catch { }
                 if (latest.Completed)
                 {
-                    _log.Info($"[VIDEO_UPLOAD_MANAGER_RESULT] profile={ctx.Profile.Name} ok={latest.Ok} posted={latest.Posted} public={latest.PrivacyUpdated} verified={latest.ProfileVerified} stage={latest.Stage} href={latest.PostedHref} deleteFallbackAttempted={latest.DeleteFallbackAttempted} deleteFallbackOk={latest.DeleteFallbackSucceeded} deleteFallbackDeleted={latest.DeleteFallbackDeletedCount} error={latest.Error}");
+                    if (studioCleanupOnly)
+                    {
+                        _log.Info(
+                            $"[VIDEO_DELETE_FALLBACK_MANAGER_RESULT] profile={ctx.Profile.Name} ok={latest.Ok} " +
+                            $"attempted={latest.DeleteFallbackAttempted} fallbackOk={latest.DeleteFallbackSucceeded} " +
+                            $"deleted={latest.DeleteFallbackDeletedCount} remaining={latest.DeleteFallbackRemainingCount} " +
+                            $"stage={latest.Stage} error={latest.DeleteFallbackError} commandError={latest.Error}");
+                    }
+                    else
+                    {
+                        _log.Info($"[VIDEO_UPLOAD_MANAGER_RESULT] profile={ctx.Profile.Name} ok={latest.Ok} posted={latest.Posted} public={latest.PrivacyUpdated} verified={latest.ProfileVerified} stage={latest.Stage} href={latest.PostedHref} deleteFallbackAttempted={latest.DeleteFallbackAttempted} deleteFallbackOk={latest.DeleteFallbackSucceeded} deleteFallbackDeleted={latest.DeleteFallbackDeletedCount} error={latest.Error}");
+                    }
                     return latest;
                 }
 
@@ -2926,30 +2949,72 @@ public sealed partial class ManagerForm
         var runUpload = state.VideoUploadEnabled && uploadStatus != "DONE";
         var skipUploadBecauseLoginRequired = false;
         var studioDeleteFallbackNeeded = false;
-        var forceDeleteAllAndRepost =
+        var cleanupExistingPostedVideoOnly =
             runDelete
             && state.VideoUploadEnabled
             && uploadStatus == "DONE";
 
-        // Người dùng đã chốt: FAIL|DONE phải xóa hết rồi đăng lại.
-        // Trước khi xóa, hạ vế ĐĂNG về FAIL để checkpoint không còn nói DONE
-        // nếu tool bị tắt sau khi video cũ đã bị xóa.
-        if (forceDeleteAllAndRepost)
+        // FAIL|DONE: vế ĐĂNG đã xác nhận DONE nên tuyệt đối KHÔNG upload lại và
+        // cũng KHÔNG chạy XÓA chính (nhánh đó có thể xóa luôn video mới). Gọi thẳng
+        // chính fallback Studio hiện có: giữ hàng 1, xóa hàng 2 trở xuống.
+        // Nếu cleanup lỗi thì giữ nguyên FAIL|DONE để chu kỳ READY sau có thể thử lại.
+        if (cleanupExistingPostedVideoOnly)
         {
-            uploadStatus = "FAIL";
-            runUpload = true;
+            runDelete = false;
+            runUpload = false;
+            _log.Info(
+                $"[AUTO_VIDEO_DELETE_FALLBACK_DIRECT_BEGIN] profile={ctx.Profile.Name} account={username} " +
+                $"status={ComposeVideoStatus(deleteStatus, uploadStatus)} action=KEEP_ROW1_DELETE_ROW2_PLUS_NO_UPLOAD");
 
-            var invalidate = await WriteVideoStatusVerifiedAsync(
+            try
+            {
+                var cleanupReply = await UploadTikTokVideoAsync(
+                    ctx,
+                    "",
+                    "",
+                    resumeAutomation: false,
+                    studioDeleteFallback: false,
+                    studioCleanupOnly: true);
+
+                if (cleanupReply.DeleteFallbackSucceeded
+                    && cleanupReply.DeleteFallbackRemainingCount == 1)
+                {
+                    deleteStatus = "DONE";
+                    _log.Info(
+                        $"[AUTO_VIDEO_DELETE_FALLBACK_DONE] profile={ctx.Profile.Name} account={username} " +
+                        $"source=direct_cleanup deleted={cleanupReply.DeleteFallbackDeletedCount} " +
+                        $"remaining={cleanupReply.DeleteFallbackRemainingCount} status=DONE uploadStatus=KEEP_DONE");
+                }
+                else
+                {
+                    deleteStatus = "FAIL";
+                    _log.Warn(
+                        $"[AUTO_VIDEO_DELETE_FALLBACK_FAIL] profile={ctx.Profile.Name} account={username} " +
+                        $"source=direct_cleanup deleted={cleanupReply.DeleteFallbackDeletedCount} " +
+                        $"remaining={cleanupReply.DeleteFallbackRemainingCount} " +
+                        $"error={(string.IsNullOrWhiteSpace(cleanupReply.DeleteFallbackError) ? cleanupReply.Error : cleanupReply.DeleteFallbackError)} " +
+                        "status=FAIL|DONE action=KEEP_STATUS_NO_UPLOAD");
+                }
+            }
+            catch (Exception ex)
+            {
+                deleteStatus = "FAIL";
+                _log.Warn(
+                    $"[AUTO_VIDEO_DELETE_FALLBACK_EXCEPTION] profile={ctx.Profile.Name} account={username} " +
+                    $"source=direct_cleanup error={ex.Message} status=FAIL|DONE action=KEEP_STATUS_NO_UPLOAD");
+            }
+
+            var cleanupWrite = await WriteVideoStatusVerifiedAsync(
                 username,
                 ctx.Profile.Name,
                 deleteStatus,
                 uploadStatus,
                 CancellationToken.None);
-            if (!invalidate.Ok)
+            if (!cleanupWrite.Ok)
             {
                 _log.Warn(
-                    $"[AUTO_VIDEO_EXCEL_INVALIDATE_POST_WARN] profile={ctx.Profile.Name} account={username} " +
-                    $"error={invalidate.Error}");
+                    $"[AUTO_VIDEO_EXCEL_AFTER_FALLBACK_WARN] profile={ctx.Profile.Name} account={username} " +
+                    $"status={cleanupWrite.Status} error={cleanupWrite.Error}");
             }
         }
 
@@ -2957,14 +3022,12 @@ public sealed partial class ManagerForm
         {
             try
             {
-                var deleteMode = forceDeleteAllAndRepost
-                    ? "all"
-                    : string.Equals(
-                        state.VideoDeleteMode,
-                        "newest",
-                        StringComparison.OrdinalIgnoreCase)
-                        ? "newest"
-                        : "all";
+                var deleteMode = string.Equals(
+                    state.VideoDeleteMode,
+                    "newest",
+                    StringComparison.OrdinalIgnoreCase)
+                    ? "newest"
+                    : "all";
 
                 _log.Info(
                     $"[AUTO_VIDEO_DELETE_BEGIN] profile={ctx.Profile.Name} account={username} mode={deleteMode}");
@@ -3169,11 +3232,9 @@ public sealed partial class ManagerForm
     async Task EnsureAutoVideoBeforeStartAsync(
         ProfileContext ctx,
         bool force = false,
-        string trigger = "auto_on_ready")
+        string trigger = "prestart")
     {
         var state = LoadIdentityToolState();
-        if (!state.AutoOnReady && !force)
-            return;
 
         if (!state.VideoDeleteEnabled && !state.VideoUploadEnabled)
         {
@@ -3198,14 +3259,6 @@ public sealed partial class ManagerForm
         if (username.Length == 0)
             return;
 
-        if (_autoVideoHandledReadyAccount.TryGetValue(ctx.Profile.Name, out var handledUsername)
-            && handledUsername.Equals(username, StringComparison.OrdinalIgnoreCase))
-        {
-            _log.Info(
-                $"[AUTO_VIDEO_PRESTART_SKIP_SESSION] profile={ctx.Profile.Name} account={username}");
-            return;
-        }
-
         // Nếu đã có một lượt VIDEO đang chạy trên chính Worker này, chờ nó kết thúc
         // trước khi cho Start/LIVE đi tiếp. Timeout chỉ fail-open; VIDEO không bao giờ
         // được phép khóa tool vô hạn.
@@ -3222,21 +3275,10 @@ public sealed partial class ManagerForm
         await _autoIdentityQueueGate.WaitAsync();
         try
         {
-            // Re-check sau khi chờ gate vì scheduler có thể vừa xử lý VIDEO xong.
-            if (_autoVideoHandledReadyAccount.TryGetValue(ctx.Profile.Name, out handledUsername)
-                && handledUsername.Equals(username, StringComparison.OrdinalIgnoreCase))
-            {
-                _log.Info(
-                    $"[AUTO_VIDEO_PRESTART_SKIP_AFTER_WAIT] profile={ctx.Profile.Name} account={username}");
-                return;
-            }
-
             // Re-load sau khi lấy gate để nhận đúng cấu hình mới nhất nếu người dùng
-            // vừa thay đổi VIDEO trong lúc chờ. Với +Auto Profile force=true, không phụ
-            // thuộc AutoOnReady chung nhưng vẫn tôn trọng bật/tắt XÓA/ĐĂNG trong cấu hình VIDEO.
+            // vừa thay đổi VIDEO trong lúc chờ. PRE-START luôn độc lập AutoOnReady;
+            // mỗi lệnh Start phải đọc lại trạng thái Excel, không được skip theo cache READY.
             state = LoadIdentityToolState();
-            if (!state.AutoOnReady && !force)
-                return;
             if (!state.VideoDeleteEnabled && !state.VideoUploadEnabled)
             {
                 _log.Info(
@@ -3248,7 +3290,15 @@ public sealed partial class ManagerForm
 
             _log.Info(
                 $"[AUTO_VIDEO_PRESTART_BEGIN] profile={ctx.Profile.Name} account={username} trigger={trigger} force={force}");
+
+            // RunAutoVideoPipelineAsync luôn đọc lại cột VIDEO từ Excel. Kết quả DONE,
+            // FAIL, lỗi đọc/ghi Excel, lỗi XÓA/ĐĂNG hay exception đều chỉ là best-effort;
+            // caller tuyệt đối không dùng bool kết quả để chặn Start/LIVE.
             await RunAutoVideoPipelineAsync(ctx, username, state);
+
+            // Marker này CHỈ để scheduler AutoOnReady không chen thêm một pipeline thứ hai
+            // trong cùng READY-session. PRE-START phía trên không đọc marker để skip,
+            // nên lần Start tiếp theo vẫn đọc Excel lại đúng yêu cầu.
             _autoVideoHandledReadyAccount[ctx.Profile.Name] = username;
         }
         catch (Exception ex)

@@ -1276,6 +1276,105 @@ function() {
         return new TikTokStudioDeleteFallbackResult(false, deleted, scan.Count, "Fallback xóa đã chạm giới hạn an toàn 100 video.");
     }
 
+    public async Task<TikTokVideoUploadResult> CleanupTikTokStudioOldPostsKeepingFirstAsync(
+        Action<TikTokVideoUploadProgress>? progress = null,
+        CancellationToken ct = default)
+    {
+        var attempted = false;
+        var succeeded = false;
+        var deleted = 0;
+        var remaining = -1;
+        var fallbackError = "";
+
+        void Report(string stage, string message, bool running = true, bool completed = false, bool ok = false, string error = "")
+        {
+            try
+            {
+                progress?.Invoke(new TikTokVideoUploadProgress(
+                    running, stage, "", "", message, completed, ok,
+                    false, false, false, error)
+                {
+                    DeleteFallbackAttempted = attempted,
+                    DeleteFallbackSucceeded = succeeded,
+                    DeleteFallbackDeletedCount = deleted,
+                    DeleteFallbackRemainingCount = remaining,
+                    DeleteFallbackError = fallbackError
+                });
+            }
+            catch { }
+        }
+
+        try
+        {
+            if (!Connected)
+                throw new InvalidOperationException("Chrome chưa kết nối.");
+
+            attempted = true;
+            Report("DELETE_FALLBACK_OPEN_STUDIO", "Đang mở TikTok Studio để giữ hàng 1 và xóa video cũ từ hàng 2...");
+
+            const string contentUrl = "https://www.tiktok.com/tiktokstudio/content";
+            await NavigateAndWaitAsync(contentUrl, 900, 30000, ct);
+            if (await IsTikTokLoginPromptVisibleAsync(ct))
+                throw new InvalidOperationException("TikTok mất đăng nhập trước bước fallback Studio.");
+
+            Report("DELETE_FALLBACK", "Đang giữ video hàng 1 và xóa các video cũ từ hàng 2...");
+            var fallback = await DeleteTikTokStudioOldPostsKeepingFirstAsync(ct);
+            succeeded = fallback.Ok;
+            deleted = fallback.DeletedCount;
+            remaining = fallback.RemainingCount;
+            fallbackError = fallback.Error;
+
+            if (fallback.Ok)
+            {
+                _log.Info($"[VIDEO_DELETE_FALLBACK_STUDIO_RESULT] ok=true mode=cleanup_only deleted={deleted} remaining={remaining}");
+                Report("DELETE_FALLBACK_DONE", $"Fallback Studio hoàn tất: đã xóa {deleted} video cũ, còn {remaining} video.", false, true, true);
+                return new TikTokVideoUploadResult(
+                    true, false, false, false, "", "",
+                    "Fallback Studio đã giữ hàng 1 và xóa video cũ.", "")
+                {
+                    DeleteFallbackAttempted = true,
+                    DeleteFallbackSucceeded = true,
+                    DeleteFallbackDeletedCount = deleted,
+                    DeleteFallbackRemainingCount = remaining,
+                    DeleteFallbackError = ""
+                };
+            }
+
+            _log.Warn($"[VIDEO_DELETE_FALLBACK_STUDIO_RESULT] ok=false mode=cleanup_only deleted={deleted} remaining={remaining} error={fallbackError}");
+            Report("DELETE_FALLBACK_WARN", "Fallback Studio chưa xóa hết video cũ.", false, true, false, fallbackError);
+            return new TikTokVideoUploadResult(
+                false, false, false, false, "", "",
+                "Fallback Studio chưa hoàn tất.", fallbackError)
+            {
+                DeleteFallbackAttempted = true,
+                DeleteFallbackSucceeded = false,
+                DeleteFallbackDeletedCount = deleted,
+                DeleteFallbackRemainingCount = remaining,
+                DeleteFallbackError = fallbackError
+            };
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            fallbackError = ex.Message;
+            _log.Warn($"[VIDEO_DELETE_FALLBACK_STUDIO_EXCEPTION] mode=cleanup_only error={ex.Message}");
+            Report("DELETE_FALLBACK_ERROR", "Fallback Studio gặp lỗi.", false, true, false, ex.Message);
+            return new TikTokVideoUploadResult(
+                false, false, false, false, "", "",
+                "Fallback Studio gặp lỗi.", ex.Message)
+            {
+                DeleteFallbackAttempted = attempted,
+                DeleteFallbackSucceeded = false,
+                DeleteFallbackDeletedCount = deleted,
+                DeleteFallbackRemainingCount = remaining,
+                DeleteFallbackError = fallbackError
+            };
+        }
+    }
+
     async Task CleanupTikTokStudioUploadPageAsync(string profileHref, long beforeAcceptedCount)
     {
         if (!Connected) return;

@@ -72,6 +72,8 @@ public sealed partial class ManagerForm
         string[] important =
         [
             "[AUTO_PROFILE_",
+            "[AUTO_VIDEO_",
+            "[VIDEO_",
             "[AUTO_CLOSE_",
             "[AUTO_REPLACE_",
             "[LOGIN_BAN_",
