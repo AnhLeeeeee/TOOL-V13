@@ -653,14 +653,13 @@ function() {
 
     async Task<bool> WaitTikTokPostSubmissionAcceptedAsync(CancellationToken ct)
     {
-        var deadline = DateTime.UtcNow.AddMinutes(2);
+        // Policy VIDEO hiện tại: chỉ chính toast xuất hiện SAU khi bấm Đăng mới là
+        // bằng chứng UPLOAD DONE. Không dùng redirect /tiktokstudio/content, privacy
+        // hay việc bài xuất hiện trên profile làm điều kiện thành công nữa.
+        var deadline = DateTime.UtcNow.AddSeconds(30);
         while (DateTime.UtcNow < deadline)
         {
             ct.ThrowIfCancellationRequested();
-            await TryDismissTikTokVideoBlockingPopupAsync("post-submit", ct);
-            var href = await ReadCurrentLocationHrefAsync(ct);
-            if (href.Contains("/tiktokstudio/content", StringComparison.OrdinalIgnoreCase))
-                return true;
 
             const string js = """
 (() => {
@@ -672,21 +671,45 @@ function() {
     if (!el) return false;
     const r = el.getBoundingClientRect();
     const cs = getComputedStyle(el);
-    return r.width > 2 && r.height > 2 && cs.display !== 'none' && cs.visibility !== 'hidden';
+    return r.width > 2 && r.height > 2 && r.bottom > 0 && r.right > 0
+      && r.top < innerHeight && r.left < innerWidth
+      && cs.display !== 'none' && cs.visibility !== 'hidden' && Number(cs.opacity || 1) > 0.05;
   };
-  const notices = [...document.querySelectorAll('[role="alert"],[role="status"],[aria-live],div')]
-    .filter(visible)
-    .map(el => fold(el.innerText || el.textContent || ''));
-  return notices.some(t => t.includes('dang thanh cong') || t.includes('posted successfully') || t.includes('upload complete') || t.includes('video da duoc dang'));
+
+  // Ưu tiên các vùng toast/status trước; body chỉ là fallback vì TikTok có thể
+  // thay đổi wrapper của toast giữa các phiên bản giao diện.
+  const nodes = [...document.querySelectorAll('[role="alert"],[role="status"],[aria-live],div,span')]
+    .filter(visible);
+  const matched = nodes.some(el => {
+    const t = fold(el.innerText || el.textContent || '');
+    return t === 'da dang video'
+      || t.includes('da dang video')
+      || t === 'video posted'
+      || t.includes('video has been posted')
+      || t.includes('posted successfully');
+  });
+  if (matched) return true;
+
+  const body = fold(document.body?.innerText || '');
+  return body.includes('da dang video')
+    || body.includes('video has been posted')
+    || body.includes('posted successfully');
 })()
 """;
             try
             {
-                if (ReadEvalBool(await EvalAsync(js, ct: ct))) return true;
+                if (ReadEvalBool(await EvalAsync(js, ct: ct)))
+                {
+                    _log.Info("[VIDEO_UPLOAD_POST_TOAST_CONFIRMED] text=DA_DANG_VIDEO");
+                    return true;
+                }
             }
             catch (Exception ex) when (IsTransientDocumentContextError(ex)) { }
-            await Task.Delay(750, ct);
+
+            await Task.Delay(150, ct);
         }
+
+        _log.Warn("[VIDEO_UPLOAD_POST_TOAST_TIMEOUT] waited=30s text=DA_DANG_VIDEO");
         return false;
     }
 
@@ -1042,6 +1065,86 @@ function() {
         catch (Exception ex) when (IsTransientDocumentContextError(ex)) { return false; }
     }
 
+    async Task<bool> ClickTikTokStudioFirstRowMenuAsync(CancellationToken ct)
+    {
+        const string js = """
+(() => {
+  const visible = el => {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    return r.width > 2 && r.height > 2 && r.bottom > 0 && r.right > 0
+      && r.top < innerHeight + 1200 && r.left < innerWidth
+      && cs.display !== 'none' && cs.visibility !== 'hidden' && Number(cs.opacity || 1) > 0.05;
+  };
+  const fold = s => (s || '')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/đ/g, 'd').replace(/Đ/g, 'D')
+    .replace(/\s+/g, ' ').trim().toLowerCase();
+  const privacyWords = new Set(['moi nguoi','everyone','public','ban be','friends','chi minh toi','only me','private']);
+  const isPrivacyText = t => privacyWords.has(t)
+    || t.startsWith('chi minh') || t.startsWith('only me');
+  const anchors = [...document.querySelectorAll('button,[role="button"],[aria-haspopup],div,span')]
+    .filter(visible)
+    .filter(el => isPrivacyText(fold(el.innerText || el.textContent || '')));
+  const rows = [];
+  for (const anchor of anchors) {
+    let node = anchor;
+    let best = null;
+    for (let i = 0; i < 11 && node; i++, node = node.parentElement) {
+      const r = node.getBoundingClientRect?.();
+      if (!r) continue;
+      if (r.width < Math.min(650, innerWidth * 0.45) || r.height < 70 || r.height > 190) continue;
+      const buttons = [...node.querySelectorAll('button,[role="button"]')].filter(visible);
+      if (buttons.length < 2) continue;
+      best = node;
+      break;
+    }
+    if (!best) continue;
+    const r = best.getBoundingClientRect();
+    if (rows.some(x => Math.abs(x.top - r.top) < 5)) continue;
+    rows.push({el:best, top:r.top});
+  }
+  rows.sort((a,b) => a.top - b.top);
+  if (rows.length < 1) return false;
+  const row = rows[0].el;
+  const rr = row.getBoundingClientRect();
+  const buttons = [...row.querySelectorAll('button,[role="button"]')]
+    .filter(visible)
+    .map(el => ({el, r:el.getBoundingClientRect()}))
+    .filter(x => x.r.left > rr.left + rr.width * 0.62 && x.r.width <= 90 && x.r.height <= 90)
+    .sort((a,b) => b.r.right - a.r.right);
+  const hit = buttons[0];
+  if (!hit) return false;
+  try { hit.el.click(); return true; } catch (_) { return false; }
+})()
+""";
+        try { return ReadEvalBool(await EvalAsync(js, ct: ct)); }
+        catch (Exception ex) when (IsTransientDocumentContextError(ex)) { return false; }
+    }
+
+    async Task<bool> IsTikTokStudioContentConfirmedEmptyAsync(CancellationToken ct)
+    {
+        const string js = """
+(() => {
+  if (!location.pathname.includes('/tiktokstudio/content')) return false;
+  const fold = s => (s || '')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/đ/g, 'd').replace(/Đ/g, 'D')
+    .replace(/\s+/g, ' ').trim().toLowerCase();
+  const text = fold(document.body?.innerText || '');
+  if (/\bbai dang\s*0\b/.test(text) || /\bposts?\s*0\b/.test(text)) return true;
+  return text.includes('chua co bai dang')
+    || text.includes('khong co bai dang')
+    || text.includes('no posts yet')
+    || text.includes('you have no posts');
+})()
+""";
+        try { return ReadEvalBool(await EvalAsync(js, ct: ct)); }
+        catch (Exception ex) when (IsTransientDocumentContextError(ex)) { return false; }
+        catch { return false; }
+    }
+
     async Task<bool> ClickTikTokStudioDeleteMenuItemAsync(CancellationToken ct)
     {
         const string js = """
@@ -1276,6 +1379,205 @@ function() {
         return new TikTokStudioDeleteFallbackResult(false, deleted, scan.Count, "Fallback xóa đã chạm giới hạn an toàn 100 video.");
     }
 
+    public async Task<TikTokVideoDeleteResult> DeleteTikTokStudioPostsAsync(
+        string? deleteMode,
+        Action<TikTokVideoDeleteProgress>? progress = null,
+        CancellationToken ct = default)
+    {
+        var mode = (deleteMode ?? "all").Trim().ToLowerInvariant();
+        if (mode is not ("all" or "newest" or "none")) mode = "all";
+        if (mode == "none")
+            return new TikTokVideoDeleteResult(true, 0, 0, 0, false, "Không xóa video theo cấu hình.", "");
+
+        var initialCount = 0;
+        var deletedCount = 0;
+        var remainingCount = -1;
+        var verifiedEmpty = false;
+
+        void Report(string stage, string message, bool running = true, bool completed = false, bool ok = false, string error = "")
+        {
+            try
+            {
+                progress?.Invoke(new TikTokVideoDeleteProgress(
+                    running,
+                    stage,
+                    initialCount,
+                    deletedCount,
+                    remainingCount,
+                    message,
+                    completed,
+                    ok,
+                    verifiedEmpty,
+                    error));
+            }
+            catch { }
+        }
+
+        try
+        {
+            if (!Connected)
+                throw new InvalidOperationException("Chrome chưa kết nối.");
+
+            Report("SESSION_CHECK", "Đang kiểm tra đăng nhập TikTok...");
+            if (!await EnsureTikTokIdentitySessionReadyAsync(ct))
+                return new TikTokVideoDeleteResult(
+                    false, 0, 0, -1, false, "",
+                    "LOGIN_REQUIRED: TikTok chưa đăng nhập; trả về logic đăng nhập hiện tại.");
+
+            Report("OPEN_STUDIO", "Đang mở TikTok Studio để xóa video/bài cũ...");
+            const string contentUrl = "https://www.tiktok.com/tiktokstudio/content";
+            await NavigateAndWaitAsync(contentUrl, 900, 30000, ct);
+            if (await IsTikTokLoginPromptVisibleAsync(ct))
+                return new TikTokVideoDeleteResult(
+                    false, 0, 0, -1, false, "",
+                    "LOGIN_REQUIRED: TikTok mất đăng nhập khi mở TikTok Studio.");
+
+            // Chờ Studio render. count=0 chỉ được coi là sạch khi có empty-state rõ.
+            var readyDeadline = DateTime.UtcNow.AddSeconds(30);
+            TikTokStudioContentRowsSnapshot scan = new(0, "");
+            while (DateTime.UtcNow < readyDeadline)
+            {
+                ct.ThrowIfCancellationRequested();
+                scan = await ScanTikTokStudioContentRowsAsync(ct);
+                if (scan.Count > 0) break;
+                if (await IsTikTokStudioContentConfirmedEmptyAsync(ct))
+                {
+                    initialCount = 0;
+                    remainingCount = 0;
+                    verifiedEmpty = true;
+                    Report("COMPLETED", "TikTok Studio xác nhận không còn video/bài cũ.", false, true, true);
+                    _log.Info("[VIDEO_DELETE_STUDIO_EMPTY] initial=0 remaining=0");
+                    return new TikTokVideoDeleteResult(true, 0, 0, 0, true, "Không còn video/bài cũ.", "");
+                }
+                await Task.Delay(450, ct);
+            }
+
+            if (scan.Count <= 0)
+                throw new TimeoutException("TikTok Studio chưa tải được danh sách Bài đăng và cũng chưa xác nhận trạng thái trống.");
+
+            initialCount = scan.Count;
+            remainingCount = initialCount;
+            _log.Info($"[VIDEO_DELETE_STUDIO_READY] mode={mode} rows={initialCount} engine=FALLBACK_STUDIO_DIRECT");
+            Report("SCANNED", $"TikTok Studio có {initialCount} video/bài cũ.");
+
+            // Với XÓA TẤT CẢ: tái sử dụng đúng nhánh fallback đã ổn định trước đây
+            // để giữ hàng 1 và xóa hàng 2 trở xuống. Sau khi chỉ còn hàng 1 mới xóa
+            // nốt hàng 1. Như vậy toàn bộ Delete chạy trên Studio, không chạm profile.
+            if (mode == "all" && initialCount > 1)
+            {
+                Report("DELETE_STUDIO_OLD", "Đang dùng nhánh Studio ổn định để xóa từ hàng 2 trở xuống...");
+                var keepFirst = await DeleteTikTokStudioOldPostsKeepingFirstAsync(ct);
+                deletedCount += keepFirst.DeletedCount;
+                remainingCount = keepFirst.RemainingCount;
+                if (!keepFirst.Ok || remainingCount != 1)
+                    throw new InvalidOperationException(
+                        string.IsNullOrWhiteSpace(keepFirst.Error)
+                            ? $"Studio chưa thu gọn được danh sách về đúng 1 video (remaining={remainingCount})."
+                            : keepFirst.Error);
+
+                Report("DELETE_STUDIO_LAST", $"Đã xóa {deletedCount} bài cũ; đang xóa video/bài cuối cùng...");
+            }
+            else
+            {
+                Report("DELETE_STUDIO_ROW1", mode == "newest"
+                    ? "Đang xóa video/bài mới nhất bằng TikTok Studio..."
+                    : "Đang xóa video/bài cuối cùng bằng TikTok Studio...");
+            }
+
+            // newest: xóa hàng 1 đúng một lần.
+            // all: sau nhánh keep-first phía trên, đây là hàng cuối cùng còn lại.
+            scan = await ScanTikTokStudioContentRowsAsync(ct);
+            if (scan.Count <= 0)
+            {
+                if (mode == "all" && await IsTikTokStudioContentConfirmedEmptyAsync(ct))
+                {
+                    remainingCount = 0;
+                    verifiedEmpty = true;
+                    var doneAlready = $"Đã xóa sạch {deletedCount} video/bài cũ bằng TikTok Studio.";
+                    Report("COMPLETED", doneAlready, false, true, true);
+                    return new TikTokVideoDeleteResult(true, initialCount, deletedCount, 0, true, doneAlready, "");
+                }
+                throw new InvalidOperationException("TikTok Studio mất danh sách bài trước bước xóa hàng 1.");
+            }
+
+            var beforeCount = scan.Count;
+            if (!await ClickTikTokStudioFirstRowMenuAsync(ct))
+                throw new InvalidOperationException("Không mở được nút 3 chấm của video/bài hàng 1 trên TikTok Studio.");
+
+            await Task.Delay(250, ct);
+            if (!await ClickTikTokStudioDeleteMenuItemAsync(ct))
+                throw new InvalidOperationException("Không tìm/bấm được mục Xóa trong menu TikTok Studio.");
+
+            await Task.Delay(300, ct);
+            if (!await ConfirmTikTokStudioDeleteDialogAsync(ct))
+                throw new InvalidOperationException("Không bấm được nút Xóa trong hộp xác nhận TikTok Studio.");
+
+            var expectedCount = Math.Max(0, beforeCount - 1);
+            var settleDeadline = DateTime.UtcNow.AddSeconds(15);
+            var changed = false;
+            var zeroStable = 0;
+            while (DateTime.UtcNow < settleDeadline)
+            {
+                ct.ThrowIfCancellationRequested();
+                await Task.Delay(350, ct);
+                var after = await ScanTikTokStudioContentRowsAsync(ct);
+                if (expectedCount == 0)
+                {
+                    if (after.Count == 0)
+                    {
+                        zeroStable++;
+                        if (zeroStable >= 2 || await IsTikTokStudioContentConfirmedEmptyAsync(ct))
+                        {
+                            changed = true;
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        zeroStable = 0;
+                    }
+                }
+                else if (after.Count == expectedCount)
+                {
+                    changed = true;
+                    break;
+                }
+            }
+
+            if (!changed)
+                throw new InvalidOperationException(
+                    $"Đã xác nhận Xóa nhưng số video chưa giảm đúng {beforeCount}->{expectedCount} sau 15 giây.");
+
+            deletedCount++;
+            remainingCount = expectedCount;
+            verifiedEmpty = remainingCount == 0;
+            _log.Info($"[VIDEO_DELETE_STUDIO_ROW1_OK] mode={mode} deleted={deletedCount} remaining={remainingCount}");
+
+            var message = mode == "all"
+                ? $"Đã xóa sạch {deletedCount} video/bài cũ bằng TikTok Studio."
+                : "Đã xóa video/bài mới nhất bằng TikTok Studio.";
+            Report("COMPLETED", message, false, true, true);
+            return new TikTokVideoDeleteResult(
+                true,
+                initialCount,
+                deletedCount,
+                remainingCount,
+                verifiedEmpty,
+                message,
+                "");
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"[VIDEO_DELETE_STUDIO_FAILED] mode={mode} initial={initialCount} deleted={deletedCount} remaining={remainingCount} error={ex.Message}");
+            Report("ERROR", ex.Message, false, true, false, ex.Message);
+            return new TikTokVideoDeleteResult(false, initialCount, deletedCount, remainingCount, verifiedEmpty, "", ex.Message);
+        }
+    }
+
     public async Task<TikTokVideoUploadResult> CleanupTikTokStudioOldPostsKeepingFirstAsync(
         Action<TikTokVideoUploadProgress>? progress = null,
         CancellationToken ct = default)
@@ -1422,7 +1724,7 @@ function() {
         var privacyUpdated = false;
         var profileVerified = false;
         var postedHref = "";
-        var profileHref = "";
+        var recoveryHref = TikTokUrl;
         var deleteFallbackAttempted = false;
         var deleteFallbackSucceeded = false;
         var deleteFallbackDeletedCount = 0;
@@ -1455,11 +1757,13 @@ function() {
             if (string.IsNullOrWhiteSpace(videoPath) || !File.Exists(videoPath))
                 throw new FileNotFoundException("Không tìm thấy file video cần đăng.", videoPath);
 
-            Report("PREPARE_PROFILE", "Đang xác nhận tài khoản và ghi nhận bài hiện có...");
-            profileHref = await NavigateToOwnTikTokProfileForVideoAsync(username, ct);
-            var beforeScan = await ScanTikTokProfilePostsAsync(profileHref, 10, ct);
-            var beforePosts = new HashSet<string>(beforeScan.Hrefs.Select(StripTikTokUrlSuffix), StringComparer.OrdinalIgnoreCase);
-            _log.Info($"[VIDEO_UPLOAD_BEFORE_SCAN] count={beforePosts.Count} profile={profileHref}");
+            // Delete hiện được xử lý RIÊNG trước Upload bằng TikTok Studio. Tham số
+            // fallback cũ chỉ được giữ để tương thích IPC/source cũ; Upload không chạy
+            // thêm bất kỳ bước xóa nào sau khi bài đã đăng.
+            if (studioDeleteFallback)
+            {
+                _log.Warn("[VIDEO_UPLOAD_DELETE_FALLBACK_IGNORED] reason=delete_is_separate_preupload_stage");
+            }
 
             Report("OPEN_UPLOAD", "Đang mở thẳng TikTok Studio Upload...");
             const string uploadUrl = "https://www.tiktok.com/tiktokstudio/upload?from=webapp&tab=video";
@@ -1469,9 +1773,8 @@ function() {
             if (!await WaitForTikTokStudioUploadShellAsync(ct))
                 throw new TimeoutException("Không tải được giao diện TikTok Studio Upload.");
 
-            // Từ lúc đã vào Studio Upload, mọi lần rời trang có thể phát sinh dialog
-            // native "Rời khỏi trang web?" (beforeunload). Arm guard CDP riêng cho
-            // VIDEO; không tác động các confirm/prompt khác.
+            // Từ lúc đã vào Studio Upload, rời trang có thể phát sinh dialog native
+            // beforeunload. Guard này chỉ phục vụ cleanup nếu thao tác lỗi/dừng.
             Cdp.AutoAcceptBeforeUnload = true;
             beforeUnloadGuardArmed = true;
             beforeUnloadAcceptedAtArm = Cdp.BeforeUnloadAutoAcceptedCount;
@@ -1484,8 +1787,6 @@ function() {
             Report("UPLOADING", "Đang chờ TikTok tải/xử lý video...");
             await WaitTikTokStudioUploadReadyAsync(videoPath, progress, ct);
 
-            // Yêu cầu đã chốt: KHÔNG bật kiểm tra tự động; nếu popup hỏi thì Hủy,
-            // và hai toggle Kiểm tra bản quyền nhạc / Kiểm tra nội dung nhanh phải ở OFF.
             for (var i = 0; i < 3; i++)
             {
                 var action = await HandleTikTokStudioUploadPopupAsync(ct);
@@ -1495,8 +1796,8 @@ function() {
             }
             await EnsureTikTokStudioChecksOffAsync(ct);
 
-            // Luôn xử lý caption. Khi cấu hình trống, bước này sẽ xóa tên file/caption
-            // TikTok tự sinh thay vì giữ nguyên nội dung mặc định.
+            // Caption vẫn là best-effort như policy cũ: lỗi/không verify caption
+            // không được chặn nút Đăng.
             Report("CAPTION", string.IsNullOrWhiteSpace(caption) ? "Đang xóa caption mặc định..." : "Đang thay caption...");
             if (await SetTikTokStudioCaptionAsync(caption, ct))
                 _log.Info($"[VIDEO_UPLOAD_CAPTION_OK] length={caption.Length}");
@@ -1511,126 +1812,51 @@ function() {
             if (!await ClickTikTokStudioPostAsync(ct))
                 throw new InvalidOperationException("Không tìm/bấm được nút Đăng trên TikTok Studio.");
 
+            // Mốc DUY NHẤT để xác nhận UPLOAD DONE: toast "Đã đăng video" xuất hiện
+            // sau lần click Đăng vừa rồi. Không đổi privacy, không poll Mọi người,
+            // không quay profile verify nữa.
+            Report("WAIT_POST_TOAST", "Đang chờ TikTok xác nhận 'Đã đăng video'...");
             var accepted = await WaitTikTokPostSubmissionAcceptedAsync(ct);
-            _log.Info($"[VIDEO_UPLOAD_POST_ACCEPTED] signal={accepted}");
-            posted = accepted;
-
-            // Nếu TikTok không phát tín hiệu/redirect sau khi bấm Đăng, chỉ khi đó mới
-            // quay về profile để chứng minh bài mới đã tồn tại trước khi đụng quyền riêng tư.
-            // Bình thường (accepted=true) đi thẳng /tiktokstudio/content theo đúng quy trình tối ưu.
             if (!accepted)
+                throw new TimeoutException("Đã bấm Đăng nhưng không thấy thông báo 'Đã đăng video' trong 30 giây.");
+
+            posted = true;
+            var message = "Đăng video thành công — TikTok đã hiện thông báo 'Đã đăng video'.";
+            _log.Info("[VIDEO_UPLOAD_DONE_BY_TOAST] posted=true privacy=not_checked profile=not_checked");
+            Report("COMPLETED", message, running: false, completed: true, ok: true);
+
+            return new TikTokVideoUploadResult(
+                true,
+                true,
+                false,
+                false,
+                videoPath,
+                "",
+                message,
+                "")
             {
-                Report("VERIFY_POST", "Chưa thấy tín hiệu đăng; đang kiểm tra bài mới trước khi chỉnh quyền riêng tư...");
-                postedHref = await FindNewTikTokProfilePostAsync(profileHref, beforePosts, ct);
-                posted = !string.IsNullOrWhiteSpace(postedHref);
-                if (!posted)
-                    throw new InvalidOperationException("Đã bấm Đăng nhưng chưa xác nhận được bài mới; tool dừng bước ĐĂNG để tránh chỉnh nhầm bài cũ.");
-            }
-
-            Report("PRIVACY", "Đang mở trang quản lý và chuyển quyền riêng tư sang Mọi người...");
-            const string contentUrl = "https://www.tiktok.com/tiktokstudio/content";
-            await NavigateAndWaitAsync(contentUrl, 900, 30000, ct);
-            if (await IsTikTokLoginPromptVisibleAsync(ct))
-                throw new InvalidOperationException("TikTok mất đăng nhập trước bước cập nhật quyền riêng tư.");
-
-            // Fallback chỉ được bật khi bước XÓA chính trước đó đã thất bại.
-            // Quy ước đã chốt của luồng này: sau khi ĐĂNG, hàng 1 trong Studio là
-            // video mới cần giữ; mọi hàng từ thứ 2 trở xuống là video cũ. Luôn
-            // xóa lại hàng 2 sau mỗi lần reflow cho đến khi còn đúng 1 video.
-            // Fallback là best-effort: lỗi ở đây KHÔNG được chặn bước privacy/Profile.
-            if (studioDeleteFallback)
-            {
-                deleteFallbackAttempted = true;
-                Report("DELETE_FALLBACK", "Xóa chính chưa hoàn tất; đang dùng TikTok Studio để giữ video mới và xóa các video cũ...");
-                try
-                {
-                    var fallback = await DeleteTikTokStudioOldPostsKeepingFirstAsync(ct);
-                    deleteFallbackSucceeded = fallback.Ok;
-                    deleteFallbackDeletedCount = fallback.DeletedCount;
-                    deleteFallbackRemainingCount = fallback.RemainingCount;
-                    deleteFallbackError = fallback.Error;
-
-                    if (fallback.Ok)
-                    {
-                        _log.Info(
-                            $"[VIDEO_DELETE_FALLBACK_STUDIO_RESULT] ok=true deleted={fallback.DeletedCount} remaining={fallback.RemainingCount}");
-                        Report("DELETE_FALLBACK_DONE",
-                            fallback.DeletedCount > 0
-                                ? $"Fallback Studio đã xóa {fallback.DeletedCount} video cũ; còn đúng video mới."
-                                : "Fallback Studio xác nhận đã chỉ còn video mới; không cần xóa thêm.");
-                    }
-                    else
-                    {
-                        _log.Warn(
-                            $"[VIDEO_DELETE_FALLBACK_STUDIO_RESULT] ok=false deleted={fallback.DeletedCount} remaining={fallback.RemainingCount} error={fallback.Error}");
-                        Report("DELETE_FALLBACK_WARN",
-                            "Fallback Studio chưa xóa hết video cũ; vẫn tiếp tục đổi quyền riêng tư và trả profile về luồng hiện tại.");
-                    }
-                }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-                catch (Exception ex)
-                {
-                    deleteFallbackSucceeded = false;
-                    deleteFallbackError = ex.Message;
-                    _log.Warn($"[VIDEO_DELETE_FALLBACK_STUDIO_EXCEPTION] error={ex.Message}");
-                    Report("DELETE_FALLBACK_WARN",
-                        "Fallback Studio gặp lỗi; vẫn tiếp tục đổi quyền riêng tư và trả profile về luồng hiện tại.");
-                }
-            }
-
-            var privacy = await SetTikTokStudioPostPrivacyPublicAsync(postedHref, ct);
-            privacyUpdated = privacy.Ok;
-            if (!privacyUpdated)
-                _log.Warn($"[VIDEO_UPLOAD_PRIVACY_FAILED] href={postedHref}");
-
-            Report("VERIFY_PROFILE", "Đang trở về profile và kiểm tra bài mới...");
-            if (string.IsNullOrWhiteSpace(postedHref))
-            {
-                postedHref = await FindNewTikTokProfilePostAsync(profileHref, beforePosts, ct);
-                profileVerified = !string.IsNullOrWhiteSpace(postedHref);
-            }
-            else
-            {
-                await NavigateAndWaitAsync(profileHref, 900, 30000, ct);
-                var finalScan = await ScanTikTokProfilePostsAsync(profileHref, 10, ct);
-                profileVerified = finalScan.Hrefs.Any(h =>
-                    string.Equals(StripTikTokUrlSuffix(h), StripTikTokUrlSuffix(postedHref), StringComparison.OrdinalIgnoreCase));
-            }
-            posted = posted || profileVerified;
-
-            if (!profileVerified)
-                _log.Warn($"[VIDEO_UPLOAD_PROFILE_VERIFY_FAILED] href={postedHref}");
-            else
-                _log.Info($"[VIDEO_UPLOAD_PROFILE_VERIFY_OK] href={postedHref}");
-
-            var ok = posted && privacyUpdated && profileVerified;
-            var message = ok
-                ? "Đăng video thành công, quyền riêng tư đã là Mọi người và bài đã xuất hiện trên profile."
-                : posted
-                    ? $"Video đã đăng nhưng còn bước chưa xác nhận hoàn tất (public={privacyUpdated}, profile={profileVerified})."
-                    : "Chưa xác nhận được video đã đăng.";
-            Report(ok ? "COMPLETED" : "PARTIAL", message, running: false, completed: true, ok: ok, error: ok ? "" : message);
-            return new TikTokVideoUploadResult(ok, posted, privacyUpdated, profileVerified, videoPath, postedHref, message, ok ? "" : message)
-            {
-                DeleteFallbackAttempted = deleteFallbackAttempted,
-                DeleteFallbackSucceeded = deleteFallbackSucceeded,
-                DeleteFallbackDeletedCount = deleteFallbackDeletedCount,
-                DeleteFallbackRemainingCount = deleteFallbackRemainingCount,
-                DeleteFallbackError = deleteFallbackError
+                DeleteFallbackAttempted = false,
+                DeleteFallbackSucceeded = false,
+                DeleteFallbackDeletedCount = 0,
+                DeleteFallbackRemainingCount = -1,
+                DeleteFallbackError = ""
             };
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
-            _log.Warn($"[VIDEO_UPLOAD_FAILED] posted={posted} public={privacyUpdated} profile={profileVerified} error={ex.Message}");
+            _log.Warn($"[VIDEO_UPLOAD_FAILED] posted={posted} toastConfirmed={posted} error={ex.Message}");
             Report("ERROR", ex.Message, running: false, completed: true, ok: false, error: ex.Message);
-            return new TikTokVideoUploadResult(false, posted, privacyUpdated, profileVerified, videoPath, postedHref, "", ex.Message)
+            return new TikTokVideoUploadResult(false, posted, false, false, videoPath, "", "", ex.Message)
             {
-                DeleteFallbackAttempted = deleteFallbackAttempted,
-                DeleteFallbackSucceeded = deleteFallbackSucceeded,
-                DeleteFallbackDeletedCount = deleteFallbackDeletedCount,
-                DeleteFallbackRemainingCount = deleteFallbackRemainingCount,
-                DeleteFallbackError = deleteFallbackError
+                DeleteFallbackAttempted = false,
+                DeleteFallbackSucceeded = false,
+                DeleteFallbackDeletedCount = 0,
+                DeleteFallbackRemainingCount = -1,
+                DeleteFallbackError = ""
             };
         }
         finally
@@ -1639,10 +1865,7 @@ function() {
             {
                 try
                 {
-                    // Nếu lỗi xảy ra khi vẫn còn ở /tiktokstudio/upload, chủ động rời
-                    // trang ngay khi guard còn arm. Nhờ vậy luồng LIVE/comment sau đó
-                    // không bị kẹt bởi dialog native và không cần người dùng bấm tay.
-                    await CleanupTikTokStudioUploadPageAsync(profileHref, beforeUnloadAcceptedAtArm);
+                    await CleanupTikTokStudioUploadPageAsync(recoveryHref, beforeUnloadAcceptedAtArm);
                 }
                 catch { }
 
@@ -1655,4 +1878,5 @@ function() {
             }
         }
     }
+
 }

@@ -408,9 +408,11 @@ public sealed partial class AutomationEngine
                     // không được coi như ô nhập bất thường rồi tiếp tục đổi LIVE.
                     await StopIfFatalTikTokRestrictionAsync("ranh giới vòng chính", ct);
 
-                    // Nếu Enter vừa hiện popup “Đăng nhập vào TikTok” ở lần xác minh 1/3 hoặc 2/3,
-                    // khóa workflow và chuyển LIVE trước. Streak không bị reset chỉ vì popup biến mất
-                    // sau chuyển LIVE/F5; chỉ Enter thành công kế tiếp mới reset.
+                    // Nếu Enter vừa hiện toast “Vui lòng đăng nhập trước” lần 1/2, khóa workflow,
+                    // chuyển LIVE và F5 bắt buộc đúng một lần trước khi cho Click/Dán/Enter lại.
+                    if (await HandlePendingRuntimeLoginToastTransitionAsync(ct)) continue;
+
+                    // Popup “Đăng nhập vào TikTok” vẫn giữ detector fallback 2/2 hiện tại.
                     if (await HandlePendingRuntimeLoginSuspectTransitionAsync(ct)) continue;
 
                     // Nếu Enter vừa bị TikTok từ chối bằng toast “Bạn hiện bị cấm bình luận”,
@@ -2511,8 +2513,27 @@ public sealed partial class AutomationEngine
         string source,
         LiveSwitchVerification changed,
         int waitAfterReloadMs,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool forceF5AfterArrowDown = false)
     {
+        if (forceF5AfterArrowDown)
+        {
+            await _chrome.ReloadAndWaitAsync(Math.Max(0, waitAfterReloadMs), 15000, ct);
+            _log.Info($"[LIVE_SWITCH_DOM_READY] source={source} preReloadChanged=True attempt={changed.Attempt} action=F5_FORCED");
+            await StopIfFatalTikTokRestrictionAsync($"sau chuyển LIVE + F5 bắt buộc: {source}", ct);
+            var afterForcedReloadIdentity = await GetCurrentLiveIdentityAsync(ct);
+            _log.Info(
+                $"[LIVE_SWITCH_CONFIRMED] source={source} attempt={changed.Attempt} " +
+                $"before={TrimIdentityForLog(changed.BeforeIdentity)} after={TrimIdentityForLog(afterForcedReloadIdentity)} " +
+                $"action=F5_FORCED");
+            return new LiveSwitchVerification(
+                true,
+                changed.BeforeIdentity,
+                afterForcedReloadIdentity,
+                changed.Attempt,
+                changed.ElapsedMs);
+        }
+
         var fastReady = await WaitForArrowDownFastReadyAsync(source, changed, ct);
         if (fastReady.Ready)
         {
@@ -2616,7 +2637,7 @@ public sealed partial class AutomationEngine
         }
     }
 
-    async Task<LiveSwitchVerification> TryArrowDownSwitchAsync(string source, int count, int waitAfterReloadMs, CancellationToken ct)
+    async Task<LiveSwitchVerification> TryArrowDownSwitchAsync(string source, int count, int waitAfterReloadMs, CancellationToken ct, bool forceF5AfterArrowDown = false)
     {
         var resumeStep = _step;
         var originalBefore = await GetCurrentLiveIdentityAsync(ct);
@@ -2644,7 +2665,7 @@ public sealed partial class AutomationEngine
                 : ArrowDownRecoveryAttemptWaitMs;
             var changed = await WaitForPageChangeBeforeReloadAsync(source, beforeAttempt, attemptWaitMs, attempt, ct);
             if (changed.Changed)
-                return await FinalizeConfirmedArrowDownAsync(source, changed, waitAfterReloadMs, ct);
+                return await FinalizeConfirmedArrowDownAsync(source, changed, waitAfterReloadMs, ct, forceF5AfterArrowDown);
 
             // Máy chậm có thể nhận ArrowDown đúng nhưng React cập nhật roomId/url trễ hơn cửa sổ nhanh đầu tiên.
             // Ở lần đầu chỉ quan sát thêm, KHÔNG gửi phím thứ hai và KHÔNG reconnect vội.
@@ -2664,7 +2685,7 @@ public sealed partial class AutomationEngine
                     _log.Info(
                         $"[LIVE_SWITCH_LATE_CONFIRMED] source={source} elapsedExtraMs={lateChanged.ElapsedMs} " +
                         $"action=ACCEPT_ORIGINAL_ARROW_NO_RETRY");
-                    return await FinalizeConfirmedArrowDownAsync(source, lateChanged, waitAfterReloadMs, ct);
+                    return await FinalizeConfirmedArrowDownAsync(source, lateChanged, waitAfterReloadMs, ct, forceF5AfterArrowDown);
                 }
             }
 
@@ -2699,7 +2720,7 @@ public sealed partial class AutomationEngine
         _log.Info($"[LIVE_KEY_SENT] source={source} attempt=post-reset key=ArrowDown mode=recovery-keyDown");
         var finalChanged = await WaitForPageChangeBeforeReloadAsync(source, beforeFinal, ArrowDownPostResetAttemptWaitMs, ArrowDownRecoveryAttempts + 1, ct);
         if (finalChanged.Changed)
-            return await FinalizeConfirmedArrowDownAsync(source, finalChanged, waitAfterReloadMs, ct);
+            return await FinalizeConfirmedArrowDownAsync(source, finalChanged, waitAfterReloadMs, ct, forceF5AfterArrowDown);
 
         ReportProblem("LIVE_SWITCH_KEY_UNRESPONSIVE", source,
             "ArrowDown CDP vẫn không làm LIVE đổi sau reconnect + focus + F5 reset. Không F5 lặp cùng LIVE; Viewer/InputGuard vẫn khóa workflow và vòng sau sẽ thử lại.",
@@ -2817,7 +2838,7 @@ public sealed partial class AutomationEngine
     }
 
     async Task<bool> TransitionAsync(string source, TransitionAction action, string xpath, int count, bool scheduledPeriodic,
-        CancellationToken ct, int waitAfterReloadMs = F5WaitMs)
+        CancellationToken ct, int waitAfterReloadMs = F5WaitMs, bool forceF5AfterArrowDown = false)
     {
         if (_transitioning)
         {
@@ -2830,7 +2851,7 @@ public sealed partial class AutomationEngine
         _log.Info($"BẮT ĐẦU KHÓA CHUYỂN LIVE: {source}");
         try
         {
-            LiveSwitchVerification verify = await ExecuteTransitionAttemptAsync(source, action, xpath, count, waitAfterReloadMs, ct);
+            LiveSwitchVerification verify = await ExecuteTransitionAttemptAsync(source, action, xpath, count, waitAfterReloadMs, ct, forceF5AfterArrowDown);
             if (!verify.Changed)
             {
                 if (verify.PageRecovered)
@@ -2872,7 +2893,7 @@ public sealed partial class AutomationEngine
             try
             {
                 if (cdpSessionLost) await _chrome.BringToFrontAsync(ct);
-                LiveSwitchVerification verify = await ExecuteTransitionAttemptAsync(source + " retry", action, xpath, count, waitAfterReloadMs, ct);
+                LiveSwitchVerification verify = await ExecuteTransitionAttemptAsync(source + " retry", action, xpath, count, waitAfterReloadMs, ct, forceF5AfterArrowDown);
                 if (!verify.Changed)
                 {
                     if (verify.PageRecovered)
@@ -2921,10 +2942,10 @@ public sealed partial class AutomationEngine
     }
 
     async Task<LiveSwitchVerification> ExecuteTransitionAttemptAsync(string source, TransitionAction action, string xpath, int count,
-        int waitAfterReloadMs, CancellationToken ct)
+        int waitAfterReloadMs, CancellationToken ct, bool forceF5AfterArrowDown = false)
     {
         if (action == TransitionAction.ArrowDown)
-            return await TryArrowDownSwitchAsync(source, count, waitAfterReloadMs, ct);
+            return await TryArrowDownSwitchAsync(source, count, waitAfterReloadMs, ct, forceF5AfterArrowDown);
 
         var verify = await TryClickSwitchAsync(source, xpath, count, ct);
         if (!verify.Changed) return verify;

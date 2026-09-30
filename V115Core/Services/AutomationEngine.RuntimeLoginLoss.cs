@@ -15,12 +15,21 @@ public sealed partial class AutomationEngine
     string _runtimeLoginSuspectContext = "";
     string _runtimeLoginSuspectMarker = "";
 
+    int _runtimeLoginToastStreak;
+    bool _runtimeLoginToastTransitionPending;
+    string _runtimeLoginToastContext = "";
+    string _runtimeLoginToastMarker = "";
+
     void ResetRuntimeLoginModalState(string reason)
     {
         ResetRuntimeLoginModalConfirmation(reason);
         _runtimeLoginSuspectTransitionPending = false;
         _runtimeLoginSuspectContext = "";
         _runtimeLoginSuspectMarker = "";
+        ResetRuntimeLoginToastConfirmation(reason);
+        _runtimeLoginToastTransitionPending = false;
+        _runtimeLoginToastContext = "";
+        _runtimeLoginToastMarker = "";
     }
 
     void ResetRuntimeLoginModalConfirmation(string reason)
@@ -33,11 +42,21 @@ public sealed partial class AutomationEngine
         _runtimeLoginModalStreak = 0;
     }
 
+    void ResetRuntimeLoginToastConfirmation(string reason)
+    {
+        if (_runtimeLoginToastStreak > 0)
+        {
+            _log.Info($"[RUNTIME_LOGIN_TOAST_STREAK_RESET] previous={_runtimeLoginToastStreak}/{RuntimeLoginModalConfirmationsRequired} reason={reason}");
+        }
+
+        _runtimeLoginToastStreak = 0;
+    }
+
     /// <summary>
     /// Một DOM probe dùng ngay sau Enter.
+    /// - LOGIN_TOAST: chỉ khi toast “Vui lòng đăng nhập trước” đang visible thật + hit-test trúng.
     /// - LOGIN_MODAL: chỉ khi thấy popup/dialog có tiêu đề “Đăng nhập vào TikTok” / “Log in to TikTok”.
     /// - COMMENT_BANNED: vẫn giữ detector toast cấm bình luận hiện tại.
-    /// Không dùng toast “Vui lòng đăng nhập trước” để xác nhận mất login nữa.
     /// </summary>
     async Task<string> DetectPostEnterReactionAsync(CancellationToken ct)
     {
@@ -58,6 +77,61 @@ public sealed partial class AutomationEngine
     const s = getComputedStyle(el);
     return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity || 1) > 0.05;
   };
+
+  const visibleAndHitTested = (el) => {
+    if (!visible(el)) return false;
+    const r = el.getBoundingClientRect();
+    const cx = Math.max(0, Math.min(innerWidth - 1, r.left + r.width / 2));
+    const cy = Math.max(0, Math.min(innerHeight - 1, r.top + r.height / 2));
+    const top = document.elementFromPoint(cx, cy);
+    return !!top && (top === el || el.contains(top) || top.contains?.(el));
+  };
+
+  const loginToastText = (text) => {
+    const t = norm(text);
+    return t.includes('vui long dang nhap truoc');
+  };
+
+  const bodyText = norm(document.body?.textContent || '');
+
+  // 0) Toast mất login mới: chỉ nhận khi element thật sự nằm trên màn hình và hit-test trúng.
+  // Không dùng body.textContent đơn thuần để tránh bắt node ẩn/stale.
+  const loginToastCandidates = new Set();
+  if (bodyText.includes('vui long dang nhap truoc')) {
+    for (const el of document.querySelectorAll('[role="alert"],[role="status"],[aria-live]:not([aria-live="off"]),[class*="toast" i],[class*="notice" i],[class*="snackbar" i],div,span,p')) {
+      const text = norm(el.innerText || el.textContent || '');
+      if (text.length > 0 && text.length <= 180 && loginToastText(text)) loginToastCandidates.add(el);
+    }
+  }
+  for (const el of loginToastCandidates) {
+    if (!visibleAndHitTested(el)) continue;
+    const text = norm(el.innerText || el.textContent || '');
+    if (!loginToastText(text) || text.length > 180) continue;
+
+    let anchor = el;
+    let positioned = false;
+    for (let i = 0; i < 5 && anchor; i++, anchor = anchor.parentElement) {
+      if (!visible(anchor)) continue;
+      const s = getComputedStyle(anchor);
+      const pos = String(s.position || '').toLowerCase();
+      if (pos === 'fixed' || pos === 'absolute' || pos === 'sticky'
+          || anchor.getAttribute?.('role') === 'alert'
+          || anchor.getAttribute?.('role') === 'status'
+          || anchor.hasAttribute?.('aria-live')) {
+        positioned = true;
+        break;
+      }
+    }
+
+    const r = el.getBoundingClientRect();
+    const cx = r.left + r.width / 2;
+    const inToastZone = r.top >= 0 && r.top <= innerHeight * 0.55
+      && cx >= innerWidth * 0.12 && cx <= innerWidth * 0.88;
+    const compact = r.height <= 180 && r.width <= Math.max(900, innerWidth * 0.75);
+    if (!(compact && (positioned || inToastZone))) continue;
+
+    return `LOGIN_TOAST|text=${text.slice(0,120)}|x=${Math.round(r.left)}|y=${Math.round(r.top)}|w=${Math.round(r.width)}|h=${Math.round(r.height)}`;
+  }
 
   const loginModalText = (text) => {
     const t = norm(text);
@@ -160,6 +234,83 @@ public sealed partial class AutomationEngine
             : "";
     }
 
+    void RegisterRuntimeLoginToastAfterEnter(string pointName, int restartStep, string marker)
+    {
+        _step = restartStep;
+        _runtimeLoginToastStreak = Math.Min(
+            RuntimeLoginModalConfirmationsRequired,
+            _runtimeLoginToastStreak + 1);
+
+        _log.Warn(
+            $"[RUNTIME_LOGIN_TOAST_CONFIRM] point={pointName} confirmation={_runtimeLoginToastStreak}/{RuntimeLoginModalConfirmationsRequired} marker={marker}");
+
+        if (_runtimeLoginToastStreak >= RuntimeLoginModalConfirmationsRequired)
+        {
+            _runtimeLoginToastTransitionPending = false;
+            _runtimeLoginToastContext = "";
+            _runtimeLoginToastMarker = "";
+
+            var confirmedMarker = $"{marker}; repeated={_runtimeLoginToastStreak}/{RuntimeLoginModalConfirmationsRequired}";
+            LatchRuntimeLoginLostFromToast(pointName, confirmedMarker);
+            Stop($"Toast ‘Vui lòng đăng nhập trước’ lặp lại {_runtimeLoginToastStreak}/{RuntimeLoginModalConfirmationsRequired} lần sau Enter; chờ Manager gọi luồng đăng nhập có sẵn.");
+            return;
+        }
+
+        _runtimeLoginToastTransitionPending = true;
+        _runtimeLoginToastContext = pointName;
+        _runtimeLoginToastMarker = marker;
+
+        SetStatus(
+            "NGHI MẤT ĐĂNG NHẬP",
+            $"{pointName}: toast ‘Vui lòng đăng nhập trước’ {_runtimeLoginToastStreak}/{RuntimeLoginModalConfirmationsRequired}; chuyển LIVE + F5 rồi thử gửi lại cùng nội dung.");
+    }
+
+    async Task<bool> HandlePendingRuntimeLoginToastTransitionAsync(CancellationToken ct)
+    {
+        if (!_runtimeLoginToastTransitionPending) return false;
+
+        await WaitIfPausedAsync(ct);
+        var pointName = string.IsNullOrWhiteSpace(_runtimeLoginToastContext)
+            ? "sau Enter"
+            : _runtimeLoginToastContext;
+        var source = $"xác minh toast mất login sau Enter {pointName} {_runtimeLoginToastStreak}/{RuntimeLoginModalConfirmationsRequired}";
+
+        SetStatus(
+            "ĐANG XÁC MINH ĐĂNG NHẬP",
+            $"{pointName}: chuyển LIVE + F5 sau toast {_runtimeLoginToastStreak}/{RuntimeLoginModalConfirmationsRequired}; chưa gọi login lại.");
+        _log.Warn(
+            $"[RUNTIME_LOGIN_TOAST_SWITCH] point={pointName} confirmation={_runtimeLoginToastStreak}/{RuntimeLoginModalConfirmationsRequired} action={(_s.UseArrowDownForLiveSwitch ? "ArrowDown+F5" : "ClickXPath+F5")}");
+
+        var action = _s.UseArrowDownForLiveSwitch ? TransitionAction.ArrowDown : TransitionAction.ClickXPath;
+        var transitioned = await TransitionAsync(
+            source,
+            action,
+            _s.XPathPeriodicAction,
+            1,
+            scheduledPeriodic: false,
+            ct,
+            F5WaitMs,
+            forceF5AfterArrowDown: true);
+
+        if (transitioned)
+        {
+            _runtimeLoginToastTransitionPending = false;
+            _runtimeLoginToastContext = "";
+            _runtimeLoginToastMarker = "";
+            _log.Warn(
+                $"[RUNTIME_LOGIN_TOAST_SWITCHED_F5] point={pointName} confirmation={_runtimeLoginToastStreak}/{RuntimeLoginModalConfirmationsRequired} result=OK action=RETRY_SAME_CONTENT_AFTER_VIEWER_AND_INPUT_GUARD");
+            SetStatus(
+                "ĐANG XÁC MINH ĐĂNG NHẬP",
+                $"Đã chuyển LIVE + F5; chờ Click/Dán/Enter kế tiếp để xác minh toast {_runtimeLoginToastStreak}/{RuntimeLoginModalConfirmationsRequired}.");
+            return true;
+        }
+
+        _log.Warn(
+            $"[RUNTIME_LOGIN_TOAST_SWITCH_PENDING] point={pointName} confirmation={_runtimeLoginToastStreak}/{RuntimeLoginModalConfirmationsRequired} result=NOT_CONFIRMED waitMs={RuntimeLoginSuspectTransitionRetryMs} action=KEEP_WORKFLOW_LOCKED");
+        await Task.Delay(RuntimeLoginSuspectTransitionRetryMs, ct);
+        return true;
+    }
+
     /// <summary>
     /// Mỗi lần Enter chỉ được cộng đúng 1 xác nhận. Popup biến mất do chuyển LIVE/F5 không
     /// được tính là hồi login và cũng không reset streak. Chỉ một lần Enter kế tiếp chạy qua
@@ -243,6 +394,23 @@ public sealed partial class AutomationEngine
             $"[RUNTIME_LOGIN_MODAL_SWITCH_PENDING] point={pointName} confirmation={_runtimeLoginModalStreak}/{RuntimeLoginModalConfirmationsRequired} result=NOT_CONFIRMED waitMs={RuntimeLoginSuspectTransitionRetryMs} action=KEEP_WORKFLOW_LOCKED");
         await Task.Delay(RuntimeLoginSuspectTransitionRetryMs, ct);
         return true;
+    }
+
+    void LatchRuntimeLoginLostFromToast(string pointName, string marker)
+    {
+        _runtimeLoginLostDetail = $"point={pointName}; marker={marker}; signal=LOGIN_TOAST";
+        _runtimeLoginLostConfirmed = true;
+
+        ReportProblem(
+            "RUNTIME_LOGIN_LOST_CONFIRMED",
+            pointName,
+            $"Toast ‘Vui lòng đăng nhập trước’ đã hiển thị thật {RuntimeLoginModalConfirmationsRequired} lần sau hai lượt Enter, có chuyển LIVE + F5 ở giữa. Dừng Worker automation để Manager đóng sạch, mở lại chính PRF và gọi nguyên logic đăng nhập hiện tại.",
+            error: true,
+            throttleSeconds: 5);
+
+        SetStatus(
+            "MẤT ĐĂNG NHẬP",
+            $"{pointName}: toast ‘Vui lòng đăng nhập trước’ lặp lại {RuntimeLoginModalConfirmationsRequired}/{RuntimeLoginModalConfirmationsRequired}; chờ Manager gọi luồng đăng nhập có sẵn.");
     }
 
     void LatchRuntimeLoginLost(string pointName, string marker)

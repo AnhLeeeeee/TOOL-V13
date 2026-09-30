@@ -195,12 +195,49 @@ public sealed partial class ManagerForm
             if (deficit <= 0)
                 return;
 
+            // Request đang WAIT do khung giờ cấm CREATE không được làm queue PRF chờ
+            // bị "đóng băng" tới sáng. Mỗi nhịp capacity reconcile (15s) vẫn quét
+            // lại nguồn PRF có sẵn; nếu một PRF vừa hết cooldown và trở lại eligible,
+            // RefreshReusableProfileQueueAsync() sẽ Wake request schedule-wait ngay.
+            // Không thay đổi policy 20:00-07:00: chỉ dùng PRF đã tồn tại, không CREATE.
+            if (pendingPass2.Waiting > 0
+                && HasAutoReplacementNoCreateScheduleWaitingRequest())
+            {
+                _log.Info(
+                    $"[AUTO_REPLACE_PENDING_WAITING_REUSE_RESCAN] source={source} target={target} occupied={stableOccupied} " +
+                    $"deficit={Math.Max(0, deficit)} pendingWaiting={pendingPass2.Waiting}");
+
+                await RefreshReusableProfileQueueAsync(
+                    "capacity_pending_schedule_wait");
+
+                if (!IsAutoReplacementExecutionAllowedForCapacityReconcile())
+                    return;
+
+                var pendingAfterReuseRefresh = GetAutoReplacementPendingCapacitySnapshot();
+                var reusableAfterRefresh = GetReusableProfileQueueCount();
+
+                // Refresh có thể vừa Wake queue và queue runner có thể claim/remove request
+                // rất nhanh. Không chỉ dựa vào pendingActive tăng, vì snapshot kế tiếp có
+                // thể bắt đúng lúc request đã được runner lấy ra. Nếu có supply hoặc runner
+                // đã thức dậy thì nhường lượt cho request cũ, tuyệt đối không sinh request mới.
+                if (pendingAfterReuseRefresh.Reserving > pendingPass2.Reserving
+                    || reusableAfterRefresh > 0
+                    || _autoReplacementQueueRunning)
+                {
+                    _log.Info(
+                        $"[AUTO_REPLACE_PENDING_WAITING_REUSE_WAKE] source={source} pendingActiveBefore={pendingPass2.Reserving} " +
+                        $"pendingActiveAfter={pendingAfterReuseRefresh.Reserving} pendingWaitingAfter={pendingAfterReuseRefresh.Waiting} " +
+                        $"reusable={reusableAfterRefresh} queueRunning={_autoReplacementQueueRunning} action=RUN_EXISTING_REQUESTS");
+                    return;
+                }
+            }
+
             QueueAutoReplacementCapacityDeficit(
                 deficit,
                 source,
                 target,
                 stableOccupied,
-                pendingPass2);
+                GetAutoReplacementPendingCapacitySnapshot());
         }
         catch (Exception ex)
         {
@@ -212,6 +249,29 @@ public sealed partial class ManagerForm
             _autoReplacementCapacityReconcileRunning = false;
         }
     }
+
+    bool HasAutoReplacementNoCreateScheduleWaitingRequest()
+    {
+        var nowUtc = DateTime.UtcNow;
+        lock (_autoReplacementQueueLock)
+        {
+            return _autoReplacementQueue.Any(request =>
+                request.NextAttemptUtc > nowUtc
+                && (request.LastError ?? "").StartsWith(
+                    "Khung giờ cấm CREATE:",
+                    StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
+    bool IsAutoReplacementExecutionAllowedForCapacityReconcile()
+        => !IsAutomationHalted
+           && !_closing
+           && !IsDisposed
+           && !Disposing
+           && _autoReplacementFeatureInitialized
+           && _autoCloseSettings.OpenReplacementAfterAutoClose
+           && _autoReplacementSessionArmed
+           && !_autoReplacementStartAllInProgress;
 
     void QueueAutoReplacementCapacityDeficit(
         int requestedCount,

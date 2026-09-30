@@ -91,8 +91,9 @@ public sealed partial class MainForm
         {
             try
             {
-                var result = await _chrome.DeleteTikTokProfilePostsAsync(
-                    request.Username,
+                // VIDEO delete hiện dùng thẳng TikTok Studio; bỏ hoàn toàn nhánh
+                // xóa gốc trên trang profile vì nhánh Studio ổn định hơn.
+                var result = await _chrome.DeleteTikTokStudioPostsAsync(
                     request.DeleteMode,
                     progress =>
                     {

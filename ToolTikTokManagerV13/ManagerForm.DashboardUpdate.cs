@@ -100,7 +100,10 @@ public sealed partial class ManagerForm
     bool _updateDownloadInProgress;
     bool _updatingHoldToggle;
     DateTime _dashboardNextPeriodicRefreshUtc = DateTime.MinValue;
-    static readonly TimeSpan DashboardPeriodicRefreshInterval = TimeSpan.FromSeconds(5);
+    // Chỉ repaint Dashboard từ state/snapshot Manager đã có mỗi 1 giây.
+    // Worker nền vẫn giữ status poll 5 giây trong RefreshOpenProfilesAsync();
+    // cache account vẫn 15 giây, nên thay đổi này không nhân tải backend.
+    static readonly TimeSpan DashboardPeriodicRefreshInterval = TimeSpan.FromSeconds(1);
 
     // Font dùng chung cho các cell được style lại nhiều lần. Không tạo GDI Font mới theo mỗi tick/hàng.
     static readonly Font DashboardCellFont9Regular = new("Segoe UI", 9F, FontStyle.Regular);
@@ -115,8 +118,8 @@ public sealed partial class ManagerForm
         RefreshDashboard();
         _dashboardNextPeriodicRefreshUtc = DateTime.UtcNow.Add(DashboardPeriodicRefreshInterval);
 
-        // Dashboard chỉ là phần HIỂN THỊ. LastSnapshot vẫn được Manager cập nhật theo nhịp cũ;
-        // giảm riêng repaint/đọc thống kê của Dashboard xuống 5 giây để không đụng workflow.
+        // Dashboard chỉ là phần HIỂN THỊ. LastSnapshot vẫn được Manager cập nhật theo
+        // policy cũ (tab đang xem 1s, tab nền 5s); ở đây chỉ repaint state đã cache mỗi 1s.
         _refreshTimer.Tick += (_, _) => RefreshDashboardPeriodic();
 
         Shown += async (_, _) =>

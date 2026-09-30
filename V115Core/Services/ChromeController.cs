@@ -237,6 +237,9 @@ public sealed partial class ChromeController : IAsyncDisposable
         var args =
             $"--remote-debugging-port={port} --remote-allow-origins=* --user-data-dir=\"{profileDir}\" " +
             "--no-first-run --no-default-browser-check " +
+            // Mute ngay từ lúc process Chrome khởi tạo để không có khe 0.5-1s
+            // trước khi CDP/DOM media policy kịp attach vào tab TikTok.
+            "--mute-audio " +
             "--lang=vi --accept-lang=vi-VN,vi,en-US,en " + windowFlags + backgroundFlags + proxyFlags +
             TikTokUrl;
         var psi = new ProcessStartInfo(chrome, args)
@@ -246,6 +249,7 @@ public sealed partial class ChromeController : IAsyncDisposable
         };
 
         _log.Info($"Launching Chrome user-data-dir={profileDir}");
+        _log.Info("[CHROME_LAUNCH_AUDIO_MUTE] enabled=True source=--mute-audio");
         var launched = Process.Start(psi);
         CacheManagedLaunch(profileDir, port, launched?.Id);
         _log.Info($"Đã mở Chrome V13 ở chế độ HIỂN THỊ; cổng CDP={port}; profile={profileDir}");

@@ -1,9 +1,48 @@
-﻿using ToolTikTokV12.Services;
+﻿using System.Globalization;
+using ToolTikTokV12.Services;
 
 namespace ToolTikTokManagerV13;
 
 public sealed partial class ManagerForm
 {
+    static string FormatTimeLoginForDisplay(string? rawValue)
+    {
+        var value = (rawValue ?? "").Trim();
+        if (value.Length == 0)
+            return "";
+
+        // Excel vẫn lưu nguyên HH:mm dd/MM/yyyy để các logic sau này còn đủ dữ liệu.
+        // UI chỉ rút gọn còn ngày/tháng. Hỗ trợ cả vài format cũ để không làm hỏng
+        // dữ liệu đã có từ các phiên bản trước.
+        var formats = new[]
+        {
+            "HH:mm dd/MM/yyyy",
+            "H:mm dd/MM/yyyy",
+            "dd/MM/yyyy HH:mm",
+            "dd/MM/yyyy H:mm",
+            "dd/MM/yyyy",
+            "dd/MM"
+        };
+
+        if (DateTime.TryParseExact(
+                value,
+                formats,
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.AllowWhiteSpaces,
+                out var parsed)
+            || DateTime.TryParse(
+                value,
+                CultureInfo.GetCultureInfo("vi-VN"),
+                DateTimeStyles.AllowWhiteSpaces,
+                out parsed))
+        {
+            return parsed.ToString("dd/MM", CultureInfo.InvariantCulture);
+        }
+
+        // Giá trị lạ/ghi tay: giữ nguyên thay vì tự sửa sai.
+        return value;
+    }
+
     sealed record RuntimeTimeLoginWriteResult(
         bool Found,
         bool AlreadyExisted,

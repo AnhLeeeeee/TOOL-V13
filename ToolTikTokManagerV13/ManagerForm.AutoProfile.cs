@@ -2594,11 +2594,15 @@ public sealed partial class ManagerForm
                     IdentityExcelDone: identityExcelDone);
             }
 
-            // +Auto Profile có công tắc VIDEO riêng cho trường hợp CHỈ xử lý account
-            // nhưng chưa Auto Start. Khi autoStart=ON, VIDEO được dời về PRE-START
-            // ngay trước start_auto để luôn đọc Excel mới nhất và tránh chạy hai lần.
-            // Mọi đường VIDEO đều fail-open; kết quả VIDEO không được quyền chặn Tool chính.
-            if (autoVideo && !autoStart)
+            // VIDEO không được là điều kiện hoàn tất của một PRF tạo để CHỜ.
+            // Khi Auto Start=OFF, profile mới chỉ cần hoàn tất LOGIN + Tên/ảnh theo
+            // policy hiện có là được công nhận READY; cột VIDEO vẫn giữ nguyên để
+            // PRE-START đọc và xử lý khi profile thực sự được đưa vào lượt chạy.
+            //
+            // Với profile RESUME tạo dở, vẫn cho phép checkbox Tự xử lý VIDEO chạy
+            // như trước để không làm mất chức năng sửa/hoàn tất thủ công. Dù VIDEO
+            // DONE hay FAIL thì kết quả vẫn fail-open và không quyết định READY.
+            if (autoVideo && !autoStart && item.ResumeExisting)
             {
                 await WaitAutoProfilePausePointAsync(isPaused, ct);
                 step = "VIDEO";
@@ -2659,8 +2663,18 @@ public sealed partial class ManagerForm
             }
             else if (!autoStart)
             {
-                // autoStart=OFF và Tự xử lý VIDEO=OFF: đây là lượt setup độc lập,
-                // không có PRE-START phía sau. Nhả startup HOLD và không chạy VIDEO.
+                // Auto Start=OFF: profile mới được tính READY/CHỜ độc lập VIDEO.
+                // Nếu VIDEO đang bật nhưng đây là profile mới, cố ý DEFER VIDEO đến
+                // lần profile thực sự Start; không chờ DONE/FAIL ở lượt tạo CHỜ này.
+                if (autoVideo && !item.ResumeExisting)
+                {
+                    _log.Info(
+                        $"[AUTO_PROFILE_VIDEO_DEFER_WAITING_READY] profile={item.ProfileName} account={item.Account.Username} " +
+                        "reason=new_profile_auto_start_off action=KEEP_VIDEO_EXCEL_FOR_NEXT_PRESTART");
+                }
+
+                // Không có PRE-START phía sau trong lượt này. Nhả startup HOLD để
+                // caller có thể đóng runtime/đưa profile vào CHỜ ngay.
                 var holdReason = GetManagedAccountSetupHoldReason(ctx);
                 if (holdReason.Equals("before_worker_start", StringComparison.OrdinalIgnoreCase)
                     || holdReason.Equals("auto_profile_video_pipeline", StringComparison.OrdinalIgnoreCase))

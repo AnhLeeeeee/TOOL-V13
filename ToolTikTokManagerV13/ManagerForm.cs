@@ -246,7 +246,37 @@ public sealed partial class ManagerForm : Form
         var toolbarRow2 = ToolbarRow();
         toolbarRow2.Controls.Add(Button("🗑 Delete", (_, _) => ShowDeleteProfilesDialog(), UiButtonKind.Danger));
         toolbarRow2.Controls.Add(Button("▶ Auto Run", async (_, _) => await ShowRunAllStrategyDialogAndStartAsync(), UiButtonKind.Primary));
-        toolbarRow2.Controls.Add(Button("⏹ Stop All", async (_, _) => await StopAllAsync(), UiButtonKind.Danger));
+
+        // Stop All chỉ mở menu lựa chọn. Nút Stop riêng của từng PRF ở Dashboard
+        // giữ nguyên 100% logic hiện tại. Hai lựa chọn dưới đây tái sử dụng đúng
+        // StopAllAsync() và CloseChromeForProfileAsync() đã có, không tạo một luồng
+        // STOP/đóng Chrome song song khác.
+        var stopAllMenu = new ContextMenuStrip();
+        var stopOnlyItem = new ToolStripMenuItem("■ Stop");
+        var stopAndCloseChromeItem = new ToolStripMenuItem("■ Stop + đóng Chrome");
+
+        stopOnlyItem.Click += async (_, _) =>
+        {
+            try { await StopAllAsync(); }
+            catch (Exception ex) { ShowError(ex); }
+        };
+        stopAndCloseChromeItem.Click += async (_, _) =>
+        {
+            try { await StopAllAndCloseChromeAsync(); }
+            catch (Exception ex) { ShowError(ex); }
+        };
+
+        stopAllMenu.Items.Add(stopOnlyItem);
+        stopAllMenu.Items.Add(stopAndCloseChromeItem);
+
+        var stopAllButton = Button("⏹ Stop All ▼", (_, _) => { }, UiButtonKind.Danger);
+        stopAllButton.Click += (_, _) =>
+        {
+            if (!stopAllButton.IsDisposed)
+                stopAllMenu.Show(stopAllButton, new Point(0, stopAllButton.Height));
+        };
+        stopAllButton.Disposed += (_, _) => stopAllMenu.Dispose();
+        toolbarRow2.Controls.Add(stopAllButton);
 
         _managerPrimaryToolbar = toolbarRow1;
         _managerActionToolbar = toolbarRow2;
@@ -1354,6 +1384,34 @@ public sealed partial class ManagerForm : Form
                 "start_all_complete",
                 force: true);
         }
+    }
+
+    async Task StopAllAndCloseChromeAsync()
+    {
+        // Tái sử dụng nguyên Stop All hiện tại trước. Hàm này đã cancel Auto Profile,
+        // kết thúc Run Strategy và đăng ký manual intent trước khi gửi STOP để không bù lại.
+        await StopAllAsync();
+
+        // Cho Worker một nhịp ngắn để hoàn tất chuyển STOPPED rồi gọi đúng cơ chế
+        // Đóng Chrome hiện có cho từng profile. Không dùng manualIntent=true ở đây vì
+        // StopAllAsync() đã đăng ký intent thủ công; đăng ký lần nữa có thể co target 2 lần.
+        await Task.Delay(250);
+
+        var contexts = _contexts.Values.ToList();
+        foreach (var ctx in contexts)
+        {
+            try
+            {
+                await CloseChromeForProfileAsync(ctx);
+            }
+            catch (Exception ex)
+            {
+                // Một Chrome lỗi không được làm các profile còn lại không được đóng.
+                _log.Warn($"[STOP_ALL_CLOSE_CHROME_WARN] profile={ctx.Profile.Name} error={ex.Message}");
+            }
+        }
+
+        _log.Info($"[STOP_ALL_CLOSE_CHROME] requested={contexts.Count}");
     }
 
     async Task StopAllAsync()
@@ -3005,7 +3063,7 @@ public sealed partial class ManagerForm : Form
             var timeLoginText =
                 timeLoginResults.TryGetValue(item.Username, out var timeLogin)
                     && !string.IsNullOrWhiteSpace(timeLogin)
-                        ? timeLogin.Trim()
+                        ? FormatTimeLoginForDisplay(timeLogin)
                         : "—";
 
             detailInfo.Text =
@@ -3085,7 +3143,7 @@ public sealed partial class ManagerForm : Form
                             : $"#{reuseItem.Position} · {FormatReusableRuntime(reuseItem.TotalRuntime)}"
                         : "",
                     timeLoginResults.TryGetValue(item.Username, out var timeLoginValue)
-                        ? timeLoginValue
+                        ? FormatTimeLoginForDisplay(timeLoginValue)
                         : "",
                     string.IsNullOrWhiteSpace(item.AssignedProfile)
                         ? "CHƯA GÁN PROFILE"
@@ -5446,8 +5504,8 @@ public sealed partial class ManagerForm : Form
         {
             Text = title,
             Width = Math.Clamp(chooserColumns * 178 + 70, 500, 1120),
-            Height = 565,
-            MinimumSize = new Size(500, 440),
+            Height = 585,
+            MinimumSize = new Size(500, 460),
             StartPosition = FormStartPosition.CenterParent,
             FormBorderStyle = FormBorderStyle.Sizable,
             MinimizeBox = false,
@@ -5479,17 +5537,68 @@ public sealed partial class ManagerForm : Form
             AutoSize = true,
             AutoSizeMode = AutoSizeMode.GrowAndShrink,
             ColumnCount = 1,
-            RowCount = 3,
+            RowCount = 4,
             Margin = new Padding(0, 0, 0, 8)
         };
         var label = new Label { Text = "Chọn profile cần mở", AutoSize = true, Font = new Font("Segoe UI", 10F, FontStyle.Bold), Margin = new Padding(0, 0, 0, 8) };
         var search = new TextBox { Dock = DockStyle.Top, PlaceholderText = "Tìm profile...", Font = new Font("Segoe UI", 11F), Margin = new Padding(0, 0, 0, 8) };
-        var multiSelect = new CheckBox { Text = "Chọn nhiều profile", AutoSize = true, Font = new Font("Segoe UI", 10F), Margin = new Padding(0, 0, 0, 2) };
+        var rangeSelect = new CheckBox { Text = "Chọn dãy", AutoSize = true, Font = new Font("Segoe UI", 10F), Margin = new Padding(0, 1, 12, 0) };
+        var clearSelection = new Button { Text = "Bỏ chọn tất cả", AutoSize = false, Width = 122, Height = 28, Margin = new Padding(0, 0, 12, 0) };
+        ModernDialog.StyleSecondaryButton(clearSelection);
+        // Style chung có thể co nút theo DPI; ép lại đủ rộng để không cắt chữ.
+        clearSelection.AutoSize = false;
+        clearSelection.Width = 122;
+        clearSelection.MinimumSize = new Size(122, 28);
+        var rangeHint = new Label
+        {
+            Text = "",
+            AutoSize = true,
+            ForeColor = Color.DimGray,
+            Font = new Font("Segoe UI", 9F),
+            Margin = new Padding(0, 3, 14, 0),
+            Visible = false
+        };
+        var dragHint = new Label
+        {
+            Text = "Kéo khung ở vùng trống để quét chọn",
+            AutoSize = true,
+            ForeColor = Color.DimGray,
+            Font = new Font("Segoe UI", 9F),
+            Margin = new Padding(0, 3, 0, 0)
+        };
+        var selectTools = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            WrapContents = false,
+            FlowDirection = FlowDirection.LeftToRight,
+            Margin = new Padding(0, 0, 0, 3),
+            Padding = new Padding(0)
+        };
+        selectTools.Controls.Add(rangeSelect);
+        selectTools.Controls.Add(clearSelection);
+
+        // Tách phần hướng dẫn khỏi hàng nút để không bị cắt chữ ở DPI cao/cửa sổ hẹp.
+        var selectHints = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            WrapContents = true,
+            FlowDirection = FlowDirection.LeftToRight,
+            Margin = new Padding(0, 0, 0, 2),
+            Padding = new Padding(0)
+        };
+        selectHints.Controls.Add(rangeHint);
+        selectHints.Controls.Add(dragHint);
+
         ModernDialog.StylePrimaryLabel(label);
         ModernDialog.StyleTextInput(search);
         header.Controls.Add(label, 0, 0);
         header.Controls.Add(search, 0, 1);
-        header.Controls.Add(multiSelect, 0, 2);
+        header.Controls.Add(selectTools, 0, 2);
+        header.Controls.Add(selectHints, 0, 3);
 
         var viewport = new Panel
         {
@@ -5497,7 +5606,8 @@ public sealed partial class ManagerForm : Form
             AutoScroll = true,
             BorderStyle = BorderStyle.FixedSingle,
             BackColor = Color.White,
-            Margin = new Padding(0)
+            Margin = new Padding(0),
+            Cursor = Cursors.Default
         };
         var profileGrid = new TableLayoutPanel
         {
@@ -5534,21 +5644,235 @@ public sealed partial class ManagerForm : Form
         form.CancelButton = cancel;
 
         var checkedContexts = new HashSet<ProfileContext>();
-        ProfileContext? selectedSingleContext = allItems.FirstOrDefault()?.Context;
+        var visibleChecks = new List<CheckBox>();
+        var filteredContexts = new List<ProfileContext>();
+        ProfileContext? rangeAnchor = null;
         ProfileOpenSelection? selection = null;
+
+        // Rubber-band selection giống File Explorer. Logic chọn vẫn dùng tọa độ
+        // screen như trước (đã hoạt động đúng). Riêng phần hiển thị khung dùng một
+        // overlay con của viewport, nên không phụ thuộc màn hình chính/phụ và chỉ
+        // vẽ viền, không tô trắng vùng bên trong.
+        var marqueeActive = false;
+        var marqueeThresholdPassed = false;
+        var marqueeStartScreen = Point.Empty;
+        var marqueeBaseline = new HashSet<ProfileContext>();
+        var marqueeOverlay = new Panel
+        {
+            BackColor = Color.DodgerBlue,
+            Visible = false,
+            Enabled = false,
+            TabStop = false,
+            Margin = new Padding(0)
+        };
+        viewport.Controls.Add(marqueeOverlay);
+        marqueeOverlay.BringToFront();
+
+        Rectangle NormalizeRectangle(Point a, Point b)
+        {
+            var left = Math.Min(a.X, b.X);
+            var top = Math.Min(a.Y, b.Y);
+            var right = Math.Max(a.X, b.X);
+            var bottom = Math.Max(a.Y, b.Y);
+            return Rectangle.FromLTRB(left, top, right, bottom);
+        }
+
+        void HideMarqueeOutline()
+        {
+            marqueeOverlay.Visible = false;
+            marqueeOverlay.Region?.Dispose();
+            marqueeOverlay.Region = null;
+        }
+
+        void ShowMarqueeOutline(Rectangle screenRect)
+        {
+            if (screenRect.Width <= 1 || screenRect.Height <= 1)
+            {
+                HideMarqueeOutline();
+                return;
+            }
+
+            // Đổi từ screen -> client của chính viewport để khung luôn bám đúng
+            // cửa sổ hiện tại, kể cả form đang nằm trên màn hình phụ/DPI khác.
+            var clientTopLeft = viewport.PointToClient(screenRect.Location);
+            var clientBottomRight = viewport.PointToClient(new Point(screenRect.Right, screenRect.Bottom));
+            var clientRect = NormalizeRectangle(clientTopLeft, clientBottomRight);
+            clientRect = Rectangle.Intersect(clientRect, viewport.ClientRectangle);
+            if (clientRect.Width <= 1 || clientRect.Height <= 1)
+            {
+                HideMarqueeOutline();
+                return;
+            }
+
+            // viewport có AutoScroll nên tọa độ con phải bù lại scroll offset để
+            // overlay vẫn nằm đúng vị trí đang thấy trên màn hình.
+            var scrollOffset = viewport.AutoScrollPosition; // getter trả giá trị âm khi đã scroll
+            marqueeOverlay.Bounds = new Rectangle(
+                clientRect.X - scrollOffset.X,
+                clientRect.Y - scrollOffset.Y,
+                clientRect.Width,
+                clientRect.Height);
+            var border = Math.Max(1, (int)Math.Round(2f * form.DeviceDpi / 96f));
+            var outlineRegion = new Region(new Rectangle(0, 0, clientRect.Width, clientRect.Height));
+            var inner = new Rectangle(
+                border,
+                border,
+                Math.Max(0, clientRect.Width - border * 2),
+                Math.Max(0, clientRect.Height - border * 2));
+            if (inner.Width > 0 && inner.Height > 0)
+                outlineRegion.Exclude(inner);
+
+            marqueeOverlay.Region?.Dispose();
+            marqueeOverlay.Region = outlineRegion;
+            marqueeOverlay.Visible = true;
+            marqueeOverlay.BringToFront();
+        }
+
+        void CancelMarquee()
+        {
+            HideMarqueeOutline();
+            marqueeActive = false;
+            marqueeThresholdPassed = false;
+            viewport.Capture = false;
+        }
+
+        void UpdateOpenEnabled() => open.Enabled = checkedContexts.Count > 0;
+
+        void SetContextChecked(ProfileContext context, bool value)
+        {
+            if (value) checkedContexts.Add(context);
+            else checkedContexts.Remove(context);
+
+            foreach (var check in visibleChecks)
+            {
+                if (!ReferenceEquals(check.Tag, context) || check.Checked == value) continue;
+                check.Checked = value;
+            }
+            UpdateOpenEnabled();
+        }
+
+        void ApplyRangeSelection(ProfileContext clickedContext)
+        {
+            if (!rangeSelect.Checked) return;
+
+            SetContextChecked(clickedContext, true);
+            if (rangeAnchor is null)
+            {
+                rangeAnchor = clickedContext;
+                rangeHint.Text = $"Mốc đầu: {clickedContext.Profile.Name} — chọn mốc cuối";
+                rangeHint.Visible = true;
+                return;
+            }
+
+            var first = filteredContexts.FindIndex(context => ReferenceEquals(context, rangeAnchor));
+            var last = filteredContexts.FindIndex(context => ReferenceEquals(context, clickedContext));
+            if (first < 0 || last < 0)
+            {
+                rangeAnchor = clickedContext;
+                rangeHint.Text = $"Mốc đầu: {clickedContext.Profile.Name} — chọn mốc cuối";
+                rangeHint.Visible = true;
+                return;
+            }
+
+            var from = Math.Min(first, last);
+            var to = Math.Max(first, last);
+            for (var index = from; index <= to; index++)
+                SetContextChecked(filteredContexts[index], true);
+
+            rangeAnchor = null;
+            rangeHint.Text = "Chọn mốc đầu cho dãy tiếp theo";
+            rangeHint.Visible = true;
+        }
+
+        void BeginMarquee(Control source, MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Left) return;
+            CancelMarquee();
+            marqueeActive = true;
+            marqueeThresholdPassed = false;
+            marqueeStartScreen = source.PointToScreen(e.Location);
+            marqueeBaseline = new HashSet<ProfileContext>(checkedContexts);
+            viewport.Capture = true;
+        }
+
+        Rectangle GetMarqueeHitBounds(CheckBox check)
+        {
+            // Không dùng toàn bộ chiều rộng row. Chỉ vùng checkbox + tên PRF
+            // mới được coi là vùng chọn, để kéo ở khoảng trắng bên phải không tick sớm.
+            var textWidth = TextRenderer.MeasureText(
+                check.Text ?? string.Empty,
+                check.Font,
+                Size.Empty,
+                TextFormatFlags.NoPadding | TextFormatFlags.SingleLine).Width;
+            var hitWidth = Math.Min(check.ClientSize.Width, Math.Max(30, textWidth + 30));
+            var localHit = new Rectangle(0, 0, hitWidth, check.ClientSize.Height);
+            return check.RectangleToScreen(localHit);
+        }
+
+        void UpdateMarquee(Point currentScreen)
+        {
+            if (!marqueeActive) return;
+
+            if (!marqueeThresholdPassed)
+            {
+                var dragSize = SystemInformation.DragSize;
+                var dx = Math.Abs(currentScreen.X - marqueeStartScreen.X);
+                var dy = Math.Abs(currentScreen.Y - marqueeStartScreen.Y);
+                if (dx < Math.Max(4, dragSize.Width / 2) && dy < Math.Max(4, dragSize.Height / 2))
+                {
+                    HideMarqueeOutline();
+                    return;
+                }
+                marqueeThresholdPassed = true;
+            }
+
+            var viewportScreen = viewport.RectangleToScreen(viewport.ClientRectangle);
+            var raw = NormalizeRectangle(marqueeStartScreen, currentScreen);
+            var clipped = Rectangle.Intersect(raw, viewportScreen);
+            ShowMarqueeOutline(clipped);
+
+            foreach (var check in visibleChecks)
+            {
+                if (check.Tag is not ProfileContext context) continue;
+                var itemScreen = GetMarqueeHitBounds(check);
+                var inside = clipped.Width > 1 && clipped.Height > 1 && clipped.IntersectsWith(itemScreen);
+                var shouldCheck = marqueeBaseline.Contains(context) || inside;
+                if (check.Checked != shouldCheck) check.Checked = shouldCheck;
+                if (shouldCheck) checkedContexts.Add(context);
+                else checkedContexts.Remove(context);
+            }
+            UpdateOpenEnabled();
+        }
+
+        void EndMarquee()
+        {
+            if (!marqueeActive) return;
+            CancelMarquee();
+            UpdateOpenEnabled();
+        }
 
         void RebuildProfiles()
         {
+            CancelMarquee();
             var keyword = search.Text.Trim();
             var filtered = string.IsNullOrEmpty(keyword)
                 ? allItems
                 : allItems.Where(item => item.Context.Profile.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase)).ToList();
+            filteredContexts = filtered.Select(item => item.Context).ToList();
 
-            if (!multiSelect.Checked && selectedSingleContext is not null && !filtered.Any(x => ReferenceEquals(x.Context, selectedSingleContext)))
-                selectedSingleContext = filtered.FirstOrDefault()?.Context;
+            if (rangeAnchor is not null && !filteredContexts.Any(context => ReferenceEquals(context, rangeAnchor)))
+            {
+                rangeAnchor = null;
+                if (rangeSelect.Checked)
+                {
+                    rangeHint.Text = "Chọn mốc đầu";
+                    rangeHint.Visible = true;
+                }
+            }
 
             profileGrid.SuspendLayout();
             profileGrid.Controls.Clear();
+            visibleChecks.Clear();
             profileGrid.ColumnStyles.Clear();
             profileGrid.RowStyles.Clear();
             profileGrid.RowCount = 10;
@@ -5562,95 +5886,106 @@ public sealed partial class ManagerForm : Form
                 var item = filtered[i];
                 var col = i / 10;
                 var row = i % 10;
-                if (multiSelect.Checked)
+                var check = new CheckBox
                 {
-                    var check = new CheckBox
-                    {
-                        Text = item.Context.Profile.Name,
-                        Tag = item.Context,
-                        Checked = checkedContexts.Contains(item.Context),
-                        AutoSize = false,
-                        Width = 164,
-                        Height = 30,
-                        Margin = new Padding(2, 1, 2, 1),
-                        Padding = new Padding(2, 0, 0, 0),
-                        Font = new Font("Segoe UI", 10.5F),
-                        BackColor = Color.White
-                    };
-                    check.CheckedChanged += (_, _) =>
-                    {
-                        if (check.Checked) checkedContexts.Add(item.Context);
-                        else checkedContexts.Remove(item.Context);
-                        open.Enabled = checkedContexts.Count > 0;
-                    };
-                    profileGrid.Controls.Add(check, col, row);
-                }
-                else
+                    Text = item.Context.Profile.Name,
+                    Tag = item.Context,
+                    Checked = checkedContexts.Contains(item.Context),
+                    AutoSize = false,
+                    Width = 164,
+                    Height = 30,
+                    Margin = new Padding(2, 1, 2, 1),
+                    Padding = new Padding(2, 0, 0, 0),
+                    Font = new Font("Segoe UI", 10.5F),
+                    BackColor = Color.White
+                };
+                check.CheckedChanged += (_, _) =>
                 {
-                    var radio = new RadioButton
-                    {
-                        Text = item.Context.Profile.Name,
-                        Tag = item.Context,
-                        Checked = ReferenceEquals(item.Context, selectedSingleContext),
-                        AutoSize = false,
-                        Width = 164,
-                        Height = 30,
-                        Margin = new Padding(2, 1, 2, 1),
-                        Padding = new Padding(2, 0, 0, 0),
-                        Font = new Font("Segoe UI", 10.5F),
-                        BackColor = Color.White
-                    };
-                    radio.CheckedChanged += (_, _) =>
-                    {
-                        if (!radio.Checked) return;
-                        selectedSingleContext = item.Context;
-                        open.Enabled = true;
-                    };
-                    radio.MouseDoubleClick += (_, _) => { selectedSingleContext = item.Context; open.PerformClick(); };
-                    profileGrid.Controls.Add(radio, col, row);
-                }
+                    if (check.Checked) checkedContexts.Add(item.Context);
+                    else checkedContexts.Remove(item.Context);
+                    UpdateOpenEnabled();
+                };
+                check.Click += (_, _) =>
+                {
+                    if (rangeSelect.Checked)
+                        ApplyRangeSelection(item.Context);
+                };
+                visibleChecks.Add(check);
+                profileGrid.Controls.Add(check, col, row);
             }
             profileGrid.ResumeLayout(true);
             profileGrid.Location = new Point(0, 0);
-            open.Enabled = multiSelect.Checked ? checkedContexts.Count > 0 : selectedSingleContext is not null && filtered.Any(x => ReferenceEquals(x.Context, selectedSingleContext));
+            UpdateOpenEnabled();
         }
 
         void OpenSelectedProfiles()
         {
-            if (multiSelect.Checked)
+            if (checkedContexts.Count == 0)
             {
-                if (checkedContexts.Count == 0)
-                {
-                    ModernDialog.ShowMessage(form, "Vui lòng chọn ít nhất một profile.", "Mở profile", MessageBoxIcon.Information);
-                    return;
-                }
-                selection = new ProfileOpenSelection(
-                    IsMultiple: true,
-                    Contexts: allItems.Where(item => checkedContexts.Contains(item.Context)).Select(item => item.Context).ToList());
+                ModernDialog.ShowMessage(form, "Vui lòng chọn ít nhất một profile.", "Mở profile", MessageBoxIcon.Information);
+                return;
             }
-            else
-            {
-                if (selectedSingleContext is null) return;
-                selection = new ProfileOpenSelection(IsMultiple: false, Contexts: [selectedSingleContext]);
-            }
+
+            var selected = allItems
+                .Where(item => checkedContexts.Contains(item.Context))
+                .Select(item => item.Context)
+                .ToList();
+            selection = new ProfileOpenSelection(IsMultiple: selected.Count > 1, Contexts: selected);
             form.DialogResult = DialogResult.OK;
             form.Close();
         }
 
         search.TextChanged += (_, _) => RebuildProfiles();
-        multiSelect.CheckedChanged += (_, _) =>
+        rangeSelect.CheckedChanged += (_, _) =>
         {
-            // Chế độ chọn nhiều luôn bắt đầu trống; không lấy profile đang chọn ở chế độ đơn.
-            if (multiSelect.Checked) checkedContexts.Clear();
-            RebuildProfiles();
+            rangeAnchor = null;
+            rangeHint.Text = rangeSelect.Checked ? "Chọn mốc đầu" : "";
+            rangeHint.Visible = rangeSelect.Checked;
             viewport.Focus();
         };
+        clearSelection.Click += (_, _) =>
+        {
+            CancelMarquee();
+            checkedContexts.Clear();
+            foreach (var check in visibleChecks)
+                check.Checked = false;
+            rangeAnchor = null;
+            rangeHint.Text = rangeSelect.Checked ? "Chọn mốc đầu" : "";
+            rangeHint.Visible = rangeSelect.Checked;
+            UpdateOpenEnabled();
+            viewport.Focus();
+        };
+
+        // Bắt đầu kéo từ vùng trống của danh sách. Capture được chuyển về viewport
+        // nên khung vẫn tiếp tục chạy khi con trỏ đi qua các checkbox/profile.
+        viewport.MouseDown += (_, e) => BeginMarquee(viewport, e);
+        profileGrid.MouseDown += (_, e) => BeginMarquee(profileGrid, e);
+        viewport.MouseMove += (_, e) =>
+        {
+            if (marqueeActive && (Control.MouseButtons & MouseButtons.Left) == MouseButtons.Left)
+                UpdateMarquee(viewport.PointToScreen(e.Location));
+        };
+        profileGrid.MouseMove += (_, e) =>
+        {
+            if (marqueeActive && (Control.MouseButtons & MouseButtons.Left) == MouseButtons.Left)
+                UpdateMarquee(profileGrid.PointToScreen(e.Location));
+        };
+        viewport.MouseUp += (_, e) => { if (e.Button == MouseButtons.Left) EndMarquee(); };
+        profileGrid.MouseUp += (_, e) => { if (e.Button == MouseButtons.Left) EndMarquee(); };
+        viewport.MouseCaptureChanged += (_, _) =>
+        {
+            if (marqueeActive && !viewport.Capture) EndMarquee();
+        };
+
         open.Click += (_, _) => OpenSelectedProfiles();
+        form.Deactivate += (_, _) => CancelMarquee();
+        form.FormClosed += (_, _) => CancelMarquee();
         form.KeyDown += (_, e) =>
         {
             if (e.KeyCode == Keys.Escape)
             {
                 e.Handled = true;
+                CancelMarquee();
                 form.DialogResult = DialogResult.Cancel;
                 form.Close();
             }

@@ -14,6 +14,8 @@ public sealed partial class ManagerForm
     }
 
     Button? _autoReplacementManualControlButton;
+    Label? _autoReplacementRunTargetStatusLabel;
+    bool _autoReplacementRunTargetRefreshHooked;
     bool _autoReplacementManualControlInitialized;
     bool _emergencyStopStateInitialized;
     volatile bool _emergencyStopActive;
@@ -160,6 +162,22 @@ public sealed partial class ManagerForm
 
         toolbar.Controls.Add(_autoReplacementManualControlButton);
 
+        _autoReplacementRunTargetStatusLabel = new Label
+        {
+            AutoSize = true,
+            Height = 34,
+            MinimumSize = new Size(285, 34),
+            Margin = new Padding(12, 3, 4, 3),
+            Padding = new Padding(0),
+            TextAlign = ContentAlignment.MiddleLeft,
+            BorderStyle = BorderStyle.None,
+            BackColor = Color.Transparent,
+            ForeColor = Color.DimGray,
+            Font = new Font("Segoe UI", 9F, FontStyle.Bold),
+            Text = "● Manager: Đã dừng  |  0 / 0 PRF"
+        };
+        toolbar.Controls.Add(_autoReplacementRunTargetStatusLabel);
+
         try
         {
             if (_autoCloseToolbarButton is not null
@@ -171,13 +189,121 @@ public sealed partial class ManagerForm
                     _autoReplacementManualControlButton,
                     Math.Min(toolbar.Controls.Count - 1, autoCloseIndex + 1));
             }
+
+            // Trạng thái luôn nằm ngay bên phải nút Dừng khẩn cấp/Tiếp tục.
+            var emergencyIndex = toolbar.Controls.GetChildIndex(_autoReplacementManualControlButton);
+            toolbar.Controls.SetChildIndex(
+                _autoReplacementRunTargetStatusLabel,
+                Math.Min(toolbar.Controls.Count - 1, emergencyIndex + 1));
         }
         catch { }
 
+        if (!_autoReplacementRunTargetRefreshHooked)
+        {
+            _autoReplacementRunTargetRefreshHooked = true;
+            _refreshTimer.Tick += (_, _) => UpdateAutoReplacementRunTargetStatus();
+        }
+
         UpdateEmergencyStopButton();
         UpdateAutoCloseToolbarButtonText();
+        UpdateAutoReplacementRunTargetStatus();
 
         _log.Info($"[EMERGENCY_STOP_UI_READY] halted={IsAutomationHalted}");
+    }
+
+    void UpdateAutoReplacementRunTargetStatus()
+    {
+        var label = _autoReplacementRunTargetStatusLabel;
+        if (label is null || label.IsDisposed)
+            return;
+
+        // Đây chỉ là snapshot UI 1 giây/lần. Không mở Chrome, không gọi Worker/CDP,
+        // không đọc Excel. Chỉ đọc state Manager đã có sẵn để tránh tăng tải backend.
+        var running = 0;
+        try
+        {
+            running = _contexts.Values
+                .ToList()
+                .Count(ctx => string.Equals(
+                    GetEffectiveRuntimeState(ctx),
+                    RuntimeStateRunning,
+                    StringComparison.Ordinal));
+        }
+        catch
+        {
+            // Chỉ là trạng thái hiển thị; không được ảnh hưởng scheduler.
+        }
+
+        int target;
+        bool initialized;
+        lock (_autoReplacementFixedSlotLock)
+        {
+            target = Math.Max(0, _autoReplacementTargetSlots);
+            initialized = _autoReplacementTargetInitialized;
+        }
+
+        if (!initialized)
+            target = 0;
+
+        var pending = new AutoReplacementPendingCapacitySnapshot(0, 0, 0);
+        try { pending = GetAutoReplacementPendingCapacitySnapshot(); } catch { }
+
+        var autoProfileRunning = false;
+        try
+        {
+            lock (_autoProfileRunCtsLock)
+                autoProfileRunning = _autoProfileActiveRunCts is { IsCancellationRequested: false };
+        }
+        catch { }
+
+        string managerState;
+        Color stateColor;
+
+        if (_emergencyResumeInProgress)
+        {
+            managerState = "Đang kiểm tra";
+            stateColor = Color.FromArgb(96, 96, 96);
+        }
+        else if (IsAutomationHalted)
+        {
+            managerState = "Dừng khẩn cấp";
+            stateColor = Color.FromArgb(168, 42, 42);
+        }
+        else if (autoProfileRunning)
+        {
+            managerState = "Đang tạo PRF";
+            stateColor = Color.FromArgb(164, 94, 17);
+        }
+        else if (_autoReplacementQueueRunning || pending.Reserving > 0)
+        {
+            managerState = "Đang bù PRF";
+            stateColor = Color.FromArgb(164, 94, 17);
+        }
+        else if (target > 0 && running < target)
+        {
+            // Pending WAITING/cooldown/chờ hết giờ tạo đều gom thành trạng thái vận hành
+            // dễ đọc. Chi tiết kỹ thuật vẫn nằm trong Log, không làm toolbar quá dài.
+            managerState = "Đang chờ";
+            stateColor = Color.FromArgb(164, 94, 17);
+        }
+        else if (target > 0 || running > 0)
+        {
+            managerState = "Đang chạy";
+            stateColor = Color.FromArgb(25, 113, 55);
+        }
+        else
+        {
+            managerState = "Đã dừng";
+            stateColor = Color.DimGray;
+        }
+
+        var text = $"● Manager: {managerState}  |  {running} / {target} PRF";
+        if (!string.Equals(label.Text, text, StringComparison.Ordinal))
+            label.Text = text;
+
+        // Dòng trạng thái thuần: không border, không nền/panel riêng.
+        label.BackColor = Color.Transparent;
+        label.ForeColor = stateColor;
     }
 
     static bool IsAutoReplacementManagerActionToolbar(FlowLayoutPanel panel)

@@ -26,6 +26,7 @@ public sealed class ProxyManagerForm : Form
     readonly DataGridView _assignmentGrid = Grid();
     readonly Label _status = new() { AutoSize = false, Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft, AutoEllipsis = true };
     readonly Button _testButton = new() { Text = "Test tất cả", AutoSize = true };
+    readonly Button _useSelectedProxyButton = new() { Text = "Dùng Proxy đã chọn", AutoSize = true };
     readonly Button _autoAssignButton = new() { Text = "Test + Gán tự động", AutoSize = true };
     readonly Button _replaceBadButton = new() { Text = "Gán lại Proxy lỗi", AutoSize = true };
     readonly Button _applyButton = new() { Text = "Áp dụng cho lần mở tiếp theo", AutoSize = true };
@@ -254,8 +255,12 @@ public sealed class ProxyManagerForm : Form
         _testButton.Width = 150;
         _testButton.Height = 29;
         _testButton.Click += async (_, _) => await TestAllAsync();
+        _useSelectedProxyButton.Width = 150;
+        _useSelectedProxyButton.Height = 29;
+        _useSelectedProxyButton.Click += async (_, _) => await UseSelectedProxyAsync();
         buttons.Controls.Add(add);
         buttons.Controls.Add(_testButton);
+        buttons.Controls.Add(_useSelectedProxyButton);
         buttons.Controls.Add(remove);
         import.Controls.Add(buttons, 1, 0);
         import.SetRowSpan(buttons, 3);
@@ -434,6 +439,7 @@ public sealed class ProxyManagerForm : Form
         _autoAssignButton.Text = shared ? "Test + Chọn Proxy chung" : "Test + Gán tự động";
         _replaceBadButton.Text = shared ? "Chuyển Proxy chung lỗi" : "Gán lại Proxy lỗi";
         _clearAssignmentsButton.Enabled = enabled && !shared;
+        _useSelectedProxyButton.Enabled = enabled && shared;
         _assignmentGrid.Enabled = enabled;
     }
 
@@ -673,6 +679,46 @@ public sealed class ProxyManagerForm : Form
         _status.Text = $"Đã xóa {removed} Proxy và bỏ các mapping liên quan. PRF đang mở không bị restart.";
     }
 
+    async Task UseSelectedProxyAsync()
+    {
+        SaveSettingsFromUi();
+
+        if (!_master.Checked)
+        {
+            _status.Text = "Hãy bật Proxy trước khi chọn Proxy đang dùng.";
+            return;
+        }
+        if (!_modeManagerShared.Checked)
+        {
+            _status.Text = "Nút này chỉ dùng ở chế độ 1 Proxy chung toàn Manager.";
+            return;
+        }
+
+        var row = _proxyGrid.CurrentRow;
+        var proxyId = row?.Cells["ProxyId"].Value?.ToString() ?? "";
+        if (string.IsNullOrWhiteSpace(proxyId))
+        {
+            _status.Text = "Hãy chọn 1 Proxy trong Pool trước.";
+            return;
+        }
+
+        await RunOperationAsync(async token =>
+        {
+            _status.Text = "Đang chuyển sang Proxy đã chọn...";
+            var endpoint = await _coordinator.UseManagerSharedProxyAsync(proxyId, token);
+            if (endpoint is null)
+            {
+                _status.Text = "Không thể dùng Proxy đã chọn. Hãy kiểm tra Proxy còn hạn và test kết nối.";
+                return;
+            }
+
+            // Ghi Proxy chung mới vào config để các PRF dùng ở lần mở Chrome tiếp theo.
+            // Không restart hoặc đổi mạng của những PRF đang mở.
+            await _coordinator.ApplyAssignmentsToProfilesAsync(Profiles());
+            _status.Text = $"Đã chuyển Proxy đang dùng sang {endpoint.MaskedDisplay}. PRF đang mở giữ nguyên; có hiệu lực ở lần mở Chrome tiếp theo.";
+        });
+    }
+
     async Task TestAllAsync()
     {
         SaveSettingsFromUi();
@@ -778,6 +824,7 @@ public sealed class ProxyManagerForm : Form
     {
         _master.Enabled = !busy;
         _testButton.Enabled = !busy;
+        _useSelectedProxyButton.Enabled = !busy && _master.Checked && _modeManagerShared.Checked;
         _autoAssignButton.Enabled = !busy;
         _replaceBadButton.Enabled = !busy;
         _applyButton.Enabled = !busy;

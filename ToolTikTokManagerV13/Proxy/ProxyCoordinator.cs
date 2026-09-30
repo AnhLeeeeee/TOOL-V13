@@ -463,6 +463,59 @@ public sealed class ProxyCoordinator
         return null;
     }
 
+    public async Task<ProxyEndpoint?> UseManagerSharedProxyAsync(
+        string proxyId,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(proxyId)) return null;
+
+        await _sharedProxyGate.WaitAsync(cancellationToken);
+        try
+        {
+            ProxySettings settings;
+            ProxyEndpoint? selected;
+            string previousId;
+            lock (_stateSync)
+            {
+                settings = CopySettings(_state.Settings);
+                previousId = _state.ActiveManagerProxyId;
+                var endpoint = _state.Proxies.FirstOrDefault(x => x.Id.Equals(proxyId, StringComparison.OrdinalIgnoreCase));
+                selected = endpoint is null ? null : CloneEndpoint(endpoint);
+            }
+
+            if (!settings.Enabled || settings.DistributionMode != ProxyDistributionMode.ManagerShared)
+                return null;
+            if (selected is null || !selected.Enabled || selected.IsExpired)
+                return null;
+
+            // Người dùng chủ động chọn Proxy: nếu health chưa đủ tin cậy thì test ngay.
+            // Chỉ chuyển ActiveManagerProxyId khi Proxy thực sự dùng được để tránh
+            // làm toàn Manager rơi sang một Proxy chết.
+            var now = DateTimeOffset.UtcNow;
+            var fresh = selected.LastTestUtc is not null
+                        && now - selected.LastTestUtc.Value <= SharedProxyHealthFreshFor;
+            if (!selected.IsHealthy || !fresh)
+            {
+                var test = await _tester.TestAsync(selected, cancellationToken);
+                ApplyTestResult(selected.Id, test);
+                selected = GetProxyById(selected.Id);
+                if (selected is not { IsHealthy: true })
+                {
+                    _diagnostics.Write("SHARED_MANUAL_SELECT_REJECT", $"proxy={selected?.MaskedDisplay ?? proxyId} health={test.Health} error={Short(test.Error)}");
+                    return null;
+                }
+            }
+
+            SetActiveManagerProxy(selected.Id, previousId, "manual_selected");
+            _diagnostics.Write("SHARED_MANUAL_SELECT", $"proxy={selected.MaskedDisplay} action=next_launch_only");
+            return selected;
+        }
+        finally
+        {
+            _sharedProxyGate.Release();
+        }
+    }
+
     async Task<ProxyEndpoint?> EnsureManagerSharedProxyAsync(
         CancellationToken cancellationToken,
         bool forceHealthCheck,

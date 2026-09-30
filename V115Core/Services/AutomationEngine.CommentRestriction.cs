@@ -19,10 +19,10 @@ public sealed partial class AutomationEngine
     }
 
     /// <summary>
-    /// Poll DOM nhẹ trong 2 giây sau Enter. Hai phản hồi được ưu tiên:
-    /// - popup “Đăng nhập vào TikTok”: cộng đúng một xác nhận cho lần Enter hiện tại;
+    /// Poll DOM nhẹ trong 2 giây sau Enter. Ba phản hồi được ưu tiên:
+    /// - toast “Vui lòng đăng nhập trước”: visible + hit-test, xác nhận 2 lượt Enter với chuyển LIVE + F5 ở giữa;
+    /// - popup “Đăng nhập vào TikTok”: giữ flow xác nhận 2 lượt Enter hiện tại;
     /// - toast cấm bình luận: giữ nguyên flow chuyển LIVE hiện tại.
-    /// Popup login được xác nhận xuyên qua nhiều lần Click/Dán/Enter, không xác nhận bằng F5.
     /// </summary>
     async Task<bool> WatchPostEnterReactionAsync(string pointName, int restartStep, CancellationToken ct)
     {
@@ -52,11 +52,19 @@ public sealed partial class AutomationEngine
                 marker = "";
             }
 
+            if (marker.StartsWith("LOGIN_TOAST|", StringComparison.Ordinal))
+            {
+                // Toast mới chỉ có giá trị khi DetectPostEnterReactionAsync đã xác nhận visible + hit-test.
+                // Tách streak khỏi popup login cũ để không trộn hai loại bằng chứng.
+                ResetRuntimeLoginModalConfirmation($"{pointName}: chuyển sang xác minh toast Vui lòng đăng nhập trước");
+                RegisterRuntimeLoginToastAfterEnter(pointName, restartStep, marker);
+                return true;
+            }
+
             if (marker.StartsWith("LOGIN_MODAL|", StringComparison.Ordinal))
             {
-                // Không coi nội dung là đã gửi thành công. Mỗi Enter chỉ cộng 1 lần rồi thoát.
-                // Lần 1/3 và 2/3 sẽ chuyển LIVE; lần 3/3 latch LOGOUT_CONFIRMED để
-                // Manager gọi đúng luồng đóng sạch + launch_auto + start_auto đang có.
+                // Popup login cũ vẫn là fallback riêng 2/2. Không cộng chéo streak với toast mới.
+                ResetRuntimeLoginToastConfirmation($"{pointName}: chuyển sang xác minh popup Đăng nhập vào TikTok");
                 RegisterRuntimeLoginModalAfterEnter(pointName, restartStep, marker);
                 return true;
             }
@@ -93,6 +101,7 @@ public sealed partial class AutomationEngine
                 {
                     // Một phản hồi sau Enter không phải login-modal phá chuỗi xác nhận mất login.
                     ResetRuntimeLoginModalConfirmation($"{pointName}: xác nhận cấm bình luận {CommentRestrictionConfirmationsRequired}/{CommentRestrictionConfirmationsRequired}");
+                    ResetRuntimeLoginToastConfirmation($"{pointName}: xác nhận cấm bình luận {CommentRestrictionConfirmationsRequired}/{CommentRestrictionConfirmationsRequired}");
 
                     _step = restartStep;
                     _postEnterCommentRestrictionPending = true;
@@ -132,7 +141,10 @@ public sealed partial class AutomationEngine
         // Chỉ reset khi đã có ít nhất một DOM probe thành công. Nếu toàn bộ probe lỗi CDP thì
         // giữ streak cũ để không biến lỗi kỹ thuật thành bằng chứng “login đã hồi”.
         if (successfulProbeCount > 0)
+        {
             ResetRuntimeLoginModalConfirmation($"{pointName}: Enter kế tiếp không còn popup login");
+            ResetRuntimeLoginToastConfirmation($"{pointName}: Enter kế tiếp không còn toast Vui lòng đăng nhập trước");
+        }
 
         return false;
     }
