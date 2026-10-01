@@ -90,6 +90,7 @@ public sealed partial class ManagerForm
     Label? _dashboardSummary;
     Label? _dashboardUpdateStatus;
     Label? _dashboardDeviceId;
+    Button? _dashboardCopyDeviceIdButton;
     Button? _dashboardUpdateButton;
     ComboBox? _dashboardVersionSelector;
     CheckBox? _dashboardHoldVersionToggle;
@@ -266,13 +267,43 @@ public sealed partial class ManagerForm
         var currentDeviceId = DeviceAccessService.GetDeviceId(_baseDir);
         _dashboardDeviceId = new Label
         {
-            AutoSize = false,
+            AutoSize = true,
             Height = 24,
             TextAlign = ContentAlignment.MiddleLeft,
             Text = $"Mã thiết bị: {currentDeviceId}",
             ForeColor = Color.DimGray,
-            Location = new Point(10, 82),
-            AutoEllipsis = true
+            Location = new Point(10, 82)
+        };
+
+        _dashboardCopyDeviceIdButton = new Button
+        {
+            Text = "⧉",
+            Width = 30,
+            Height = 24,
+            Location = new Point(_dashboardDeviceId.Right + 6, 80),
+            Cursor = Cursors.Hand,
+            TabStop = false,
+            AccessibleName = "Sao chép mã máy",
+            AccessibleDescription = "Sao chép mã thiết bị vào clipboard"
+        };
+        UiTheme.StyleButton(_dashboardCopyDeviceIdButton, UiButtonKind.Neutral);
+        _dashboardCopyDeviceIdButton.Click += async (_, _) =>
+        {
+            if (string.IsNullOrWhiteSpace(currentDeviceId)) return;
+
+            try
+            {
+                Clipboard.SetText(currentDeviceId);
+                var oldText = _dashboardCopyDeviceIdButton.Text;
+                _dashboardCopyDeviceIdButton.Text = "✓";
+                await Task.Delay(700);
+                if (_dashboardCopyDeviceIdButton is not null && !_dashboardCopyDeviceIdButton.IsDisposed)
+                    _dashboardCopyDeviceIdButton.Text = oldText;
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"[DEVICE_ID_COPY_FAIL] {ex.Message}");
+            }
         };
 
         _dashboardVersionSelector = new ComboBox
@@ -330,6 +361,7 @@ public sealed partial class ManagerForm
 
         panel.Controls.Add(_dashboardUpdateStatus);
         panel.Controls.Add(_dashboardDeviceId);
+        panel.Controls.Add(_dashboardCopyDeviceIdButton);
         panel.Controls.Add(_dashboardVersionSelector);
         panel.Controls.Add(_dashboardUpdateButton);
         panel.Controls.Add(check);
@@ -347,8 +379,14 @@ public sealed partial class ManagerForm
             const int gap = 8;
             const int rightPadding = 10;
             _dashboardUpdateStatus.Width = Math.Max(250, panel.ClientSize.Width - 20);
-            if (_dashboardDeviceId is not null && !_dashboardDeviceId.IsDisposed)
-                _dashboardDeviceId.Width = Math.Max(220, panel.ClientSize.Width - 20);
+            if (_dashboardDeviceId is not null && !_dashboardDeviceId.IsDisposed
+                && _dashboardCopyDeviceIdButton is not null && !_dashboardCopyDeviceIdButton.IsDisposed)
+            {
+                _dashboardDeviceId.AutoSize = true;
+                _dashboardCopyDeviceIdButton.Left = Math.Min(
+                    Math.Max(10, panel.ClientSize.Width - rightPadding - _dashboardCopyDeviceIdButton.Width),
+                    _dashboardDeviceId.Right + 6);
+            }
 
             var right = Math.Max(0, panel.ClientSize.Width - rightPadding);
             _dashboardHoldVersionToggle.Left = Math.Max(10, right - _dashboardHoldVersionToggle.Width);
