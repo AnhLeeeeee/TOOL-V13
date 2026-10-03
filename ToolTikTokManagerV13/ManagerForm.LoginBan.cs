@@ -105,14 +105,21 @@ public sealed partial class ManagerForm
 
         var runtimeClosed = await CloseLoginBannedRuntimeAsync(ctx, source, detail);
 
-        // Chỉ queue xóa sau khi note=ban đã verify. Nếu đây đang là một candidate
-        // của Tự bù, hoãn xóa tới SAU CleanupCreatedReplacementAttemptAsync để tránh
-        // hai luồng cùng đụng Worker/Chrome/catalog.
+        // Chỉ queue xóa sau khi note=ban đã verify. Không được "defer rồi quên"
+        // khi profile đang là candidate của Tự bù: deleter có interlock riêng và sẽ
+        // chờ _autoReplacementClaimedProfiles/opening được nhả trước khi đụng folder/catalog.
+        // Vì vậy queue job NGAY; nếu đang claim thì job chỉ đứng WAIT_OPEN_CLAIM.
         var replacementClaimed = _autoReplacementClaimedProfiles.Contains(profileName);
-        if (banVerified && !replacementClaimed)
+        if (banVerified)
+        {
+            if (replacementClaimed)
+            {
+                _log.Info(
+                    $"[LOGIN_BAN_AUTO_DELETE_QUEUED_WAIT_CLAIM] profile={profileName} source={source} reason=replacement_cleanup_first");
+            }
+
             QueueAutoDeleteRetiredProfileAfterExcelNote(profileName, "BAN");
-        else if (banVerified)
-            _log.Info($"[LOGIN_BAN_AUTO_DELETE_DEFERRED] profile={profileName} source={source} reason=replacement_cleanup_first");
+        }
 
         WriteAutoActivityLog(
             action: "LOGIN BAN",

@@ -484,9 +484,28 @@ public sealed partial class ManagerForm
         try
         {
             var worker = context.Worker;
+            var workerAlive = false;
 
-            if (worker is not null
-                && !worker.HasExited)
+            if (worker is not null)
+            {
+                try
+                {
+                    workerAlive = !worker.HasExited;
+                }
+                catch (InvalidOperationException ex)
+                {
+                    // Process object có thể đã bị một cleanup song song Dispose sau khi
+                    // Worker thực tế đã thoát. Đây không phải lý do làm chết luôn job xóa.
+                    _log.Info(
+                        $"[{plan.Profile.Name}] [AUTO_RETIRED_DELETE_WORKER_STALE] stage=initial action=treat_as_exited detail={ex.Message}");
+                    try { worker.Dispose(); } catch { }
+                    if (ReferenceEquals(context.Worker, worker))
+                        context.Worker = null;
+                    worker = null;
+                }
+            }
+
+            if (worker is not null && workerAlive)
             {
                 try
                 {
@@ -530,14 +549,37 @@ public sealed partial class ManagerForm
                         $"[{plan.Profile.Name}] [AUTO_RETIRED_DELETE_SHUTDOWN_WARN] {ex.Message}");
                 }
 
-                if (!await WaitForProcessExitAsync(
+                var workerExited = false;
+                try
+                {
+                    workerExited = await WaitForProcessExitAsync(
                         worker,
-                        TimeSpan.FromSeconds(7)))
+                        TimeSpan.FromSeconds(7));
+                }
+                catch (InvalidOperationException ex)
+                {
+                    // Race đã thấy trong log: shutdown/cleanup khác Dispose Process đúng lúc
+                    // WaitForProcessExitAsync đọc HasExited. Coi handle cũ đã hết hiệu lực,
+                    // nhả reference và tiếp tục probe Chrome theo ProfilePath bên dưới.
+                    workerExited = true;
+                    _log.Info(
+                        $"[{plan.Profile.Name}] [AUTO_RETIRED_DELETE_WORKER_STALE] stage=wait_after_shutdown action=treat_as_exited detail={ex.Message}");
+                }
+
+                if (!workerExited)
                 {
                     try
                     {
                         worker.Kill(
                             entireProcessTree: true);
+                    }
+                    catch (InvalidOperationException ex)
+                    {
+                        // Process object vừa mất handle/đã bị Dispose: coi như race cleanup,
+                        // không làm rơi job xóa. Chrome vẫn được verify độc lập ngay sau đây.
+                        workerExited = true;
+                        _log.Info(
+                            $"[{plan.Profile.Name}] [AUTO_RETIRED_DELETE_WORKER_STALE] stage=force_kill action=treat_as_exited detail={ex.Message}");
                     }
                     catch (Exception ex)
                     {
@@ -545,9 +587,23 @@ public sealed partial class ManagerForm
                             $"[{plan.Profile.Name}] [AUTO_RETIRED_DELETE_WORKER_KILL_WARN] {ex.Message}");
                     }
 
-                    if (!await WaitForProcessExitAsync(
-                            worker,
-                            TimeSpan.FromSeconds(3)))
+                    if (!workerExited)
+                    {
+                        try
+                        {
+                            workerExited = await WaitForProcessExitAsync(
+                                worker,
+                                TimeSpan.FromSeconds(3));
+                        }
+                        catch (InvalidOperationException ex)
+                        {
+                            workerExited = true;
+                            _log.Info(
+                                $"[{plan.Profile.Name}] [AUTO_RETIRED_DELETE_WORKER_STALE] stage=wait_after_kill action=treat_as_exited detail={ex.Message}");
+                        }
+                    }
+
+                    if (!workerExited)
                     {
                         throw new AutoRetiredDeleteRetryException(
                             $"Worker profile {plan.Profile.Name} chưa dừng được; giữ DELETE_PENDING.");
@@ -555,7 +611,16 @@ public sealed partial class ManagerForm
                 }
 
                 try { worker.Dispose(); } catch { }
-                context.Worker = null;
+                if (ReferenceEquals(context.Worker, worker))
+                    context.Worker = null;
+            }
+            else if (worker is not null)
+            {
+                // Worker đã exit trước khi bước xóa bắt đầu: dọn Process object cũ để
+                // các lượt cleanup sau không đọc lại một handle đã hết hạn.
+                try { worker.Dispose(); } catch { }
+                if (ReferenceEquals(context.Worker, worker))
+                    context.Worker = null;
             }
         }
         finally

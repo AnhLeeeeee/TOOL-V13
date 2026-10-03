@@ -12,34 +12,43 @@ public sealed partial class ManagerForm
             return "";
 
         // Excel vẫn lưu nguyên HH:mm dd/MM/yyyy để các logic sau này còn đủ dữ liệu.
-        // UI chỉ rút gọn còn ngày/tháng. Hỗ trợ cả vài format cũ để không làm hỏng
-        // dữ liệu đã có từ các phiên bản trước.
-        var formats = new[]
+        // UI chỉ bỏ phần năm, nhưng GIỮ GIỜ: HH:mm dd/MM. Hỗ trợ cả vài format
+        // cũ để không làm hỏng dữ liệu đã có từ các phiên bản trước.
+        var formatsWithTime = new[]
         {
             "HH:mm dd/MM/yyyy",
             "H:mm dd/MM/yyyy",
             "dd/MM/yyyy HH:mm",
             "dd/MM/yyyy H:mm",
-            "dd/MM/yyyy",
-            "dd/MM"
+            "HH:mm dd/MM",
+            "H:mm dd/MM",
+            "dd/MM HH:mm",
+            "dd/MM H:mm"
         };
 
         if (DateTime.TryParseExact(
                 value,
-                formats,
+                formatsWithTime,
                 CultureInfo.InvariantCulture,
                 DateTimeStyles.AllowWhiteSpaces,
-                out var parsed)
-            || DateTime.TryParse(
+                out var parsed))
+        {
+            return parsed.ToString("HH:mm dd/MM", CultureInfo.InvariantCulture);
+        }
+
+        // Chỉ dùng parse linh hoạt khi chuỗi thật sự có thành phần giờ.
+        // Tránh biến dữ liệu cũ chỉ có dd/MM thành giờ giả 00:00.
+        if (value.Contains(':')
+            && DateTime.TryParse(
                 value,
                 CultureInfo.GetCultureInfo("vi-VN"),
                 DateTimeStyles.AllowWhiteSpaces,
                 out parsed))
         {
-            return parsed.ToString("dd/MM", CultureInfo.InvariantCulture);
+            return parsed.ToString("HH:mm dd/MM", CultureInfo.InvariantCulture);
         }
 
-        // Giá trị lạ/ghi tay: giữ nguyên thay vì tự sửa sai.
+        // Dữ liệu cũ không có giờ hoặc giá trị ghi tay: giữ nguyên thay vì tự bịa giờ.
         return value;
     }
 

@@ -3238,7 +3238,25 @@ public sealed partial class ManagerForm
         {
             try
             {
-                if (ctx.Worker is not null && !ctx.Worker.HasExited)
+                var workerAliveForPreClose = false;
+                if (ctx.Worker is not null)
+                {
+                    try
+                    {
+                        workerAliveForPreClose = !ctx.Worker.HasExited;
+                    }
+                    catch (InvalidOperationException ex)
+                    {
+                        // Worker vừa tự thoát hoặc Process object đã bị Dispose bởi
+                        // một nhánh cleanup khác. Không chặn Auto Profile vì ngay sau
+                        // đây EnsureAutoCloseWorkerStoppedAsync + strict Chrome cleanup
+                        // vẫn xác minh runtime sạch trước khi đưa PRF vào hàng chờ.
+                        _log.Warn(
+                            $"[AUTO_PROFILE_PRECREATE_WORKER_STALE] profile={profileName} action=continue_cleanup error={ex.Message}");
+                    }
+                }
+
+                if (workerAliveForPreClose)
                 {
                     try
                     {

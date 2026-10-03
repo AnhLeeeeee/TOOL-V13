@@ -2319,9 +2319,22 @@ public sealed partial class ManagerForm
         if (worker is null)
             return;
 
-        bool IsExited()
+        bool IsExitedForCleanup(string phase)
         {
-            try { return worker.HasExited; }
+            try
+            {
+                return worker.HasExited;
+            }
+            catch (InvalidOperationException ex)
+            {
+                // Process có thể đã thoát và bị một nhánh cleanup khác Dispose ngay
+                // giữa lúc Manager đang kiểm tra. Với cleanup, object Process stale
+                // được coi là đã thoát; bước kế tiếp vẫn strict-verify Chrome theo
+                // đúng ProfilePath nên không làm nới lỏng Cleanup Barrier.
+                _log.Warn(
+                    $"[AUTO_CLOSE_WORKER_STALE] profile={ctx.Profile.Name} phase={phase} action=treat_as_exited error={ex.Message}");
+                return true;
+            }
             catch (Exception ex)
             {
                 throw new InvalidOperationException(
@@ -2330,7 +2343,23 @@ public sealed partial class ManagerForm
             }
         }
 
-        if (!IsExited())
+        async Task<bool> WaitForExitForCleanupAsync(TimeSpan timeout, string phase)
+        {
+            try
+            {
+                return await WaitForProcessExitAsync(worker, timeout);
+            }
+            catch (InvalidOperationException ex)
+            {
+                // Cùng race với HasExited: Worker đã tự thoát/được Dispose trước khi
+                // WaitForExitAsync kịp gắn vào Process object.
+                _log.Warn(
+                    $"[AUTO_CLOSE_WORKER_STALE] profile={ctx.Profile.Name} phase={phase} action=treat_as_exited error={ex.Message}");
+                return true;
+            }
+        }
+
+        if (!IsExitedForCleanup("initial_has_exited"))
         {
             ThrowIfEmergencyStopRequested("before_shutdown");
             try
@@ -2346,14 +2375,23 @@ public sealed partial class ManagerForm
                     $"[AUTO_CLOSE_WORKER_SHUTDOWN_WARN] profile={ctx.Profile.Name} error={ex.Message}");
             }
 
-            if (!await WaitForProcessExitAsync(worker, TimeSpan.FromSeconds(7)))
+            if (!await WaitForExitForCleanupAsync(
+                    TimeSpan.FromSeconds(7),
+                    "wait_after_shutdown"))
             {
                 ThrowIfEmergencyStopRequested("before_force_kill");
+                var workerGoneDuringKill = false;
                 try
                 {
                     worker.Kill(true);
                     _log.Warn(
                         $"[AUTO_CLOSE_WORKER_FORCE_KILL] profile={ctx.Profile.Name}");
+                }
+                catch (InvalidOperationException ex)
+                {
+                    workerGoneDuringKill = true;
+                    _log.Warn(
+                        $"[AUTO_CLOSE_WORKER_STALE] profile={ctx.Profile.Name} phase=force_kill action=treat_as_exited error={ex.Message}");
                 }
                 catch (Exception ex)
                 {
@@ -2362,7 +2400,10 @@ public sealed partial class ManagerForm
                         ex);
                 }
 
-                if (!await WaitForProcessExitAsync(worker, TimeSpan.FromSeconds(3)))
+                if (!workerGoneDuringKill
+                    && !await WaitForExitForCleanupAsync(
+                        TimeSpan.FromSeconds(3),
+                        "wait_after_force_kill"))
                 {
                     ThrowIfEmergencyStopRequested("after_force_kill_wait");
                     throw new InvalidOperationException(
@@ -2373,7 +2414,7 @@ public sealed partial class ManagerForm
 
         ThrowIfEmergencyStopRequested("before_final_verify");
 
-        if (!IsExited())
+        if (!IsExitedForCleanup("final_has_exited"))
         {
             throw new InvalidOperationException(
                 $"Worker profile {ctx.Profile.Name} chưa thoát hoàn toàn. Cleanup Barrier chặn Tự bù.");

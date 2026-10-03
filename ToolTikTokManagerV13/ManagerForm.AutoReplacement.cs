@@ -44,16 +44,15 @@ public sealed partial class ManagerForm
 
         public string LastError { get; set; } = "";
 
-        // Mỗi profile bù chỉ được mở/thử tối đa 1 lần trong một vòng vét PRF chờ.
-        // Khi một CREATE thật đã thất bại, danh sách này vẫn được giữ trong suốt
-        // cooldown để Wake sớm chỉ thử NGUỒN CHỜ MỚI. Đúng lúc cooldown CREATE hết,
-        // Auto Replace xóa danh sách và bắt đầu một vòng vét TOÀN BỘ PRF chờ mới
-        // trước khi được phép CREATE profile tiếp theo.
+        // Mỗi profile bù chỉ được mở/thử tối đa 1 lần trong SUỐT một request bù.
+        // CREATE thất bại KHÔNG được xóa danh sách này: profile vừa thử lỗi/cooldown
+        // không được giữ suất hiện tại đứng chờ rồi mở lại. Trong lúc CREATE cooldown,
+        // chỉ NGUỒN CHỜ MỚI/chưa từng thử của request này mới được Wake và thử ngay.
         public List<string> AttemptedProfiles { get; set; } = new();
 
         // Một CREATE thật vừa thất bại và đã đăng ký cooldown. Khi deadline CREATE
-        // đến hạn, request phải reset AttemptedProfiles để vét lại toàn bộ hàng chờ
-        // đúng một lượt trước khi cân nhắc tiêu account mới lần nữa.
+        // đến hạn chỉ mở lại quyền cân nhắc CREATE; KHÔNG reset AttemptedProfiles.
+        // Nhờ vậy hết PRF chờ chưa thử => CREATE mới, không quay lại PRF vừa fail.
         public bool ReuseSweepBeforeNextCreatePending { get; set; }
 
         // Request sinh từ thiếu suất sau Start All không có profile nguồn cần cleanup.
@@ -1490,6 +1489,18 @@ public sealed partial class ManagerForm
                                 }
                                 else if (!filled
                                     && request.LastError.StartsWith(
+                                        "PRF chờ chưa vét xong:",
+                                        StringComparison.OrdinalIgnoreCase))
+                                {
+                                    reusableGuardBlocked = true;
+                                    createAttempted = false;
+                                    lastError = request.LastError;
+
+                                    _log.Warn(
+                                        $"[AUTO_REPLACE_REUSE_DRAIN_ROUTED] id={request.Id} closed={request.ClosedProfileName} action=SHORT_REUSE_RETRY detail={lastError}");
+                                }
+                                else if (!filled
+                                    && request.LastError.StartsWith(
                                         "Khung giờ cấm CREATE:",
                                         StringComparison.OrdinalIgnoreCase))
                                 {
@@ -2169,6 +2180,166 @@ public sealed partial class ManagerForm
         return true;
     }
 
+    async Task<(bool Filled, bool BlockCreate, string Detail)>
+        DrainAllReusableProfilesBeforeCreateAsync(
+            AutoReplacementRequest request,
+            int executionGeneration,
+            CancellationToken executionToken)
+    {
+        // Hard gate cuối trước MỌI CREATE (kể cả FRESH/PRIME).
+        // Mục tiêu: CREATE chỉ được phép khi đã xác minh và vét hết PRF chờ hiện có.
+        // Nếu refresh hàng chờ lỗi / trạng thái còn mơ hồ thì fail-closed: giữ slot,
+        // retry ngắn; tuyệt đối không tiêu account mới.
+        const int maxPasses = 3;
+
+        for (var pass = 1; pass <= maxPasses; pass++)
+        {
+            if (!IsAutoReplacementExecutionAllowed(executionGeneration))
+                return (false, true, "execution không còn được phép");
+
+            executionToken.ThrowIfCancellationRequested();
+
+            SetAutoReplacementUiPhase(
+                "VÉT PRF CHỜ TRƯỚC CREATE",
+                $"lượt {pass}/{maxPasses}",
+                request.Id);
+
+            var refreshOk = await RefreshReusableProfileQueueAsync(
+                $"before_create_hard_gate_pass_{pass}",
+                executionToken);
+
+            if (!refreshOk)
+            {
+                var detail =
+                    $"Không xác minh được hàng chờ ở lượt {pass}; chặn CREATE để tránh tạo mới khi vẫn còn PRF có thể dùng.";
+                _log.Warn(
+                    $"[AUTO_REPLACE_REUSE_DRAIN_REFRESH_FAILED] id={request.Id} closed={request.ClosedProfileName} pass={pass} action=BLOCK_CREATE");
+                return (false, true, detail);
+            }
+
+            if (!IsAutoReplacementExecutionAllowed(executionGeneration))
+                return (false, true, "execution không còn được phép sau refresh");
+
+            executionToken.ThrowIfCancellationRequested();
+
+            // Lane thường: hàm này tự đi lần lượt TOÀN BỘ candidate chưa attempted
+            // trong snapshot, không dừng ở candidate lỗi cứng hợp lệ.
+            bool filled;
+            try
+            {
+                filled = await TryUseReusableProfileQueueAsync(
+                    request,
+                    executionGeneration,
+                    executionToken);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (AutoReplacementCleanupBarrierException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                var detail =
+                    $"Lỗi khi vét PRF chờ thường ở lượt {pass}: {ex.Message}";
+                _log.Warn(
+                    $"[AUTO_REPLACE_REUSE_DRAIN_NORMAL_ERROR] id={request.Id} closed={request.ClosedProfileName} pass={pass} action=BLOCK_CREATE error={ex.Message}");
+                return (false, true, detail);
+            }
+
+            if (filled)
+            {
+                _log.Info(
+                    $"[AUTO_REPLACE_REUSE_DRAIN_FILLED] id={request.Id} closed={request.ClosedProfileName} pass={pass} lane=normal action=SKIP_CREATE");
+                return (true, false, "Đã dùng PRF chờ thường.");
+            }
+
+            if (!IsAutoReplacementExecutionAllowed(executionGeneration))
+                return (false, true, "execution không còn được phép sau lane thường");
+
+            executionToken.ThrowIfCancellationRequested();
+
+            // Lane NAME_SYNC_PENDING vẫn phải được xét trước CREATE.
+            try
+            {
+                filled = await TryRecoverNameSyncPendingReusableProfilesOnceAsync(
+                    request,
+                    executionGeneration,
+                    executionToken);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (AutoReplacementCleanupBarrierException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                var detail =
+                    $"Lỗi khi vét PRF chờ đồng bộ tên ở lượt {pass}: {ex.Message}";
+                _log.Warn(
+                    $"[AUTO_REPLACE_REUSE_DRAIN_NAME_SYNC_ERROR] id={request.Id} closed={request.ClosedProfileName} pass={pass} action=BLOCK_CREATE error={ex.Message}");
+                return (false, true, detail);
+            }
+
+            if (filled)
+            {
+                _log.Info(
+                    $"[AUTO_REPLACE_REUSE_DRAIN_FILLED] id={request.Id} closed={request.ClosedProfileName} pass={pass} lane=name_sync action=SKIP_CREATE");
+                return (true, false, "Đã dùng PRF chờ đồng bộ tên.");
+            }
+
+            // Refresh lần cuối của pass để bắt PRF vừa trở thành eligible trong lúc sweep.
+            // Nếu xuất hiện candidate mới chưa attempted thì lặp ngay một pass nữa thay vì CREATE.
+            refreshOk = await RefreshReusableProfileQueueAsync(
+                $"before_create_hard_gate_verify_{pass}",
+                executionToken);
+
+            if (!refreshOk)
+            {
+                var detail =
+                    $"Không xác minh được hàng chờ sau lượt vét {pass}; chặn CREATE.";
+                _log.Warn(
+                    $"[AUTO_REPLACE_REUSE_DRAIN_VERIFY_FAILED] id={request.Id} closed={request.ClosedProfileName} pass={pass} action=BLOCK_CREATE");
+                return (false, true, detail);
+            }
+
+            if (!TryFindUntestedEligibleReusableProfile(
+                    request,
+                    out var pendingProfile,
+                    out var pendingLane,
+                    out var pendingDetail))
+            {
+                _log.Info(
+                    $"[AUTO_REPLACE_REUSE_DRAIN_EXHAUSTED] id={request.Id} closed={request.ClosedProfileName} pass={pass} attemptedProfiles={GetAutoReplacementAttemptedProfileCount(request)} action=ALLOW_CREATE");
+                return (false, false, "Đã vét hết PRF chờ đủ điều kiện.");
+            }
+
+            _log.Info(
+                $"[AUTO_REPLACE_REUSE_DRAIN_CONTINUE] id={request.Id} closed={request.ClosedProfileName} pass={pass} profile={pendingProfile} lane={pendingLane} detail={pendingDetail}");
+        }
+
+        if (TryFindUntestedEligibleReusableProfile(
+                request,
+                out var blockedProfile,
+                out var blockedLane,
+                out var blockedDetail))
+        {
+            return (
+                false,
+                true,
+                $"Còn PRF chờ chưa thử: {blockedProfile} ({blockedLane}). {blockedDetail}");
+        }
+
+        // Nếu queue biến động quá nhanh nhưng cuối cùng không còn candidate chưa thử,
+        // CREATE được phép. Mọi lỗi refresh phía trên đều đã fail-closed.
+        return (false, false, "Đã vét hết PRF chờ đủ điều kiện.");
+    }
+
     async Task<bool> TryCreateReplacementAsync(
         AutoReplacementRequest request,
         int executionGeneration,
@@ -2179,6 +2350,9 @@ public sealed partial class ManagerForm
                 StringComparison.OrdinalIgnoreCase)
             || request.LastError.StartsWith(
                 "Khung giờ cấm CREATE:",
+                StringComparison.OrdinalIgnoreCase)
+            || request.LastError.StartsWith(
+                "PRF chờ chưa vét xong:",
                 StringComparison.OrdinalIgnoreCase))
         {
             request.LastError = "";
@@ -2194,6 +2368,29 @@ public sealed partial class ManagerForm
             return false;
 
         executionToken.ThrowIfCancellationRequested();
+
+        // PRE-GATE: vét PRF chờ TRƯỚC cả _autoProfileQueueGate và cooldown CREATE.
+        // Đây là điểm quan trọng với Run Strategy FRESH/PRIME: PRF đã có sẵn + login
+        // phải được mở ngay, tuyệt đối không bị bắt chờ cooldown vốn chỉ dành cho CREATE mới.
+        var preGateReuse = await DrainAllReusableProfilesBeforeCreateAsync(
+            request,
+            executionGeneration,
+            executionToken);
+
+        if (preGateReuse.Filled)
+            return true;
+
+        if (preGateReuse.BlockCreate)
+        {
+            request.LastError =
+                "PRF chờ chưa vét xong: " + preGateReuse.Detail;
+
+            _log.Warn(
+                $"[AUTO_REPLACE_REUSE_DRAIN_BLOCK_CREATE] id={request.Id} closed={request.ClosedProfileName} " +
+                $"stage=before_auto_profile_gate detail={preGateReuse.Detail}");
+            return false;
+        }
+
         // Tự bù chỉ dùng tài khoản CHƯA GÁN và luôn tạo profile MỚI.
         // BuildAutoProfileQueue(requestedNew: 1, resumeIncomplete: false) sẽ lấy
         // tài khoản chưa gán + có mật khẩu theo thứ tự Excel, sau đó ASSIGN ngay
@@ -2274,6 +2471,27 @@ public sealed partial class ManagerForm
 
                 if (IsAutoReplacementCreateBlockedBySchedule(request, "after_cooldown_before_account_assign", startName))
                     return false;
+
+                // HARD GATE: ngay trước khi ASSIGN account/CREATE, vét lại TOÀN BỘ hàng chờ.
+                // Nhánh FRESH/PRIME không được phép bỏ qua PRF chờ đang eligible.
+                var preCreateReuse = await DrainAllReusableProfilesBeforeCreateAsync(
+                    request,
+                    executionGeneration,
+                    executionToken);
+
+                if (preCreateReuse.Filled)
+                    return true;
+
+                if (preCreateReuse.BlockCreate)
+                {
+                    request.LastError =
+                        "PRF chờ chưa vét xong: " + preCreateReuse.Detail;
+
+                    _log.Warn(
+                        $"[AUTO_REPLACE_REUSE_DRAIN_BLOCK_CREATE] id={request.Id} closed={request.ClosedProfileName} " +
+                        $"profile={startName} detail={preCreateReuse.Detail}");
+                    return false;
+                }
 
                 var reuseOnlyBlockedAtAccountCommit = false;
                 var scheduleBlockedAtAccountCommit = false;
@@ -3319,6 +3537,14 @@ public sealed partial class ManagerForm
         string profileName,
         string source)
     {
+        // CREATE candidate này đã được thử thật trong chính suất bù hiện tại.
+        // Nếu profile được giữ lại/đưa vào Chờ dùng lại (ví dụ NAME_SYNC_PENDING),
+        // tuyệt đối không để nó tự giữ suất rồi chờ 60s/5p để mở lại trong cùng request.
+        MarkAutoReplacementProfileAttempted(
+            request,
+            profileName,
+            "create_failed_same_request:" + source);
+
         var armed = false;
 
         lock (_autoReplacementQueueLock)
@@ -3341,7 +3567,7 @@ public sealed partial class ManagerForm
         {
             _log.Info(
                 $"[AUTO_REPLACE_CREATE_REUSE_SWEEP_ARMED] id={request.Id} closed={request.ClosedProfileName} " +
-                $"profile={profileName} source={source} action=SWEEP_ALL_REUSE_AFTER_CREATE_COOLDOWN");
+                $"profile={profileName} source={source} action=KEEP_ATTEMPTED_TRY_ONLY_NEW_REUSE");
         }
     }
 
@@ -3349,7 +3575,7 @@ public sealed partial class ManagerForm
         AutoReplacementRequest request)
     {
         var nowUtc = DateTime.UtcNow;
-        var clearedAttempted = 0;
+        var preservedAttempted = 0;
         DateTime? createDeadlineUtc = null;
         var started = false;
 
@@ -3364,9 +3590,10 @@ public sealed partial class ManagerForm
 
             createDeadlineUtc = target.CreateNotBeforeUtc;
 
-            // WakeAutoReplacementForReusableSupply có thể đánh thức request sớm trong
-            // cooldown. Khi đó GIỮ AttemptedProfiles để chỉ nguồn chờ mới được thử.
-            // Chỉ reset toàn bộ đúng khi deadline CREATE đã đến hạn.
+            // Nếu WakeAutoReplacementForReusableSupply đánh thức request sớm trong
+            // cooldown thì giữ nguyên cờ này. Đến đúng deadline CREATE chỉ gỡ cờ chờ;
+            // AttemptedProfiles vẫn được GIỮ NGUYÊN trong toàn bộ request bù.
+            // Như vậy PRF đã thử fail/cooldown không bị mở lại trước CREATE kế tiếp.
             if (createDeadlineUtc.HasValue
                 && createDeadlineUtc.Value > nowUtc)
             {
@@ -3374,8 +3601,11 @@ public sealed partial class ManagerForm
             }
 
             target.AttemptedProfiles ??= new List<string>();
-            clearedAttempted = target.AttemptedProfiles.Count;
-            target.AttemptedProfiles.Clear();
+            preservedAttempted = target.AttemptedProfiles
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Count();
+
             target.ReuseSweepBeforeNextCreatePending = false;
             started = true;
 
@@ -3387,8 +3617,8 @@ public sealed partial class ManagerForm
         {
             _log.Info(
                 $"[AUTO_REPLACE_CREATE_REUSE_SWEEP_ROUND_BEGIN] id={request.Id} closed={request.ClosedProfileName} " +
-                $"clearedAttempted={clearedAttempted} createDeadline={createDeadlineUtc:O} " +
-                "action=RETRY_ALL_REUSE_BEFORE_NEXT_CREATE");
+                $"preservedAttempted={preservedAttempted} createDeadline={createDeadlineUtc:O} " +
+                "action=TRY_ONLY_UNATTEMPTED_REUSE_THEN_CREATE");
         }
     }
 
@@ -3943,8 +4173,7 @@ public sealed partial class ManagerForm
                     continue;
 
                 // Chỉ đánh thức request đang chờ nhánh tạo mới HOẶC đang chờ hết
-                // khung giờ cấm CREATE. PRF chờ vẫn được phép mở trong giờ cấm nên
-                // schedule-wait phải được wake khi có supply mới.
+                // khung giờ cấm CREATE. PRF chờ vẫn được phép mở trong giờ cấm.
                 var waitingForSchedule =
                     request.LastError.StartsWith(
                         "Khung giờ cấm CREATE:",
@@ -3957,8 +4186,24 @@ public sealed partial class ManagerForm
                     continue;
                 }
 
+                // V14.3.7: không còn Wake chỉ vì queue có entry. Chỉ Wake khi request
+                // này có ÍT NHẤT 1 PRF chưa từng thử và thực sự có thể xét NGAY.
+                // PRF đã attempted, đang cooldown, NAME_SYNC chưa đủ tuổi hoặc state
+                // OPENING/UNKNOWN không được tự đánh thức request lặp hàng nghìn vòng.
+                if (!HasReadyUnattemptedReusableSupplyForWake(
+                        request,
+                        out var readyProfile,
+                        out var readyLane))
+                {
+                    continue;
+                }
+
                 request.NextAttemptUtc = now;
                 woke++;
+
+                _log.Info(
+                    $"[AUTO_REPLACE_REUSE_SUPPLY_WAKE_READY] id={request.Id} source={source} " +
+                    $"profile={readyProfile} lane={readyLane}");
             }
 
             if (woke > 0)

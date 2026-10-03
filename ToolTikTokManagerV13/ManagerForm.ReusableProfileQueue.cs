@@ -74,12 +74,12 @@ public sealed partial class ManagerForm
     string ReusableProfileQueuePath
         => Path.Combine(_baseDir, "manager_reuse_profile_queue.json");
 
-    async Task RefreshReusableProfileQueueAsync(
+    async Task<bool> RefreshReusableProfileQueueAsync(
         string source,
         CancellationToken ct = default)
     {
         if (_closing || IsDisposed || Disposing)
-            return;
+            return false;
 
         source = string.IsNullOrWhiteSpace(source)
             ? "unknown"
@@ -603,6 +603,8 @@ public sealed partial class ManagerForm
             // nguồn, đánh thức suất đó ngay. Timer phút không được giữ PRF đã tồn tại.
             if (eligible.Count > 0)
                 WakeAutoReplacementForReusableSupply("reuse_refresh:" + source);
+
+            return true;
         }
         catch (OperationCanceledException)
         {
@@ -620,6 +622,8 @@ public sealed partial class ManagerForm
             {
                 throw;
             }
+
+            return false;
         }
         finally
         {
@@ -2043,6 +2047,80 @@ public sealed partial class ManagerForm
 
         _log.Info(
             $"[NAME_SYNC_RECOVERY_SWEEP_END] closed={request.ClosedProfileName} result=NO_MATCH pending={GetNameSyncPendingReusableProfileCount()}");
+
+        return false;
+    }
+
+    bool HasReadyUnattemptedReusableSupplyForWake(
+        AutoReplacementRequest request,
+        out string profileName,
+        out string lane)
+    {
+        profileName = "";
+        lane = "";
+
+        List<ReusableProfileQueueEntry> snapshot;
+        lock (_reusableProfileQueueLock)
+        {
+            snapshot = OrderReusableProfileEntries(
+                    EnsureReusableProfileQueueLoadedUnsafe().Pending)
+                .Select(CloneReusableProfileQueueEntry)
+                .ToList();
+        }
+
+        var allowNightReserveBorrowForFreshQuota =
+            (request.Reason ?? "").Contains(
+                "allow_night_reserve_borrow=fresh_quota",
+                StringComparison.OrdinalIgnoreCase);
+
+        foreach (var candidate in snapshot)
+        {
+            var name = (candidate.ProfileName ?? "").Trim();
+            if (name.Length == 0
+                || name.Equals(request.ClosedProfileName, StringComparison.OrdinalIgnoreCase)
+                || _autoReplacementClaimedProfiles.Contains(name)
+                || IsProfileRetireDeleteBlockedForOpen(name)
+                || IsManualCloseSuppressed(name)
+                || HasAutoReplacementProfileBeenAttempted(request, name)
+                || (IsNightReserveProfileProtected(name)
+                    && !allowNightReserveBorrowForFreshQuota))
+            {
+                continue;
+            }
+
+            if (!candidate.IsManual)
+            {
+                var supplyState = GetProfileSupplyState(name);
+                var retired =
+                    _autoReplacementRetiredProfiles.Contains(name)
+                    || (supplyState is not null
+                        && (supplyState.State ?? "").Trim().Equals(
+                            "retired",
+                            StringComparison.OrdinalIgnoreCase));
+
+                if (retired || IsReplacementProfileCoolingDown(name))
+                    continue;
+            }
+
+            // NAME_SYNC_PENDING chỉ được Wake khi đã đủ tuổi probe. Nếu chưa đủ tuổi,
+            // request đang chạy sẽ tự retry ngắn theo guard; request đang ngủ CREATE
+            // không bị entry này tự đánh thức liên tục.
+            if (candidate.NameSyncPending)
+            {
+                var age = DateTime.UtcNow - candidate.LastCheckedUtc;
+                if (age < AutoReplacementNameSyncMinRetryAge)
+                    continue;
+            }
+
+            // OPENING/UNKNOWN/RUNNING... chưa phải nguồn sẵn sàng để Wake. Khi trạng thái
+            // thay đổi thành usable, lượt Refresh kế tiếp sẽ Wake đúng một lần.
+            if (IsReusableProfileBusy(name))
+                continue;
+
+            profileName = name;
+            lane = candidate.NameSyncPending ? "NAME_SYNC_PENDING" : "REUSE_READY";
+            return true;
+        }
 
         return false;
     }
