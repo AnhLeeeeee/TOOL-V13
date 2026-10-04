@@ -134,7 +134,7 @@ public sealed partial class MainForm : Form
         var settingsSw = System.Diagnostics.Stopwatch.StartNew();
         _settings = _settingsService.Load();
         settingsSw.Stop();
-        _chrome = new ChromeController(_log); ApplyChromeWindowSettings(); ApplyVmOptimizationSettings(); _engine = new AutomationEngine(_baseDir, _chrome, _log); _engine.RuntimeLiveSearchAsync = TryRuntimeLiveSearchAsync; _runtimeStats = new RuntimeStatsTracker(_baseDir, _log);
+        _chrome = new ChromeController(_log); ApplyChromeWindowSettings(); ApplyVmOptimizationSettings(); _engine = new AutomationEngine(_baseDir, _chrome, _log); _engine.ConfigureCommentCheckTelemetryProfile(_startupOptions.ProfileName); _engine.RuntimeLiveSearchAsync = TryRuntimeLiveSearchAsync; _runtimeStats = new RuntimeStatsTracker(_baseDir, _log);
         var profileSw = System.Diagnostics.Stopwatch.StartNew();
         if (_managedMode)
         {

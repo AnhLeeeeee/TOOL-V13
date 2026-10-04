@@ -40,7 +40,7 @@ Name: "desktopicon"; Description: "Tạo biểu tượng ngoài Desktop"; GroupD
 [Files]
 ; Lấy toàn bộ bản publish V13.5 nhưng KHÔNG đụng dữ liệu runtime/profile hiện có.
 Source: "publish_v13_5_vm\*"; DestDir: "{app}"; \
-  Excludes: "\profiles\*,\TikTokProfiles\*,\logs\*,\manager_default_config\*,\default_config_backups\*"; \
+  Excludes: "\profiles\*,\TikTokProfiles\*,\logs\*,\manager_default_config\*,\default_config_backups\*,\CommentCheck\CommentCheckData\*"; \
   Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]

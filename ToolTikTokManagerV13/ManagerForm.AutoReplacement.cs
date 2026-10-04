@@ -2868,6 +2868,25 @@ public sealed partial class ManagerForm
                                 return false;
                             }
 
+                            // BAN/TIME có thể xuất hiện ngay trong stabilize. Handler BAN
+                            // đã đóng runtime + queue xóa; không được rơi xuống nhánh FAIL
+                            // chung vì nhánh đó cleanup/cooldown trước khi finally nhả claim.
+                            // Return ngay để finally release _autoReplacementClaimedProfiles.
+                            if (IsProfileRetireDeleteBlockedForOpen(item.ProfileName)
+                                || (!stabilization.Healthy
+                                    && (stabilization.Detail ?? "").StartsWith(
+                                        "RETIRE_DELETE_BLOCKED:",
+                                        StringComparison.OrdinalIgnoreCase)))
+                            {
+                                ClearAutoCloseExpectedRunning(
+                                    item.ProfileName,
+                                    "auto_replace_created_retire_delete_abort");
+
+                                _log.Warn(
+                                    $"[AUTO_REPLACE_CREATE_ABORT_RETIRE_DELETE] id={request.Id} profile={item.ProfileName} detail={stabilization.Detail} action=RETURN_RELEASE_CLAIM_NO_COOLDOWN");
+                                return false;
+                            }
+
                             if (stabilization.NameSyncPending)
                             {
                                 await CleanupCreatedReplacementAttemptAsync(
@@ -3060,7 +3079,12 @@ public sealed partial class ManagerForm
                 }
                 finally
                 {
-                    _autoReplacementClaimedProfiles.Remove(item.ProfileName);
+                    var claimReleased = _autoReplacementClaimedProfiles.Remove(item.ProfileName);
+                    if (claimReleased && IsProfileRetireDeleteBlockedForOpen(item.ProfileName))
+                    {
+                        _log.Warn(
+                            $"[AUTO_REPLACE_CLAIM_RELEASE_RETIRE_DELETE] profile={item.ProfileName} source=create_candidate action=DELETE_JOB_CAN_CONTINUE");
+                    }
                 }
             }
 
@@ -3276,6 +3300,18 @@ public sealed partial class ManagerForm
                         _log.Warn(
                             $"[AUTO_REPLACE_STABILIZE_REOPEN_WARN] profile={ctx.Profile.Name} error={ex.Message}");
                     }
+
+                    if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+                    {
+                        ClearAutoCloseExpectedRunning(
+                            ctx.Profile.Name,
+                            "auto_replace_retire_delete_after_reopen_worker");
+                        _log.Warn(
+                            $"[AUTO_REPLACE_STABILIZE_RETIRE_DELETE_ABORT] id={request.Id} profile={ctx.Profile.Name} source={source} stage=after_reopen_worker action=RELEASE_CLAIM");
+                        return new AutoReplacementStabilizationResult(
+                            false, false, false,
+                            "RETIRE_DELETE_BLOCKED: profile bị hard-retired trong lúc mở lại Worker.");
+                    }
                 }
 
                 try { await RefreshStatusAsync(ctx); } catch { }
@@ -3300,11 +3336,38 @@ public sealed partial class ManagerForm
                             $"[AUTO_REPLACE_STABILIZE_CHROME_WARN] profile={ctx.Profile.Name} error={ex.Message}");
                     }
 
+                    // OpenChromeForProfileAsync có thể vừa nhận account_banned và đã
+                    // đóng runtime. Thoát NGAY trong cùng iteration để finally của caller
+                    // nhả _autoReplacementClaimedProfiles; không được rơi xuống START.
+                    if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+                    {
+                        ClearAutoCloseExpectedRunning(
+                            ctx.Profile.Name,
+                            "auto_replace_retire_delete_after_reopen_chrome");
+                        _log.Warn(
+                            $"[AUTO_REPLACE_STABILIZE_RETIRE_DELETE_ABORT] id={request.Id} profile={ctx.Profile.Name} source={source} stage=after_reopen_chrome action=RELEASE_CLAIM");
+                        return new AutoReplacementStabilizationResult(
+                            false, false, false,
+                            "RETIRE_DELETE_BLOCKED: TikTok xác nhận BAN/retired trong lúc mở Chrome.");
+                    }
+
                     state = GetEffectiveRuntimeState(ctx);
                     chromeConnected = string.Equals(
                         ctx.LastSnapshot?.Chrome,
                         "CONNECTED",
                         StringComparison.OrdinalIgnoreCase);
+                }
+
+                if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+                {
+                    ClearAutoCloseExpectedRunning(
+                        ctx.Profile.Name,
+                        "auto_replace_retire_delete_before_recovery_start");
+                    _log.Warn(
+                        $"[AUTO_REPLACE_STABILIZE_RETIRE_DELETE_ABORT] id={request.Id} profile={ctx.Profile.Name} source={source} stage=before_recovery_start action=RELEASE_CLAIM");
+                    return new AutoReplacementStabilizationResult(
+                        false, false, false,
+                        "RETIRE_DELETE_BLOCKED: profile đã hard-retired trước recovery Start.");
                 }
 
                 if (workerAlive
@@ -3317,6 +3380,19 @@ public sealed partial class ManagerForm
                             "start_auto",
                             startCommandTimeout,
                             suppressStatus: true);
+
+                        if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name)
+                            || string.Equals(reply, "hard_retired", StringComparison.OrdinalIgnoreCase))
+                        {
+                            ClearAutoCloseExpectedRunning(
+                                ctx.Profile.Name,
+                                "auto_replace_retire_delete_after_recovery_start");
+                            _log.Warn(
+                                $"[AUTO_REPLACE_STABILIZE_RETIRE_DELETE_ABORT] id={request.Id} profile={ctx.Profile.Name} source={source} stage=after_recovery_start reply={reply} action=RELEASE_CLAIM");
+                            return new AutoReplacementStabilizationResult(
+                                false, false, false,
+                                "RETIRE_DELETE_BLOCKED: profile bị hard-retired trong Name/VIDEO/Start recovery.");
+                        }
 
                         if (IsNameGuardNameSyncPendingStartReply(reply))
                         {
@@ -3422,6 +3498,13 @@ public sealed partial class ManagerForm
 
         while (!_closing && DateTime.UtcNow < deadlineUtc)
         {
+            if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+            {
+                _log.Warn(
+                    $"[AUTO_REPLACE_PROBE_GRACE_RETIRE_DELETE_ABORT] id={request.Id} profile={ctx.Profile.Name} source={source} stage=loop_begin");
+                return false;
+            }
+
             if (IsManualCloseSuppressed(ctx.Profile.Name))
             {
                 _log.Warn(
@@ -3471,6 +3554,13 @@ public sealed partial class ManagerForm
                     {
                         lastFault = "open_worker:" + ex.Message;
                     }
+
+                    if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+                    {
+                        _log.Warn(
+                            $"[AUTO_REPLACE_PROBE_GRACE_RETIRE_DELETE_ABORT] id={request.Id} profile={ctx.Profile.Name} source={source} stage=after_open_worker");
+                        return false;
+                    }
                 }
 
                 try { await RefreshStatusAsync(ctx); } catch { }
@@ -3485,6 +3575,14 @@ public sealed partial class ManagerForm
                     try
                     {
                         await OpenChromeForProfileAsync(ctx);
+
+                        if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+                        {
+                            _log.Warn(
+                                $"[AUTO_REPLACE_PROBE_GRACE_RETIRE_DELETE_ABORT] id={request.Id} profile={ctx.Profile.Name} source={source} stage=after_open_chrome");
+                            return false;
+                        }
+
                         try { await RefreshStatusAsync(ctx); } catch { }
                     }
                     catch (Exception ex)

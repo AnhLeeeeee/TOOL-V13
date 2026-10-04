@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <AssemblyName>CommentVisibilityMonitor</AssemblyName>
+    <RootNamespace>CommentVisibilityMonitor</RootNamespace>
+    <OutputPath>..\dist_comment_check\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+  <!--
+    IMPORTANT SAFETY BOUNDARY:
+    CommentVisibilityMonitor is a separate EXE.  It compiles the SAME ChromeController
+    source used by the Worker, but it does not modify or reference a running Worker.
+    Observer uses its own Chrome process, CDP port and user-data-dir.
+  -->
+  <ItemGroup>
+    <Compile Include="..\V115Core\Models\*.cs" Link="Shared\Models\%(Filename)%(Extension)" />
+    <Compile Include="..\V115Core\Proxy\*.cs" Link="Shared\Proxy\%(Filename)%(Extension)" />
+    <Compile Include="..\V115Core\Utils\*.cs" Link="Shared\Utils\%(Filename)%(Extension)" />
+    <Compile Include="..\V115Core\Services\CdpClient.cs" Link="Shared\Services\CdpClient.cs" />
+    <Compile Include="..\V115Core\Services\ChromeController.cs" Link="Shared\Services\ChromeController.cs" />
+    <Compile Include="..\V115Core\Services\ChromeController.*.cs" Link="Shared\Services\%(Filename)%(Extension)" />
+    <Compile Include="..\ManagerShared\Services\TikTokAuthService.cs" Link="Shared\Services\TikTokAuthService.cs" />
+  </ItemGroup>
+</Project>

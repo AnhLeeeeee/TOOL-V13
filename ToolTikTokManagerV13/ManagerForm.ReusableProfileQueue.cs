@@ -1653,6 +1653,19 @@ public sealed partial class ManagerForm
 
                 if (!probeReady)
                 {
+                    if (IsProfileRetireDeleteBlockedForOpen(profileName))
+                    {
+                        ClearAutoCloseExpectedRunning(
+                            profileName,
+                            "name_sync_probe_retire_delete_abort");
+                        RemoveReusableProfileQueueEntry(
+                            profileName,
+                            "retire_delete_during_probe_grace");
+                        _log.Warn(
+                            $"[NAME_SYNC_RECOVERY_ABORT_RETIRE_DELETE] id={request.Id} profile={profileName} stage=probe_grace action=CONTINUE_RELEASE_CLAIM");
+                        continue;
+                    }
+
                     if (IsManualCloseSuppressed(profileName))
                     {
                         await CleanupCreatedReplacementAttemptAsync(
@@ -2041,7 +2054,12 @@ public sealed partial class ManagerForm
             }
             finally
             {
-                _autoReplacementClaimedProfiles.Remove(profileName);
+                var claimReleased = _autoReplacementClaimedProfiles.Remove(profileName);
+                if (claimReleased && IsProfileRetireDeleteBlockedForOpen(profileName))
+                {
+                    _log.Warn(
+                        $"[AUTO_REPLACE_CLAIM_RELEASE_RETIRE_DELETE] profile={profileName} source=reuse_name_sync action=DELETE_JOB_CAN_CONTINUE");
+                }
             }
         }
 
@@ -2711,7 +2729,12 @@ public sealed partial class ManagerForm
             }
             finally
             {
-                _autoReplacementClaimedProfiles.Remove(profileName);
+                var claimReleased = _autoReplacementClaimedProfiles.Remove(profileName);
+                if (claimReleased && IsProfileRetireDeleteBlockedForOpen(profileName))
+                {
+                    _log.Warn(
+                        $"[AUTO_REPLACE_CLAIM_RELEASE_RETIRE_DELETE] profile={profileName} source=reuse_candidate action=DELETE_JOB_CAN_CONTINUE");
+                }
             }
         }
 

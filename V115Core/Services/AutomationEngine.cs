@@ -287,6 +287,10 @@ public sealed partial class AutomationEngine
 
         _s = settings;
         _contents = contents;
+        InitializeCommentCheckTelemetryIdentity();
+        _commentCheckLastHeartbeatUtc = DateTime.MinValue;
+        _commentCheckLastHeartbeatUrl = "";
+        _commentCheckLastHeartbeatIndex = -1;
         _contentIndex = 0;
         _step = 1;
         _rounds = 0;
@@ -1001,6 +1005,7 @@ public sealed partial class AutomationEngine
 
     async Task ExecuteOneStepAsync(CancellationToken ct)
     {
+        EmitCommentCheckHeartbeat();
         var stepAtStart = _step;
         var stepPerf = System.Diagnostics.Stopwatch.StartNew();
         var content = _contents[_contentIndex];
@@ -1030,8 +1035,10 @@ public sealed partial class AutomationEngine
                 case 3:
                 {
                     SetStatus("BƯỚC 3/8", "Enter ô 1 • theo dõi popup đăng nhập / cấm bình luận");
+                    var commentCheckSendId = EmitCommentCheckWillSend(_contentIndex + 1, content);
                     await _chrome.PressKeyAsync("Enter", ct: ct);
                     if (await WatchPostEnterReactionAsync("điểm 1", restartStep: 1, ct)) return;
+                    EmitCommentCheckSent(commentCheckSendId, _contentIndex + 1, content);
                     AdvanceContentAfterSuccessfulSend("điểm 1");
                     _step = 4;
                     break;
@@ -1063,8 +1070,10 @@ public sealed partial class AutomationEngine
                 case 7:
                 {
                     SetStatus("BƯỚC 7/8", "Enter ô 2 • theo dõi popup đăng nhập / cấm bình luận");
+                    var commentCheckSendId = EmitCommentCheckWillSend(_contentIndex + 1, content);
                     await _chrome.PressKeyAsync("Enter", ct: ct);
                     if (await WatchPostEnterReactionAsync("điểm 2", restartStep: 5, ct)) return;
+                    EmitCommentCheckSent(commentCheckSendId, _contentIndex + 1, content);
                     AdvanceContentAfterSuccessfulSend("điểm 2");
                     _step = 8;
                     break;

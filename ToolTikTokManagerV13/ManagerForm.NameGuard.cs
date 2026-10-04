@@ -92,6 +92,14 @@ public sealed partial class ManagerForm
         // Tên/ảnh -> VIDEO đang chạy.
         ArmManagedAccountSetupHold(ctx, "start_with_name_guard");
 
+        if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+        {
+            await CancelManagedAccountSetupHoldAsync(ctx, "hard_retired_before_name_guard");
+            _log.Warn(
+                $"[NAME_GUARD_START_ABORT_RETIRE_DELETE] profile={ctx.Profile.Name} stage=before_guard action=NO_VIDEO_NO_START");
+            return "hard_retired";
+        }
+
         // VIDEO chỉ được thử một lượt trong cùng một lệnh Start. Tên/ảnh có thể retry
         // tối đa 3 lượt theo logic cũ, nhưng VIDEO không được lặp lại chỉ vì Name Guard
         // đang chờ ổn định. Quan trọng: VIDEO luôn nằm SAU lần xử lý Tên/ảnh đầu tiên
@@ -109,6 +117,16 @@ public sealed partial class ManagerForm
             var guard = await EnsureNameGuardBeforeStartAsync(
                 ctx,
                 deferTerminalCleanup: true);
+
+            // BAN có thể được phát hiện ngay trong lúc EnsureNameGuard mở Chrome/login.
+            // Khi đó tuyệt đối không chạy VIDEO theo policy fail-open cũ.
+            if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+            {
+                await CancelManagedAccountSetupHoldAsync(ctx, "hard_retired_after_name_guard");
+                _log.Warn(
+                    $"[NAME_GUARD_START_ABORT_RETIRE_DELETE] profile={ctx.Profile.Name} stage=after_guard action=NO_VIDEO_NO_START");
+                return "hard_retired";
+            }
 
             string guardUsername = "";
             try
@@ -139,6 +157,17 @@ public sealed partial class ManagerForm
                         $"[PRESTART_SEQUENCE_VIDEO_FAILOPEN] profile={ctx.Profile.Name} account={guardUsername} " +
                         $"error={ex.Message}");
                 }
+            }
+
+            // BAN có thể phát sinh trong chính nhánh VIDEO (ví dụ mở lại Chrome để
+            // xóa/đăng). Một khi profile đã hard-retired thì không được đi tiếp tới
+            // finalize/Start và cũng không replay intent Start đang nằm trong HOLD.
+            if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+            {
+                await CancelManagedAccountSetupHoldAsync(ctx, "hard_retired_after_video");
+                _log.Warn(
+                    $"[NAME_GUARD_START_ABORT_RETIRE_DELETE] profile={ctx.Profile.Name} stage=after_video action=NO_START");
+                return "hard_retired";
             }
 
             // Nếu Name Guard cần cleanup/queue đóng profile, chỉ thực hiện sau khi
@@ -316,12 +345,33 @@ public sealed partial class ManagerForm
             }
             catch { }
 
-            await OpenProfileAsync(ctx);
+            var opened = await OpenProfileAsync(ctx);
+            if (!opened && IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+            {
+                _log.Warn(
+                    $"[NAME_GUARD_ABORT_RETIRE_DELETE] profile={ctx.Profile.Name} stage=open_profile action=HARD_BLOCK");
+                return new NameGuardResult(
+                    false,
+                    "Profile đã BAN/retired hoặc đang Tự đóng/Tự xóa.",
+                    Transient: false);
+            }
+
             try { await RefreshStatusAsync(ctx); } catch { }
 
             if (!string.Equals(ctx.LastSnapshot?.Chrome, "CONNECTED", StringComparison.OrdinalIgnoreCase))
             {
                 await OpenChromeForProfileAsync(ctx);
+
+                if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+                {
+                    _log.Warn(
+                        $"[NAME_GUARD_ABORT_RETIRE_DELETE] profile={ctx.Profile.Name} stage=open_chrome action=HARD_BLOCK");
+                    return new NameGuardResult(
+                        false,
+                        "Profile đã BAN/retired trong lúc mở Chrome.",
+                        Transient: false);
+                }
+
                 try { await RefreshStatusAsync(ctx); } catch { }
             }
 

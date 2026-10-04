@@ -2033,10 +2033,36 @@ public sealed partial class ManagerForm
         bool resumeAutomation = true,
         CancellationToken cancellationToken = default)
     {
+        if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+        {
+            _log.Warn(
+                $"[VIDEO_DELETE_ABORT_RETIRE_DELETE] profile={ctx.Profile.Name} stage=before_open action=NO_CHROME");
+            return new VideoDeleteReply
+            {
+                Ok = false,
+                Completed = true,
+                Stage = "HARD_RETIRED",
+                Error = "Profile đã BAN/retired hoặc đang Tự đóng/Tự xóa."
+            };
+        }
+
         if (_messageReplyProfilesInFlight.Contains(ctx.Profile.Name))
             return new VideoDeleteReply { Ok = false, Completed = true, Error = "Profile đang được mục Tin nhắn TikTok xử lý. Hãy dừng/đợi Tin nhắn hoàn tất rồi xóa video." };
 
-        await OpenProfileAsync(ctx);
+        var opened = await OpenProfileAsync(ctx);
+        if (!opened && IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+        {
+            _log.Warn(
+                $"[VIDEO_DELETE_ABORT_RETIRE_DELETE] profile={ctx.Profile.Name} stage=open_profile action=NO_CHROME");
+            return new VideoDeleteReply
+            {
+                Ok = false,
+                Completed = true,
+                Stage = "HARD_RETIRED",
+                Error = "Profile đã BAN/retired; không mở lại để xóa video."
+            };
+        }
+
         try { await RefreshStatusAsync(ctx); } catch { }
         if (ctx.LastSnapshot?.VideoDeleteRunning == true)
             return new VideoDeleteReply { Ok = false, Completed = true, Error = "Profile này đang có một lượt xóa video chạy." };
@@ -2069,6 +2095,20 @@ public sealed partial class ManagerForm
             if (!string.Equals(ctx.LastSnapshot?.Chrome, "CONNECTED", StringComparison.OrdinalIgnoreCase))
             {
                 await OpenChromeForProfileAsync(ctx);
+
+                if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+                {
+                    _log.Warn(
+                        $"[VIDEO_DELETE_ABORT_RETIRE_DELETE] profile={ctx.Profile.Name} stage=open_chrome action=NO_DELETE");
+                    return new VideoDeleteReply
+                    {
+                        Ok = false,
+                        Completed = true,
+                        Stage = "HARD_RETIRED",
+                        Error = "Profile đã BAN/retired trong lúc mở Chrome; dừng VIDEO."
+                    };
+                }
+
                 try { await RefreshStatusAsync(ctx); } catch { }
             }
             if (!string.Equals(ctx.LastSnapshot?.Chrome, "CONNECTED", StringComparison.OrdinalIgnoreCase))
@@ -2300,6 +2340,20 @@ public sealed partial class ManagerForm
         bool studioCleanupOnly = false,
         CancellationToken cancellationToken = default)
     {
+        if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+        {
+            _log.Warn(
+                $"[VIDEO_UPLOAD_ABORT_RETIRE_DELETE] profile={ctx.Profile.Name} stage=before_open action=NO_CHROME");
+            return new VideoUploadReply
+            {
+                Ok = false,
+                Completed = true,
+                Stage = "HARD_RETIRED",
+                VideoPath = videoPath,
+                Error = "Profile đã BAN/retired hoặc đang Tự đóng/Tự xóa."
+            };
+        }
+
         if (_messageReplyProfilesInFlight.Contains(ctx.Profile.Name))
             return new VideoUploadReply { Ok = false, Completed = true, Error = "Profile đang được mục Tin nhắn TikTok xử lý. Hãy dừng/đợi Tin nhắn hoàn tất rồi đăng video." };
 
@@ -2307,7 +2361,21 @@ public sealed partial class ManagerForm
             && (string.IsNullOrWhiteSpace(videoPath) || !File.Exists(videoPath)))
             return new VideoUploadReply { Ok = false, Completed = true, Error = "Không tìm thấy file video cần đăng." };
 
-        await OpenProfileAsync(ctx);
+        var opened = await OpenProfileAsync(ctx);
+        if (!opened && IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+        {
+            _log.Warn(
+                $"[VIDEO_UPLOAD_ABORT_RETIRE_DELETE] profile={ctx.Profile.Name} stage=open_profile action=NO_CHROME");
+            return new VideoUploadReply
+            {
+                Ok = false,
+                Completed = true,
+                Stage = "HARD_RETIRED",
+                VideoPath = videoPath,
+                Error = "Profile đã BAN/retired; không mở lại để đăng video."
+            };
+        }
+
         try { await RefreshStatusAsync(ctx); } catch { }
         if (ctx.LastSnapshot?.VideoDeleteRunning == true)
             return new VideoUploadReply { Ok = false, Completed = true, Error = "Profile này đang có một thao tác VIDEO khác chạy." };
@@ -2340,6 +2408,21 @@ public sealed partial class ManagerForm
             if (!string.Equals(ctx.LastSnapshot?.Chrome, "CONNECTED", StringComparison.OrdinalIgnoreCase))
             {
                 await OpenChromeForProfileAsync(ctx);
+
+                if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+                {
+                    _log.Warn(
+                        $"[VIDEO_UPLOAD_ABORT_RETIRE_DELETE] profile={ctx.Profile.Name} stage=open_chrome action=NO_UPLOAD");
+                    return new VideoUploadReply
+                    {
+                        Ok = false,
+                        Completed = true,
+                        Stage = "HARD_RETIRED",
+                        VideoPath = videoPath,
+                        Error = "Profile đã BAN/retired trong lúc mở Chrome; dừng VIDEO."
+                    };
+                }
+
                 try { await RefreshStatusAsync(ctx); } catch { }
             }
             if (!string.Equals(ctx.LastSnapshot?.Chrome, "CONNECTED", StringComparison.OrdinalIgnoreCase))
@@ -2840,6 +2923,14 @@ public sealed partial class ManagerForm
         string username,
         IdentityToolState state)
     {
+        if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+        {
+            _log.Warn(
+                $"[AUTO_VIDEO_ABORT_RETIRE_DELETE] profile={ctx.Profile.Name} account={username} " +
+                "stage=pipeline_begin action=KEEP_EXCEL_UNCHANGED_NO_VIDEO");
+            return false;
+        }
+
         username = (username ?? "").Trim();
         if (username.Length == 0)
         {
@@ -2908,6 +2999,14 @@ public sealed partial class ManagerForm
                 $"status={initialWrite.Status} error={initialWrite.Error}");
         }
 
+        if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+        {
+            _log.Warn(
+                $"[AUTO_VIDEO_ABORT_RETIRE_DELETE] profile={ctx.Profile.Name} account={username} " +
+                "stage=after_initial_excel action=KEEP_STATUS_NO_VIDEO");
+            return false;
+        }
+
         if ((!state.VideoDeleteEnabled || deleteStatus == "DONE")
             && (!state.VideoUploadEnabled || uploadStatus == "DONE"))
         {
@@ -2946,6 +3045,14 @@ public sealed partial class ManagerForm
                     resumeAutomation: false,
                     studioDeleteFallback: false,
                     studioCleanupOnly: true);
+
+                if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+                {
+                    _log.Warn(
+                        $"[AUTO_VIDEO_ABORT_RETIRE_DELETE] profile={ctx.Profile.Name} account={username} " +
+                        "stage=cleanup_after_call action=KEEP_EXCEL_UNCHANGED_NO_VIDEO");
+                    return false;
+                }
 
                 if (cleanupReply.DeleteFallbackSucceeded
                     && cleanupReply.DeleteFallbackRemainingCount == 1)
@@ -3013,6 +3120,14 @@ public sealed partial class ManagerForm
                     deleteMode,
                     resumeAutomation: false);
 
+                if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+                {
+                    _log.Warn(
+                        $"[AUTO_VIDEO_ABORT_RETIRE_DELETE] profile={ctx.Profile.Name} account={username} " +
+                        $"stage=delete_after_call replyStage={reply.Stage} action=KEEP_EXCEL_UNCHANGED_SKIP_UPLOAD");
+                    return false;
+                }
+
                 deleteStatus = reply.Ok ? "DONE" : "FAIL";
                 if (IsVideoLoginRequired(reply))
                 {
@@ -3040,6 +3155,14 @@ public sealed partial class ManagerForm
                     $"[AUTO_VIDEO_DELETE_EXCEPTION] profile={ctx.Profile.Name} account={username} error={ex.Message} action=KEEP_DELETE_FAIL_CONTINUE_UPLOAD");
             }
 
+            if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+            {
+                _log.Warn(
+                    $"[AUTO_VIDEO_ABORT_RETIRE_DELETE] profile={ctx.Profile.Name} account={username} " +
+                    "stage=before_delete_excel action=KEEP_EXCEL_UNCHANGED_SKIP_UPLOAD");
+                return false;
+            }
+
             var write = await WriteVideoStatusVerifiedAsync(
                 username,
                 ctx.Profile.Name,
@@ -3058,6 +3181,14 @@ public sealed partial class ManagerForm
         // Riêng khi XÓA đã xác định LOGIN_REQUIRED thì không thử upload nữa: giữ
         // vế ĐĂNG ở trạng thái hiện tại (thường là FAIL), ghi checkpoint Excel và
         // trả Chrome ngay cho logic login đang có của tool.
+        if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+        {
+            _log.Warn(
+                $"[AUTO_VIDEO_ABORT_RETIRE_DELETE] profile={ctx.Profile.Name} account={username} " +
+                "stage=before_upload_branch action=KEEP_EXCEL_UNCHANGED_SKIP_UPLOAD");
+            return false;
+        }
+
         if (runUpload && skipUploadBecauseLoginRequired)
         {
             _log.Warn(
@@ -3091,6 +3222,14 @@ public sealed partial class ManagerForm
                         resumeAutomation: false,
                         studioDeleteFallback: false);
 
+                    if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+                    {
+                        _log.Warn(
+                            $"[AUTO_VIDEO_ABORT_RETIRE_DELETE] profile={ctx.Profile.Name} account={username} " +
+                            $"stage=upload_after_call replyStage={reply.Stage} action=KEEP_EXCEL_UNCHANGED");
+                        return false;
+                    }
+
                     // Mốc DONE mới: TikTok đã hiện toast "Đã đăng video".
                     // Không còn phụ thuộc privacy hay verify bài trên profile.
                     var uploadOk = reply.Ok && reply.Posted;
@@ -3115,6 +3254,14 @@ public sealed partial class ManagerForm
                     _log.Warn(
                         $"[AUTO_VIDEO_UPLOAD_EXCEPTION] profile={ctx.Profile.Name} account={username} error={ex.Message}");
                 }
+            }
+
+            if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+            {
+                _log.Warn(
+                    $"[AUTO_VIDEO_ABORT_RETIRE_DELETE] profile={ctx.Profile.Name} account={username} " +
+                    "stage=before_upload_excel action=KEEP_EXCEL_UNCHANGED");
+                return false;
             }
 
             var write = await WriteVideoStatusVerifiedAsync(
@@ -3187,6 +3334,13 @@ public sealed partial class ManagerForm
         bool force = false,
         string trigger = "prestart")
     {
+        if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+        {
+            _log.Warn(
+                $"[AUTO_VIDEO_PRESTART_ABORT_RETIRE_DELETE] profile={ctx.Profile.Name} trigger={trigger} action=NO_VIDEO");
+            return;
+        }
+
         var state = LoadIdentityToolState();
 
         if (!state.VideoDeleteEnabled && !state.VideoUploadEnabled)
@@ -3222,6 +3376,13 @@ public sealed partial class ManagerForm
         if (!existingVideoFinished)
         {
             _autoVideoHandledReadyAccount[ctx.Profile.Name] = username;
+            return;
+        }
+
+        if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+        {
+            _log.Warn(
+                $"[AUTO_VIDEO_PRESTART_ABORT_RETIRE_DELETE] profile={ctx.Profile.Name} trigger={trigger} stage=after_wait action=NO_VIDEO");
             return;
         }
 
@@ -3450,6 +3611,19 @@ public sealed partial class ManagerForm
                     $"updateName={state.UpdateName} names={names.Count}");
             }
 
+            // BAN/retired là terminal exception duy nhất của policy "VIDEO vẫn chạy sau
+            // Tên/ảnh FAIL/TRANSIENT". Khi đã hard-retired thì không được mở Chrome
+            // hay gửi thêm login chỉ để chạy VIDEO.
+            if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+            {
+                await CancelManagedAccountSetupHoldAsync(ctx, "auto_identity_hard_retired_before_video");
+                _autoIdentityPendingResumeState.Remove(ctx.Profile.Name);
+                _log.Warn(
+                    $"[AUTO_IDENTITY_ABORT_RETIRE_DELETE] profile={ctx.Profile.Name} account={username} " +
+                    "stage=before_video action=NO_VIDEO_NO_START");
+                return;
+            }
+
             // VIDEO luôn được thử SAU Tên/ảnh, kể cả khi Tên/ảnh vừa FAIL/TRANSIENT.
             // Nếu đã có một lượt VIDEO khác đang chạy thì chờ nó tối đa 10 phút;
             // timeout chỉ fail-open và KHÔNG thay đổi kết quả Name Guard.
@@ -3481,6 +3655,18 @@ public sealed partial class ManagerForm
                 _log.Warn(
                     $"[AUTO_VIDEO_PIPELINE_FAILOPEN] profile={ctx.Profile.Name} " +
                     $"account={username} error={ex.Message}");
+            }
+
+            // Nếu BAN được phát hiện trong VIDEO thì dừng tại đây. Không nhả HOLD theo
+            // kiểu resume/start và không áp fail-open của VIDEO lên luồng chính.
+            if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+            {
+                await CancelManagedAccountSetupHoldAsync(ctx, "auto_identity_hard_retired_after_video");
+                _autoIdentityPendingResumeState.Remove(ctx.Profile.Name);
+                _log.Warn(
+                    $"[AUTO_IDENTITY_ABORT_RETIRE_DELETE] profile={ctx.Profile.Name} account={username} " +
+                    "stage=after_video action=NO_START");
+                return;
             }
 
             // Tới đây VIDEO đã kết thúc/skip/fail-open. Bây giờ mới áp kết quả

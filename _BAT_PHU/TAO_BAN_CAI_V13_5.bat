@@ -52,14 +52,36 @@ echo XPath-only - KHONG CAN TESSERACT
 echo ========================================
 echo.
 
-echo [1/3] Publish Worker self-contained win-x64...
+echo [1/4] Publish Worker self-contained win-x64...
 dotnet publish ".\ToolTikTokWorkerV13\ToolTikTokWorkerV13.csproj" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -p:PublishReadyToRun=false -p:PublishTrimmed=false -o "%OUT%"
 if errorlevel 1 goto :fail
 
 echo.
-echo [2/3] Publish Manager self-contained win-x64...
+echo [2/4] Publish Manager self-contained win-x64...
 dotnet publish ".\ToolTikTokManagerV13\ToolTikTokManagerV13.csproj" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -p:PublishReadyToRun=false -p:PublishTrimmed=false -o "%OUT%"
 if errorlevel 1 goto :fail
+
+echo.
+echo [3/4] Publish Comment Visibility Monitor self-contained win-x64...
+if not exist ".\CommentVisibilityMonitor\CommentVisibilityMonitor.csproj" (
+    echo.
+    echo ========================================
+    echo LOI: KHONG TIM THAY COMMENT MONITOR SOURCE
+    echo .\CommentVisibilityMonitor\CommentVisibilityMonitor.csproj
+    echo ========================================
+    goto :fail
+)
+dotnet publish ".\CommentVisibilityMonitor\CommentVisibilityMonitor.csproj" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -p:PublishReadyToRun=false -p:PublishTrimmed=false -o "%OUT%\CommentCheck"
+if errorlevel 1 goto :fail
+
+if not exist "%OUT%\CommentCheck\CommentVisibilityMonitor.exe" (
+    echo.
+    echo ========================================
+    echo LOI: COMMENT MONITOR BUILD XONG NHUNG KHONG CO EXE
+    echo %OUT%\CommentCheck\CommentVisibilityMonitor.exe
+    echo ========================================
+    goto :fail
+)
 
 for /r "%OUT%" %%F in (*.pdb) do del /q "%%F" >nul 2>&1
 
@@ -67,18 +89,28 @@ for /r "%OUT%" %%F in (*.pdb) do del /q "%%F" >nul 2>&1
 >>"%OUT%\CHAY_TOOL_V13_5.bat" echo cd /d "%%~dp0"
 >>"%OUT%\CHAY_TOOL_V13_5.bat" echo start "" ".\ToolTikTokManagerV13.exe"
 
+> "%OUT%\CHAY_KIEM_TRA_CMT.bat" echo @echo off
+>>"%OUT%\CHAY_KIEM_TRA_CMT.bat" echo cd /d "%%~dp0CommentCheck"
+>>"%OUT%\CHAY_KIEM_TRA_CMT.bat" echo if not exist ".\CommentVisibilityMonitor.exe" ^(
+>>"%OUT%\CHAY_KIEM_TRA_CMT.bat" echo   echo KHONG TIM THAY CommentVisibilityMonitor.exe
+>>"%OUT%\CHAY_KIEM_TRA_CMT.bat" echo   pause
+>>"%OUT%\CHAY_KIEM_TRA_CMT.bat" echo   exit /b 1
+>>"%OUT%\CHAY_KIEM_TRA_CMT.bat" echo ^)
+>>"%OUT%\CHAY_KIEM_TRA_CMT.bat" echo start "" ".\CommentVisibilityMonitor.exe"
+
 > "%OUT%\README_MAY_AO.txt" echo TOOL TIKTOK V%APP_VERSION% VM CLIENT
 >>"%OUT%\README_MAY_AO.txt" echo - Khong can cai .NET 8.
 >>"%OUT%\README_MAY_AO.txt" echo - Khong can cai Tesseract/OCR.
 >>"%OUT%\README_MAY_AO.txt" echo - Can Google Chrome.
 >>"%OUT%\README_MAY_AO.txt" echo - Chay CHAY_TOOL_V13_5.bat hoac ToolTikTokManagerV13.exe.
+>>"%OUT%\README_MAY_AO.txt" echo - Kiem tra CMT: chay CHAY_KIEM_TRA_CMT.bat.
 >>"%OUT%\README_MAY_AO.txt" echo - Profile Chrome: TikTokProfiles\ten_profile\chrome_profile
 
 mkdir "%OUT%\TikTokProfiles" >nul 2>&1
 mkdir "%OUT%\profiles" >nul 2>&1
 
 echo.
-echo [3/3] Nen ZIP may ao...
+echo [4/4] Nen ZIP may ao...
 echo Dang nen bang tar.exe de tranh loi Compress-Archive...
 
 where tar.exe >nul 2>&1

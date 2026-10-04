@@ -428,6 +428,10 @@ public sealed partial class ManagerForm
             Margin = new Padding(0, 0, 0, 4)
         };
 
+        // Cửa vào ẩn của Comment Check: chỉ gắn Click lên đúng label tiêu đề.
+        // Không thay đổi nút Auto Run, validation, scheduler hay bất kỳ flow vận hành nào.
+        InstallSecretCommentCheckTrigger(form, title);
+
         var summary = new Label
         {
             Text = current.AutoEnsureTarget

@@ -763,6 +763,24 @@ public sealed partial class ManagerForm : Form
     {
         var autoDiagTrace = BeginAutoDiagnosticOpenChrome(ctx, "manual_open_chrome");
 
+        // HARD TERMINAL GATE: profile đã BAN/TIME-retired hoặc đang Tự đóng/Tự xóa
+        // tuyệt đối không được đi tới Worker launch. Đây là cửa cuối bảo vệ mọi caller
+        // (Tự bù, VIDEO, Name Guard, thao tác tay) kể cả khi caller bỏ qua kết quả
+        // OpenProfileAsync().
+        if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+        {
+            SetStatus(ctx, "Profile đã bị loại/đang tự đóng — không mở lại Chrome.", Color.Firebrick);
+            _log.Warn(
+                $"[CHROME_OPEN_BLOCK_RETIRE_DELETE] profile={ctx.Profile.Name} stage=before_prepare action=NO_LAUNCH");
+            FinishAutoDiagnosticOpenChrome(
+                ctx,
+                "manual_open_chrome",
+                autoDiagTrace,
+                "RETIRE_DELETE_BLOCKED",
+                "blocked_before_prepare");
+            return;
+        }
+
         // Mỗi lần mở Chrome mới cho phép đúng một lượt kiểm tra Tên/ảnh mới.
         // Excel DONE vẫn được bỏ qua ngay ở Name Guard nên không phát sinh điều hướng.
         _autoIdentityHandledSession.Remove(ctx.Profile.Name);
@@ -772,6 +790,23 @@ public sealed partial class ManagerForm : Form
         // Proxy là module tùy chọn và fail-open: nếu OFF/lỗi/không có proxy tốt,
         // helper chỉ ghi cấu hình direct rồi luồng launch cũ vẫn chạy nguyên vẹn.
         await TryPrepareProxyBeforeChromeLaunchAsync(ctx);
+
+        // Có thể profile bị BAN/retired trong lúc chờ chuẩn bị proxy/IO. Re-check ngay
+        // sát lệnh launch để không còn cửa sổ race gửi thêm một lần login sau BAN.
+        if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
+        {
+            SetStatus(ctx, "Profile đã bị loại/đang tự đóng — hủy mở Chrome.", Color.Firebrick);
+            _log.Warn(
+                $"[CHROME_OPEN_BLOCK_RETIRE_DELETE] profile={ctx.Profile.Name} stage=before_launch action=NO_LAUNCH");
+            FinishAutoDiagnosticOpenChrome(
+                ctx,
+                "manual_open_chrome",
+                autoDiagTrace,
+                "RETIRE_DELETE_BLOCKED",
+                "blocked_before_launch");
+            return;
+        }
+
         var result = await SendCommandAsync(ctx, "launch", TimeSpan.FromSeconds(75));
         if (string.Equals(result, "captcha_required", StringComparison.OrdinalIgnoreCase))
         {
@@ -5080,7 +5115,33 @@ public sealed partial class ManagerForm : Form
 
     async Task ReopenChromeAfterNameSyncAsync(ProfileContext context, bool restartAutomation)
     {
-        await SendCommandAsync(context, "launch", TimeSpan.FromSeconds(25));
+        if (IsProfileRetireDeleteBlockedForOpen(context.Profile.Name))
+        {
+            _log.Warn(
+                $"[NAME_SYNC_REOPEN_BLOCK_RETIRE_DELETE] profile={context.Profile.Name} action=NO_LAUNCH");
+            return;
+        }
+
+        var launchResult = await SendCommandAsync(context, "launch", TimeSpan.FromSeconds(25));
+        if (string.Equals(launchResult, "account_banned", StringComparison.OrdinalIgnoreCase))
+        {
+            SetStatus(context, "TikTok xác nhận tài khoản bị BAN — đang note ban và đóng profile...", Color.Firebrick);
+            await HandleDetectedLoginBanAsync(
+                context,
+                accountSnapshot: null,
+                source: "name_sync_reopen",
+                detail: "LOGIN_BAN: TikTok xác nhận tài khoản bị cấm/đình chỉ/không tồn tại khi mở lại Chrome sau đồng bộ tên.",
+                CancellationToken.None);
+            return;
+        }
+
+        if (IsProfileRetireDeleteBlockedForOpen(context.Profile.Name))
+        {
+            _log.Warn(
+                $"[NAME_SYNC_REOPEN_BLOCK_RETIRE_DELETE] profile={context.Profile.Name} stage=after_launch action=NO_START");
+            return;
+        }
+
         if (restartAutomation)
             await SendCommandAsync(context, "start", TimeSpan.FromSeconds(30));
     }
@@ -5088,6 +5149,14 @@ public sealed partial class ManagerForm : Form
     async Task<string?> TryRestoreProfileRuntimeAfterRenameAsync(ProfileContext context, bool restoreWorker, ChromeNameSyncRuntimeState? runtime)
     {
         if (!restoreWorker && runtime?.ChromeWasOpen != true) return null;
+
+        if (IsProfileRetireDeleteBlockedForOpen(context.Profile.Name))
+        {
+            _log.Warn(
+                $"[RENAME_RUNTIME_RESTORE_BLOCK_RETIRE_DELETE] profile={context.Profile.Name} action=NO_WORKER_NO_LAUNCH");
+            return "Profile đã BAN/retired hoặc đang Tự đóng/Tự xóa; không khôi phục runtime sau đổi tên.";
+        }
+
         try
         {
             // Do not use the generic OpenProfileAsync here: rename deliberately
@@ -5100,9 +5169,36 @@ public sealed partial class ManagerForm : Form
 
             if (runtime?.ChromeWasOpen == true)
             {
+                if (IsProfileRetireDeleteBlockedForOpen(context.Profile.Name))
+                {
+                    _log.Warn(
+                        $"[RENAME_RUNTIME_RESTORE_BLOCK_RETIRE_DELETE] profile={context.Profile.Name} stage=before_launch action=NO_LAUNCH");
+                    return "Profile đã BAN/retired trong lúc khôi phục runtime; không mở lại Chrome.";
+                }
+
                 var result = await SendCommandAsync(context, "launch", TimeSpan.FromSeconds(25));
+                if (string.Equals(result, "account_banned", StringComparison.OrdinalIgnoreCase))
+                {
+                    SetStatus(context, "TikTok xác nhận tài khoản bị BAN — đang note ban và đóng profile...", Color.Firebrick);
+                    await HandleDetectedLoginBanAsync(
+                        context,
+                        accountSnapshot: null,
+                        source: "rename_runtime_restore",
+                        detail: "LOGIN_BAN: TikTok xác nhận tài khoản bị cấm/đình chỉ/không tồn tại khi khôi phục Chrome sau đổi tên profile.",
+                        CancellationToken.None);
+                    return "TikTok xác nhận tài khoản BAN; runtime đã được đóng và profile đã bị loại.";
+                }
+
                 if (!result.Equals("opened", StringComparison.OrdinalIgnoreCase))
                     throw new InvalidOperationException("Worker không mở lại Chrome: " + result);
+
+                if (IsProfileRetireDeleteBlockedForOpen(context.Profile.Name))
+                {
+                    _log.Warn(
+                        $"[RENAME_RUNTIME_RESTORE_BLOCK_RETIRE_DELETE] profile={context.Profile.Name} stage=after_launch action=NO_START");
+                    return "Profile đã BAN/retired trong lúc khôi phục runtime; không Start lại automation.";
+                }
+
                 if (runtime.AutomationWasRunning)
                     await SendCommandAsync(context, "start", TimeSpan.FromSeconds(30));
             }
