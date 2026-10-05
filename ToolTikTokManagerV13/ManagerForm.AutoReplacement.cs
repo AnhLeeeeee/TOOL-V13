@@ -68,10 +68,17 @@ public sealed partial class ManagerForm
 
     sealed class AutoReplacementCreateLimitStateDocument
     {
-        public int Version { get; set; } = 1;
+        public int Version { get; set; } = 2;
         public string SessionId { get; set; } = "";
         public int SessionCreatedCount { get; set; }
         public List<DateTime> CreatedUtc { get; set; } = new();
+
+        // Ngân sách CREATE dùng CHUNG cho toàn bộ một đợt thiếu capacity.
+        // Không còn 3 CREATE riêng cho từng CAPACITY_GAP/request.
+        public bool DeficitActive { get; set; }
+        public string DeficitId { get; set; } = "";
+        public int DeficitCreatedCount { get; set; }
+        public DateTime? DeficitStartedUtc { get; set; }
     }
 
     sealed record AutoReplacementCreateLimitSnapshot(
@@ -134,10 +141,10 @@ public sealed partial class ManagerForm
     static readonly TimeSpan AutoReplacementFailedProfileCooldown = TimeSpan.FromMinutes(5);
     static readonly TimeSpan AutoReplacementQueueWaitSlice = TimeSpan.FromSeconds(5);
 
-    // Hard policy của Tự bù: một slot thiếu chỉ được phép tiêu tối đa 3 CREATE thật.
-    // Sau 3/3 tuyệt đối không CREATE thêm; request chỉ quay vòng toàn bộ PRF chờ
-    // mỗi khoảng 2 phút cho tới khi một PRF dùng được. Setting user thấp hơn 3
-    // vẫn được tôn trọng; setting cao hơn/disabled không thể vượt hard cap này.
+    // Hard policy của Tự bù: TOÀN BỘ một đợt thiếu capacity chỉ được phép tiêu
+    // tối đa 3 CREATE thật, dùng chung cho mọi CAPACITY_GAP/request. Sau 3/3
+    // tuyệt đối không CREATE thêm; chỉ quay vòng toàn bộ PRF chờ mỗi ~2 phút
+    // cho tới khi capacity phục hồi đủ target. Setting user thấp hơn 3 vẫn thắng.
     const int AutoReplacementHardCreatePerSlotCap = 3;
     static readonly TimeSpan AutoReplacementHardCreateCapReuseRetry = TimeSpan.FromMinutes(2);
     static readonly TimeSpan AutoReplacementReusableStateRetry = TimeSpan.FromSeconds(5);
@@ -314,7 +321,7 @@ public sealed partial class ManagerForm
             state = new AutoReplacementCreateLimitStateDocument();
         }
 
-        state.Version = 1;
+        state.Version = 2;
         state.CreatedUtc ??= new List<DateTime>();
         state.CreatedUtc = state.CreatedUtc
             .Select(x => x.Kind == DateTimeKind.Utc ? x : x.ToUniversalTime())
@@ -322,6 +329,19 @@ public sealed partial class ManagerForm
             .OrderBy(x => x)
             .ToList();
         state.SessionCreatedCount = Math.Max(0, state.SessionCreatedCount);
+        state.DeficitCreatedCount = Math.Max(0, state.DeficitCreatedCount);
+        if (state.DeficitStartedUtc is DateTime deficitStarted)
+            state.DeficitStartedUtc = deficitStarted.Kind == DateTimeKind.Utc ? deficitStarted : deficitStarted.ToUniversalTime();
+        if (!state.DeficitActive)
+        {
+            state.DeficitCreatedCount = 0;
+            state.DeficitId = "";
+            state.DeficitStartedUtc = null;
+        }
+        else if (string.IsNullOrWhiteSpace(state.DeficitId))
+        {
+            state.DeficitId = Guid.NewGuid().ToString("N");
+        }
         if (string.IsNullOrWhiteSpace(state.SessionId))
             state.SessionId = Guid.NewGuid().ToString("N");
 
@@ -360,6 +380,82 @@ public sealed partial class ManagerForm
         var before = state.CreatedUtc.Count;
         state.CreatedUtc.RemoveAll(x => x <= cutoff || x > nowUtc.AddMinutes(5));
         return before - state.CreatedUtc.Count;
+    }
+
+    (bool Active, string Id, int Created) GetAutoReplacementDeficitCreateBudgetSnapshot()
+    {
+        lock (_autoReplacementCreateLimitLock)
+        {
+            var state = EnsureAutoReplacementCreateLimitStateUnsafe();
+            return (state.DeficitActive, state.DeficitId ?? "", Math.Max(0, state.DeficitCreatedCount));
+        }
+    }
+
+    void EnsureAutoReplacementDeficitCreateBudgetActiveUnsafe(string source)
+    {
+        var state = EnsureAutoReplacementCreateLimitStateUnsafe();
+        if (state.DeficitActive)
+            return;
+
+        state.DeficitActive = true;
+        state.DeficitId = Guid.NewGuid().ToString("N");
+        state.DeficitCreatedCount = 0;
+        state.DeficitStartedUtc = DateTime.UtcNow;
+        SaveAutoReplacementCreateLimitStateUnsafe();
+
+        _log.Warn(
+            $"[AUTO_CREATE_DEFICIT_BEGIN] source={source} deficitId={state.DeficitId} hardCap={AutoReplacementHardCreatePerSlotCap}");
+    }
+
+    void ResetAutoReplacementDeficitCreateBudget(string source)
+    {
+        lock (_autoReplacementCreateLimitLock)
+        {
+            var state = EnsureAutoReplacementCreateLimitStateUnsafe();
+            if (!state.DeficitActive && state.DeficitCreatedCount == 0)
+                return;
+
+            var oldId = state.DeficitId;
+            var oldCreated = state.DeficitCreatedCount;
+            state.DeficitActive = false;
+            state.DeficitId = "";
+            state.DeficitCreatedCount = 0;
+            state.DeficitStartedUtc = null;
+            SaveAutoReplacementCreateLimitStateUnsafe();
+
+            _log.Info(
+                $"[AUTO_CREATE_DEFICIT_RESET] source={source} deficitId={oldId} created={oldCreated} action=NEW_DEFICIT_MAY_CREATE_AGAIN");
+        }
+    }
+
+    void ResetAutoReplacementDeficitCreateBudgetIfCapacityRecovered(
+        int target,
+        int occupied,
+        string source)
+    {
+        if (target <= 0 || occupied < target)
+            return;
+
+        ResetAutoReplacementDeficitCreateBudget(
+            $"capacity_recovered:{source}:occupied={occupied}:target={target}");
+    }
+
+    void TryResetAutoReplacementDeficitCreateBudgetFromLiveCapacity(string source)
+    {
+        int target;
+        bool initialized;
+        lock (_autoReplacementFixedSlotLock)
+        {
+            target = _autoReplacementTargetSlots;
+            initialized = _autoReplacementTargetInitialized;
+        }
+
+        if (!initialized || target <= 0)
+            return;
+
+        var occupied = CountAutoReplacementFulfilledSlots();
+        ResetAutoReplacementDeficitCreateBudgetIfCapacityRecovered(
+            target, occupied, source);
     }
 
     public void ResetAutoReplacementCreateLimitSession(string source)
@@ -406,17 +502,17 @@ public sealed partial class ManagerForm
     bool TryGetAutoReplacementCreateLimitBlock(
         AutoReplacementRequest request,
         out string reason,
-        out int slotCreated,
+        out int deficitCreated,
         out int hourCreated,
         out int sessionCreated)
     {
         reason = "";
-        slotCreated = GetAutoReplacementRequestCreatedCount(request);
+        deficitCreated = 0;
         hourCreated = 0;
         sessionCreated = 0;
 
         var limit = GetAutoReplacementCreateLimitSnapshot();
-        var effectivePerSlotCap = GetEffectiveAutoReplacementPerSlotCreateCap(limit);
+        var effectiveDeficitCap = GetEffectiveAutoReplacementPerSlotCreateCap(limit);
 
         lock (_autoReplacementCreateLimitLock)
         {
@@ -426,18 +522,18 @@ public sealed partial class ManagerForm
             if (pruned > 0)
                 SaveAutoReplacementCreateLimitStateUnsafe();
 
+            deficitCreated = state.DeficitActive ? Math.Max(0, state.DeficitCreatedCount) : 0;
             hourCreated = state.CreatedUtc.Count;
             sessionCreated = state.SessionCreatedCount;
         }
 
-        // Hard cap 3/slot luôn có hiệu lực, kể cả checkbox giới hạn CREATE đang OFF.
-        if (slotCreated >= effectivePerSlotCap)
+        // Hard cap dùng CHUNG cho toàn bộ đợt thiếu, không phải từng request.
+        if (deficitCreated >= effectiveDeficitCap)
         {
-            reason = $"slot={slotCreated}/{effectivePerSlotCap}";
+            reason = $"deficit={deficitCreated}/{effectiveDeficitCap}";
             return true;
         }
 
-        // Per-hour / per-session vẫn là các cầu chì tùy chọn theo setting hiện có.
         if (!limit.Enabled)
             return false;
 
@@ -464,21 +560,23 @@ public sealed partial class ManagerForm
         blockReason = "";
         var limit = GetAutoReplacementCreateLimitSnapshot();
         var nowUtc = DateTime.UtcNow;
-
-        // Queue runner hiện chạy tuần tự, tuy nhiên vẫn re-check cả per-slot lẫn
-        // global ngay trước CREATE để setting vừa Lưu có hiệu lực ở lượt kế tiếp.
-        var slotCreated = GetAutoReplacementRequestCreatedCount(request);
-        var effectivePerSlotCap = GetEffectiveAutoReplacementPerSlotCreateCap(limit);
+        var effectiveDeficitCap = GetEffectiveAutoReplacementPerSlotCreateCap(limit);
+        string deficitId;
+        int deficitCreated;
 
         lock (_autoReplacementCreateLimitLock)
         {
             var state = EnsureAutoReplacementCreateLimitStateUnsafe();
             PruneAutoReplacementCreateHourWindowUnsafe(nowUtc);
+            EnsureAutoReplacementDeficitCreateBudgetActiveUnsafe(
+                $"reserve:{request.Id}:{request.ClosedProfileName}");
 
-            // Hard cap per-slot luôn bật. Các cầu chì hour/session chỉ áp dụng khi
-            // user bật Create Limit như trước.
-            if (slotCreated >= effectivePerSlotCap)
-                blockReason = $"slot={slotCreated}/{effectivePerSlotCap}";
+            state = EnsureAutoReplacementCreateLimitStateUnsafe();
+            deficitId = state.DeficitId;
+            deficitCreated = Math.Max(0, state.DeficitCreatedCount);
+
+            if (deficitCreated >= effectiveDeficitCap)
+                blockReason = $"deficit={deficitCreated}/{effectiveDeficitCap}";
             else if (limit.Enabled && state.CreatedUtc.Count >= limit.PerHour)
                 blockReason = $"hour={state.CreatedUtc.Count}/{limit.PerHour}";
             else if (limit.Enabled && state.SessionCreatedCount >= limit.PerSession)
@@ -490,13 +588,17 @@ public sealed partial class ManagerForm
                 return false;
             }
 
-            // Luôn ghi nhận CREATE thật kể cả user tạm tắt giới hạn. Nếu bật lại giữa
-            // phiên, counter phản ánh đúng số PRF đã tiêu thụ trong phiên/60 phút.
+            // Điểm COMMIT CREATE thật: tăng ngân sách dùng chung của cả deficit.
+            state.DeficitCreatedCount++;
+            deficitCreated = state.DeficitCreatedCount;
             state.CreatedUtc.Add(nowUtc);
             state.SessionCreatedCount++;
             SaveAutoReplacementCreateLimitStateUnsafe();
         }
 
+        // Giữ counter per-request chỉ để chẩn đoán/tương thích queue cũ; nó KHÔNG
+        // còn quyết định hard-cap.
+        int requestCreated;
         lock (_autoReplacementQueueLock)
         {
             var live = _autoReplacementQueue.FirstOrDefault(x =>
@@ -509,7 +611,7 @@ public sealed partial class ManagerForm
             if (live is not null)
                 SaveAutoReplacementQueueUnsafe();
 
-            slotCreated = target.CreatedProfileCount;
+            requestCreated = target.CreatedProfileCount;
         }
 
         int hourCreated;
@@ -523,7 +625,8 @@ public sealed partial class ManagerForm
 
         _log.Info(
             $"[AUTO_CREATE_LIMIT_COUNT] request={request.Id} profile={profileName} enabled={limit.Enabled} " +
-            $"slot={slotCreated}/{effectivePerSlotCap} configuredPerSlot={limit.PerSlot} hardCap={AutoReplacementHardCreatePerSlotCap} " +
+            $"deficitId={deficitId} deficit={deficitCreated}/{effectiveDeficitCap} requestCreated={requestCreated} " +
+            $"configuredPerSlot={limit.PerSlot} hardCap={AutoReplacementHardCreatePerSlotCap} " +
             $"hour={hourCreated}/{limit.PerHour} session={sessionCreated}/{limit.PerSession}");
 
         return true;
@@ -534,11 +637,12 @@ public sealed partial class ManagerForm
         string lastError)
     {
         var limit = GetAutoReplacementCreateLimitSnapshot();
-        var slotCreated = GetAutoReplacementRequestCreatedCount(requestId);
+        var deficitSnapshot = GetAutoReplacementDeficitCreateBudgetSnapshot();
+        var slotCreated = deficitSnapshot.Created;
         var effectivePerSlotCap = GetEffectiveAutoReplacementPerSlotCreateCap(limit);
-        var hardSlotCapReached = slotCreated >= effectivePerSlotCap;
+        var hardSlotCapReached = deficitSnapshot.Active && slotCreated >= effectivePerSlotCap;
 
-        // Sau khi slot đã đạt 3/3 (hoặc ngưỡng user thấp hơn), không CREATE thêm.
+        // Sau khi toàn bộ đợt thiếu đã đạt 3/3 (hoặc ngưỡng user thấp hơn), không CREATE thêm.
         // Chỉ quay vòng toàn bộ hàng chờ mỗi ~2 phút. Hour/session-only vẫn giữ
         // RetryMinutes cấu hình cũ để không thay đổi hành vi ngoài yêu cầu này.
         var delay = hardSlotCapReached
@@ -565,8 +669,8 @@ public sealed partial class ManagerForm
 
             _log.Warn(
                 $"[AUTO_CREATE_LIMIT_WAIT_REUSE] id={request.Id} closed={request.ClosedProfileName} " +
-                $"retryIn={delay:c} mode={(hardSlotCapReached ? "PER_SLOT_HARD_CAP_ROTATION" : "CONFIGURED_LIMIT_WAIT")} " +
-                $"slot={slotCreated}/{effectivePerSlotCap} clearedAttempted={previousAttempted} reason={request.CreateLimitWaitReason}");
+                $"retryIn={delay:c} mode={(hardSlotCapReached ? "DEFICIT_HARD_CAP_ROTATION" : "CONFIGURED_LIMIT_WAIT")} " +
+                $"deficit={slotCreated}/{effectivePerSlotCap} clearedAttempted={previousAttempted} reason={request.CreateLimitWaitReason}");
 
             WriteAutoActivityLog(
                 action: "TỰ BÙ",
@@ -574,7 +678,7 @@ public sealed partial class ManagerForm
                 reason: request.Reason,
                 result: "TẠM DỪNG TẠO / CHỜ PRF",
                 detail: hardSlotCapReached
-                    ? $"Đã đạt {slotCreated}/{effectivePerSlotCap} CREATE cho suất này. Khóa CREATE; cứ khoảng 2 phút quét xoay vòng lại toàn bộ PRF chờ cho tới khi có PRF dùng được. {request.CreateLimitWaitReason}"
+                    ? $"Đã đạt {slotCreated}/{effectivePerSlotCap} CREATE cho toàn bộ đợt thiếu. Khóa CREATE cho mọi suất; cứ khoảng 2 phút quét xoay vòng lại toàn bộ PRF chờ cho tới khi capacity phục hồi. {request.CreateLimitWaitReason}"
                     : $"Tạm dừng nhánh tạo. Nghỉ {limit.RetryMinutes} phút rồi thử lại lần lượt toàn bộ PRF chờ; nếu vẫn chưa được sẽ tiếp tục chu kỳ chờ. {request.CreateLimitWaitReason}");
         }
     }
@@ -1069,6 +1173,9 @@ public sealed partial class ManagerForm
         // Ghi bền vững để sau khi mở lại Manager cũng không bị lấy làm profile bù.
         _autoReplacementRetiredProfiles.Add(closedProfileName);
         MarkProfileSupplyState(closedProfileName, "retired", "auto_close:" + reason);
+        // Báo ngay cho Comment Check rằng lifecycle của PRF cũ đã kết thúc. Không chờ
+        // tick 1 giây vì profile có thể bị xóa khỏi catalog rất nhanh sau cleanup.
+        EmitCommentCheckManagerStateTelemetry(force: true);
 
         if (!_autoCloseSettings.OpenReplacementAfterAutoClose)
             return;
@@ -1492,14 +1599,14 @@ public sealed partial class ManagerForm
                             else if (TryGetAutoReplacementCreateLimitBlock(
                                          request,
                                          out var createLimitReason,
-                                         out var createLimitSlotCount,
+                                         out var createLimitDeficitCount,
                                          out var createLimitHourCount,
                                          out var createLimitSessionCount))
                             {
                                 createLimitBlocked = true;
                                 var limit = GetAutoReplacementCreateLimitSnapshot();
                                 var effectivePerSlotCap = GetEffectiveAutoReplacementPerSlotCreateCap(limit);
-                                var slotCapReached = createLimitSlotCount >= effectivePerSlotCap;
+                                var slotCapReached = createLimitDeficitCount >= effectivePerSlotCap;
                                 var retryDelay = slotCapReached
                                     ? AutoReplacementHardCreateCapReuseRetry
                                     : TimeSpan.FromMinutes(limit.RetryMinutes);
@@ -1508,13 +1615,13 @@ public sealed partial class ManagerForm
 
                                 _log.Warn(
                                     $"[AUTO_CREATE_LIMIT_BLOCK] id={request.Id} closed={request.ClosedProfileName} " +
-                                    $"slot={createLimitSlotCount}/{effectivePerSlotCap} hour={createLimitHourCount}/{limit.PerHour} " +
+                                    $"deficit={createLimitDeficitCount}/{effectivePerSlotCap} hour={createLimitHourCount}/{limit.PerHour} " +
                                     $"session={createLimitSessionCount}/{limit.PerSession} retryIn={retryDelay:c} reason={createLimitReason}");
 
                                 SetAutoReplacementUiPhase(
                                     "TẠM DỪNG TẠO",
                                     slotCapReached
-                                        ? $"đã {createLimitSlotCount}/{effectivePerSlotCap} · quét lại PRF chờ sau ~2 phút"
+                                        ? $"đã {createLimitDeficitCount}/{effectivePerSlotCap} toàn đợt · quét lại PRF chờ sau ~2 phút"
                                         : $"retry PRF chờ sau {limit.RetryMinutes} phút",
                                     request.Id);
                             }
@@ -1609,14 +1716,14 @@ public sealed partial class ManagerForm
                                     && TryGetAutoReplacementCreateLimitBlock(
                                         request,
                                         out var postCreateLimitReason,
-                                        out var postCreateSlotCount,
+                                        out var postCreateDeficitCount,
                                         out var postCreateHourCount,
                                         out var postCreateSessionCount))
                                 {
                                     createLimitBlocked = true;
                                     var limit = GetAutoReplacementCreateLimitSnapshot();
                                     var effectivePerSlotCap = GetEffectiveAutoReplacementPerSlotCreateCap(limit);
-                                    var slotCapReached = postCreateSlotCount >= effectivePerSlotCap;
+                                    var slotCapReached = postCreateDeficitCount >= effectivePerSlotCap;
                                     var retryDelay = slotCapReached
                                         ? AutoReplacementHardCreateCapReuseRetry
                                         : TimeSpan.FromMinutes(limit.RetryMinutes);
@@ -1625,7 +1732,7 @@ public sealed partial class ManagerForm
 
                                     _log.Warn(
                                         $"[AUTO_CREATE_LIMIT_REACHED_AFTER_CREATE] id={request.Id} closed={request.ClosedProfileName} " +
-                                        $"slot={postCreateSlotCount}/{effectivePerSlotCap} hour={postCreateHourCount}/{limit.PerHour} " +
+                                        $"deficit={postCreateDeficitCount}/{effectivePerSlotCap} hour={postCreateHourCount}/{limit.PerHour} " +
                                         $"session={postCreateSessionCount}/{limit.PerSession} retryIn={retryDelay:c} reason={postCreateLimitReason}");
                                 }
                             }
@@ -1695,6 +1802,8 @@ public sealed partial class ManagerForm
                 {
                     ClearAutoReplacementUiPhase(request.Id);
                     RemoveAutoReplacementRequest(request.Id);
+                    TryResetAutoReplacementDeficitCreateBudgetFromLiveCapacity(
+                        $"slot_done:{request.Id}");
 
                     _log.Info(
                         $"[AUTO_REPLACE_SLOT_DONE] id={request.Id} closed={request.ClosedProfileName} pending={GetAutoReplacementPendingCount()}");

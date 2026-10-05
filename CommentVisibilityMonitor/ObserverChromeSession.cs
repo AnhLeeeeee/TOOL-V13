@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using ToolTikTokV11.Models;
 using ToolTikTokV11.Services;
 using ToolTikTokV11.Utils;
@@ -336,7 +336,7 @@ internal sealed class ObserverChromeSession : IAsyncDisposable
                             readySinceUtc = DateTime.UtcNow;
 
                         // Không kết luận quá sớm khi TikTok mới render một phần danh sách.
-                        // Chờ danh sách ổn định rồi mới trả NOT_FOUND; bên ngoài còn xác nhận lần 2.
+                        // Chờ danh sách ổn định rồi mới trả NOT_FOUND; kết quả này đủ để CHECK BAN ghi ban ngay.
                         var stableFor = DateTime.UtcNow - readySinceUtc;
                         if ((noResult && stableFor >= TimeSpan.FromSeconds(2.0))
                             || stableFor >= TimeSpan.FromSeconds(3.5))
@@ -453,12 +453,15 @@ internal sealed class ObserverChromeSession : IAsyncDisposable
         if (!_chrome.Connected) return;
         const string js = """
 (() => {
-  if (window.__ttcc && window.__ttcc.version === 2) return true;
+  if (window.__ttcc && window.__ttcc.version === 4) return true;
+  try { window.__ttcc?.shutdown?.(); } catch {}
 
   const norm = v => String(v || '').replace(/\s+/g,' ').trim().toLocaleLowerCase('vi-VN');
   const userNorm = v => norm(v).replace(/^@+/,'');
   const targets = new Map();
+  const claimedRows = new WeakMap();
   let observer = null;
+  let pollTimer = null;
 
   const handle = href => {
     try {
@@ -479,15 +482,120 @@ internal sealed class ObserverChromeSession : IAsyncDisposable
       && r.height > 0;
   };
 
+  const allChatRows = () => [...document.querySelectorAll('[data-e2e="chat-message"]')];
+
+  const contentNodeOf = row => {
+    if (!row?.querySelector) return null;
+    return row.querySelector('[class~="w-full"][class~="break-words"][class~="align-middle"]');
+  };
+
+  const ownerNodeOf = row => row?.querySelector?.('[data-e2e="message-owner-name"]') || null;
+
+  const rowIndexOf = row => {
+    const wrap = row?.closest?.('[data-index]');
+    const raw = wrap?.getAttribute?.('data-index') || '';
+    const n = Number.parseInt(raw, 10);
+    return Number.isFinite(n) ? n : -1;
+  };
+
+  const rowContent = row => norm(contentNodeOf(row)?.textContent || '');
+
+  const rowSample = row => {
+    const owner = ownerNodeOf(row);
+    const ownerText = String(owner?.getAttribute?.('title') || owner?.textContent || '').replace(/\s+/g,' ').trim();
+    const contentText = String(contentNodeOf(row)?.innerText || contentNodeOf(row)?.textContent || '').replace(/\s+/g,' ').trim();
+    return (`owner=${ownerText} | content=${contentText}`).slice(0, 500);
+  };
+
+  const explicitHandles = row => {
+    if (!row?.querySelectorAll) return [];
+    const out = [];
+    for (const a of row.querySelectorAll('a[href*="/@"]')) {
+      const h = handle(a.href || a.getAttribute('href'));
+      if (h) out.push(h);
+    }
+    return [...new Set(out)];
+  };
+
+  const ownerContainsExpected = (row, expected) => {
+    if (!expected) return false;
+    const owner = ownerNodeOf(row);
+    if (!owner) return false;
+    const values = [
+      owner.getAttribute?.('title') || '',
+      owner.getAttribute?.('aria-label') || '',
+      owner.getAttribute?.('data-unique-id') || '',
+      owner.getAttribute?.('data-username') || '',
+      owner.textContent || ''
+    ].map(userNorm).filter(Boolean);
+    return values.some(v => v === expected || v.includes('@' + expected) || v.includes(expected));
+  };
+
+  // TikTok LIVE hiện tại chỉ render nickname ở data-e2e=message-owner-name,
+  // không luôn expose @uniqueId trong DOM. Thử đọc React props/fiber một cách giới hạn
+  // để xác minh handle nếu TikTok vẫn giữ uniqueId trong props nội bộ.
+  const reactContainsExpected = (row, expected) => {
+    if (!row || !expected) return false;
+    const roots = [];
+    const collect = el => {
+      if (!el) return;
+      for (const k of Object.keys(el)) {
+        if (k.startsWith('__reactProps$') || k.startsWith('__reactFiber$')) {
+          try { roots.push(el[k]); } catch {}
+        }
+      }
+    };
+    collect(row);
+    collect(ownerNodeOf(row));
+    if (roots.length === 0) return false;
+
+    const seen = new WeakSet();
+    let budget = 450;
+    const interestingKey = k => /unique.?id|username|user.?name|handle|author|owner|user/i.test(String(k || ''));
+
+    const walk = (v, depth, keyHint='') => {
+      if (budget-- <= 0 || depth > 6 || v == null) return false;
+      if (typeof v === 'string') {
+        const x = userNorm(v);
+        if (!x) return false;
+        if (x === expected || x === '@' + expected) return true;
+        if (interestingKey(keyHint) && (x.includes('@' + expected) || x === expected)) return true;
+        return false;
+      }
+      if (typeof v !== 'object') return false;
+      if (seen.has(v)) return false;
+      seen.add(v);
+
+      let entries;
+      try { entries = Object.entries(v); } catch { return false; }
+      for (const [k,val] of entries) {
+        if (k === 'return' || k === 'child' || k === 'sibling' || k === 'stateNode') continue;
+        if (walk(val, depth + 1, k)) return true;
+      }
+      return false;
+    };
+
+    for (const root of roots) {
+      if (walk(root, 0, '')) return true;
+    }
+    return false;
+  };
+
   const hasUnmatchedTarget = () => {
     for (const [,t] of targets) if (!t.matched) return true;
     return false;
   };
 
   const stopIfIdle = () => {
-    if (!observer || (targets.size !== 0 && hasUnmatchedTarget())) return;
-    try { observer.disconnect(); } catch {}
-    observer = null;
+    if (targets.size !== 0 && hasUnmatchedTarget()) return;
+    if (observer) {
+      try { observer.disconnect(); } catch {}
+      observer = null;
+    }
+    if (pollTimer) {
+      try { clearInterval(pollTimer); } catch {}
+      pollTimer = null;
+    }
   };
 
   const cleanupExpired = () => {
@@ -498,87 +606,156 @@ internal sealed class ObserverChromeSession : IAsyncDisposable
     stopIfIdle();
   };
 
+  const inspectRow = row => {
+    if (!row || targets.size === 0 || !visible(row)) return;
+    const contentNode = contentNodeOf(row);
+    if (!contentNode || !visible(contentNode)) return;
+
+    const content = rowContent(row);
+    if (!content) return;
+
+    const claimedBy = claimedRows.get(row) || '';
+    const handles = explicitHandles(row);
+    const sample = rowSample(row);
+    const idx = rowIndexOf(row);
+
+    // Một DOM row chỉ được dùng để xác nhận một pending comment.
+    // Chọn target cũ nhất trước nếu có nhiều pending cùng nội dung.
+    const candidates = [...targets.entries()]
+      .filter(([,t]) => !t.matched && t.content && content === t.content)
+      .sort((a,b) => a[1].armedAt - b[1].armedAt);
+
+    for (const [key,t] of candidates) {
+      if (claimedBy && claimedBy !== key) continue;
+      if (t.baselineMatches?.has?.(row)) continue;
+
+      t.textFound = true;
+      t.lastSample = sample;
+      t.lastRowIndex = idx;
+
+      let userVerified = false;
+      let explicitMismatch = false;
+
+      if (!t.username) {
+        userVerified = true;
+      } else if (handles.length > 0) {
+        userVerified = handles.includes(t.username);
+        explicitMismatch = !userVerified;
+      } else if (ownerContainsExpected(row, t.username)) {
+        userVerified = true;
+      } else if (reactContainsExpected(row, t.username)) {
+        userVerified = true;
+      }
+
+      if (explicitMismatch) {
+        t.mode = 'TEXT_FOUND_USER_MISMATCH';
+        continue;
+      }
+
+      if (userVerified) {
+        t.matched = true;
+        t.mode = t.username ? 'USER+TEXT' : 'TEXT_ONLY';
+      } else {
+        // HTML LIVE hiện tại không luôn chứa @handle; chỉ có nickname trong
+        // [data-e2e=message-owner-name]. Nếu đúng nội dung xuất hiện ở một row mới
+        // sau ARM và không có bằng chứng đây là handle khác, coi là Visible theo
+        // temporal row match thay vì âm thầm tính Missing.
+        t.matched = true;
+        t.mode = 'NEW_ROW+TEXT';
+      }
+
+      t.sample = sample;
+      t.matchedAt = Date.now();
+      claimedRows.set(row, key);
+      break;
+    }
+
+    stopIfIdle();
+  };
+
   const inspect = node => {
     if (targets.size === 0) return;
+    const e = node?.nodeType === 1 ? node : node?.parentElement;
+    if (!e) return;
 
-    let e = node?.nodeType === 1 ? node : node?.parentElement;
-    for (let depth = 0; e && depth < 7; depth++, e = e.parentElement) {
-      // Fast pre-filter: textContent avoids style/layout work for nearly all
-      // unrelated high-volume LIVE DOM mutations.
-      const quick = norm(e.textContent || '');
-      if (!quick || quick.length > 1800) continue;
+    const direct = e.closest?.('[data-e2e="chat-message"]');
+    if (direct) inspectRow(direct);
 
-      const candidates = [];
-      for (const [key,t] of targets) {
-        if (!t.matched && t.content && quick.includes(t.content)) candidates.push([key,t]);
-      }
-      if (candidates.length === 0) continue;
-
-      // Only pay the expensive visibility/layout cost after the content can match.
-      if (!visible(e)) continue;
-
-      const raw = String(e.innerText || e.textContent || '').replace(/\s+/g,' ').trim();
-      if (!raw || raw.length > 1400) continue;
-      const text = norm(raw);
-
-      const matchedCandidates = candidates.filter(([,t]) => text.includes(t.content));
-      if (matchedCandidates.length === 0) continue;
-
-      let uniq = null;
-      const getUsers = () => {
-        if (uniq) return uniq;
-        const anchors = [...e.querySelectorAll('a[href*="/@"]')]
-          .map(a => handle(a.href || a.getAttribute('href')))
-          .filter(Boolean);
-        if (e.matches?.('a[href*="/@"]')) anchors.push(handle(e.href || e.getAttribute('href')));
-        uniq = [...new Set(anchors)];
-        return uniq;
-      };
-
-      for (const [key,t] of matchedCandidates) {
-        let userOk = true;
-        let mode = 'TEXT_ONLY';
-        if (t.username) {
-          const users = getUsers();
-          userOk = users.includes(t.username) || text.includes('@' + t.username);
-          mode = userOk ? 'USER+TEXT' : '';
-        }
-        if (!userOk) continue;
-
-        t.matched = true;
-        t.mode = mode;
-        t.sample = raw.slice(0,500);
-        t.matchedAt = Date.now();
-      }
-      stopIfIdle();
+    if (e.querySelectorAll) {
+      const rows = e.matches?.('[data-e2e="chat-message"]')
+        ? [e]
+        : [...e.querySelectorAll('[data-e2e="chat-message"]')];
+      for (const row of rows) inspectRow(row);
     }
   };
 
+  const scanVisibleCandidates = () => {
+    if (!hasUnmatchedTarget()) return;
+    const rows = allChatRows();
+    const start = Math.max(0, rows.length - 180);
+    for (let i = start; i < rows.length; i++) inspectRow(rows[i]);
+  };
+
   const ensureWatching = () => {
-    if (observer || !hasUnmatchedTarget()) return;
-    observer = new MutationObserver(ms => {
-      if (targets.size === 0) {
-        stopIfIdle();
-        return;
-      }
-      for (const m of ms) {
-        for (const n of m.addedNodes) inspect(n);
-      }
-      cleanupExpired();
-    });
-    observer.observe(document.body || document.documentElement, {subtree:true, childList:true});
+    if (!hasUnmatchedTarget()) return;
+
+    if (!observer) {
+      observer = new MutationObserver(ms => {
+        if (targets.size === 0) {
+          stopIfIdle();
+          return;
+        }
+        for (const m of ms) {
+          if (m.type === 'childList') {
+            for (const n of m.addedNodes) inspect(n);
+            inspect(m.target);
+          } else if (m.type === 'characterData') {
+            inspect(m.target);
+          }
+        }
+        cleanupExpired();
+      });
+      observer.observe(document.body || document.documentElement, {
+        subtree:true,
+        childList:true,
+        characterData:true
+      });
+    }
+
+    if (!pollTimer) {
+      pollTimer = setInterval(() => {
+        try { scanVisibleCandidates(); } catch {}
+        cleanupExpired();
+      }, 300);
+    }
+
+    try { scanVisibleCandidates(); } catch {}
+  };
+
+  const makeBaselineMatches = content => {
+    const set = new WeakSet();
+    if (!content) return set;
+    for (const row of allChatRows()) {
+      if (rowContent(row) === content) set.add(row);
+    }
+    return set;
   };
 
   window.__ttcc = {
-    version:2,
+    version:4,
     arm:(key,username,content) => {
+      const normalizedContent = norm(content);
       targets.set(String(key), {
         username:userNorm(username),
-        content:norm(content),
+        content:normalizedContent,
         armedAt:Date.now(),
+        baselineMatches:makeBaselineMatches(normalizedContent),
         matched:false,
-        mode:'',
+        mode:'TEXT_NOT_FOUND',
         sample:'',
+        lastSample:'',
+        lastRowIndex:-1,
+        textFound:false,
         matchedAt:0
       });
       ensureWatching();
@@ -586,16 +763,32 @@ internal sealed class ObserverChromeSession : IAsyncDisposable
     },
     check:key => {
       const t=targets.get(String(key));
-      return t
-        ? {exists:true,matched:!!t.matched,mode:t.mode||'',sample:t.sample||'',matchedAt:t.matchedAt||0}
-        : {exists:false,matched:false,mode:'',sample:'',matchedAt:0};
+      if (!t) return {exists:false,matched:false,mode:'',sample:'',matchedAt:0};
+      const diagnosticMode = t.matched
+        ? (t.mode || '')
+        : (t.textFound ? (t.mode || 'TEXT_FOUND_USER_UNVERIFIED') : 'TEXT_NOT_FOUND');
+      return {
+        exists:true,
+        matched:!!t.matched,
+        mode:diagnosticMode,
+        sample:t.sample || t.lastSample || '',
+        matchedAt:t.matchedAt || 0
+      };
     },
     clear:key => {
       targets.delete(String(key));
       stopIfIdle();
       return true;
     },
-    pendingCount:() => targets.size
+    pendingCount:() => targets.size,
+    shutdown:() => {
+      try { observer?.disconnect?.(); } catch {}
+      observer = null;
+      try { if (pollTimer) clearInterval(pollTimer); } catch {}
+      pollTimer = null;
+      targets.clear();
+      return true;
+    }
   };
   return true;
 })()

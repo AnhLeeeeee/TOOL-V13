@@ -1,9 +1,14 @@
-namespace ToolTikTokManagerV13;
+﻿namespace ToolTikTokManagerV13;
 
 public sealed partial class ManagerForm
 {
     static readonly TimeSpan RunStrategyDailyReplaceAllRetryDelay =
         TimeSpan.FromMinutes(2);
+
+    // THAY ALL chỉ được quyền CREATE PRF mới trong 2 giờ kể từ Giờ thay.
+    // Ví dụ Giờ thay=11:00 -> cửa sổ CREATE là [11:00, 13:00).
+    static readonly TimeSpan RunStrategyDailyReplaceAllCreateWindow =
+        TimeSpan.FromHours(2);
 
     readonly object _runStrategyDailyReplaceAllLock = new();
     readonly List<string> _runStrategyDailyReplaceAllVictims = new();
@@ -114,15 +119,77 @@ public sealed partial class ManagerForm
         }
     }
 
+    (DateTime Start, DateTime End) GetRunStrategyDailyReplaceAllCreateWindow(
+        RunAllStrategySettings settings,
+        DateTime now)
+    {
+        var start = now.Date.AddHours(settings.PrimeStartHour);
+        return (start, start.Add(RunStrategyDailyReplaceAllCreateWindow));
+    }
+
+    bool IsRunStrategyDailyReplaceAllCreateWindowOpen(
+        RunAllStrategySettings settings,
+        DateTime now,
+        out DateTime windowStart,
+        out DateTime windowEnd)
+    {
+        (windowStart, windowEnd) = GetRunStrategyDailyReplaceAllCreateWindow(settings, now);
+        return now >= windowStart && now < windowEnd;
+    }
+
+    void ExpireRunStrategyDailyReplaceAllForToday(
+        RunAllStrategySettings settings,
+        string source)
+    {
+        var now = GetToolNow().LocalDateTime;
+        var (_, windowEnd) = GetRunStrategyDailyReplaceAllCreateWindow(settings, now);
+        int remainingVictims;
+        DateTime cycleDate;
+
+        lock (_runStrategyDailyReplaceAllLock)
+        {
+            remainingVictims = _runStrategyDailyReplaceAllVictims.Count;
+            cycleDate = _runStrategyDailyReplaceAllCycleScheduledLocalDate == DateTime.MinValue
+                ? now.Date
+                : _runStrategyDailyReplaceAllCycleScheduledLocalDate.Date;
+
+            _runStrategyDailyReplaceAllBootstrapPending = false;
+            _runStrategyDailyReplaceAllCycleActive = false;
+            _runStrategyDailyReplaceAllVictims.Clear();
+            _runStrategyDailyReplaceAllCycleScheduledLocalDate = DateTime.MinValue;
+            _runStrategyDailyReplaceAllNextAttemptUtc = DateTime.MinValue;
+            _runStrategyDailyReplaceAllLastCompletedLocalDate = now.Date;
+        }
+
+        // Hết cửa sổ CREATE: trả quyền về Tự bù thường. THAY ALL vẫn active nên
+        // hard-gate CREATE ngoài refresh tiếp tục chặn; queue chỉ được reuse PRF chờ.
+        ArmAutoReplacementSession("daily_replace_all_window_closed");
+        UpdateAutoCloseToolbarButtonText();
+        _log.Warn(
+            $"[RUN_DAILY_REPLACE_ALL_WINDOW_CLOSED] source={source} now={now:yyyy-MM-dd HH:mm:ss} " +
+            $"deadline={windowEnd:yyyy-MM-dd HH:mm:ss} cycleDate={cycleDate:yyyy-MM-dd} " +
+            $"remainingVictims={remainingVictims} filled={CountAutoReplacementFulfilledSlots()} " +
+            "action=STOP_DAILY_REFRESH_NO_MORE_CREATE_TODAY autoRefill=REUSE_ONLY");
+
+        if (!_closing && GetAutoReplacementPendingCount() > 0)
+            _ = RunAutoReplacementQueueAsync();
+    }
+
     void InitializeRunStrategyDailyReplaceAllRuntime(
         RunAllStrategySettings settings,
         int target,
         int filled,
         string source)
     {
-        var now = GetToolNow();
-        var scheduledToday = now.Date.AddHours(settings.PrimeStartHour);
-        var bootstrapPending = filled < target;
+        var now = GetToolNow().LocalDateTime;
+        var (scheduledToday, createDeadlineToday) =
+            GetRunStrategyDailyReplaceAllCreateWindow(settings, now);
+        var createWindowOpen = now >= scheduledToday && now < createDeadlineToday;
+
+        // Trước Giờ thay chỉ ARM. Sau deadline 2 giờ cũng chỉ ARM/reuse, tuyệt đối
+        // không bootstrap CREATE. Chỉ đúng trong cửa sổ [Giờ thay, Giờ thay+2h)
+        // mới cho bootstrap phần target còn thiếu bằng create pipeline hiện tại.
+        var bootstrapPending = createWindowOpen && filled < target;
 
         lock (_runStrategyDailyReplaceAllLock)
         {
@@ -135,22 +202,24 @@ public sealed partial class ManagerForm
                 ? DateTime.UtcNow.Add(RunStrategyDailyReplaceAllRetryDelay)
                 : DateTime.MinValue;
 
-            // Khi user bấm Bắt đầu tại/sau giờ thay, dàn đang mở + phần bootstrap
-            // thêm được coi là dàn HÔM NAY. Không thay lại ngay trong cùng ngày.
+            // Trước giờ thay: để scheduler được phép mở cycle hôm nay khi tới giờ.
+            // Trong/qua cửa sổ hôm nay: coi lần Start hiện tại là baseline hôm nay;
+            // đặc biệt sau deadline thì không được "bù muộn" bằng CREATE.
             _runStrategyDailyReplaceAllLastCompletedLocalDate =
-                now >= scheduledToday
-                    ? now.Date
-                    : now.Date.AddDays(-1);
+                now < scheduledToday
+                    ? now.Date.AddDays(-1)
+                    : now.Date;
         }
 
         UpdateAutoCloseToolbarButtonText();
         _log.Info(
-            $"[RUN_DAILY_REPLACE_ALL_ARMED] source={source} hour={settings.PrimeStartHour:00}:00 target={target} " +
+            $"[RUN_DAILY_REPLACE_ALL_ARMED] source={source} window={scheduledToday:HH:mm}-{createDeadlineToday:HH:mm} target={target} " +
             $"filled={filled} bootstrapPending={bootstrapPending} baselineDate={_runStrategyDailyReplaceAllLastCompletedLocalDate:yyyy-MM-dd} " +
             "autoRefill=REUSE_ALL autoCreateOutsideRefresh=OFF");
     }
 
     async Task<int> EnsureRunStrategyDailyReplaceAllStartupTargetAsync(
+        RunAllStrategySettings settings,
         int target,
         CancellationToken token)
     {
@@ -166,6 +235,20 @@ public sealed partial class ManagerForm
             var occupied = CountAutoReplacementFulfilledSlots();
             if (occupied >= target)
                 return occupied;
+
+            var createNow = GetToolNow().LocalDateTime;
+            if (!IsRunStrategyDailyReplaceAllCreateWindowOpen(
+                    settings,
+                    createNow,
+                    out var windowStart,
+                    out var windowEnd))
+            {
+                _log.Warn(
+                    $"[RUN_DAILY_REPLACE_ALL_CREATE_WINDOW_BLOCKED] now={createNow:yyyy-MM-dd HH:mm:ss} " +
+                    $"window={windowStart:yyyy-MM-dd HH:mm:ss}->{windowEnd:yyyy-MM-dd HH:mm:ss} " +
+                    $"target={target} filled={occupied} action=NO_CREATE");
+                return occupied;
+            }
 
             var slot = occupied + 1;
             var created = await TryCreateRunStrategyReplacementAsync(
@@ -191,7 +274,9 @@ public sealed partial class ManagerForm
 
         token.ThrowIfCancellationRequested();
         target = Math.Max(1, target);
-        var now = GetToolNow();
+        var now = GetToolNow().LocalDateTime;
+        var (scheduled, createDeadline) =
+            GetRunStrategyDailyReplaceAllCreateWindow(settings, now);
 
         bool bootstrapPending;
         bool cycleActive;
@@ -206,26 +291,51 @@ public sealed partial class ManagerForm
             lastCompletedDate = _runStrategyDailyReplaceAllLastCompletedLocalDate;
         }
 
+        // Deadline là hard stop cho CREATE của ngày hôm nay. Nếu cycle/bootstrap
+        // còn dang dở thì kết thúc phần THAY ALL hôm nay, không đóng thêm PRF cũ và
+        // trả về chế độ Tự bù reuse-only cho tới cửa sổ ngày mai.
+        if (now >= createDeadline)
+        {
+            if (bootstrapPending || cycleActive || lastCompletedDate.Date < now.Date)
+                ExpireRunStrategyDailyReplaceAllForToday(settings, "deadline_reached");
+            return;
+        }
+
         if (DateTime.UtcNow < nextAttemptUtc)
             return;
 
         if (bootstrapPending)
         {
+            // Hard-gate chống race/stale state: ngoài cửa sổ CREATE đều không được
+            // gọi create pipeline, kể cả cờ bootstrap bị giữ nhầm.
+            if (now < scheduled)
+            {
+                lock (_runStrategyDailyReplaceAllLock)
+                {
+                    _runStrategyDailyReplaceAllBootstrapPending = false;
+                    _runStrategyDailyReplaceAllNextAttemptUtc = DateTime.MinValue;
+                }
+
+                UpdateAutoCloseToolbarButtonText();
+                _log.Warn(
+                    $"[RUN_DAILY_REPLACE_ALL_PREHOUR_CREATE_BLOCKED] now={now:yyyy-MM-dd HH:mm:ss} " +
+                    $"window={scheduled:yyyy-MM-dd HH:mm:ss}->{createDeadline:yyyy-MM-dd HH:mm:ss} " +
+                    $"target={target} action=ARM_ONLY_NO_CREATE");
+                return;
+            }
+
             var bootstrapFilled = await EnsureRunStrategyDailyReplaceAllStartupTargetAsync(
+                settings,
                 target,
                 token);
 
             if (bootstrapFilled >= target)
             {
-                var scheduledToday = now.Date.AddHours(settings.PrimeStartHour);
                 lock (_runStrategyDailyReplaceAllLock)
                 {
                     _runStrategyDailyReplaceAllBootstrapPending = false;
                     _runStrategyDailyReplaceAllNextAttemptUtc = DateTime.MinValue;
-                    _runStrategyDailyReplaceAllLastCompletedLocalDate =
-                        GetToolNow() >= scheduledToday
-                            ? now.Date
-                            : now.Date.AddDays(-1);
+                    _runStrategyDailyReplaceAllLastCompletedLocalDate = now.Date;
                 }
 
                 UpdateAutoCloseToolbarButtonText();
@@ -235,17 +345,24 @@ public sealed partial class ManagerForm
             }
             else
             {
+                var afterAttempt = GetToolNow().LocalDateTime;
+                if (afterAttempt >= createDeadline)
+                {
+                    ExpireRunStrategyDailyReplaceAllForToday(settings, "bootstrap_deadline_reached");
+                    return;
+                }
+
                 lock (_runStrategyDailyReplaceAllLock)
                     _runStrategyDailyReplaceAllNextAttemptUtc = DateTime.UtcNow.Add(RunStrategyDailyReplaceAllRetryDelay);
 
                 _log.Warn(
-                    $"[RUN_DAILY_REPLACE_ALL_BOOTSTRAP_WAIT] target={target} filled={bootstrapFilled} retryIn={RunStrategyDailyReplaceAllRetryDelay:c}");
+                    $"[RUN_DAILY_REPLACE_ALL_BOOTSTRAP_WAIT] target={target} filled={bootstrapFilled} retryIn={RunStrategyDailyReplaceAllRetryDelay:c} " +
+                    $"deadline={createDeadline:HH:mm:ss}");
             }
 
             return;
         }
 
-        var scheduled = now.Date.AddHours(settings.PrimeStartHour);
         if (!cycleActive)
         {
             if (now < scheduled || lastCompletedDate.Date >= now.Date)
@@ -294,9 +411,12 @@ public sealed partial class ManagerForm
         }
 
         UpdateAutoCloseToolbarButtonText();
+        var cycleWindowStart = scheduledLocalDate.Date.AddHours(settings.PrimeStartHour);
+        var cycleWindowEnd = cycleWindowStart.Add(RunStrategyDailyReplaceAllCreateWindow);
         _log.Warn(
-            $"[RUN_DAILY_REPLACE_ALL_CYCLE_BEGIN] date={scheduledLocalDate:yyyy-MM-dd} hour={settings.PrimeStartHour:00}:00 " +
-            $"target={target} victims={victims.Count} action=ONE_OUT_ONE_NEW_THEN_FILL_REMAINDER");
+            $"[RUN_DAILY_REPLACE_ALL_CYCLE_BEGIN] date={scheduledLocalDate:yyyy-MM-dd} " +
+            $"window={cycleWindowStart:HH:mm}-{cycleWindowEnd:HH:mm} target={target} victims={victims.Count} " +
+            "action=ONE_OUT_ONE_NEW_THEN_FILL_REMAINDER");
     }
 
     async Task ContinueRunStrategyDailyReplaceAllCycleAsync(
@@ -310,6 +430,20 @@ public sealed partial class ManagerForm
         {
             victimName = _runStrategyDailyReplaceAllVictims.FirstOrDefault();
             cycleDate = _runStrategyDailyReplaceAllCycleScheduledLocalDate;
+        }
+
+        var cycleNow = GetToolNow().LocalDateTime;
+        if (!IsRunStrategyDailyReplaceAllCreateWindowOpen(
+                settings,
+                cycleNow,
+                out _,
+                out var cycleWindowEnd))
+        {
+            _log.Warn(
+                $"[RUN_DAILY_REPLACE_ALL_CYCLE_WINDOW_BLOCKED] now={cycleNow:yyyy-MM-dd HH:mm:ss} " +
+                $"deadline={cycleWindowEnd:yyyy-MM-dd HH:mm:ss} action=STOP_CYCLE_NO_CREATE");
+            ExpireRunStrategyDailyReplaceAllForToday(settings, "cycle_window_closed");
+            return;
         }
 
         // Pha 1: đúng yêu cầu đóng 1 -> mở 1. Chỉ khi PRF cũ đã bị delete pipeline
@@ -395,6 +529,7 @@ public sealed partial class ManagerForm
         ArmAutoReplacementSession("daily_replace_all_after_all_old_deleted");
 
         var filled = await EnsureRunStrategyDailyReplaceAllStartupTargetAsync(
+            settings,
             target,
             token);
 

@@ -1180,11 +1180,14 @@ public sealed partial class ManagerForm
         {
             if (dailyReplaceAll.Checked)
             {
+                var replaceStartHour = (int)startHour.Value;
+                var replaceEndHour = (replaceStartHour + 2) % 24;
                 reuseNote.Text =
-                    $"THAY ALL: mỗi ngày đúng {(int)startHour.Value:00}h thay dàn theo kiểu đóng 1 → mở 1; PRF cũ note=thay_all + xóa bằng luồng hiện tại, " +
-                    $"PRF mới luôn MỚI HOÀN TOÀN bằng Auto Profile hiện tại. Xóa hết dàn cũ mà vẫn thiếu mới mở tiếp đến đủ {(int)dailyReplaceAllTarget.Value}. " +
-                    "Giữa hai lượt thay: Tự bù vẫn quét/mở TOÀN BỘ PRF chờ, nhưng tuyệt đối không CREATE PRF mới để bù. " +
-                    "BAN/TIME/FAULT vẫn theo cài đặt hiện tại; CREATE của phiên THAY ALL vẫn giữ Global Login 120s, cooldown/giới hạn và khung cấm hiện có.";
+                    $"THAY ALL: mỗi ngày bắt đầu lúc {replaceStartHour:00}h và chỉ được CREATE PRF mới trong 2 giờ, đến {replaceEndHour:00}h thì khóa CREATE. " +
+                    "Trong cửa sổ này thay dàn theo kiểu đóng 1 → mở 1; PRF cũ note=thay_all + xóa bằng luồng hiện tại, " +
+                    $"PRF mới luôn MỚI HOÀN TOÀN bằng Auto Profile hiện tại. Nếu hết 2 giờ mà chưa đủ {(int)dailyReplaceAllTarget.Value}, dừng phần THAY ALL còn lại và không CREATE thêm trong ngày. " +
+                    "Ngoài cửa sổ: Tự bù vẫn quét/mở TOÀN BỘ PRF chờ, nhưng tuyệt đối không CREATE PRF mới để bù. " +
+                    "BAN/TIME/FAULT vẫn theo cài đặt hiện tại; CREATE trong cửa sổ THAY ALL vẫn giữ Global Login 120s, cooldown/giới hạn và khung cấm hiện có.";
                 return;
             }
 
@@ -1853,21 +1856,52 @@ public sealed partial class ManagerForm
         if (selected.DailyReplaceAll)
         {
             // StartAll() chốt target theo số tab đang mở; THAY ALL có target riêng nên
-            // ghi lại ngay target cố định trước khi gọi create pipeline hiện có.
+            // ghi lại ngay target cố định. Nếu hiện tại CHƯA tới Giờ thay thì chỉ ARM
+            // chiến lược, tuyệt đối không CREATE để lấp target. Auto Replace vẫn được
+            // reuse PRF chờ theo logic hiện tại; CREATE chỉ được mở tại phiên THAY ALL.
             SetRunAllDesiredTarget(target, "run_all_daily_replace_all_target");
 
-            var dailyStartToken = BeginRunAllSequentialStart();
+            var dailyNow = GetToolNow();
+            var dailyScheduledToday = dailyNow.Date.AddHours(selected.PrimeStartHour);
+            var dailyCreateDeadline = dailyScheduledToday.Add(RunStrategyDailyReplaceAllCreateWindow);
+            var beforeDailyReplaceHour = dailyNow < dailyScheduledToday;
+            var afterDailyCreateDeadline = dailyNow >= dailyCreateDeadline;
+            var dailyCreateWindowOpen = !beforeDailyReplaceHour && !afterDailyCreateDeadline;
             int dailyFilled;
-            try
+
+            if (!dailyCreateWindowOpen)
             {
-                dailyFilled = await EnsureRunStrategyDailyReplaceAllStartupTargetAsync(
-                    target,
-                    dailyStartToken);
+                dailyFilled = CountAutoReplacementFulfilledSlots();
+                if (beforeDailyReplaceHour)
+                {
+                    _log.Info(
+                        $"[RUN_DAILY_REPLACE_ALL_PREHOUR_ARM_ONLY] now={dailyNow:yyyy-MM-dd HH:mm:ss} " +
+                        $"window={dailyScheduledToday:yyyy-MM-dd HH:mm:ss}->{dailyCreateDeadline:yyyy-MM-dd HH:mm:ss} " +
+                        $"target={target} filled={dailyFilled} action=NO_CREATE_UNTIL_REPLACE_HOUR");
+                }
+                else
+                {
+                    _log.Warn(
+                        $"[RUN_DAILY_REPLACE_ALL_START_AFTER_WINDOW] now={dailyNow:yyyy-MM-dd HH:mm:ss} " +
+                        $"window={dailyScheduledToday:yyyy-MM-dd HH:mm:ss}->{dailyCreateDeadline:yyyy-MM-dd HH:mm:ss} " +
+                        $"target={target} filled={dailyFilled} action=NO_CREATE_WAIT_NEXT_DAY");
+                }
             }
-            catch (OperationCanceledException)
+            else
             {
-                _log.Info("[RUN_DAILY_REPLACE_ALL_START_FILL_CANCELLED] source=user_stop_or_new_start");
-                return;
+                var dailyStartToken = BeginRunAllSequentialStart();
+                try
+                {
+                    dailyFilled = await EnsureRunStrategyDailyReplaceAllStartupTargetAsync(
+                        selected,
+                        target,
+                        dailyStartToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    _log.Info("[RUN_DAILY_REPLACE_ALL_START_FILL_CANCELLED] source=user_stop_or_new_start");
+                    return;
+                }
             }
 
             StartRunStrategySession(selected, target);
@@ -1879,13 +1913,29 @@ public sealed partial class ManagerForm
 
             if (dailyFilled < target)
             {
-                ModernDialog.ShowMessage(
-                    this,
-                    $"THAY ALL đã khởi động {dailyFilled}/{target} PRF.\n\n" +
-                    "Tool sẽ tiếp tục dùng đúng Auto Profile hiện tại để bổ sung PRF MỚI HOÀN TOÀN cho dàn khởi tạo. " +
-                    "Sau khi đủ dàn, Tự bù vẫn hoạt động nhưng chỉ được quét/mở PRF chờ; không CREATE mới để bù cho tới giờ thay tiếp theo.",
-                    "Auto Run — THAY ALL",
-                    MessageBoxIcon.Information);
+                if (beforeDailyReplaceHour)
+                {
+                    _log.Info(
+                        $"[RUN_DAILY_REPLACE_ALL_WAIT_SCHEDULE] target={target} filled={dailyFilled} " +
+                        $"window={dailyScheduledToday:yyyy-MM-dd HH:mm:ss}->{dailyCreateDeadline:yyyy-MM-dd HH:mm:ss} " +
+                        "autoRefill=REUSE_ALL autoCreate=BLOCKED");
+                }
+                else if (afterDailyCreateDeadline)
+                {
+                    _log.Warn(
+                        $"[RUN_DAILY_REPLACE_ALL_WAIT_NEXT_DAY] target={target} filled={dailyFilled} " +
+                        $"deadline={dailyCreateDeadline:yyyy-MM-dd HH:mm:ss} autoRefill=REUSE_ALL autoCreate=BLOCKED");
+                }
+                else
+                {
+                    ModernDialog.ShowMessage(
+                        this,
+                        $"THAY ALL đã khởi động {dailyFilled}/{target} PRF.\n\n" +
+                        $"Tool chỉ được CREATE PRF mới đến {dailyCreateDeadline:HH:mm}. Nếu hết cửa sổ 2 giờ mà chưa đủ target, " +
+                        "THAY ALL sẽ dừng phần còn lại trong ngày. Sau đó Tự bù vẫn hoạt động nhưng chỉ được quét/mở PRF chờ; không CREATE mới để bù.",
+                        "Auto Run — THAY ALL",
+                        MessageBoxIcon.Information);
+                }
             }
 
             return;
@@ -4003,6 +4053,33 @@ public sealed partial class ManagerForm
         CancellationToken token,
         bool forceNewProfileOnly = false)
     {
+        RunAllStrategySettings? dailyReplaceAllSettings = null;
+        DateTime dailyReplaceAllWindowEnd = DateTime.MinValue;
+
+        // Hard-gate riêng cho THAY ALL: forceNewProfileOnly được phép bỏ qua reuse-only
+        // trong phiên refresh, nhưng KHÔNG được phép bỏ qua cửa sổ CREATE 2 giờ.
+        if (forceNewProfileOnly
+            && phase.Equals("THAY_ALL", StringComparison.OrdinalIgnoreCase))
+        {
+            lock (_runStrategyLock)
+                dailyReplaceAllSettings = _runStrategySettings;
+
+            var now = GetToolNow().LocalDateTime;
+            if (!IsRunStrategyDailyReplaceAllCreateWindowOpen(
+                    dailyReplaceAllSettings,
+                    now,
+                    out var windowStart,
+                    out var windowEnd))
+            {
+                _log.Warn(
+                    $"[RUN_DAILY_REPLACE_ALL_CREATE_HARD_GATE] outgoing={outgoingProfileName} now={now:yyyy-MM-dd HH:mm:ss} " +
+                    $"window={windowStart:yyyy-MM-dd HH:mm:ss}->{windowEnd:yyyy-MM-dd HH:mm:ss} action=BLOCK_FORCE_NEW");
+                return false;
+            }
+
+            dailyReplaceAllWindowEnd = windowEnd;
+        }
+
         if (!forceNewProfileOnly && !IsAutomaticNewProfileCreationAllowedNow())
             return false;
 
@@ -4027,15 +4104,53 @@ public sealed partial class ManagerForm
             RequiresSourceCleanup = false
         };
 
+        CancellationTokenSource? deadlineCts = null;
+        CancellationTokenSource? linkedCts = null;
         try
         {
+            var createToken = execution.Token;
+
+            if (dailyReplaceAllSettings is not null)
+            {
+                var remaining = dailyReplaceAllWindowEnd - GetToolNow().LocalDateTime;
+                if (remaining <= TimeSpan.Zero)
+                {
+                    _log.Warn(
+                        $"[RUN_DAILY_REPLACE_ALL_CREATE_HARD_GATE] outgoing={outgoingProfileName} " +
+                        $"deadline={dailyReplaceAllWindowEnd:yyyy-MM-dd HH:mm:ss} action=BLOCK_BEFORE_PIPELINE");
+                    return false;
+                }
+
+                // Nếu lệnh đã được gọi sát 13:00 nhưng còn đang chờ cooldown/gate/login,
+                // token này sẽ cắt pipeline đúng deadline để không ASSIGN account/CREATE
+                // mới sau khi cửa sổ 2 giờ đã đóng.
+                deadlineCts = new CancellationTokenSource();
+                deadlineCts.CancelAfter(remaining);
+                linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+                    execution.Token,
+                    token,
+                    deadlineCts.Token);
+                createToken = linkedCts.Token;
+            }
+
             // Dùng nguyên engine tạo PRF bù hiện có: account gate, login cooldown,
             // đổi tên, user* BAN, Name Guard, one-attempt và healthy confirmation.
             return await TryCreateReplacementAsync(
                 request,
                 execution.Generation,
-                execution.Token,
+                createToken,
                 forceNewProfileOnly);
+        }
+        catch (OperationCanceledException)
+            when (deadlineCts is not null
+                  && deadlineCts.IsCancellationRequested
+                  && !token.IsCancellationRequested
+                  && !execution.Token.IsCancellationRequested)
+        {
+            _log.Warn(
+                $"[RUN_DAILY_REPLACE_ALL_CREATE_DEADLINE_CANCEL] outgoing={outgoingProfileName} phase={phase} " +
+                $"deadline={dailyReplaceAllWindowEnd:yyyy-MM-dd HH:mm:ss} action=STOP_CREATE_PIPELINE");
+            return false;
         }
         catch (OperationCanceledException)
         {
@@ -4047,5 +4162,11 @@ public sealed partial class ManagerForm
                 $"[RUN_STRATEGY_CREATE_FAIL] outgoing={outgoingProfileName} phase={phase} error={ex.Message}");
             return false;
         }
+        finally
+        {
+            linkedCts?.Dispose();
+            deadlineCts?.Dispose();
+        }
     }
+
 }

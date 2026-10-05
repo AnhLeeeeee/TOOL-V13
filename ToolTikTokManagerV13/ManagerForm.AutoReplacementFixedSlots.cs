@@ -1,4 +1,4 @@
-﻿using ToolTikTokV12.Services;
+using ToolTikTokV12.Services;
 
 namespace ToolTikTokManagerV13;
 
@@ -70,6 +70,10 @@ public sealed partial class ManagerForm
                 $"[AUTO_REPLACE_TARGET_START_ALL] old={old} requested={requestedSlots} target={_autoReplacementTargetSlots}");
         }
 
+        // Start All là một intent/đợt capacity mới. Không được mang hard-cap 3/3
+        // của đợt thiếu trước sang lượt chạy mới.
+        ResetAutoReplacementDeficitCreateBudget($"start_all_target:{requestedSlots}");
+
         // Chạy tất cả là intent rõ ràng của user muốn duy trì đúng số tab đang mở.
         ArmAutoReplacementSession($"start_all_target:{requestedSlots}");
         MarkNightReservePrimaryRunIntent(requestedSlots, "start_all_target");
@@ -135,6 +139,12 @@ public sealed partial class ManagerForm
             var pendingPass1 = GetAutoReplacementPendingCapacitySnapshot();
             var initialDeficit = target - occupiedPass1 - pendingPass1.Reserving;
 
+            // Chỉ reset ngân sách 3/3 khi capacity THẬT đã hồi phục đủ target.
+            // Pending request không được tính là đã phục hồi, nếu không budget sẽ
+            // bị reset giữa đợt và lại cho phép CREATE quá 3.
+            ResetAutoReplacementDeficitCreateBudgetIfCapacityRecovered(
+                target, occupiedPass1, $"{source}:pass1");
+
             if (initialDeficit <= 0)
             {
                 _log.Info(
@@ -193,6 +203,9 @@ public sealed partial class ManagerForm
             // vì lỗi/cooldown/retry không được làm deficit giả về 0.
             var stableOccupied = Math.Max(occupiedPass1, occupiedPass2);
             var deficit = target - stableOccupied - pendingPass2.Reserving;
+
+            ResetAutoReplacementDeficitCreateBudgetIfCapacityRecovered(
+                target, stableOccupied, $"{source}:pass2");
 
             _log.Warn(
                 $"[AUTO_REPLACE_CAPACITY_GAP_CHECK] source={source} pass=2/2 target={target} occupied1={occupiedPass1} occupied2={occupiedPass2} " +

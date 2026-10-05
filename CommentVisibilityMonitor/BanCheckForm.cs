@@ -1,4 +1,4 @@
-namespace CommentVisibilityMonitor;
+﻿namespace CommentVisibilityMonitor;
 
 internal sealed class BanCheckForm : Form
 {
@@ -322,32 +322,14 @@ internal sealed class BanCheckForm : Form
                 }
                 else if (first.State == UserSearchState.NotFound)
                 {
-                    await Task.Delay(1200, ct);
-                    var second = await _observer.SearchUserExactAsync(item.Username, ct);
-                    if (second.State == UserSearchState.Found)
-                    {
-                        _store.WriteDone(_sourcePath, item.SourceRow);
-                        alive++;
-                        uiResult = BanCheckUiResult.Alive;
-                        detail = "SỐNG · đã ghi done · lần xác nhận 2 tìm thấy exact";
-                        UpdateItemNote(item.SourceRow, "done");
-                        _log($"[BAN_CHECK_ALIVE_CONFIRMED] row={item.SourceRow} account={item.Username} result=ALIVE note=done second={second.Detail}");
-                    }
-                    else if (second.State == UserSearchState.NotFound)
-                    {
-                        _store.WriteBan(_sourcePath, item.SourceRow);
-                        banned++;
-                        uiResult = BanCheckUiResult.Ban;
-                        detail = "BAN · không có exact username ở 2 lượt tìm";
-                        UpdateItemNote(item.SourceRow, "ban");
-                        _log($"[BAN_CHECK_CONFIRMED] row={item.SourceRow} account={item.Username} result=BAN note=ban first={first.Detail} second={second.Detail}");
-                    }
-                    else
-                    {
-                        unknown++;
-                        uiResult = BanCheckUiResult.Unknown;
-                        detail = "KHÔNG RÕ · " + second.Detail;
-                    }
+                    // Một lần Search hợp lệ là đủ: SearchUserExactAsync chỉ trả NotFound
+                    // sau khi trang Search Người dùng đã load và danh sách đã ổn định.
+                    _store.WriteBan(_sourcePath, item.SourceRow);
+                    banned++;
+                    uiResult = BanCheckUiResult.Ban;
+                    detail = "BAN · không có exact username trong lượt tìm hợp lệ";
+                    UpdateItemNote(item.SourceRow, "ban");
+                    _log($"[BAN_CHECK_CONFIRMED] row={item.SourceRow} account={item.Username} result=BAN note=ban probe={first.Detail}");
                 }
                 else
                 {

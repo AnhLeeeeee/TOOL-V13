@@ -7,7 +7,7 @@ using System.Text.Json;
 
 namespace CommentVisibilityMonitor;
 
-internal sealed class MainForm : Form
+internal sealed partial class MainForm : Form
 {
     const int TelemetryPort = 47771;
     readonly string _dataDir = Path.Combine(AppContext.BaseDirectory, "CommentCheckData");
@@ -19,15 +19,20 @@ internal sealed class MainForm : Form
     readonly Dictionary<string, LiveLatencyState> _liveLatency = new(StringComparer.OrdinalIgnoreCase);
     readonly System.Windows.Forms.Timer _uiTimer = new() { Interval = 1000 };
 
-    const double InitialCommentTimeoutSeconds = 20.0;
-    const double MinCommentTimeoutSeconds = 12.0;
+    // User rule: mỗi comment được Observer chờ/quét tối đa cố định 30 giây.
+    // Giữ cùng một giá trị min/max để adaptive learning không rút ngắn timeout
+    // khi TikTok hiển thị comment chậm.
+    const double InitialCommentTimeoutSeconds = 30.0;
+    const double MinCommentTimeoutSeconds = 30.0;
     const double MaxCommentTimeoutSeconds = 30.0;
-    const double CommentTimeoutBufferSeconds = 6.0;
+    const double CommentTimeoutBufferSeconds = 0.0;
     const int MaxLatencySamplesPerLive = 20;
+    static readonly TimeSpan ProfileCheckDuration = TimeSpan.FromMinutes(10);
+    static readonly TimeSpan SessionPendingGrace = TimeSpan.FromSeconds(5);
 
     readonly Label _observerState = new() { AutoSize = true, Text = "Observer: chưa mở" };
     readonly Label _targetState = new() { AutoSize = true, Text = "Đang kiểm tra: —" };
-    readonly Label _cycleState = new() { AutoSize = true, Text = "Vòng: —" };
+    readonly Label _cycleState = new() { AutoSize = true, Text = "Phiên: —" };
     readonly Label _summaryState = new() { AutoSize = true, Text = "Đã quét: — | Hiện: — | Mất: — | Không rõ: — | Kết quả: —" };
     readonly Button _openObserver = new() { Text = "Mở Chrome Observer", AutoSize = true };
     readonly Button _start = new() { Text = "Bắt đầu kiểm tra", AutoSize = true };
@@ -35,6 +40,9 @@ internal sealed class MainForm : Form
     readonly Button _exportDiagnostic = new() { Text = "Xuất ZIP chẩn đoán", AutoSize = true };
     readonly Button _banCheck = new() { Text = "CHECK BAN", AutoSize = true };
     readonly Button _observerLogin = new() { Text = "Đăng nhập", AutoSize = true };
+    readonly ComboBox _quickProfile = new() { Width = 92, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(8, 4, 2, 0) };
+    readonly Button _quickCheck = new() { Text = "CHECK NGAY", AutoSize = true };
+    readonly Button _history = new() { Text = "LỊCH SỬ CHECK", AutoSize = true };
     readonly Label _observerLoginState = new() { AutoSize = true, Text = "Login: —", Margin = new Padding(8, 7, 0, 0) };
     string _observerLoginUsernameValue = "";
     string _observerLoginPasswordValue = "";
@@ -50,6 +58,11 @@ internal sealed class MainForm : Form
     int _rotationSeed = -1;
     bool _followInFlight;
     string _followRequestedUrl = "";
+    string _authorizedLiveUrl = "";
+    bool _manualTarget;
+    string _resumeProfile = "";
+    CycleState? _resumeCycle;
+    readonly CommentCheckHistoryStore _historyStore;
 
     public MainForm()
     {
@@ -59,29 +72,39 @@ internal sealed class MainForm : Form
         Font = new Font("Segoe UI", 9F);
         Directory.CreateDirectory(_dataDir);
         _observer = new ObserverChromeSession(49335, Path.Combine(_dataDir, "ObserverChrome"));
+        _historyStore = new CommentCheckHistoryStore(_dataDir);
         LoadObserverLoginSettings();
 
         var top = new TableLayoutPanel
         {
             Dock = DockStyle.Top,
-            Height = 90,
+            Height = 128,
             AutoSize = false,
             Padding = new Padding(8, 6, 8, 4),
             ColumnCount = 1,
-            RowCount = 2
+            RowCount = 3
         };
         top.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        top.RowStyles.Add(new RowStyle(SizeType.Absolute, 38F));
         top.RowStyles.Add(new RowStyle(SizeType.Absolute, 38F));
         top.RowStyles.Add(new RowStyle(SizeType.Absolute, 38F));
 
         var toolbar = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, Margin = new Padding(0) };
         toolbar.Controls.AddRange(new Control[] { _openObserver, _observerLogin, _start, _stop, _exportDiagnostic, _banCheck, _observerState, _observerLoginState });
 
+        var quickBar = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, Margin = new Padding(0) };
+        quickBar.Controls.AddRange(new Control[]
+        {
+            new Label { Text = "PRF cần kiểm tra:", AutoSize = true, Margin = new Padding(0, 8, 2, 0) },
+            _quickProfile, _quickCheck, _history
+        });
+
         var statusBar = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = true, Margin = new Padding(0) };
         statusBar.Controls.AddRange(new Control[] { _targetState, _cycleState, _summaryState });
 
         top.Controls.Add(toolbar, 0, 0);
-        top.Controls.Add(statusBar, 0, 1);
+        top.Controls.Add(quickBar, 0, 1);
+        top.Controls.Add(statusBar, 0, 2);
 
         _grid.Columns.Add("Profile", "PRF");
         _grid.Columns.Add("Username", "Tài khoản");
@@ -103,6 +126,8 @@ internal sealed class MainForm : Form
         _start.Click += (_, _) => StartChecking();
         _stop.Click += (_, _) => StopChecking("Người dùng dừng");
         _exportDiagnostic.Click += (_, _) => ExportDiagnostics();
+        _quickCheck.Click += (_, _) => StartQuickCheck();
+        _history.Click += (_, _) => OpenHistoryWindow();
         _banCheck.Click += (_, _) => OpenBanCheckWindow();
         _uiTimer.Tick += (_, _) => OnUiTick();
         _uiTimer.Start();
@@ -277,19 +302,37 @@ internal sealed class MainForm : Form
         _checking = true;
         _start.Enabled = false; _stop.Enabled = true;
         _cycle = null;
+        _resumeCycle = null;
+        _resumeProfile = "";
+        _manualTarget = false;
         _targetProfile = "";
         ChooseNextTarget();
-        Log("Đã bật kiểm tra xoay vòng. Chỉ đọc telemetry + chat observer; không Pause/Stop/đổi LIVE của PRF chính.");
+        Log("Đã bật kiểm tra xoay vòng 10 phút/PRF. Observer chỉ follow LIVE sau SENT thành công; lỗi tạm không đổi PRF, chỉ Manager xác nhận thay/retire mới chuyển sớm.");
     }
 
     void StopChecking(string reason)
     {
+        if (_cycle is not null)
+        {
+            CancelPendingForProfile(_cycle.Profile, countUnknown: true, reason: "USER_STOP");
+            PersistCycle(_cycle, reason);
+        }
+        if (_resumeCycle is not null)
+            PersistDetachedCycle(_resumeCycle, reason + " (phiên đang nhường CHECK NGAY)");
+
+        foreach (var item in _pending.Values.ToList())
+            _ = _observer.ClearAsync(item.Key);
+        _pending.Clear();
+
         _checking = false;
         _start.Enabled = true; _stop.Enabled = false;
-        _cycle = null; _pending.Clear();
+        _cycle = null;
+        _resumeCycle = null;
+        _resumeProfile = "";
+        _manualTarget = false;
         _targetProfile = "";
         _targetState.Text = "Đang kiểm tra: —";
-        _cycleState.Text = "Vòng: —";
+        _cycleState.Text = "Phiên: —";
         _summaryState.Text = "Đã quét: — | Hiện: — | Mất: — | Không rõ: — | Kết quả: —";
         Log("Đã dừng kiểm tra: " + reason);
     }
@@ -354,19 +397,28 @@ internal sealed class MainForm : Form
 
     void HandleTelemetry(TelemetryMessage m)
     {
+        if (m.Type.Equals("MANAGER_STATE", StringComparison.OrdinalIgnoreCase))
+        {
+            HandleManagerStateTelemetry(m);
+            RefreshGrid();
+            return;
+        }
+
         if (!_profiles.TryGetValue(m.Profile, out var p))
         {
             p = new ProfileState { Profile = m.Profile };
             _profiles[m.Profile] = p;
         }
+
         var workerRestarted = p.Pid != 0 && m.Pid != 0 && p.Pid != m.Pid;
-        if (workerRestarted && _cycle is not null && m.Profile.Equals(_targetProfile, StringComparison.OrdinalIgnoreCase))
+        if (workerRestarted && m.Profile.Equals(_targetProfile, StringComparison.OrdinalIgnoreCase))
         {
-            Log($"[CYCLE_RESET] PRF={m.Profile} Worker PID đổi {p.Pid} -> {m.Pid}; bỏ vòng cũ để tránh trộn dữ liệu.");
-            _cycle = null;
-            foreach (var key in _pending.Values.Where(x => x.Profile.Equals(m.Profile, StringComparison.OrdinalIgnoreCase)).Select(x => x.Key).ToList())
-                _pending.Remove(key);
+            // Worker restart/recovery là lỗi tạm: giữ nguyên phiên + deadline 10 phút,
+            // chỉ hủy pending gắn với PID cũ để không trộn sendId của hai process.
+            CancelPendingForProfile(m.Profile, countUnknown: true, reason: "WORKER_PID_CHANGED");
+            Log($"[SESSION_KEEP_WORKER_RESTART] PRF={m.Profile} Worker PID đổi {p.Pid} -> {m.Pid}; giữ target/deadline, chỉ dọn pending PID cũ.");
         }
+
         p.Pid = m.Pid;
         p.Username = m.Username ?? p.Username;
         p.RunState = m.RunState ?? p.RunState;
@@ -390,13 +442,7 @@ internal sealed class MainForm : Form
             return;
         }
 
-        if (m.Type.Equals("HEARTBEAT", StringComparison.OrdinalIgnoreCase))
-        {
-            // Heartbeat chỉ giúp observer bám sơ bộ. Gate trước khi quét vẫn bắt buộc
-            // WILL_SEND có LiveUrlVerified=true nên heartbeat stale không thể khởi động scan.
-            _ = FollowTargetLiveAsync(p.LiveUrl);
-        }
-        else if (m.Type.Equals("WILL_SEND", StringComparison.OrdinalIgnoreCase))
+        if (m.Type.Equals("WILL_SEND", StringComparison.OrdinalIgnoreCase))
         {
             _ = PrepareSendAsync(m);
         }
@@ -404,6 +450,8 @@ internal sealed class MainForm : Form
         {
             _ = HandleSentAsync(m);
         }
+        // HEARTBEAT chỉ cập nhật trạng thái. Observer KHÔNG chạy theo mỗi lần PRF đổi LIVE.
+        // Việc follow LIVE mới chỉ được kích hoạt sau khi nhận SENT thành công.
         RefreshGrid();
     }
 
@@ -462,43 +510,63 @@ internal sealed class MainForm : Form
     async Task PrepareSendAsync(TelemetryMessage m)
     {
         if (!_checking || !m.Profile.Equals(_targetProfile, StringComparison.OrdinalIgnoreCase)) return;
+
+        if (_cycle is not null)
+        {
+            if (_cycle.Closing) return;
+            if (_cycle.StartedUtc != default && DateTime.UtcNow >= _cycle.DeadlineUtc)
+            {
+                MarkCurrentSessionDeadlineReached();
+                return;
+            }
+        }
+
         var key = MakeSendKey(m.Profile, m.Pid, m.SendId);
         var wanted = ObserverChromeSession.NormalizeLiveUrl(m.LiveUrl);
         var freshLiveVerified = m.LiveUrlVerified && wanted.Length > 0;
-        var ready = freshLiveVerified && _observer.Connected && _observer.IsOnLive(wanted);
-        Log($"[PREPARE_SEND] PRF={m.Profile} send={m.SendId} cmt={m.ContentIndex}/{m.ContentTotal} ready={ready} liveVerified={freshLiveVerified} observerConnected={_observer.Connected} wanted={wanted} current={_observer.CurrentLiveUrl}");
+        var liveAuthorized = freshLiveVerified
+                             && string.Equals(wanted, _authorizedLiveUrl, StringComparison.OrdinalIgnoreCase);
+        var ready = liveAuthorized && _observer.Connected && _observer.IsOnLive(wanted);
+        Log($"[PREPARE_SEND] PRF={m.Profile} send={m.SendId} cmt={m.ContentIndex}/{m.ContentTotal} ready={ready} liveVerified={freshLiveVerified} liveAuthorized={liveAuthorized} observerConnected={_observer.Connected} wanted={wanted} current={_observer.CurrentLiveUrl}");
 
-        // HARD GATE: chỉ arm/quét khi Worker vừa đọc URL thật ngay trước Enter VÀ
-        // Observer đang đứng đúng LIVE đó. Nếu chưa đồng bộ thì bỏ lượt comment này,
-        // follow Observer sang LIVE mới và chờ WILL_SEND tiếp theo; không tính Missing/Unknown.
+        // Không follow ở WILL_SEND. PRF gốc có thể đổi qua nhiều LIVE để tìm nguồn phù hợp;
+        // Observer chỉ chạy theo sau khi chính PRF đã SENT thành công ở LIVE mới.
         if (!ready)
         {
-            Log($"[PREPARE_SKIP_NOT_SYNCED] PRF={m.Profile} send={m.SendId} liveVerified={freshLiveVerified} wanted={wanted} current={_observer.CurrentLiveUrl}");
-            if (freshLiveVerified) _ = FollowTargetLiveAsync(wanted);
+            Log($"[PREPARE_SKIP_WAIT_SENT_TO_FOLLOW] PRF={m.Profile} send={m.SendId} liveVerified={freshLiveVerified} wanted={wanted} current={_observer.CurrentLiveUrl}");
             return;
         }
 
-        // Chỉ bắt đầu một vòng khi observer đã đứng đúng LIVE trước lúc Enter.
         if (_cycle is null)
         {
-            if (m.ContentTotal <= 0) return;
             _cycle = new CycleState
             {
+                SessionId = Guid.NewGuid().ToString("N"),
                 Profile = m.Profile,
+                Username = m.Username ?? "",
                 Expected = m.ContentTotal,
                 StartIndex = m.ContentIndex,
-                StartedUtc = DateTime.UtcNow
+                CreatedUtc = DateTime.UtcNow,
+                IsManual = _manualTarget
             };
-            Log($"[CYCLE_START] PRF={m.Profile} bắt đầu tại CMT {m.ContentIndex}/{m.ContentTotal}.");
+            Log($"[SESSION_READY] PRF={m.Profile} observer đã đúng LIVE; chờ SENT đầu tiên để bắt đầu đồng hồ 10 phút.");
             if (string.IsNullOrWhiteSpace(m.Username))
                 Log($"[MATCH_WARN] PRF={m.Profile} không có TikTok handle hợp lệ trong tiktok_auth.json; lượt này phải match theo nội dung và độ tin cậy thấp hơn.");
         }
 
-        if (_cycle.Profile != m.Profile || _cycle.SentCount >= _cycle.Expected) return;
+        if (_cycle.Profile != m.Profile || _cycle.Closing) return;
+
         var willSendUtc = TelemetryUtcOrNow(m.SentAtUtcMs);
+        if (_cycle.StartedUtc != default && willSendUtc >= _cycle.DeadlineUtc)
+        {
+            MarkCurrentSessionDeadlineReached();
+            return;
+        }
+
         var pending = new PendingSend
         {
             Key = key,
+            SessionId = _cycle.SessionId,
             Profile = m.Profile,
             SendId = m.SendId,
             ContentIndex = m.ContentIndex,
@@ -512,47 +580,63 @@ internal sealed class MainForm : Form
         };
         _pending[key] = pending;
 
-        if (ready)
+        try
         {
-            try
-            {
-                pending.Armed = await _observer.ArmAsync(key, pending.Username, pending.Content);
-                Log($"[ARM] PRF={pending.Profile} send={pending.SendId} cmt={pending.ContentIndex} armed={pending.Armed} timeout={pending.TimeoutSeconds:0.0}s user={(string.IsNullOrWhiteSpace(pending.Username) ? "EMPTY" : "OK")}");
-                if (!pending.Armed) pending.ObserverReady = false;
-            }
-            catch (Exception ex)
-            {
-                pending.Armed = false;
-                pending.ObserverReady = false;
-                Log($"[ARM_ERROR] PRF={pending.Profile} send={pending.SendId} cmt={pending.ContentIndex} error={ex.Message}");
-            }
-            finally
-            {
-                pending.PrepareDone.TrySetResult(pending.Armed && pending.ObserverReady);
-            }
+            pending.Armed = await _observer.ArmAsync(key, pending.Username, pending.Content);
+            Log($"[ARM] PRF={pending.Profile} send={pending.SendId} cmt={pending.ContentIndex} armed={pending.Armed} timeout={pending.TimeoutSeconds:0.0}s user={(string.IsNullOrWhiteSpace(pending.Username) ? "EMPTY" : "OK")}");
+            if (!pending.Armed) pending.ObserverReady = false;
+        }
+        catch (Exception ex)
+        {
+            pending.Armed = false;
+            pending.ObserverReady = false;
+            Log($"[ARM_ERROR] PRF={pending.Profile} send={pending.SendId} cmt={pending.ContentIndex} error={ex.Message}");
+        }
+        finally
+        {
+            pending.PrepareDone.TrySetResult(pending.Armed && pending.ObserverReady);
         }
     }
 
     async Task HandleSentAsync(TelemetryMessage m)
     {
-        if (_cycle is null || _cycle.Profile != m.Profile || _cycle.SentCount >= _cycle.Expected) return;
-        var key = MakeSendKey(m.Profile, m.Pid, m.SendId);
+        if (!_checking || !m.Profile.Equals(_targetProfile, StringComparison.OrdinalIgnoreCase)) return;
+        if (_cycle is not null && _cycle.StartedUtc != default && DateTime.UtcNow >= _cycle.DeadlineUtc)
+        {
+            MarkCurrentSessionDeadlineReached();
+            return;
+        }
+        if (_cycle?.Closing == true) return;
 
-        // WILL_SEND được xử lý async để cài DOM observer. SENT có thể tới rất sát sau Enter,
-        // nên chờ ngắn cho ARM hoàn tất thay vì đọc Armed=false giữa chừng rồi bỏ oan.
+        var key = MakeSendKey(m.Profile, m.Pid, m.SendId);
+        var wanted = ObserverChromeSession.NormalizeLiveUrl(m.LiveUrl);
+        var freshLiveVerified = m.LiveUrlVerified && wanted.Length > 0;
+
+        // Không có WILL_SEND đã arm nghĩa là Observer chưa đứng đúng LIVE. Đây chính là
+        // comment mốc: sau khi SENT thành công mới cho Observer follow sang LIVE đó.
         if (!_pending.TryGetValue(key, out var pending))
         {
-            Log($"[SENT_SKIP_NOT_SYNCED] PRF={m.Profile} send={m.SendId} cmt={m.ContentIndex}/{m.ContentTotal} reason=NO_PREPARED_SEND current={_observer.CurrentLiveUrl}");
+            Log($"[SENT_MARK_FOLLOW] PRF={m.Profile} send={m.SendId} cmt={m.ContentIndex}/{m.ContentTotal} liveVerified={freshLiveVerified} wanted={wanted} current={_observer.CurrentLiveUrl}");
+            if (freshLiveVerified)
+            {
+                _authorizedLiveUrl = wanted;
+                _ = FollowTargetLiveAsync(wanted);
+            }
             return;
         }
 
         if (!pending.PrepareDone.Task.IsCompleted)
             await Task.WhenAny(pending.PrepareDone.Task, Task.Delay(2000));
 
-        if (_cycle is null || _cycle.Profile != m.Profile || _cycle.SentCount >= _cycle.Expected) return;
+        if (_cycle is null
+            || _cycle.Profile != m.Profile
+            || !string.Equals(_cycle.SessionId, pending.SessionId, StringComparison.Ordinal))
+        {
+            _pending.Remove(key);
+            _ = _observer.ClearAsync(pending.Key);
+            return;
+        }
 
-        // Không có WILL_SEND đã arm đúng LIVE => lượt này chưa đủ điều kiện kiểm tra.
-        // Tuyệt đối không tính UNKNOWN/MISSING vì sẽ làm sai thống kê.
         if (!pending.PrepareDone.Task.IsCompletedSuccessfully
             || !pending.PrepareDone.Task.Result
             || !pending.ObserverReady
@@ -562,16 +646,37 @@ internal sealed class MainForm : Form
             _pending.Remove(key);
             Log($"[SENT_SKIP_NOT_SYNCED] PRF={m.Profile} send={m.SendId} cmt={m.ContentIndex}/{m.ContentTotal} wanted={pending.LiveUrl} current={_observer.CurrentLiveUrl}");
             _ = _observer.ClearAsync(pending.Key);
+            if (freshLiveVerified)
+            {
+                _authorizedLiveUrl = wanted;
+                _ = FollowTargetLiveAsync(wanted);
+            }
+            return;
+        }
+
+        pending.SentConfirmedUtc = TelemetryUtcOrNow(m.SentAtUtcMs);
+
+        if (_cycle.StartedUtc == default)
+        {
+            _cycle.StartedUtc = pending.SentConfirmedUtc;
+            _cycle.DeadlineUtc = _cycle.StartedUtc.Add(ProfileCheckDuration);
+            _cycle.Username = string.IsNullOrWhiteSpace(m.Username) ? _cycle.Username : m.Username;
+            Log($"[SESSION_START_10M] PRF={m.Profile} start={_cycle.StartedUtc:O} deadline={_cycle.DeadlineUtc:O} manual={_cycle.IsManual}");
+        }
+
+        if (_cycle.Closing || pending.WillSendUtc >= _cycle.DeadlineUtc)
+        {
+            _pending.Remove(key);
+            _ = _observer.ClearAsync(pending.Key);
+            MarkCurrentSessionDeadlineReached();
             return;
         }
 
         if (!_cycle.SeenSendIds.Add(m.SendId)) return;
         _cycle.SentCount++;
-        pending.SentConfirmedUtc = TelemetryUtcOrNow(m.SentAtUtcMs);
-        // Never shorten a pending request if this LIVE has just learned a longer delay.
         pending.TimeoutSeconds = Math.Max(pending.TimeoutSeconds, GetAdaptiveTimeoutSeconds(pending.LiveUrl));
 
-        Log($"[SENT_ACCEPT] PRF={m.Profile} send={m.SendId} cmt={m.ContentIndex}/{m.ContentTotal} cycleSent={_cycle.SentCount}/{_cycle.Expected} timeout={pending.TimeoutSeconds:0.0}s");
+        Log($"[SENT_ACCEPT] PRF={m.Profile} send={m.SendId} cmt={m.ContentIndex}/{m.ContentTotal} sessionSent={_cycle.SentCount} remain={FormatRemaining(_cycle)} timeout={pending.TimeoutSeconds:0.0}s");
         _ = ResolveSentAsync(pending);
         UpdateCycleLabel();
     }
@@ -659,8 +764,11 @@ internal sealed class MainForm : Form
 
     void ApplyResolvedResult(PendingSend p, ResultKind result, string mode, double latencySeconds, double timeoutUsed)
     {
-        _pending.Remove(p.Key);
-        if (_cycle is null || _cycle.Profile != p.Profile) return;
+        if (!_pending.Remove(p.Key)) return;
+        if (_cycle is null
+            || _cycle.Profile != p.Profile
+            || !string.Equals(_cycle.SessionId, p.SessionId, StringComparison.Ordinal))
+            return;
 
         if (result == ResultKind.Visible && latencySeconds >= 0)
         {
@@ -678,82 +786,103 @@ internal sealed class MainForm : Form
         }
 
         _cycle.Details.Add(new CommentResult(
+            DateTimeOffset.Now,
+            p.SendId,
             p.ContentIndex,
+            p.Username,
+            p.Content,
             result.ToString(),
             mode,
             p.LiveUrl,
             result == ResultKind.Visible ? latencySeconds : null,
             timeoutUsed));
 
-        Log($"[CMT_RESULT] PRF={p.Profile} send={p.SendId} cmt={p.ContentIndex} result={result} mode={mode} latency={(result == ResultKind.Visible ? latencySeconds.ToString("0.00") + "s" : "-")} timeout={timeoutUsed:0.0}s resolved={_cycle.ResolvedCount}/{_cycle.Expected}");
+        Log($"[CMT_RESULT] PRF={p.Profile} send={p.SendId} cmt={p.ContentIndex} result={result} mode={mode} latency={(result == ResultKind.Visible ? latencySeconds.ToString("0.00") + "s" : "-")} timeout={timeoutUsed:0.0}s resolved={_cycle.ResolvedCount} remain={FormatRemaining(_cycle)}");
         UpdateCycleLabel();
-        TryFinishCycle();
-    }
-
-    void TryFinishCycle()
-    {
-        if (_cycle is null || _cycle.SentCount < _cycle.Expected || _cycle.ResolvedCount < _cycle.Expected) return;
-        var done = _cycle;
-        if (_profiles.TryGetValue(done.Profile, out var p))
-        {
-            p.LastVisible = done.Visible;
-            p.LastMissing = done.Missing;
-            p.LastUnknown = done.Unknown;
-            p.LastExpected = done.Expected;
-            p.LastResult = $"{done.Visible}/{done.Expected} hiện • {done.Missing} không thấy • {done.Unknown} không xác minh";
-            p.LastCheck = DateTime.Now;
-        }
-        SaveResult(done);
-        Log($"[CYCLE_DONE] PRF={done.Profile} visible={done.Visible}/{done.Expected} missing={done.Missing} unknown={done.Unknown}");
-        _cycle = null;
-        ChooseNextTarget();
-        RefreshGrid();
+        TryCompleteClosingSession();
     }
 
     void ChooseNextTarget()
     {
         if (!_checking) return;
+
+        // CHECK NGAY đã kết thúc: nếu phiên auto trước đó còn thời hạn và Manager chưa
+        // xác nhận thay/retire thì quay lại đúng PRF cũ. Deadline tuyệt đối không pause.
+        if (_manualTarget)
+        {
+            _manualTarget = false;
+            if (TryResumeInterruptedTarget()) return;
+        }
+
         var active = _profiles.Values
-            .Where(p => DateTime.UtcNow - p.LastSeenUtc < TimeSpan.FromSeconds(20)
-                        && p.RunState.Equals("RUNNING", StringComparison.OrdinalIgnoreCase))
+            .Where(IsEligibleForNewTarget)
             .OrderBy(p => NaturalProfileKey(p.Profile), StringComparer.OrdinalIgnoreCase)
             .ToList();
         if (active.Count == 0)
         {
             _targetProfile = "";
-            _targetState.Text = "Đang kiểm tra: chờ PRF RUNNING...";
+            _cycle = null;
+            _targetState.Text = "Đang kiểm tra: chờ PRF hoạt động...";
+            _cycleState.Text = "Phiên: —";
             return;
         }
 
         var currentIndex = active.FindIndex(p => p.Profile.Equals(_targetProfile, StringComparison.OrdinalIgnoreCase));
         var next = currentIndex >= 0 ? (currentIndex + 1) % active.Count : (_rotationSeed + 1 + active.Count) % active.Count;
         _rotationSeed = next;
-        _targetProfile = active[next].Profile;
-        _cycle = null;
-        _targetState.Text = $"Đang kiểm tra: {_targetProfile}";
-        _cycleState.Text = "Vòng: đang đồng bộ Observer với LIVE...";
-        _summaryState.Text = "Đã quét: 0/? | Hiện: 0 | Mất: 0 | Không rõ: 0 | Kết quả: —";
-        Log($"[TARGET] chuyển sang PRF {_targetProfile}.");
-        _ = FollowTargetLiveAsync(active[next].LiveUrl);
+        ActivateTarget(active[next].Profile, manual: false, cycle: null, reason: "AUTO_ROTATION");
     }
 
     void OnUiTick()
     {
         if (_checking)
         {
-            if (string.IsNullOrWhiteSpace(_targetProfile)) ChooseNextTarget();
-            else if (!_profiles.TryGetValue(_targetProfile, out var p) || DateTime.UtcNow - p.LastSeenUtc > TimeSpan.FromSeconds(25))
+            RefreshQuickProfileChoices();
+            ExpireInterruptedSessionIfNeeded();
+
+            if (string.IsNullOrWhiteSpace(_targetProfile))
             {
-                Log($"[TARGET_SKIP] {_targetProfile} không còn RUNNING/telemetry quá 25s.");
-                _cycle = null;
                 ChooseNextTarget();
             }
-            else if (_cycle is not null && DateTime.UtcNow - _cycle.StartedUtc > TimeSpan.FromMinutes(20))
+            else if (_profiles.TryGetValue(_targetProfile, out var p) && p.ManagerTerminal)
             {
-                Log($"[CYCLE_TIMEOUT] {_cycle.Profile} quá 20 phút; bỏ vòng hiện tại và chuyển PRF tiếp theo.");
-                _cycle = null;
-                ChooseNextTarget();
+                Log($"[TARGET_MANAGER_REPLACED] PRF={_targetProfile} reason={p.ManagerReason} action=FINISH_AND_ROTATE");
+                FinishCurrentSession("MANAGER_REPLACED: " + (string.IsNullOrWhiteSpace(p.ManagerReason) ? "terminal" : p.ManagerReason), cancelPendingAsUnknown: true);
             }
+            else if (_cycle is not null && _cycle.StartedUtc != default)
+            {
+                if (DateTime.UtcNow >= _cycle.DeadlineUtc)
+                    MarkCurrentSessionDeadlineReached();
+
+                if (_cycle.Closing)
+                {
+                    var pendingForSession = PendingForSession(_cycle.SessionId).ToList();
+                    if (pendingForSession.Count == 0)
+                    {
+                        FinishCurrentSession(_cycle.EndReason.Length > 0 ? _cycle.EndReason : "Hết 10 phút", cancelPendingAsUnknown: false);
+                    }
+                    else if (_cycle.DeadlineReachedUtc != default
+                             && DateTime.UtcNow - _cycle.DeadlineReachedUtc >= SessionPendingGrace)
+                    {
+                        Log($"[SESSION_PENDING_GRACE_EXPIRED] PRF={_cycle.Profile} pending={pendingForSession.Count} grace={SessionPendingGrace.TotalSeconds:0}s");
+                        FinishCurrentSession(_cycle.EndReason.Length > 0 ? _cycle.EndReason : "Hết 10 phút", cancelPendingAsUnknown: true);
+                    }
+                }
+            }
+
+            // Mất Worker telemetry hoặc RUNNING tạm thời KHÔNG còn là lý do đổi PRF.
+            // Chỉ ManagerTerminal mới cho phép chuyển sớm trước deadline.
+            if (!string.IsNullOrWhiteSpace(_targetProfile)
+                && _profiles.TryGetValue(_targetProfile, out var target)
+                && DateTime.UtcNow - target.LastSeenUtc > TimeSpan.FromSeconds(25)
+                && !target.ManagerTerminal)
+            {
+                _targetState.Text = $"Đang kiểm tra: {_targetProfile} · chờ telemetry/lỗi tạm";
+            }
+        }
+        else
+        {
+            RefreshQuickProfileChoices();
         }
         RefreshGrid();
     }
@@ -762,14 +891,15 @@ internal sealed class MainForm : Form
     {
         if (_cycle is null)
         {
-            _cycleState.Text = "Vòng: đang chờ bắt đầu";
-            _summaryState.Text = "Đã quét: 0/? | Hiện: 0 | Mất: 0 | Không rõ: 0 | Kết quả: —";
+            _cycleState.Text = "Phiên: chờ CMT đầu tiên sau khi Observer bám đúng LIVE";
+            _summaryState.Text = "Đã quét: 0 | Hiện: 0 | Mất: 0 | Không rõ: 0 | Kết quả: —";
             return;
         }
 
-        _cycleState.Text = $"Vòng: gửi {_cycle.SentCount}/{_cycle.Expected} • đã quét {_cycle.ResolvedCount}/{_cycle.Expected}";
+        var remain = _cycle.StartedUtc == default ? "chưa chạy giờ" : FormatRemaining(_cycle);
+        _cycleState.Text = $"Phiên 10 phút: gửi {_cycle.SentCount} • đã quét {_cycle.ResolvedCount} • còn {remain}";
         _summaryState.Text =
-            $"Đã quét: {_cycle.ResolvedCount}/{_cycle.Expected} | Hiện: {_cycle.Visible} | Mất: {_cycle.Missing} | Không rõ: {_cycle.Unknown} | Kết quả: {FormatVisibilityRate(_cycle.Visible, _cycle.Missing)}";
+            $"Đã quét: {_cycle.ResolvedCount} | Hiện: {_cycle.Visible} | Mất: {_cycle.Missing} | Không rõ: {_cycle.Unknown} | Kết quả: {FormatVisibilityRate(_cycle.Visible, _cycle.Missing)}";
     }
 
     static string FormatVisibilityRate(int visible, int missing)
@@ -785,16 +915,25 @@ internal sealed class MainForm : Form
         foreach (var p in _profiles.Values.OrderBy(x => NaturalProfileKey(x.Profile), StringComparer.OrdinalIgnoreCase))
         {
             var fresh = DateTime.UtcNow - p.LastSeenUtc < TimeSpan.FromSeconds(20);
-            var state = fresh ? p.RunState : "OFFLINE";
+            var managerFresh = p.LastManagerSeenUtc != default && DateTime.UtcNow - p.LastManagerSeenUtc < TimeSpan.FromSeconds(8);
+            var state = p.ManagerTerminal
+                ? "ĐANG THAY/RETIRE"
+                : managerFresh && !string.IsNullOrWhiteSpace(p.ManagerRunState)
+                    ? p.ManagerRunState
+                    : fresh ? p.RunState : "OFFLINE";
             var isTarget = p.Profile.Equals(_targetProfile, StringComparison.OrdinalIgnoreCase);
             var progress = isTarget
-                ? (_cycle is null ? "Đồng bộ LIVE" : $"{_cycle.ResolvedCount}/{_cycle.Expected}")
+                ? (_cycle is null
+                    ? "Chờ SENT để bám LIVE"
+                    : _cycle.StartedUtc == default
+                        ? "Đã bám LIVE · chờ CMT đầu"
+                        : $"{_cycle.ResolvedCount} CMT · còn {FormatRemaining(_cycle)}")
                 : "Chờ";
 
             var visible = isTarget && _cycle is not null ? _cycle.Visible : p.LastVisible;
             var missing = isTarget && _cycle is not null ? _cycle.Missing : p.LastMissing;
             var unknown = isTarget && _cycle is not null ? _cycle.Unknown : p.LastUnknown;
-            var hasResult = (isTarget && _cycle is not null) || p.LastExpected > 0;
+            var hasResult = (isTarget && _cycle is not null && _cycle.ResolvedCount > 0) || p.LastExpected > 0;
             var score = hasResult ? FormatVisibilityRate(visible, missing) : "";
 
             _grid.Rows.Add(
@@ -934,7 +1073,8 @@ internal sealed class MainForm : Form
             Follow = new
             {
                 InFlight = _followInFlight,
-                RequestedUrl = _followRequestedUrl
+                RequestedUrl = _followRequestedUrl,
+                AuthorizedLiveUrl = _authorizedLiveUrl
             },
             Cycle = _cycle is null ? null : new
             {
@@ -946,7 +1086,11 @@ internal sealed class MainForm : Form
                 _cycle.Visible,
                 _cycle.Missing,
                 _cycle.Unknown,
-                _cycle.StartedUtc
+                _cycle.StartedUtc,
+                _cycle.DeadlineUtc,
+                _cycle.Closing,
+                _cycle.IsManual,
+                Remaining = FormatRemaining(_cycle)
             },
             Pending = _pending.Values.Select(x => new
             {
@@ -986,7 +1130,12 @@ internal sealed class MainForm : Form
                     x.LastMissing,
                     x.LastUnknown,
                     x.LastExpected,
-                    x.LastCheck
+                    x.LastCheck,
+                    x.ManagerPresent,
+                    x.ManagerTerminal,
+                    x.ManagerReason,
+                    x.ManagerRunState,
+                    x.LastManagerSeenUtc
                 })
                 .ToArray()
         };
@@ -1112,6 +1261,11 @@ internal sealed class MainForm : Form
         public long Seq { get; set; }
         public long SentAtUtcMs { get; set; }
         public int Pid { get; set; }
+        public bool ManagerPresent { get; set; }
+        public bool ManagerTerminal { get; set; }
+        public string ManagerReason { get; set; } = "";
+        public string ManagerRunState { get; set; } = "";
+        public long ManagerSeq { get; set; }
     }
 
     sealed class ProfileState
@@ -1130,11 +1284,18 @@ internal sealed class MainForm : Form
         public int LastUnknown { get; set; }
         public int LastExpected { get; set; }
         public DateTime LastCheck { get; set; }
+        public bool ManagerPresent { get; set; }
+        public bool ManagerTerminal { get; set; }
+        public string ManagerReason { get; set; } = "";
+        public string ManagerRunState { get; set; } = "";
+        public DateTime LastManagerSeenUtc { get; set; }
+        public long ManagerSeq { get; set; }
     }
 
     sealed class PendingSend
     {
         public string Key { get; set; } = "";
+        public string SessionId { get; set; } = "";
         public string Profile { get; set; } = "";
         public long SendId { get; set; }
         public int ContentIndex { get; set; }
@@ -1158,7 +1319,9 @@ internal sealed class MainForm : Form
 
     sealed class CycleState
     {
+        public string SessionId { get; set; } = Guid.NewGuid().ToString("N");
         public string Profile { get; set; } = "";
+        public string Username { get; set; } = "";
         public int Expected { get; set; }
         public int StartIndex { get; set; }
         public int SentCount { get; set; }
@@ -1166,13 +1329,23 @@ internal sealed class MainForm : Form
         public int Visible { get; set; }
         public int Missing { get; set; }
         public int Unknown { get; set; }
+        public DateTime CreatedUtc { get; set; }
         public DateTime StartedUtc { get; set; }
+        public DateTime DeadlineUtc { get; set; }
+        public DateTime DeadlineReachedUtc { get; set; }
+        public bool Closing { get; set; }
+        public bool IsManual { get; set; }
+        public string EndReason { get; set; } = "";
         public HashSet<long> SeenSendIds { get; } = new();
         public List<CommentResult> Details { get; } = new();
     }
 
     sealed record CommentResult(
+        DateTimeOffset Timestamp,
+        long SendId,
         int ContentIndex,
+        string Username,
+        string Content,
         string Result,
         string MatchMode,
         string LiveUrl,

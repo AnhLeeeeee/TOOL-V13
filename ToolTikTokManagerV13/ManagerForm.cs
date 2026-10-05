@@ -185,6 +185,7 @@ public sealed partial class ManagerForm : Form
         ReloadCatalog();
         EnsureAddTab();
         InitializeDashboardAndUpdater();
+        InitializeCommentCheckManagerStateTelemetry();
         UpdateManagerClock();
         _refreshTimer.Tick += (_, _) => UpdateManagerClock();
         _refreshTimer.Tick += (_, _) => UpdateAutoCloseToolbarButtonText();
