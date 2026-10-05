@@ -2677,7 +2677,12 @@ public sealed partial class ManagerForm
                 // Chỉ các candidate SKIP trước khi mở runtime mới được phép continue nội bộ.
                 var startName = DetectNextAutoProfileName();
 
-                if (TryGetAutoReplacementCreateLimitBlock(
+                // THAY ALL có target CREATE riêng trong cửa sổ refresh hằng ngày.
+                // Cầu chì CREATE của Auto Replace thường (3/deficit, per-hour, per-session)
+                // không được chặn nhánh force-new này; các gate schedule/deadline/cooldown,
+                // Global Login, login/name/video/stabilize vẫn giữ nguyên ở pipeline hiện có.
+                if (!forceNewProfileOnly
+                    && TryGetAutoReplacementCreateLimitBlock(
                         request,
                         out var preCreateLimitReason,
                         out _,
@@ -2867,15 +2872,24 @@ public sealed partial class ManagerForm
                 // Re-check + reserve quota ngay sát CREATE thật. Đây là chốt chống
                 // CREATE vượt quota; ngoài ra sau đúng 1 profile CREATE thật bị lỗi,
                 // hàm sẽ return ra tầng ngoài để cooldown + vét lại toàn bộ PRF chờ.
-                if (!TryReserveAutoReplacementCreateAttempt(
-                        request,
-                        item.ProfileName,
-                        out var createLimitBlockReason))
+                if (!forceNewProfileOnly)
                 {
-                    _log.Warn(
-                        $"[AUTO_CREATE_LIMIT_BLOCK_INSIDE_CREATE] id={request.Id} closed={request.ClosedProfileName} " +
-                        $"profile={item.ProfileName} reason={createLimitBlockReason}");
-                    return false;
+                    if (!TryReserveAutoReplacementCreateAttempt(
+                            request,
+                            item.ProfileName,
+                            out var createLimitBlockReason))
+                    {
+                        _log.Warn(
+                            $"[AUTO_CREATE_LIMIT_BLOCK_INSIDE_CREATE] id={request.Id} closed={request.ClosedProfileName} " +
+                            $"profile={item.ProfileName} reason={createLimitBlockReason}");
+                        return false;
+                    }
+                }
+                else
+                {
+                    _log.Info(
+                        $"[RUN_DAILY_REPLACE_ALL_CREATE_LIMIT_BYPASS] outgoing={request.ClosedProfileName} " +
+                        $"profile={item.ProfileName} scope=AUTO_REPLACE_GENERIC_LIMITS action=ALLOW_FORCE_NEW");
                 }
 
                 attemptedAccountIds.Add(item.Account.Id);

@@ -333,9 +333,12 @@ internal sealed class BanCheckForm : Form
                 }
                 else
                 {
+                    // Unknown/INVALID tuyệt đối không ghi Ghi chú Excel.
+                    // Vì note vẫn trống nên lần chạy CHECK BAN sau tài khoản sẽ được check lại.
                     unknown++;
                     uiResult = BanCheckUiResult.Unknown;
-                    detail = "KHÔNG RÕ · " + first.Detail;
+                    detail = "KHÔNG RÕ · không ghi Excel · sẽ check lại lần sau · " + first.Detail;
+                    _log($"[BAN_CHECK_INVALID_NO_NOTE] row={item.SourceRow} account={item.Username} result=UNKNOWN note=UNCHANGED probe={first.Detail}");
                 }
 
                 processed++;

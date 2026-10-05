@@ -15,6 +15,10 @@ public sealed partial class ManagerForm
 
     bool _runStrategyDailyReplaceAllRuntimeArmed;
     bool _runStrategyDailyReplaceAllBootstrapPending;
+    // Từ lúc user bấm Bắt đầu THAY ALL cho tới khi StartAllAsync() hoàn tất toàn bộ
+    // PRF đang mở. Scheduler nền tuyệt đối không được bootstrap CREATE trong khoảng này,
+    // nếu không sẽ nhìn RUNNING tạm thời < target rồi tạo dư (10 -> 12).
+    bool _runStrategyDailyReplaceAllStartAllPending;
     bool _runStrategyDailyReplaceAllCycleActive;
     DateTime _runStrategyDailyReplaceAllLastCompletedLocalDate = DateTime.MinValue;
     DateTime _runStrategyDailyReplaceAllCycleScheduledLocalDate = DateTime.MinValue;
@@ -67,6 +71,7 @@ public sealed partial class ManagerForm
         {
             _runStrategyDailyReplaceAllRuntimeArmed = false;
             _runStrategyDailyReplaceAllBootstrapPending = false;
+            _runStrategyDailyReplaceAllStartAllPending = false;
             _runStrategyDailyReplaceAllCycleActive = false;
             _runStrategyDailyReplaceAllLastCompletedLocalDate = DateTime.MinValue;
             _runStrategyDailyReplaceAllCycleScheduledLocalDate = DateTime.MinValue;
@@ -87,6 +92,9 @@ public sealed partial class ManagerForm
             // Giữ capacity/queue thường đứng ngoài ngay từ trước StartAll/fill đầu phiên.
             // Initialize... sẽ hạ cờ này ngay nếu target đã đủ.
             _runStrategyDailyReplaceAllBootstrapPending = true;
+            // Gate riêng cho race StartAll <-> scheduler. Chỉ RunStrategy sau khi await
+            // StartAllAsync() xong mới được hạ cờ này rồi mới đếm/fill thiếu.
+            _runStrategyDailyReplaceAllStartAllPending = true;
         }
 
         // Bỏ request cũ của chiến lược trước. Sau Start, THAY ALL vẫn arm Tự bù,
@@ -97,6 +105,26 @@ public sealed partial class ManagerForm
 
         _log.Info(
             $"[RUN_DAILY_REPLACE_ALL_PREPARE] source={source} target={target} autoRefill=REUSE_ONLY autoCreateOutsideRefresh=OFF createMode=FORCE_NEW_EXISTING_PIPELINE");
+    }
+
+    void CompleteRunStrategyDailyReplaceAllStartAllGate(string source)
+    {
+        var changed = false;
+        lock (_runStrategyDailyReplaceAllLock)
+        {
+            if (_runStrategyDailyReplaceAllStartAllPending)
+            {
+                _runStrategyDailyReplaceAllStartAllPending = false;
+                changed = true;
+            }
+        }
+
+        if (changed)
+        {
+            _log.Info(
+                $"[RUN_DAILY_REPLACE_ALL_START_ALL_GATE_RELEASED] source={source} " +
+                "action=ALLOW_BOOTSTRAP_RECOUNT_AFTER_START_ALL");
+        }
     }
 
     void ClearPendingAutoReplacementForDailyReplaceAll(string source)
@@ -154,6 +182,7 @@ public sealed partial class ManagerForm
                 : _runStrategyDailyReplaceAllCycleScheduledLocalDate.Date;
 
             _runStrategyDailyReplaceAllBootstrapPending = false;
+            _runStrategyDailyReplaceAllStartAllPending = false;
             _runStrategyDailyReplaceAllCycleActive = false;
             _runStrategyDailyReplaceAllVictims.Clear();
             _runStrategyDailyReplaceAllCycleScheduledLocalDate = DateTime.MinValue;
@@ -195,6 +224,8 @@ public sealed partial class ManagerForm
         {
             _runStrategyDailyReplaceAllRuntimeArmed = true;
             _runStrategyDailyReplaceAllBootstrapPending = bootstrapPending;
+            // Initialize chỉ được gọi sau StartAll/direct startup fill đã hoàn tất.
+            _runStrategyDailyReplaceAllStartAllPending = false;
             _runStrategyDailyReplaceAllCycleActive = false;
             _runStrategyDailyReplaceAllVictims.Clear();
             _runStrategyDailyReplaceAllCycleScheduledLocalDate = DateTime.MinValue;
@@ -273,12 +304,23 @@ public sealed partial class ManagerForm
             return;
 
         token.ThrowIfCancellationRequested();
-        target = Math.Max(1, target);
+
+        var incomingTarget = Math.Max(1, target);
+        var configuredTarget = Math.Clamp(settings.DailyReplaceAllTargetSlots, 1, 50);
+        if (incomingTarget != configuredTarget)
+        {
+            _log.Warn(
+                $"[RUN_DAILY_REPLACE_ALL_TARGET_CORRECTED] incoming={incomingTarget} configured={configuredTarget} " +
+                $"action=USE_DAILY_TARGET");
+        }
+        target = configuredTarget;
+
         var now = GetToolNow().LocalDateTime;
         var (scheduled, createDeadline) =
             GetRunStrategyDailyReplaceAllCreateWindow(settings, now);
 
         bool bootstrapPending;
+        bool startAllPending;
         bool cycleActive;
         DateTime nextAttemptUtc;
         DateTime lastCompletedDate;
@@ -286,6 +328,7 @@ public sealed partial class ManagerForm
         lock (_runStrategyDailyReplaceAllLock)
         {
             bootstrapPending = _runStrategyDailyReplaceAllBootstrapPending;
+            startAllPending = _runStrategyDailyReplaceAllStartAllPending;
             cycleActive = _runStrategyDailyReplaceAllCycleActive;
             nextAttemptUtc = _runStrategyDailyReplaceAllNextAttemptUtc;
             lastCompletedDate = _runStrategyDailyReplaceAllLastCompletedLocalDate;
@@ -303,6 +346,18 @@ public sealed partial class ManagerForm
 
         if (DateTime.UtcNow < nextAttemptUtc)
             return;
+
+        // Quan trọng: Prepare THAY ALL được gọi trước StartAllAsync để khóa queue/capacity.
+        // Trong thời gian đó RUNNING chỉ là số tạm thời (ví dụ 8/10). Scheduler không
+        // được hiểu 8/10 là thiếu thật rồi CREATE a46/a47 trong khi a44/a45 còn đang
+        // chờ StartAll tới lượt. Chỉ sau khi StartAll hoàn tất mới được recount/fill.
+        if (bootstrapPending && startAllPending)
+        {
+            _log.Info(
+                $"[RUN_DAILY_REPLACE_ALL_BOOTSTRAP_WAIT_START_ALL] target={target} " +
+                $"filledNow={CountAutoReplacementFulfilledSlots()} action=WAIT_START_ALL_COMPLETE");
+            return;
+        }
 
         if (bootstrapPending)
         {

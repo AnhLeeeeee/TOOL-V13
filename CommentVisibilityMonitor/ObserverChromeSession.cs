@@ -336,14 +336,26 @@ internal sealed class ObserverChromeSession : IAsyncDisposable
                             readySinceUtc = DateTime.UtcNow;
 
                         // Không kết luận quá sớm khi TikTok mới render một phần danh sách.
-                        // Chờ danh sách ổn định rồi mới trả NOT_FOUND; kết quả này đủ để CHECK BAN ghi ban ngay.
+                        // QUAN TRỌNG CHECK BAN:
+                        // Màn TikTok "Không tìm thấy kết quả dành cho ..." có thể là lỗi Search tạm thời,
+                        // KHÔNG được coi là bằng chứng BAN. Trả Unknown để BanCheckForm không note Excel;
+                        // lần chạy sau dòng này vẫn còn trống và sẽ được check lại.
                         var stableFor = DateTime.UtcNow - readySinceUtc;
-                        if ((noResult && stableFor >= TimeSpan.FromSeconds(2.0))
-                            || stableFor >= TimeSpan.FromSeconds(3.5))
+                        if (noResult && stableFor >= TimeSpan.FromSeconds(2.0))
+                        {
+                            return new UserSearchProbe(
+                                UserSearchState.Unknown,
+                                "TIKTOK_SEARCH_INVALID_NO_RESULT_PAGE",
+                                lastCount);
+                        }
+
+                        // Chỉ khi TikTok thực sự trả một danh sách Search đã ổn định nhưng không có
+                        // exact username thì mới kết luận NotFound => CHECK BAN được phép ghi ban.
+                        if (!noResult && stableFor >= TimeSpan.FromSeconds(3.5))
                         {
                             return new UserSearchProbe(
                                 UserSearchState.NotFound,
-                                noResult ? "trang báo không có kết quả" : "danh sách đã load nhưng không có exact username",
+                                "danh sách đã load nhưng không có exact username",
                                 lastCount);
                         }
                     }

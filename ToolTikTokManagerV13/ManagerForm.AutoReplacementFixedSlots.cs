@@ -58,25 +58,47 @@ public sealed partial class ManagerForm
         if (!_autoCloseSettings.OpenReplacementAfterAutoClose || requestedSlots <= 0)
             return;
 
+        var effectiveTarget = requestedSlots;
+        var dailyReplaceAllActive = IsRunStrategyDailyReplaceAllActive();
+        if (dailyReplaceAllActive)
+        {
+            RunAllStrategySettings settings;
+            lock (_runStrategyLock)
+                settings = _runStrategySettings;
+
+            // THAY ALL có target cố định riêng. StartAll chỉ khởi động các tab đang có,
+            // tuyệt đối không được co target về openContexts.Count (ví dụ 10 -> 7).
+            effectiveTarget = Math.Clamp(settings.DailyReplaceAllTargetSlots, 1, 50);
+        }
+
         lock (_autoReplacementFixedSlotLock)
         {
             var old = _autoReplacementTargetSlots;
-            // Start All là intent mới rõ ràng: target phải BẰNG đúng số tab đang mở,
-            // không giữ target lớn hơn từ một lượt Start All cũ trong cùng phiên.
-            _autoReplacementTargetSlots = requestedSlots;
+            _autoReplacementTargetSlots = effectiveTarget;
             _autoReplacementTargetInitialized = true;
 
-            _log.Info(
-                $"[AUTO_REPLACE_TARGET_START_ALL] old={old} requested={requestedSlots} target={_autoReplacementTargetSlots}");
+            if (dailyReplaceAllActive)
+            {
+                _log.Info(
+                    $"[AUTO_REPLACE_TARGET_START_ALL_DAILY_PIN] old={old} requestedOpen={requestedSlots} " +
+                    $"dailyTarget={effectiveTarget} action=KEEP_DAILY_TARGET");
+            }
+            else
+            {
+                // Start All thường là intent mới rõ ràng: target phải BẰNG đúng số tab đang mở,
+                // không giữ target lớn hơn từ một lượt Start All cũ trong cùng phiên.
+                _log.Info(
+                    $"[AUTO_REPLACE_TARGET_START_ALL] old={old} requested={requestedSlots} target={_autoReplacementTargetSlots}");
+            }
         }
 
         // Start All là một intent/đợt capacity mới. Không được mang hard-cap 3/3
         // của đợt thiếu trước sang lượt chạy mới.
-        ResetAutoReplacementDeficitCreateBudget($"start_all_target:{requestedSlots}");
+        ResetAutoReplacementDeficitCreateBudget($"start_all_target:{effectiveTarget}");
 
-        // Chạy tất cả là intent rõ ràng của user muốn duy trì đúng số tab đang mở.
-        ArmAutoReplacementSession($"start_all_target:{requestedSlots}");
-        MarkNightReservePrimaryRunIntent(requestedSlots, "start_all_target");
+        // Với THAY ALL, intent phải giữ đúng target cố định chứ không phải số tab đang mở.
+        ArmAutoReplacementSession($"start_all_target:{effectiveTarget}");
+        MarkNightReservePrimaryRunIntent(effectiveTarget, "start_all_target");
     }
 
     async Task MaybeReconcileAutoReplacementCapacityAsync(
@@ -445,6 +467,18 @@ public sealed partial class ManagerForm
             ClearManualCloseSuppression(
                 profileName,
                 "runtime_command:start:user_intent");
+
+            // StartAll là một user intent chung, nhưng target đã được Capture... chốt đúng
+            // một lần trước khi chạy từng PRF. Không được coi mỗi PRF Start thành một
+            // manual expand riêng (đặc biệt khi THAY ALL target=10 nhưng CREATE bootstrap
+            // đã chen vào làm active tạm thành 11/12). Vẫn clear manual suppression ở trên.
+            if (_autoReplacementStartAllInProgress)
+            {
+                _log.Info(
+                    $"[AUTO_REPLACE_TARGET_START_ALL_MEMBER] profile={profileName} target={_autoReplacementTargetSlots} " +
+                    "action=KEEP_CAPTURED_START_ALL_TARGET");
+                return;
+            }
 
             // Chỉ dùng các slot THỰC SỰ đang chạy/được claim để mở rộng target.
             // Không dùng CountAutoReplacementOccupiedSlots() ở đây vì hàm đó cố ý

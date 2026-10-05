@@ -1849,7 +1849,9 @@ public sealed partial class ManagerForm
         }
 
         // Bước 1: tận dụng nguyên StartAll hiện có cho mọi PRF đang mở.
-        // Không có PRF mở thì bỏ qua; target sẽ được fill ở bước 2.
+        // Với THAY ALL, startup gate đã được dựng ở Prepare... và PHẢI giữ nguyên
+        // xuyên suốt cả StartAll + startup fill bên dưới. Nếu hạ gate ngay sau StartAll
+        // thì timer có thể chen đúng khe này và CREATE song song với startup fill.
         if (openCount > 0)
             await StartAllAsync();
 
@@ -1899,6 +1901,7 @@ public sealed partial class ManagerForm
                 }
                 catch (OperationCanceledException)
                 {
+                    CompleteRunStrategyDailyReplaceAllStartAllGate("run_all_start_fill_cancelled");
                     _log.Info("[RUN_DAILY_REPLACE_ALL_START_FILL_CANCELLED] source=user_stop_or_new_start");
                     return;
                 }
@@ -2584,6 +2587,23 @@ public sealed partial class ManagerForm
         {
             desiredTarget = _autoReplacementTargetSlots;
             targetInitialized = _autoReplacementTargetInitialized;
+        }
+
+        // THAY ALL có target cấu hình riêng và đó là nguồn sự thật của scheduler.
+        // Không được phục hồi session bằng target tạm lấy từ số tab đang mở.
+        if (settings.DailyReplaceAll)
+        {
+            var configuredDailyTarget = Math.Clamp(settings.DailyReplaceAllTargetSlots, 1, 50);
+            if (desiredTarget != configuredDailyTarget || !targetInitialized)
+            {
+                _log.Warn(
+                    $"[RUN_DAILY_REPLACE_ALL_TARGET_RESTORE_PIN] source={source} " +
+                    $"runtimeTarget={desiredTarget} initialized={targetInitialized} configured={configuredDailyTarget} " +
+                    $"action=USE_DAILY_TARGET");
+            }
+
+            desiredTarget = configuredDailyTarget;
+            targetInitialized = true;
         }
 
         if (settings.PrimeModeSuspended)
