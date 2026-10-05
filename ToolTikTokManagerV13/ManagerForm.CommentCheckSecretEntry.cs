@@ -6,7 +6,7 @@ public sealed partial class ManagerForm
 {
     const int CommentCheckSecretClickCount = 5;
     static readonly TimeSpan CommentCheckSecretClickWindow = TimeSpan.FromSeconds(3);
-    const string CommentCheckSecretSha256 = "A4F488D8472393E1821F8D536E77F64307D70D124DC3B7513E7A99C153186FDB";
+    const string CommentCheckSecretSha256 = "20F65C28671B40937C5BF23ACC7C6F37E5A5EC0622E347B57685725DF5BA9E50";
 
     void InstallSecretCommentCheckTrigger(Form autoRunForm, Label autoRunTitle)
     {
@@ -180,9 +180,12 @@ public sealed partial class ManagerForm
         var baseDir = AppContext.BaseDirectory;
         var candidates = new[]
         {
-            Path.Combine(baseDir, "CommentCheck", "CommentVisibilityMonitor.exe"),
+            // Dev/source: ưu tiên bản vừa build trong dist_comment_check để tránh
+            // cửa ẩn mở nhầm CommentCheck\... cũ. Bản cài khách thường không có
+            // dist_comment_check cạnh source nên sẽ tự rơi xuống CommentCheck bên dưới.
             Path.Combine(baseDir, "dist_comment_check", "CommentVisibilityMonitor.exe"),
-            Path.GetFullPath(Path.Combine(baseDir, "..", "dist_comment_check", "CommentVisibilityMonitor.exe"))
+            Path.GetFullPath(Path.Combine(baseDir, "..", "dist_comment_check", "CommentVisibilityMonitor.exe")),
+            Path.Combine(baseDir, "CommentCheck", "CommentVisibilityMonitor.exe")
         };
 
         return candidates.FirstOrDefault(File.Exists);

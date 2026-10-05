@@ -1245,6 +1245,20 @@ public sealed partial class ManagerForm : Form
         {
             var effectiveTimeout = timeout ?? TimeSpan.FromSeconds(15);
 
+            // GLOBAL LOGIN GATE có thể xếp nhiều Worker liên tiếp; với 6 PRF, lượt cuối
+            // có thể chờ khoảng 10 phút trước khi thực sự click Login. Các lệnh có khả năng đi qua credential-flow
+            // phải có timeout đủ dài, nếu không Manager sẽ timeout rồi retry đúng lúc
+            // Worker vẫn đang chờ slot login. Chỉ nâng nhóm login-capable; status/stop
+            // và các command khác giữ nguyên timeout cũ.
+            var commandMaySubmitTikTokLogin =
+                command.Equals("launch", StringComparison.OrdinalIgnoreCase)
+                || command.Equals("launch_auto", StringComparison.OrdinalIgnoreCase)
+                || command.Equals("start", StringComparison.OrdinalIgnoreCase)
+                || command.Equals("start_auto", StringComparison.OrdinalIgnoreCase)
+                || command.Equals("runtime_relogin_auto", StringComparison.OrdinalIgnoreCase);
+            if (commandMaySubmitTikTokLogin && effectiveTimeout < TimeSpan.FromMinutes(15))
+                effectiveTimeout = TimeSpan.FromMinutes(15);
+
             // Status polling is observational only. A timeout/missing snapshot
             // must never replace/restart a live Worker and turn a transient IPC
             // failure into a fresh Worker's legitimate STOPPED snapshot.
@@ -1389,7 +1403,11 @@ public sealed partial class ManagerForm : Form
                     // Tab đã mở nhưng Worker có thể vừa thoát; OpenProfileAsync sẽ bảo đảm
                     // Worker của đúng profile sẵn sàng rồi mới gửi lệnh start.
                     await OpenProfileAsync(ctx);
-                    await StartWithNameGuardAsync(ctx, "start", TimeSpan.FromSeconds(30));
+                    await StartWithNameGuardAsync(
+                        ctx,
+                        "start",
+                        TimeSpan.FromSeconds(30),
+                        explicitUserStartIntent: true);
                 }
                 catch (Exception ex)
                 {
@@ -1451,6 +1469,20 @@ public sealed partial class ManagerForm : Form
 
     async Task StopAllAsync()
     {
+        // Cắt ngay mọi credential-flow đã bắt đầu trước thời điểm Stop All, kể cả
+        // Worker đang nằm trong hàng chờ GLOBAL LOGIN 120s. Flow mới về sau sẽ lấy
+        // generation mới nên không bị khóa vĩnh viễn.
+        try
+        {
+            var generation = TikTokGlobalLoginSubmitGate.MarkStopAll();
+            _log.Warn($"[TIKTOK_LOGIN_GLOBAL_STOP_ALL] generation={generation} action=CANCEL_PENDING_LOGIN_SUBMIT");
+        }
+        catch (Exception ex)
+        {
+            // Stop All vẫn phải tiếp tục ngay cả khi state file login gate có lỗi.
+            _log.Warn($"[TIKTOK_LOGIN_GLOBAL_STOP_ALL_WARN] error={ex.Message}");
+        }
+
         // Stop All phải dừng cả +Auto Profile đang CREATE / cooldown / vét PRF bù.
         // CancellationToken sẽ khiến PRF bù đang kiểm tra đi qua cleanup hiện có,
         // tránh hết cooldown rồi tiếp tục tạo account mới ngoài ý muốn.

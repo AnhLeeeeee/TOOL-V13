@@ -9,13 +9,12 @@ public sealed partial class ManagerForm
     readonly HashSet<string> _consumedManualCloseOperationIds =
         new(StringComparer.OrdinalIgnoreCase);
 
-    // Manual close phải thắng mọi cơ chế Tự bù. Giữ một suppression ngắn hạn để
-    // candidate đang STABILIZING/NAME_SYNC không tự mở lại ngay sau khi user vừa đóng.
-    // START thủ công sẽ xóa suppression ngay lập tức.
+    // Manual close là intent bền trong suốt vòng đời hiện tại của profile: sau USER_STOP/
+    // USER_X_CLOSE, watchdog/Auto Replace không được tự suy luận profile "đáng lẽ phải chạy"
+    // chỉ vì còn snapshot RUNNING cũ. Suppression chỉ được xóa bởi một Start/Resume có
+    // user-intent thật sự; tuyệt đối không tự hết hạn theo thời gian.
     readonly Dictionary<string, DateTime> _manualCloseSuppressedUntilUtc =
         new(StringComparer.OrdinalIgnoreCase);
-
-    static readonly TimeSpan ManualCloseSuppressionWindow = TimeSpan.FromMinutes(10);
 
     sealed class WorkerManualCloseIntentDocument
     {
@@ -282,8 +281,10 @@ public sealed partial class ManagerForm
                 return;
             }
 
-            _manualCloseSuppressedUntilUtc[profileName] =
-                DateTime.UtcNow.Add(ManualCloseSuppressionWindow);
+            // Dùng DateTime.MaxValue để giữ nguyên cấu trúc state hiện tại nhưng biến
+            // suppression thành intent bền. Chỉ ClearManualCloseSuppression() từ một
+            // Start/Resume thật sự mới được phép gỡ cờ này.
+            _manualCloseSuppressedUntilUtc[profileName] = DateTime.MaxValue;
 
             oldTarget = _autoReplacementTargetSlots;
             targetChanged = _autoReplacementSessionArmed
@@ -304,6 +305,9 @@ public sealed partial class ManagerForm
             // target trước pass 2 nên không thể dùng quota cũ để mở bù lại.
             _autoReplacementNextCapacityReconcileUtc = DateTime.MinValue;
         }
+
+        _log.Info(
+            $"[MANUAL_CLOSE_SUPPRESSION_ARMED] profile={profileName} origin={origin} operationId={operationId} mode=UNTIL_USER_START");
 
         // Target vừa co xuống thì mọi lượt Tự bù/Auto Run bootstrap đang chạy với
         // snapshot target CŨ phải dừng ngay. Nếu không, một request đã qua slot-gate
@@ -382,6 +386,12 @@ public sealed partial class ManagerForm
         }
 
         ClearAutoCloseExpectedRunning(
+            profileName,
+            "manual_close:" + origin);
+
+        // Xóa cả đồng hồ progress-stuck đang giữ từ trước USER_STOP. Nếu không, một
+        // snapshot RUNNING cũ có thể khiến watchdog giữ lại mốc FAULT sau khi user đã Stop.
+        ResetAutoCloseProgressWatch(
             profileName,
             "manual_close:" + origin);
 

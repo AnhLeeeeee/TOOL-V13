@@ -9,6 +9,7 @@ public sealed partial class AutomationEngine
 {
     const int CommentCheckTelemetryPort = 47771;
     readonly object _commentCheckTelemetryLock = new();
+    readonly Dictionary<long, string> _commentCheckSendLiveUrls = new();
     UdpClient? _commentCheckTelemetryUdp;
     long _commentCheckTelemetrySeq;
     DateTime _commentCheckLastHeartbeatUtc = DateTime.MinValue;
@@ -58,12 +59,20 @@ public sealed partial class AutomationEngine
         catch { }
     }
 
-    void EmitCommentCheckTelemetry(string type, long sendId = 0, int contentIndex = 0, string? content = null)
+    void EmitCommentCheckTelemetry(
+        string type,
+        long sendId = 0,
+        int contentIndex = 0,
+        string? content = null,
+        string? liveUrlOverride = null,
+        bool liveUrlVerified = false)
     {
         try
         {
             InitializeCommentCheckTelemetryIdentity();
-            var url = (_chrome.Page?.Url ?? "").Trim();
+            var url = liveUrlOverride is not null
+                ? liveUrlOverride.Trim()
+                : (_chrome.Page?.Url ?? "").Trim();
             var payload = JsonSerializer.SerializeToUtf8Bytes(new
             {
                 Type = type,
@@ -71,6 +80,7 @@ public sealed partial class AutomationEngine
                 Username = _commentCheckUsername,
                 RunState = !_running ? "STOPPED" : _paused ? "PAUSED" : "RUNNING",
                 LiveUrl = url,
+                LiveUrlVerified = liveUrlVerified,
                 ContentIndex = contentIndex > 0 ? contentIndex : (_contents.Count > 0 ? _contentIndex + 1 : 0),
                 ContentTotal = _contents.Count,
                 Content = content ?? "",
@@ -92,6 +102,47 @@ public sealed partial class AutomationEngine
         }
     }
 
+    async Task<string> ReadFreshCommentCheckLiveUrlAsync(CancellationToken ct)
+    {
+        // Page.Url là snapshot lúc attach và có thể stale sau khi tab đã chuyển LIVE.
+        // Với WILL_SEND phải lấy URL thật ngay trước Enter; nếu không xác minh được thì
+        // gửi URL rỗng để Monitor KHÔNG arm/quét nhầm LIVE. Telemetry vẫn fail-open.
+        try
+        {
+            using var probeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            probeCts.CancelAfter(TimeSpan.FromSeconds(2));
+
+            try
+            {
+                var r = await _chrome.EvalAsync("(() => String(location.href || ''))()", ct: probeCts.Token);
+                if (r.TryGetProperty("value", out var value)
+                    && value.ValueKind == JsonValueKind.String)
+                {
+                    var href = (value.GetString() ?? "").Trim();
+                    if (href.Length > 0) return href;
+                }
+            }
+            catch
+            {
+                // Runtime.evaluate có thể fail khi target vừa điều hướng; thử refresh metadata cùng target.
+            }
+
+            try
+            {
+                var fresh = await _chrome.RefreshAttachedPageMetadataAsync();
+                return (fresh?.Url ?? "").Trim();
+            }
+            catch
+            {
+                return "";
+            }
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
     void EmitCommentCheckHeartbeat(bool force = false)
     {
         if (!_running || _paused) return;
@@ -110,14 +161,46 @@ public sealed partial class AutomationEngine
         EmitCommentCheckTelemetry("HEARTBEAT", contentIndex: index);
     }
 
-    long EmitCommentCheckWillSend(int contentIndex, string content)
+    async Task<long> EmitCommentCheckWillSendAsync(int contentIndex, string content, CancellationToken ct)
     {
         var sendId = Interlocked.Increment(ref _commentCheckTelemetrySeq);
+        // WILL_SEND là gate quyết định Monitor có được arm hay không, nên phải dùng URL thật mới đọc.
+        var freshLiveUrl = await ReadFreshCommentCheckLiveUrlAsync(ct);
+        if (freshLiveUrl.Length > 0)
+        {
+            lock (_commentCheckTelemetryLock)
+                _commentCheckSendLiveUrls[sendId] = freshLiveUrl;
+        }
+
         // EmitCommentCheckTelemetry cũng tăng Seq độc lập; SendId chỉ cần duy nhất trong Worker/profile.
-        EmitCommentCheckTelemetry("WILL_SEND", sendId, contentIndex, content);
+        EmitCommentCheckTelemetry(
+            "WILL_SEND",
+            sendId,
+            contentIndex,
+            content,
+            liveUrlOverride: freshLiveUrl,
+            liveUrlVerified: freshLiveUrl.Length > 0);
         return sendId;
     }
 
     void EmitCommentCheckSent(long sendId, int contentIndex, string content)
-        => EmitCommentCheckTelemetry("SENT", sendId, contentIndex, content);
+    {
+        string verifiedLiveUrl = "";
+        lock (_commentCheckTelemetryLock)
+        {
+            if (_commentCheckSendLiveUrls.TryGetValue(sendId, out var saved))
+            {
+                verifiedLiveUrl = saved;
+                _commentCheckSendLiveUrls.Remove(sendId);
+            }
+        }
+
+        EmitCommentCheckTelemetry(
+            "SENT",
+            sendId,
+            contentIndex,
+            content,
+            liveUrlOverride: verifiedLiveUrl.Length > 0 ? verifiedLiveUrl : null,
+            liveUrlVerified: verifiedLiveUrl.Length > 0);
+    }
 }

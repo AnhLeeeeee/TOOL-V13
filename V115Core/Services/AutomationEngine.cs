@@ -1035,7 +1035,7 @@ public sealed partial class AutomationEngine
                 case 3:
                 {
                     SetStatus("BƯỚC 3/8", "Enter ô 1 • theo dõi popup đăng nhập / cấm bình luận");
-                    var commentCheckSendId = EmitCommentCheckWillSend(_contentIndex + 1, content);
+                    var commentCheckSendId = await EmitCommentCheckWillSendAsync(_contentIndex + 1, content, ct);
                     await _chrome.PressKeyAsync("Enter", ct: ct);
                     if (await WatchPostEnterReactionAsync("điểm 1", restartStep: 1, ct)) return;
                     EmitCommentCheckSent(commentCheckSendId, _contentIndex + 1, content);
@@ -1070,7 +1070,7 @@ public sealed partial class AutomationEngine
                 case 7:
                 {
                     SetStatus("BƯỚC 7/8", "Enter ô 2 • theo dõi popup đăng nhập / cấm bình luận");
-                    var commentCheckSendId = EmitCommentCheckWillSend(_contentIndex + 1, content);
+                    var commentCheckSendId = await EmitCommentCheckWillSendAsync(_contentIndex + 1, content, ct);
                     await _chrome.PressKeyAsync("Enter", ct: ct);
                     if (await WatchPostEnterReactionAsync("điểm 2", restartStep: 5, ct)) return;
                     EmitCommentCheckSent(commentCheckSendId, _contentIndex + 1, content);
@@ -2846,6 +2846,87 @@ public sealed partial class AutomationEngine
         }
     }
 
+    static bool IsLivePageHrefForTransition(string href)
+        => !string.IsNullOrWhiteSpace(href)
+           && (href.Contains("tiktok.com/live", StringComparison.OrdinalIgnoreCase)
+               || (href.Contains("tiktok.com/@", StringComparison.OrdinalIgnoreCase)
+                   && href.Contains("/live", StringComparison.OrdinalIgnoreCase)));
+
+    async Task<(bool Ready, bool Recovered)> EnsureLiveContextBeforeTransitionAsync(
+        string source,
+        CancellationToken ct)
+    {
+        string identity;
+        try
+        {
+            identity = await GetCurrentLiveIdentityAsync(ct);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            if (!IsLikelyCdpIssue(ex))
+            {
+                _log.Warn(
+                    $"[LIVE_CONTEXT_GUARD_READ_FAIL] source={source} error={ex.Message} action=RETURN_FALSE");
+                return (false, false);
+            }
+
+            _log.Warn(
+                $"[LIVE_CONTEXT_GUARD_CDP_LOST] source={source} error={ex.Message} action=RECONNECT");
+
+            if (!await EnsureCdpRecoveredAsync($"live-context-guard/{source}", ct))
+                return (false, false);
+
+            identity = await GetCurrentLiveIdentityAsync(ct);
+        }
+
+        var href = ExtractLiveIdentityField(identity, "href");
+        if (IsLivePageHrefForTransition(href))
+            return (true, false);
+
+        // Search miss/error có thể để browser ở /search?q=... hoặc /search/live?q=....
+        // Tuyệt đối không chạy ArrowDown/click chuyển LIVE trên các trang đó. Dùng lại
+        // flow reset /live hiện có, rồi trả về vòng chính để đọc Viewer/DOM lại từ đầu.
+        _log.Warn(
+            $"[LIVE_CONTEXT_GUARD_NOT_LIVE] source={source} href={TrimIdentityForLog(href, 180)} " +
+            "action=RETURN_TO_/live_BEFORE_TRANSITION");
+
+        try
+        {
+            await _chrome.ResetTikTokLiveRecommendationFeedAsync(ct);
+            var afterIdentity = await GetCurrentLiveIdentityAsync(ct);
+            var afterHref = ExtractLiveIdentityField(afterIdentity, "href");
+            var ready = IsLivePageHrefForTransition(afterHref);
+
+            _log.Warn(
+                $"[LIVE_CONTEXT_GUARD_RECOVERY] source={source} href={TrimIdentityForLog(afterHref, 180)} " +
+                $"result={(ready ? "LIVE" : "NOT_LIVE")}");
+
+            if (ready)
+            {
+                ResetPeriodicDue(source + " / khôi phục về /live", cancelCandidate: true);
+                ResetPageMaintenanceDue(source + " / khôi phục về /live");
+                ResetInputGuardConsecutive("sau khôi phục LIVE context");
+                SetStatus("ĐÃ VỀ LIVE", $"{source}: Search đã kết thúc ngoài LIVE; Tool đã tự về /live và sẽ kiểm tra lại.");
+            }
+
+            return (ready, ready);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn(
+                $"[LIVE_CONTEXT_GUARD_RECOVERY_FAIL] source={source} error={ex.Message}");
+            return (false, false);
+        }
+    }
+
     async Task<bool> TransitionAsync(string source, TransitionAction action, string xpath, int count, bool scheduledPeriodic,
         CancellationToken ct, int waitAfterReloadMs = F5WaitMs, bool forceF5AfterArrowDown = false)
     {
@@ -2856,6 +2937,37 @@ public sealed partial class AutomationEngine
         }
         _transitioning = true;
         bool completed = false;
+
+        (bool Ready, bool Recovered) liveContext;
+        try
+        {
+            liveContext = await EnsureLiveContextBeforeTransitionAsync(source, ct);
+        }
+        catch
+        {
+            _transitioning = false;
+            throw;
+        }
+
+        if (!liveContext.Ready)
+        {
+            ReportProblem(
+                "LIVE_CONTEXT_NOT_READY",
+                source,
+                "Trang hiện tại không phải LIVE và Tool chưa khôi phục được /live; không chạy logic chuyển LIVE trên trang sai.",
+                throttleSeconds: 10);
+            _transitioning = false;
+            return false;
+        }
+
+        if (liveContext.Recovered)
+        {
+            // Đã điều hướng về /live. Không ArrowDown thêm ngay vì như vậy có thể bỏ
+            // qua chính LIVE vừa được mở; vòng chính sẽ đọc Viewer/DOM lại bình thường.
+            _transitioning = false;
+            return false;
+        }
+
         SetStatus("ĐANG CHUYỂN LIVE", source);
         _log.Info($"BẮT ĐẦU KHÓA CHUYỂN LIVE: {source}");
         try

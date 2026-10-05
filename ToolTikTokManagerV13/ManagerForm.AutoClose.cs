@@ -270,6 +270,14 @@ public sealed partial class ManagerForm
             ? "Bù PRF"
             : "Bù";
 
+        if (IsRunStrategyDailyReplaceAllActive())
+        {
+            if (IsRunStrategyDailyReplaceAllRefreshBusy())
+                return $"{prefix}: THAY ALL";
+
+            return $"{prefix}: CHỈ PRF CHỜ · THAY ALL";
+        }
+
         if (!_autoCloseSettings.OpenReplacementAfterAutoClose)
             return $"{prefix}: TẮT";
 
@@ -465,6 +473,8 @@ public sealed partial class ManagerForm
             PreserveFreshOffPeak = _runStrategySettings.PreserveFreshOffPeak,
             RefreshAllBeforePrime = _runStrategySettings.RefreshAllBeforePrime,
             PrePrimeRefreshSource = _runStrategySettings.PrePrimeRefreshSource,
+            DailyReplaceAll = _runStrategySettings.DailyReplaceAll,
+            DailyReplaceAllTargetSlots = _runStrategySettings.DailyReplaceAllTargetSlots,
             CreateLimitEnabled = _runStrategySettings.CreateLimitEnabled,
             CreateLimitPerSlot = _runStrategySettings.CreateLimitPerSlot,
             CreateLimitPerHour = _runStrategySettings.CreateLimitPerHour,
@@ -1330,6 +1340,8 @@ public sealed partial class ManagerForm
                 PreserveFreshOffPeak = _runStrategySettings.PreserveFreshOffPeak,
                 RefreshAllBeforePrime = _runStrategySettings.RefreshAllBeforePrime,
                 PrePrimeRefreshSource = _runStrategySettings.PrePrimeRefreshSource,
+                DailyReplaceAll = _runStrategySettings.DailyReplaceAll,
+                DailyReplaceAllTargetSlots = _runStrategySettings.DailyReplaceAllTargetSlots,
                 CreateLimitEnabled = createLimitEnabled.Checked,
                 CreateLimitPerSlot = (int)perSlot.Value,
                 CreateLimitPerHour = (int)perHour.Value,
@@ -1671,6 +1683,21 @@ public sealed partial class ManagerForm
 
                 var profileName = ctx.Profile.Name;
                 var nowUtc = DateTime.UtcNow;
+
+                // USER_STOP/USER_X_CLOSE phải thắng cả snapshot RUNNING còn sót lại trong
+                // 1-2 vòng poll kế tiếp. Không dùng delay: khi manual suppression còn hiệu lực,
+                // watchdog không được re-arm expected-running, không được mở đồng hồ STUCK,
+                // và không được phát FAULT_10M/TIME cho profile này.
+                if (IsManualCloseSuppressed(profileName))
+                {
+                    ClearAutoCloseExpectedRunning(
+                        profileName,
+                        "manual_close_suppressed_watchdog");
+                    ResetAutoCloseProgressWatch(
+                        profileName,
+                        "manual_close_suppressed_watchdog");
+                    continue;
+                }
 
                 if (_autoCloseInProgressProfiles.Contains(profileName))
                     continue;
@@ -2161,11 +2188,22 @@ public sealed partial class ManagerForm
         string confirmedState,
         bool explicitUserStartIntent = false)
     {
-        if (!_autoCloseFeatureInitialized)
-            return;
-
         var profileName = ctx.Profile.Name;
         command = (command ?? "").Trim().ToLowerInvariant();
+
+        // Manual-close suppression còn được Auto Replace/queue dùng ngay cả khi tính năng
+        // Auto Close đang tắt. Vì vậy user Start/Resume phải clear intent này trước guard
+        // _autoCloseFeatureInitialized, sau khi Worker đã xác nhận command thành công.
+        if (explicitUserStartIntent
+            && command is "start" or "start_auto" or "resume")
+        {
+            ClearManualCloseSuppression(
+                profileName,
+                $"runtime_command:{command}:user_intent");
+        }
+
+        if (!_autoCloseFeatureInitialized)
+            return;
 
         WriteAutoDiagnosticEvent(
             ctx,
@@ -2177,6 +2215,10 @@ public sealed partial class ManagerForm
         if (command is "start" or "start_auto" or "resume")
         {
             _autoCloseVerifiedCleanProfiles.Remove(profileName);
+
+            // Internal start/start_auto/resume của Name/VIDEO/recovery không được tự gỡ
+            // manual suppression. User-intent thật sự đã được clear ở đầu hàm, sau khi
+            // Worker xác nhận command thành công.
 
             // Một lần Start/Resume mới mở một vòng đời mới cho profile.
             ClearAutoCloseReasonDecision(

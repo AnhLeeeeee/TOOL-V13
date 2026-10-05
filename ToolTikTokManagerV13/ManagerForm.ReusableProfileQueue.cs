@@ -660,6 +660,16 @@ public sealed partial class ManagerForm
             return true;
         }
 
+        if (source.Equals(
+                "daily_replace:THAY_ALL",
+                StringComparison.OrdinalIgnoreCase)
+            || source.Equals(
+                "auto_close:THAY_ALL",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
         if (source.StartsWith(
                 "auto_close:",
                 StringComparison.OrdinalIgnoreCase))
@@ -674,6 +684,9 @@ public sealed partial class ManagerForm
                     StringComparison.OrdinalIgnoreCase)
                 || reason.StartsWith(
                     "TIME_",
+                    StringComparison.OrdinalIgnoreCase)
+                || reason.Equals(
+                    "THAY_ALL",
                     StringComparison.OrdinalIgnoreCase))
             {
                 return true;
@@ -2190,29 +2203,36 @@ public sealed partial class ManagerForm
                     continue;
             }
 
-            // NAME_SYNC_PENDING dưới 60s chưa được phép probe lại, nhưng vẫn là
-            // nguồn PRF CÓ SẴN. Không được vì còn thiếu vài giây mà tiêu account mới.
-            // Trả true để safety guard chặn CREATE; queue ngoài sẽ retry ngắn 5 giây
-            // cho tới khi entry đủ tuổi và recovery sweep thật sự kiểm tra nó.
+            // Policy mới: NAME_SYNC_PENDING KHÔNG giữ slot CREATE. Nếu chưa đủ
+            // tuổi probe thì bỏ qua candidate này ở vòng hiện tại và tiếp tục vét
+            // các PRF khác; nếu không có PRF dùng được thì vẫn được CREATE (tối đa
+            // hard cap 3 PRF cho chính slot/request).
             if (candidate.NameSyncPending)
             {
                 var age = DateTime.UtcNow - candidate.LastCheckedUtc;
                 if (age < AutoReplacementNameSyncMinRetryAge)
                 {
                     var remaining = AutoReplacementNameSyncMinRetryAge - age;
-                    profileName = name;
-                    lane = "NAME_SYNC_PENDING_WAIT";
-                    detail = $"chờ thêm {remaining:c} trước khi probe lại; chặn CREATE account mới";
-                    return true;
+                    _log.Info(
+                        $"[NAME_SYNC_PENDING_ALLOW_CREATE_WHILE_WAITING] id={request.Id} profile={name} " +
+                        $"age={age:c} remaining={remaining:c} action=SKIP_THIS_CANDIDATE_DO_NOT_BLOCK_CREATE");
+                    continue;
                 }
             }
 
-            // Profile thật sự RUNNING/PAUSED/RECOVERING không còn là nguồn chờ.
-            // Nhưng OPENING/UNKNOWN của một entry vẫn đang trong queue là trạng thái
-            // tạm thời; phải CHẶN fallback tạo PRF mới và để request retry, nếu không
-            // kết quả sẽ phụ thuộc timing (lúc reuse, lúc tạo mới).
+            // PRF NAME_SYNC_PENDING đang được Tên/VIDEO/recovery khác xử lý là BUSY:
+            // Auto Replace không được giành mở/đóng nó và cũng không để nó giữ slot
+            // CREATE. Với lane thường, OPENING/UNKNOWN vẫn giữ safety guard cũ.
             if (IsReusableProfileBusy(name))
             {
+                if (candidate.NameSyncPending)
+                {
+                    _log.Info(
+                        $"[NAME_SYNC_PENDING_BUSY_SKIP_FOR_CREATE] id={request.Id} profile={name} " +
+                        "action=DO_NOT_TOUCH_DO_NOT_BLOCK_CREATE");
+                    continue;
+                }
+
                 if (_contexts.TryGetValue(name, out var busyCtx))
                 {
                     var busyState = GetEffectiveRuntimeState(busyCtx);

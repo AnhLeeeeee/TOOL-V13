@@ -118,8 +118,95 @@ public sealed partial class MainForm
     {
         _log.Warn($"[RUNTIME_LIVE_SEARCH_BEGIN] reason={ShortText(reason, 180)}");
         var ok = await TryLiveSearchAsync(ct);
+
+        if (!ok)
+        {
+            // Runtime Search lỗi/miss không đồng nghĩa Chrome vẫn đang ở một LIVE.
+            // Trường hợp lt06: CDP rớt đúng lúc bấm tab LIVE khiến Search trả false
+            // nhưng browser còn đứng ở /search?q=...; vòng ngoài lại chạy ArrowDown như
+            // đang ở LIVE và bị kẹt. Không retry Search ngay: chỉ đưa trang về /live
+            // bằng flow LIVE hiện có, rồi trả false để vòng chính tiếp tục bình thường.
+            var liveRecovered = await EnsureRuntimeLiveContextAfterSearchMissAsync(reason, ct);
+            _log.Warn(
+                $"[RUNTIME_LIVE_SEARCH_RECOVERY] reason={ShortText(reason, 180)} " +
+                $"searchResult=MISS liveContext={(liveRecovered ? "READY" : "FAILED")}");
+        }
+
         _log.Warn($"[RUNTIME_LIVE_SEARCH_DONE] reason={ShortText(reason, 180)} result={(ok ? "OPENED" : "MISS")}");
         return ok;
+    }
+
+    async Task<bool> EnsureRuntimeLiveContextAfterSearchMissAsync(
+        string reason,
+        CancellationToken ct)
+    {
+        string href = "";
+
+        try
+        {
+            href = await ReadRuntimeHrefAsync(ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn(
+                $"[RUNTIME_LIVE_CONTEXT_READ_FAIL] reason={ShortText(reason, 140)} error={ShortText(ex.Message, 160)} action=RECONNECT_THEN_RETURN_LIVE");
+
+            try
+            {
+                await _chrome.ReconnectAsync(ct);
+                href = await ReadRuntimeHrefAsync(ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception reconnectEx)
+            {
+                _log.Warn(
+                    $"[RUNTIME_LIVE_CONTEXT_RECONNECT_FAIL] reason={ShortText(reason, 140)} error={ShortText(reconnectEx.Message, 160)}");
+                return false;
+            }
+        }
+
+        if (LooksLikeTikTokLiveUrl(href))
+        {
+            _log.Info(
+                $"[RUNTIME_LIVE_CONTEXT_OK] reason={ShortText(reason, 140)} href={ShortText(href, 180)} action=KEEP_CURRENT_LIVE");
+            return true;
+        }
+
+        _log.Warn(
+            $"[RUNTIME_LIVE_CONTEXT_NOT_LIVE] reason={ShortText(reason, 140)} href={ShortText(href, 180)} action=NAVIGATE_/live_NO_SEARCH_RETRY");
+
+        try
+        {
+            if (!_chrome.Connected)
+                await _chrome.ReconnectAsync(ct);
+
+            // Tái sử dụng đúng flow /live hiện có của ChromeController; không viết
+            // một flow navigation/playback riêng cho lỗi Search.
+            await _chrome.ResetTikTokLiveRecommendationFeedAsync(ct);
+            href = await ReadRuntimeHrefAsync(ct);
+
+            var ready = LooksLikeTikTokLiveUrl(href);
+            _log.Warn(
+                $"[RUNTIME_LIVE_CONTEXT_RETURN] reason={ShortText(reason, 140)} href={ShortText(href, 180)} result={(ready ? "LIVE" : "NOT_LIVE")}");
+            return ready;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn(
+                $"[RUNTIME_LIVE_CONTEXT_RETURN_FAIL] reason={ShortText(reason, 140)} error={ShortText(ex.Message, 180)}");
+            return false;
+        }
     }
 
     async Task<bool> TryLiveSearchAsync(CancellationToken parentCt)

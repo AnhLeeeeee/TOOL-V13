@@ -30,6 +30,7 @@
     <Compile Include="..\ManagerShared\Services\DeviceAccessService.cs" Link="Shared\DeviceAccessService.cs" />
     <Compile Include="..\ManagerShared\Services\VersionRollbackGuard.cs" Link="Shared\VersionRollbackGuard.cs" />
     <Compile Include="..\ManagerShared\Services\TikTokAuthService.cs" Link="Shared\TikTokAuthService.cs" />
+    <Compile Include="..\ManagerShared\Services\TikTokGlobalLoginSubmitGate.cs" Link="Shared\TikTokGlobalLoginSubmitGate.cs" />
     <Compile Include="..\ManagerShared\Utils\AppVersionInfo.cs" Link="Shared\AppVersionInfo.cs" />
     <Compile Include="..\ManagerShared\Controls\*.cs" Link="Shared\Controls\%(Filename)%(Extension)" />
   </ItemGroup>

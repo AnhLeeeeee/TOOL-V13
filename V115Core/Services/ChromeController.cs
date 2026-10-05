@@ -7,6 +7,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using ToolTikTokV11.Utils;
 using ToolTikTokV11.Models;
+using ToolTikTokV12.Services;
 
 namespace ToolTikTokV11.Services;
 
@@ -2476,6 +2477,10 @@ public sealed partial class ChromeController : IAsyncDisposable
         // Chỉ arm LOGIN_BAN sau ClickTikTokLoginSubmitAsync bên dưới.
         _loginBanDetectionArmed = false;
 
+        // Snapshot generation ngay khi login-flow bắt đầu. Stop All sẽ tăng generation
+        // này; nếu nó thay đổi trước lúc submit thì flow cũ tuyệt đối không được click.
+        var loginStopGenerationAtStart = TikTokGlobalLoginSubmitGate.ReadStopGeneration();
+
         // Authentication and LIVE navigation are deliberately separable. Opening a
         // profile runs the normal auto-login flow but stays on TikTok home; pressing
         // Bắt đầu runs the same authentication gate and then opens LIVE. Session-cookie
@@ -2626,7 +2631,18 @@ public sealed partial class ChromeController : IAsyncDisposable
         }
 
         await FillTikTokLoginFormAsync(username, password, ct);
-        await ClickTikTokLoginSubmitAsync(ct);
+        var submitted = await ClickTikTokLoginSubmitAsync(loginStopGenerationAtStart, ct);
+        if (!submitted)
+        {
+            _log.Warn(
+                $"[TIKTOK_LOGIN_SUBMIT_ABORTED] reason=manager_stop_all " +
+                $"startGeneration={loginStopGenerationAtStart} currentGeneration={TikTokGlobalLoginSubmitGate.ReadStopGeneration()}");
+            return new TikTokStartupResult(
+                "LOGIN_FAILED",
+                "Đã hủy gửi đăng nhập vì Manager vừa nhận Stop All; không gửi request login mới.",
+                false,
+                false);
+        }
 
         // Từ thời điểm này mới được phép kết luận BAN cho account đang gán.
         // Trước mốc này mọi marker BAN có thể thuộc trang/session cũ.
@@ -3201,9 +3217,90 @@ public sealed partial class ChromeController : IAsyncDisposable
         _log.Info("[TIKTOK_LOGIN_FORM_FILLED] username=true password=true");
     }
 
-    async Task ClickTikTokLoginSubmitAsync(CancellationToken ct)
+    async Task<bool> ClickTikTokLoginSubmitAsync(long stopGenerationAtLoginStart, CancellationToken ct)
     {
-        var r = await EvalAsync("""
+        var waitStartedUtc = DateTime.UtcNow;
+        var waitLogged = false;
+
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var currentStopGeneration = TikTokGlobalLoginSubmitGate.ReadStopGeneration();
+            if (currentStopGeneration != stopGenerationAtLoginStart)
+            {
+                _log.Warn(
+                    $"[TIKTOK_LOGIN_SUBMIT_BLOCK_STOP_ALL] startGeneration={stopGenerationAtLoginStart} " +
+                    $"currentGeneration={currentStopGeneration} action=NO_CLICK");
+                return false;
+            }
+
+            var remaining = TikTokGlobalLoginSubmitGate.GetRemainingCooldown(DateTime.UtcNow);
+            if (remaining > TimeSpan.Zero)
+            {
+                if (!waitLogged)
+                {
+                    waitLogged = true;
+                    _log.Info(
+                        $"[TIKTOK_LOGIN_GLOBAL_GATE_WAIT] cooldownSec={(int)TikTokGlobalLoginSubmitGate.Cooldown.TotalSeconds} " +
+                        $"remainingSec={(int)Math.Ceiling(remaining.TotalSeconds)} action=WAIT_NO_CLICK");
+                }
+
+                // Chia nhỏ wait để Stop All có thể cắt lượt login đang xếp hàng gần như ngay lập tức.
+                var delay = remaining > TimeSpan.FromSeconds(1)
+                    ? TimeSpan.FromSeconds(1)
+                    : remaining;
+                if (delay < TimeSpan.FromMilliseconds(50))
+                    delay = TimeSpan.FromMilliseconds(50);
+                await Task.Delay(delay, ct);
+                continue;
+            }
+
+            // Named mutex là lớp khóa process-wide: chỉ một Worker/PRF được quyền
+            // kiểm tra mốc cuối + click + commit timestamp tại cùng thời điểm.
+            using var gateMutex = TikTokGlobalLoginSubmitGate.CreateSubmitMutex();
+            var ownsMutex = false;
+            try
+            {
+                try
+                {
+                    ownsMutex = gateMutex.WaitOne(TimeSpan.FromMilliseconds(500));
+                }
+                catch (AbandonedMutexException)
+                {
+                    // Worker trước chết giữa critical section: mutex đã được cấp cho ta.
+                    ownsMutex = true;
+                    _log.Warn("[TIKTOK_LOGIN_GLOBAL_GATE_MUTEX_ABANDONED] action=RECOVER_AND_RECHECK_STATE");
+                }
+
+                if (!ownsMutex)
+                {
+                    await Task.Delay(120, ct);
+                    continue;
+                }
+
+                ct.ThrowIfCancellationRequested();
+
+                currentStopGeneration = TikTokGlobalLoginSubmitGate.ReadStopGeneration();
+                if (currentStopGeneration != stopGenerationAtLoginStart)
+                {
+                    _log.Warn(
+                        $"[TIKTOK_LOGIN_SUBMIT_BLOCK_STOP_ALL] startGeneration={stopGenerationAtLoginStart} " +
+                        $"currentGeneration={currentStopGeneration} stage=inside_global_gate action=NO_CLICK");
+                    return false;
+                }
+
+                // Re-check sau khi lấy mutex vì Worker khác có thể vừa submit trong lúc ta chờ lock.
+                remaining = TikTokGlobalLoginSubmitGate.GetRemainingCooldown(DateTime.UtcNow);
+                if (remaining > TimeSpan.Zero)
+                    continue;
+
+                var waitedSec = Math.Max(0, (int)Math.Round((DateTime.UtcNow - waitStartedUtc).TotalSeconds));
+                _log.Info(
+                    $"[TIKTOK_LOGIN_GLOBAL_GATE_GRANTED] cooldownSec={(int)TikTokGlobalLoginSubmitGate.Cooldown.TotalSeconds} " +
+                    $"waitedSec={waitedSec} action=ALLOW_ONE_SUBMIT");
+
+                var r = await EvalAsync("""
 (() => {
   const visible = e => { if(!e) return false; const r=e.getBoundingClientRect(); const s=getComputedStyle(e); return r.width>1&&r.height>1&&s.display!=='none'&&s.visibility!=='hidden'; };
   const norm = x => String(x||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/đ/g,'d').trim();
@@ -3212,9 +3309,29 @@ public sealed partial class ChromeController : IAsyncDisposable
   if(!btn) return false; btn.click(); return true;
 })()
 """, ct: ct);
-        if (!r.TryGetProperty("value", out var v) || v.ValueKind != JsonValueKind.True)
-            throw new InvalidOperationException("Không tìm thấy nút Đăng nhập TikTok.");
-        _log.Info("[TIKTOK_LOGIN_SUBMIT] clicked=true");
+                if (!r.TryGetProperty("value", out var v) || v.ValueKind != JsonValueKind.True)
+                    throw new InvalidOperationException("Không tìm thấy nút Đăng nhập TikTok.");
+
+                // Chỉ commit cooldown SAU KHI DOM xác nhận click thành công. Nếu form/CDP lỗi
+                // trước click thì không làm các PRF khác phải chờ 2 phút vô ích.
+                var submittedUtc = DateTime.UtcNow;
+                TikTokGlobalLoginSubmitGate.RecordSuccessfulSubmitUtc(submittedUtc);
+                var nextAllowedUtc = submittedUtc + TikTokGlobalLoginSubmitGate.Cooldown;
+
+                _log.Info("[TIKTOK_LOGIN_SUBMIT] clicked=true");
+                _log.Info(
+                    $"[TIKTOK_LOGIN_GLOBAL_GATE_COMMIT] submittedUtc={submittedUtc:O} " +
+                    $"nextAllowedUtc={nextAllowedUtc:O} cooldownSec={(int)TikTokGlobalLoginSubmitGate.Cooldown.TotalSeconds}");
+                return true;
+            }
+            finally
+            {
+                if (ownsMutex)
+                {
+                    try { gateMutex.ReleaseMutex(); } catch { }
+                }
+            }
+        }
     }
 
     TikTokStartupResult BuildLoginAccountBannedResult(string signal)

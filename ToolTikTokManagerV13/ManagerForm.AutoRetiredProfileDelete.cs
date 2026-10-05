@@ -72,17 +72,23 @@ public sealed partial class ManagerForm
         if (profileName.Length == 0)
             return;
 
+        var isThayAll = requestedReason.Equals(
+            "THAY_ALL",
+            StringComparison.OrdinalIgnoreCase);
+
         // BAN là trạng thái không còn dùng lại được: sau khi Excel đã ghi + xác minh
         // note=ban thì luôn xóa profile (miễn công tắc Tự đóng khi BAN đang bật).
         // Checkbox DeleteProfileAfterBanOrLifetime từ đây chỉ còn quyết định auto-delete
         // cho TIME_xH; không được làm profile BAN nằm lại trong kho.
         if (requestedReason != "BAN"
+            && !isThayAll
             && !_autoCloseSettings.DeleteProfileAfterBanOrLifetime)
         {
             return;
         }
 
         if (requestedReason != "BAN"
+            && !isThayAll
             && !IsAutoCloseLifetimeReason(requestedReason))
         {
             return;
@@ -118,7 +124,7 @@ public sealed partial class ManagerForm
             MarkProfileSupplyState(
                 profileName,
                 "retired",
-                "auto_close:" + requestedReason);
+                (isThayAll ? "daily_replace:" : "auto_close:") + requestedReason);
             RemoveReusableProfileQueueEntry(
                 profileName,
                 "auto_retired_delete_queued:" + requestedReason);
@@ -151,6 +157,7 @@ public sealed partial class ManagerForm
                     return;
 
                 if (requestedReason != "BAN"
+                    && !requestedReason.Equals("THAY_ALL", StringComparison.OrdinalIgnoreCase)
                     && !_autoCloseSettings.DeleteProfileAfterBanOrLifetime)
                 {
                     _log.Info(
@@ -268,8 +275,14 @@ public sealed partial class ManagerForm
                     IsAutoCloseLifetimeReason(
                         verifiedNote);
 
+                var noteIsThayAll =
+                    verifiedNote.Equals(
+                        "thay_all",
+                        StringComparison.OrdinalIgnoreCase);
+
                 if (!noteIsBan
-                    && !noteIsLifetime)
+                    && !noteIsLifetime
+                    && !noteIsThayAll)
                 {
                     WriteAutoActivityLog(
                         action: "TỰ XÓA PROFILE",
@@ -278,7 +291,7 @@ public sealed partial class ManagerForm
                         reason: requestedReason,
                         result: "HỦY",
                         detail:
-                            $"Ghi chú Excel không còn là ban/TIME_xH (actual={verifiedNote}); hủy tự xóa để tránh xóa nhầm.");
+                            $"Ghi chú Excel không còn là ban/TIME_xH/thay_all (actual={verifiedNote}); hủy tự xóa để tránh xóa nhầm.");
                     return;
                 }
 
@@ -294,6 +307,21 @@ public sealed partial class ManagerForm
                         result: "HỦY",
                         detail:
                             $"Yêu cầu xóa vì BAN nhưng Excel không còn note=ban (actual={verifiedNote}); không tự xóa.");
+                    return;
+                }
+
+                if (requestedReason.Equals("THAY_ALL", StringComparison.OrdinalIgnoreCase)
+                    && !noteIsThayAll
+                    && !noteIsBan)
+                {
+                    WriteAutoActivityLog(
+                        action: "TỰ XÓA PROFILE",
+                        profile: profileName,
+                        account: account.Username,
+                        reason: requestedReason,
+                        result: "HỦY",
+                        detail:
+                            $"Yêu cầu xóa vì THAY_ALL nhưng Excel không còn note=thay_all/ban (actual={verifiedNote}); không tự xóa.");
                     return;
                 }
 
@@ -349,7 +377,7 @@ public sealed partial class ManagerForm
                         action: "TỰ XÓA PROFILE",
                         profile: profileName,
                         account: account.Username,
-                        reason: noteIsBan ? "BAN" : verifiedNote,
+                        reason: noteIsBan ? "BAN" : noteIsThayAll ? "THAY_ALL" : verifiedNote,
                         result: "BẮT ĐẦU",
                         detail:
                             retryAttempt == 0
@@ -400,7 +428,7 @@ public sealed partial class ManagerForm
                         action: "TỰ XÓA PROFILE",
                         profile: profileName,
                         account: account.Username,
-                        reason: noteIsBan ? "BAN" : verifiedNote,
+                        reason: noteIsBan ? "BAN" : noteIsThayAll ? "THAY_ALL" : verifiedNote,
                         result: "THÀNH CÔNG",
                         detail:
                             retryAttempt == 0

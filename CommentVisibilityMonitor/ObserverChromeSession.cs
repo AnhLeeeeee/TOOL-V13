@@ -51,6 +51,46 @@ internal sealed class ObserverChromeSession : IAsyncDisposable
     public int Port => _port;
     public string CoreLogDirectory => Path.Combine(_coreLogRoot, "logs");
 
+    public async Task<TikTokStartupResult> LoginAsync(
+        string username,
+        string password,
+        string totpSecret,
+        CancellationToken ct = default)
+    {
+        await EnsureStartedAsync();
+
+        await _gate.WaitAsync(ct);
+        try
+        {
+            if (!_chrome.Connected)
+                throw new InvalidOperationException("Chrome Observer chưa kết nối CDP.");
+
+            // Giống nút đăng nhập thủ công hiện tại: xóa cookie TikTok cũ để
+            // tài khoản nhập trong 3 ô thật sự là tài khoản được đăng nhập, rồi gọi
+            // đúng credential/login flow có sẵn của ChromeController.
+            // Không gọi Auto Run / Auto Replace / VIDEO / Tên-Ảnh của Worker.
+            var deletedTikTokCookies = await _chrome.ClearTikTokCookiesAsync(ct);
+            _chromeLog.Info(
+                $"[COMMENT_OBSERVER_LOGIN_COOKIES_CLEARED] count={deletedTikTokCookies} action=EXISTING_LOGIN_FLOW");
+
+            var result = await _chrome.PrepareTikTokStartupAsync(
+                username ?? "",
+                password ?? "",
+                totpSecret ?? "",
+                autoLogin: true,
+                openLiveWhenReady: false,
+                stopOnCaptcha: true,
+                ct: ct);
+
+            await RefreshCurrentUrlCoreAsync();
+            return result;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
     public static string NormalizeLiveUrl(string? raw)
     {
         if (string.IsNullOrWhiteSpace(raw)) return "";
@@ -170,6 +210,166 @@ internal sealed class ObserverChromeSession : IAsyncDisposable
             {
                 return false;
             }
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task<UserSearchProbe> SearchUserExactAsync(
+        string username,
+        CancellationToken ct = default)
+    {
+        var target = (username ?? "").Trim().TrimStart('@').ToLowerInvariant();
+        if (target.Length == 0)
+            return new UserSearchProbe(UserSearchState.Unknown, "username trống", 0);
+
+        await EnsureStartedAsync();
+        await _gate.WaitAsync(ct);
+        try
+        {
+            if (!_chrome.Connected)
+                return new UserSearchProbe(UserSearchState.Unknown, "Observer chưa kết nối", 0);
+
+            var url = "https://www.tiktok.com/search/user?q="
+                + Uri.EscapeDataString(target)
+                + "&t="
+                + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+            await _chrome.NavigateAndWaitAsync(url, minWaitMs: 1100, timeoutMs: 12000);
+            await RefreshCurrentUrlCoreAsync();
+
+            const string jsTemplate = """
+(() => {
+  const target = __TARGET__;
+  const norm = v => String(v || '').trim().replace(/^@+/, '').toLocaleLowerCase('en-US');
+  const visible = e => {
+    if (!e || e.nodeType !== 1) return false;
+    const r = e.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const s = getComputedStyle(e);
+    return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity || 1) !== 0;
+  };
+  const hrefUser = href => {
+    try {
+      const u = new URL(href || '', location.href);
+      const m = u.pathname.match(/^\/@([^/?#]+)/i);
+      return m ? norm(decodeURIComponent(m[1])) : '';
+    } catch { return ''; }
+  };
+
+  const isSearch = /\/search\/user(?:\?|$)/i.test(location.pathname + location.search);
+  const main = document.querySelector('#main-content-search_page')
+    || document.querySelector('[id*="main-content-search" i]')
+    || document.querySelector('main')
+    || document.querySelector('[role="main"]');
+  const bodyText = String(document.body?.innerText || '');
+  const challenge = !!document.querySelector('iframe[src*="captcha" i], [class*="captcha" i], [id*="captcha" i]')
+    || /verify to continue|security verification|xác minh để tiếp tục|captcha/i.test(bodyText);
+
+  if (!main) {
+    return { isSearch, challenge, ready:false, found:false, count:0, noResult:false, detail:'main_not_ready' };
+  }
+
+  const anchors = [...main.querySelectorAll('a[href*="/@"]')].filter(visible);
+  const users = [...new Set(anchors.map(a => hrefUser(a.href || a.getAttribute('href'))).filter(Boolean))];
+  const resultItems = main.querySelectorAll('[data-e2e*="search-user" i], [data-e2e*="user-item" i]');
+  const text = String(main.innerText || main.textContent || '');
+  const lines = text.split(/\n+/).map(norm).filter(Boolean);
+  const found = users.includes(target) || lines.includes(target) || lines.includes('@' + target);
+  const noResult = /không tìm thấy|không có kết quả|no results|couldn['’]t find|try another search/i.test(text);
+  const ready = document.readyState !== 'loading' && (found || users.length > 0 || resultItems.length > 0 || noResult);
+
+  return {
+    isSearch,
+    challenge,
+    ready,
+    found,
+    count: users.length,
+    noResult,
+    detail: found ? 'exact_found' : (noResult ? 'no_result' : (users.length > 0 ? 'result_list_ready' : 'waiting'))
+  };
+})()
+""";
+
+            var script = jsTemplate.Replace("__TARGET__", JsonSerializer.Serialize(target));
+            DateTime readySinceUtc = DateTime.MinValue;
+            var lastDetail = "waiting";
+            var lastCount = 0;
+
+            for (var i = 0; i < 18; i++)
+            {
+                ct.ThrowIfCancellationRequested();
+                var value = await EvalValueCoreAsync(script);
+                if (value.ValueKind == JsonValueKind.Object)
+                {
+                    static bool B(JsonElement v, string name)
+                        => v.TryGetProperty(name, out var p)
+                           && p.ValueKind is JsonValueKind.True or JsonValueKind.False
+                           && p.GetBoolean();
+                    static int I(JsonElement v, string name)
+                        => v.TryGetProperty(name, out var p) && p.TryGetInt32(out var x) ? x : 0;
+                    static string S(JsonElement v, string name)
+                        => v.TryGetProperty(name, out var p) && p.ValueKind == JsonValueKind.String
+                            ? p.GetString() ?? ""
+                            : "";
+
+                    var isSearch = B(value, "isSearch");
+                    var challenge = B(value, "challenge");
+                    var ready = B(value, "ready");
+                    var found = B(value, "found");
+                    var noResult = B(value, "noResult");
+                    lastCount = I(value, "count");
+                    lastDetail = S(value, "detail");
+
+                    if (challenge)
+                        return new UserSearchProbe(UserSearchState.Unknown, "TikTok challenge/CAPTCHA", lastCount);
+                    if (!isSearch)
+                        return new UserSearchProbe(UserSearchState.Unknown, "không ở trang Search Người dùng", lastCount);
+                    if (found)
+                        return new UserSearchProbe(UserSearchState.Found, "exact username", lastCount);
+
+                    if (ready)
+                    {
+                        if (readySinceUtc == DateTime.MinValue)
+                            readySinceUtc = DateTime.UtcNow;
+
+                        // Không kết luận quá sớm khi TikTok mới render một phần danh sách.
+                        // Chờ danh sách ổn định rồi mới trả NOT_FOUND; bên ngoài còn xác nhận lần 2.
+                        var stableFor = DateTime.UtcNow - readySinceUtc;
+                        if ((noResult && stableFor >= TimeSpan.FromSeconds(2.0))
+                            || stableFor >= TimeSpan.FromSeconds(3.5))
+                        {
+                            return new UserSearchProbe(
+                                UserSearchState.NotFound,
+                                noResult ? "trang báo không có kết quả" : "danh sách đã load nhưng không có exact username",
+                                lastCount);
+                        }
+                    }
+                    else
+                    {
+                        readySinceUtc = DateTime.MinValue;
+                    }
+                }
+
+                await Task.Delay(500, ct);
+            }
+
+            return new UserSearchProbe(UserSearchState.Unknown, "Search chưa ổn định: " + lastDetail, lastCount);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex) when (_chrome.IsCdpSessionLost(ex))
+        {
+            try { await _chrome.ReconnectAsync(); } catch { }
+            return new UserSearchProbe(UserSearchState.Unknown, "CDP_SESSION_LOST", 0);
+        }
+        catch (Exception ex)
+        {
+            return new UserSearchProbe(UserSearchState.Unknown, ex.GetType().Name + ": " + ex.Message, 0);
         }
         finally
         {
@@ -434,3 +634,12 @@ internal sealed class ObserverChromeSession : IAsyncDisposable
 }
 
 internal sealed record ObserverMatch(bool Exists, bool Matched, string Mode, string Sample, long MatchedAt);
+
+internal enum UserSearchState
+{
+    Found,
+    NotFound,
+    Unknown
+}
+
+internal sealed record UserSearchProbe(UserSearchState State, string Detail, int ResultCount);

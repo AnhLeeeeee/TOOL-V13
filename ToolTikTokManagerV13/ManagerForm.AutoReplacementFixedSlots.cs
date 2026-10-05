@@ -79,6 +79,12 @@ public sealed partial class ManagerForm
         string source = "periodic",
         bool force = false)
     {
+        if (IsRunStrategyDailyReplaceAllRefreshBusy())
+        {
+            _log.Info($"[AUTO_REPLACE_CAPACITY_SUPPRESSED_THAY_ALL] source={source} action=REFRESH_OWNS_CAPACITY");
+            return;
+        }
+
         if (IsAutomationHalted
             || _closing
             || IsDisposed
@@ -147,6 +153,7 @@ public sealed partial class ManagerForm
             await Task.Delay(delayMs);
 
             if (_closing
+                || IsRunStrategyDailyReplaceAllRefreshBusy()
                 || !_autoReplacementSessionArmed
                 || !_autoCloseSettings.OpenReplacementAfterAutoClose
                 || _autoReplacementStartAllInProgress)
@@ -271,7 +278,8 @@ public sealed partial class ManagerForm
            && _autoReplacementFeatureInitialized
            && _autoCloseSettings.OpenReplacementAfterAutoClose
            && _autoReplacementSessionArmed
-           && !_autoReplacementStartAllInProgress;
+           && !_autoReplacementStartAllInProgress
+           && !IsRunStrategyDailyReplaceAllRefreshBusy();
 
     void QueueAutoReplacementCapacityDeficit(
         int requestedCount,

@@ -93,14 +93,16 @@ public sealed class ProxyManagerForm : Form
             AutoScroll = true
         };
 
+        // Chỉ phần nội dung ở trên được cuộn. Footer Lưu/Đóng được đặt
+        // bên ngoài scrollHost để luôn nhìn thấy ở đáy cửa sổ.
         var root = new TableLayoutPanel
         {
             AutoSize = false,
             Dock = DockStyle.Top,
             ColumnCount = 1,
-            RowCount = 4,
+            RowCount = 3,
             Padding = new Padding(10),
-            Height = 1130
+            Height = 1076
         };
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 64F));
@@ -108,7 +110,6 @@ public sealed class ProxyManagerForm : Form
         // Hai bảng Pool/Gán PRF cần đủ cao để đọc nhiều dòng. Cửa sổ đã có AutoScroll
         // nên ưu tiên chiều cao thực tế thay vì ép nhỏ vừa một màn hình.
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 790F));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 54F));
 
         void FitScrollableRootWidth()
         {
@@ -194,7 +195,13 @@ public sealed class ProxyManagerForm : Form
         _body.Controls.Add(BuildAssignmentGroup(), 0, 1);
         root.Controls.Add(_body, 0, 2);
 
-        var bottom = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, Padding = new Padding(0, 6, 0, 0) };
+        var bottom = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 3,
+            Padding = new Padding(10, 6, 10, 6),
+            Margin = Padding.Empty
+        };
         bottom.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
         bottom.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         bottom.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
@@ -205,10 +212,25 @@ public sealed class ProxyManagerForm : Form
         close.Click += (_, _) => Close();
         bottom.Controls.Add(save, 1, 0);
         bottom.Controls.Add(close, 2, 0);
-        root.Controls.Add(bottom, 0, 3);
+
+        // Shell cố định: nội dung cuộn ở hàng trên, footer luôn hiện ở hàng dưới.
+        // Đây chỉ là thay đổi layout; toàn bộ event/logic Save/Close/Proxy giữ nguyên.
+        var shell = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty
+        };
+        shell.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        shell.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+        shell.RowStyles.Add(new RowStyle(SizeType.Absolute, 54F));
 
         scrollHost.Controls.Add(root);
-        Controls.Add(scrollHost);
+        shell.Controls.Add(scrollHost, 0, 0);
+        shell.Controls.Add(bottom, 0, 1);
+        Controls.Add(shell);
         FitScrollableRootWidth();
 
         _master.CheckedChanged += async (_, _) => await MasterChangedAsync();

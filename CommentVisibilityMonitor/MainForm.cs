@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
@@ -28,14 +28,23 @@ internal sealed class MainForm : Form
     readonly Label _observerState = new() { AutoSize = true, Text = "Observer: chưa mở" };
     readonly Label _targetState = new() { AutoSize = true, Text = "Đang kiểm tra: —" };
     readonly Label _cycleState = new() { AutoSize = true, Text = "Vòng: —" };
+    readonly Label _summaryState = new() { AutoSize = true, Text = "Đã quét: — | Hiện: — | Mất: — | Không rõ: — | Kết quả: —" };
     readonly Button _openObserver = new() { Text = "Mở Chrome Observer", AutoSize = true };
     readonly Button _start = new() { Text = "Bắt đầu kiểm tra", AutoSize = true };
     readonly Button _stop = new() { Text = "Dừng kiểm tra", AutoSize = true, Enabled = false };
     readonly Button _exportDiagnostic = new() { Text = "Xuất ZIP chẩn đoán", AutoSize = true };
+    readonly Button _banCheck = new() { Text = "CHECK BAN", AutoSize = true };
+    readonly Button _observerLogin = new() { Text = "Đăng nhập", AutoSize = true };
+    readonly Label _observerLoginState = new() { AutoSize = true, Text = "Login: —", Margin = new Padding(8, 7, 0, 0) };
+    string _observerLoginUsernameValue = "";
+    string _observerLoginPasswordValue = "";
+    string _observerLoginTotpValue = "";
     readonly DataGridView _grid = new() { Dock = DockStyle.Fill, ReadOnly = true, AllowUserToAddRows = false, AllowUserToDeleteRows = false, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill, SelectionMode = DataGridViewSelectionMode.FullRowSelect };
     readonly TextBox _log = new() { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, WordWrap = false };
 
     bool _checking;
+    bool _banCheckRunning;
+    BanCheckForm? _banCheckForm;
     string _targetProfile = "";
     CycleState? _cycle;
     int _rotationSeed = -1;
@@ -50,15 +59,38 @@ internal sealed class MainForm : Form
         Font = new Font("Segoe UI", 9F);
         Directory.CreateDirectory(_dataDir);
         _observer = new ObserverChromeSession(49335, Path.Combine(_dataDir, "ObserverChrome"));
+        LoadObserverLoginSettings();
 
-        var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 76, AutoSize = false, Padding = new Padding(8), WrapContents = true };
-        top.Controls.AddRange(new Control[] { _openObserver, _start, _stop, _exportDiagnostic, _observerState, _targetState, _cycleState });
+        var top = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            Height = 90,
+            AutoSize = false,
+            Padding = new Padding(8, 6, 8, 4),
+            ColumnCount = 1,
+            RowCount = 2
+        };
+        top.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        top.RowStyles.Add(new RowStyle(SizeType.Absolute, 38F));
+        top.RowStyles.Add(new RowStyle(SizeType.Absolute, 38F));
+
+        var toolbar = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, Margin = new Padding(0) };
+        toolbar.Controls.AddRange(new Control[] { _openObserver, _observerLogin, _start, _stop, _exportDiagnostic, _banCheck, _observerState, _observerLoginState });
+
+        var statusBar = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = true, Margin = new Padding(0) };
+        statusBar.Controls.AddRange(new Control[] { _targetState, _cycleState, _summaryState });
+
+        top.Controls.Add(toolbar, 0, 0);
+        top.Controls.Add(statusBar, 0, 1);
 
         _grid.Columns.Add("Profile", "PRF");
         _grid.Columns.Add("Username", "Tài khoản");
         _grid.Columns.Add("State", "Trạng thái");
         _grid.Columns.Add("Progress", "Tiến độ");
-        _grid.Columns.Add("Result", "Kết quả gần nhất");
+        _grid.Columns.Add("Visible", "Hiện");
+        _grid.Columns.Add("Missing", "Mất");
+        _grid.Columns.Add("Unknown", "Không rõ");
+        _grid.Columns.Add("Result", "Kết quả");
         _grid.Columns.Add("Last", "Lần cuối");
 
         var split = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterDistance = 390 };
@@ -67,13 +99,16 @@ internal sealed class MainForm : Form
         Controls.Add(split); Controls.Add(top);
 
         _openObserver.Click += async (_, _) => await OpenObserverAsync();
+        _observerLogin.Click += async (_, _) => await LoginObserverAsync();
         _start.Click += (_, _) => StartChecking();
         _stop.Click += (_, _) => StopChecking("Người dùng dừng");
         _exportDiagnostic.Click += (_, _) => ExportDiagnostics();
+        _banCheck.Click += (_, _) => OpenBanCheckWindow();
         _uiTimer.Tick += (_, _) => OnUiTick();
         _uiTimer.Start();
         FormClosing += async (_, _) =>
         {
+            SaveObserverLoginSettings();
             _cts.Cancel();
             try { _udp.Close(); } catch { }
             try { await _observer.DisposeAsync(); } catch { }
@@ -81,8 +116,132 @@ internal sealed class MainForm : Form
 
         _ = ReceiveLoopAsync();
         Log($"Đang nghe telemetry localhost UDP {TelemetryPort}. Module này không gửi lệnh điều khiển về Worker/Manager.");
-        Log("Bước đầu: bấm 'Mở Chrome Observer', đăng nhập một tài khoản TikTok dùng để nhìn LIVE, sau đó bấm 'Bắt đầu kiểm tra'.");
-        Log("Nút 'Xuất ZIP chẩn đoán' chỉ gom log/trạng thái; KHÔNG lấy thư mục ObserverChrome, cookie hay dữ liệu đăng nhập.");
+        Log("Bước đầu: bấm 'Mở Chrome Observer'. Khi cần đăng nhập, bấm nút 'Đăng nhập' để mở cửa sổ TK/MK/2FA; sau đó bấm 'Bắt đầu kiểm tra'.");
+        Log("Nút 'Xuất ZIP chẩn đoán' chỉ gom log/trạng thái; KHÔNG lấy thư mục ObserverChrome, cookie hay file thông tin đăng nhập Observer.");
+    }
+
+    string ObserverLoginSettingsPath => Path.Combine(_dataDir, "observer_login.json");
+
+    void LoadObserverLoginSettings()
+    {
+        try
+        {
+            if (!File.Exists(ObserverLoginSettingsPath)) return;
+            var saved = JsonSerializer.Deserialize<ObserverLoginSettings>(File.ReadAllText(ObserverLoginSettingsPath));
+            if (saved is null) return;
+            _observerLoginUsernameValue = saved.Username ?? "";
+            _observerLoginPasswordValue = saved.Password ?? "";
+            _observerLoginTotpValue = saved.TotpSecret ?? "";
+        }
+        catch (Exception ex)
+        {
+            Log("[OBSERVER_LOGIN_LOAD_WARN] " + ex.Message);
+        }
+    }
+
+    void SaveObserverLoginSettings()
+    {
+        try
+        {
+            Directory.CreateDirectory(_dataDir);
+            var settings = new ObserverLoginSettings
+            {
+                Username = _observerLoginUsernameValue.Trim(),
+                Password = _observerLoginPasswordValue,
+                TotpSecret = _observerLoginTotpValue.Trim()
+            };
+            var json = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
+            var tmp = ObserverLoginSettingsPath + ".tmp";
+            File.WriteAllText(tmp, json, new UTF8Encoding(false));
+            File.Move(tmp, ObserverLoginSettingsPath, true);
+        }
+        catch (Exception ex)
+        {
+            Log("[OBSERVER_LOGIN_SAVE_WARN] " + ex.Message);
+        }
+    }
+
+    async Task LoginObserverAsync()
+    {
+        if (!_observer.Connected)
+        {
+            MessageBox.Show(
+                this,
+                "Hãy bấm 'Mở Chrome Observer' trước rồi mới đăng nhập.",
+                "Đăng nhập Observer",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        using var dialog = new ObserverLoginDialog(
+            _observerLoginUsernameValue,
+            _observerLoginPasswordValue,
+            _observerLoginTotpValue);
+
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+            return;
+
+        var username = dialog.Username.Trim();
+        var password = dialog.Password;
+        var totpSecret = dialog.TotpSecret.Trim();
+
+        _observerLoginUsernameValue = username;
+        _observerLoginPasswordValue = password;
+        _observerLoginTotpValue = totpSecret;
+        SaveObserverLoginSettings();
+
+        _observerLogin.Enabled = false;
+        _observerLoginState.Text = "Login: 🟡 đang xử lý...";
+        UseWaitCursor = true;
+
+        try
+        {
+            Log($"[OBSERVER_LOGIN_BEGIN] usernameConfigured=true totpConfigured={totpSecret.Length > 0}");
+            var result = await _observer.LoginAsync(username, password, totpSecret, _cts.Token);
+
+            var (status, message, icon) = result.State switch
+            {
+                "READY" => ("Login: 🟢 thành công", "Đăng nhập Observer thành công.", MessageBoxIcon.Information),
+                "CAPTCHA_REQUIRED" => ("Login: 🟠 CAPTCHA", "TikTok đang yêu cầu CAPTCHA. Hãy xử lý trực tiếp trên Chrome Observer.", MessageBoxIcon.Information),
+                "TOTP_REQUIRED" => ("Login: 🟠 thiếu 2FA", "TikTok yêu cầu 2FA nhưng secret 2FA đang trống hoặc không hợp lệ.", MessageBoxIcon.Warning),
+                "ACCOUNT_BANNED" => ("Login: 🔴 tài khoản lỗi", "Tài khoản Observer bị TikTok từ chối/cấm. Xem Chrome và log để biết chi tiết.", MessageBoxIcon.Warning),
+                "LOGIN_FAILED" => ("Login: 🟠 chưa thành công", "Đăng nhập Observer chưa thành công sau thời gian chờ.", MessageBoxIcon.Warning),
+                "LOGIN_FORM_NOT_FOUND" => ("Login: 🟠 không thấy form", "Không tìm thấy form đăng nhập TikTok.", MessageBoxIcon.Warning),
+                _ => ($"Login: 🟠 {result.State}", result.Message, MessageBoxIcon.Information)
+            };
+
+            _observerLoginState.Text = status;
+            _observerState.Text = _observer.Connected ? "Observer: 🟢 đã kết nối" : "Observer: 🟠 mất kết nối";
+            Log($"[OBSERVER_LOGIN_RESULT] state={result.State} loginPerformed={result.LoginPerformed} liveOpened={result.LiveOpened} message={result.Message}");
+
+            MessageBox.Show(
+                this,
+                message,
+                "Đăng nhập Observer",
+                MessageBoxButtons.OK,
+                icon);
+        }
+        catch (OperationCanceledException)
+        {
+            _observerLoginState.Text = "Login: —";
+        }
+        catch (Exception ex)
+        {
+            _observerLoginState.Text = "Login: 🔴 lỗi";
+            Log("[OBSERVER_LOGIN_ERROR] " + ex);
+            MessageBox.Show(
+                this,
+                ex.Message,
+                "Không đăng nhập được Observer",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
+        finally
+        {
+            _observerLogin.Enabled = true;
+            UseWaitCursor = false;
+        }
     }
 
     async Task OpenObserverAsync()
@@ -91,8 +250,8 @@ internal sealed class MainForm : Form
         {
             _openObserver.Enabled = false;
             await _observer.EnsureStartedAsync();
-            _observerState.Text = "Observer: 🟢 đã kết nối — hãy bảo đảm tài khoản observer đã đăng nhập";
-            Log("Observer Chrome đã mở/kết nối. Login được lưu riêng trong CommentCheckData\\ObserverChrome.");
+            _observerState.Text = "Observer: 🟢 đã kết nối";
+            Log("Observer Chrome đã mở/kết nối. Nếu cần đăng nhập, bấm nút 'Đăng nhập' để mở cửa sổ TK/MK/2FA.");
         }
         catch (Exception ex)
         {
@@ -105,6 +264,16 @@ internal sealed class MainForm : Form
     void StartChecking()
     {
         if (_checking) return;
+        if (_banCheckRunning)
+        {
+            MessageBox.Show(
+                this,
+                "CHECK BAN đang chạy. Hãy dừng CHECK BAN trước khi kiểm tra CMT.",
+                "Check CMT",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
         _checking = true;
         _start.Enabled = false; _stop.Enabled = true;
         _cycle = null;
@@ -121,7 +290,44 @@ internal sealed class MainForm : Form
         _targetProfile = "";
         _targetState.Text = "Đang kiểm tra: —";
         _cycleState.Text = "Vòng: —";
+        _summaryState.Text = "Đã quét: — | Hiện: — | Mất: — | Không rõ: — | Kết quả: —";
         Log("Đã dừng kiểm tra: " + reason);
+    }
+
+    void OpenBanCheckWindow()
+    {
+        if (_banCheckForm is not null && !_banCheckForm.IsDisposed)
+        {
+            try
+            {
+                if (_banCheckForm.WindowState == FormWindowState.Minimized)
+                    _banCheckForm.WindowState = FormWindowState.Normal;
+                _banCheckForm.BringToFront();
+                _banCheckForm.Focus();
+            }
+            catch { }
+            return;
+        }
+
+        _banCheckForm = new BanCheckForm(
+            _observer,
+            _dataDir,
+            Log,
+            canStart: () => !_checking && !_banCheckRunning,
+            runningChanged: running =>
+            {
+                _banCheckRunning = running;
+                _start.Enabled = !running && !_checking;
+                _banCheck.Text = running ? "CHECK BAN · ĐANG CHẠY" : "CHECK BAN";
+            });
+        _banCheckForm.FormClosed += (_, _) =>
+        {
+            _banCheckRunning = false;
+            _start.Enabled = !_checking;
+            _banCheck.Text = "CHECK BAN";
+            _banCheckForm = null;
+        };
+        _banCheckForm.Show(this);
     }
 
     async Task ReceiveLoopAsync()
@@ -164,13 +370,18 @@ internal sealed class MainForm : Form
         p.Pid = m.Pid;
         p.Username = m.Username ?? p.Username;
         p.RunState = m.RunState ?? p.RunState;
-        p.LiveUrl = m.LiveUrl ?? p.LiveUrl;
+        // Chỉ thay LIVE đã biết bằng URL vừa được Worker xác minh thật ngay trước Enter.
+        // HEARTBEAT/Page.Url có thể stale sau khi tab đã chuyển LIVE nên không được ghi đè URL fresh.
+        if (m.LiveUrlVerified && !string.IsNullOrWhiteSpace(m.LiveUrl))
+            p.LiveUrl = m.LiveUrl;
+        else if (string.IsNullOrWhiteSpace(p.LiveUrl) && !string.IsNullOrWhiteSpace(m.LiveUrl))
+            p.LiveUrl = m.LiveUrl;
         p.ContentTotal = m.ContentTotal > 0 ? m.ContentTotal : p.ContentTotal;
         p.ContentIndex = m.ContentIndex > 0 ? m.ContentIndex : p.ContentIndex;
         p.LastSeenUtc = DateTime.UtcNow;
 
         if (!m.Type.Equals("HEARTBEAT", StringComparison.OrdinalIgnoreCase))
-            Log($"[TELEMETRY_{m.Type}] PRF={m.Profile} pid={m.Pid} send={m.SendId} cmt={m.ContentIndex}/{m.ContentTotal} state={m.RunState} live={ObserverChromeSession.NormalizeLiveUrl(m.LiveUrl)}");
+            Log($"[TELEMETRY_{m.Type}] PRF={m.Profile} pid={m.Pid} send={m.SendId} cmt={m.ContentIndex}/{m.ContentTotal} state={m.RunState} live={ObserverChromeSession.NormalizeLiveUrl(m.LiveUrl)} verified={m.LiveUrlVerified}");
 
         if (_checking && string.IsNullOrWhiteSpace(_targetProfile)) ChooseNextTarget();
         if (!_checking || !m.Profile.Equals(_targetProfile, StringComparison.OrdinalIgnoreCase))
@@ -181,7 +392,9 @@ internal sealed class MainForm : Form
 
         if (m.Type.Equals("HEARTBEAT", StringComparison.OrdinalIgnoreCase))
         {
-            _ = FollowTargetLiveAsync(m.LiveUrl);
+            // Heartbeat chỉ giúp observer bám sơ bộ. Gate trước khi quét vẫn bắt buộc
+            // WILL_SEND có LiveUrlVerified=true nên heartbeat stale không thể khởi động scan.
+            _ = FollowTargetLiveAsync(p.LiveUrl);
         }
         else if (m.Type.Equals("WILL_SEND", StringComparison.OrdinalIgnoreCase))
         {
@@ -189,7 +402,7 @@ internal sealed class MainForm : Form
         }
         else if (m.Type.Equals("SENT", StringComparison.OrdinalIgnoreCase))
         {
-            HandleSent(m);
+            _ = HandleSentAsync(m);
         }
         RefreshGrid();
     }
@@ -197,23 +410,48 @@ internal sealed class MainForm : Form
     async Task FollowTargetLiveAsync(string? liveUrl)
     {
         var wanted = ObserverChromeSession.NormalizeLiveUrl(liveUrl);
-        if (wanted.Length == 0 || _observer.IsOnLive(wanted)) return;
-        if (_followInFlight && string.Equals(_followRequestedUrl, wanted, StringComparison.OrdinalIgnoreCase)) return;
-        _followInFlight = true;
+        if (wanted.Length == 0) return;
+
+        // Nếu đang follow một URL cũ mà WILL_SEND vừa xác minh được LIVE mới,
+        // chỉ ghi đè đích yêu cầu. Task đang chạy sẽ tự follow tiếp đích mới nhất,
+        // tránh hai Navigate song song kéo Observer qua lại giữa hai LIVE.
         _followRequestedUrl = wanted;
+        if (_followInFlight) return;
+
+        _followInFlight = true;
         try
         {
-            Log($"[FOLLOW_BEGIN] PRF={_targetProfile} wanted={wanted} current={_observer.CurrentLiveUrl}");
-            var ok = await _observer.EnsureLiveAsync(wanted);
-            if (!IsDisposed) BeginInvoke(new Action(() =>
+            while (true)
             {
-                _observerState.Text = ok ? "Observer: 🟢 bám đúng LIVE" : "Observer: 🟠 chưa bám được LIVE";
-                Log($"[FOLLOW_DONE] ok={ok} wanted={wanted} current={_observer.CurrentLiveUrl}");
-            }));
+                var requested = _followRequestedUrl;
+                if (requested.Length == 0) break;
+
+                bool ok;
+                if (_observer.IsOnLive(requested))
+                {
+                    ok = true;
+                }
+                else
+                {
+                    Log($"[FOLLOW_BEGIN] PRF={_targetProfile} wanted={requested} current={_observer.CurrentLiveUrl}");
+                    ok = await _observer.EnsureLiveAsync(requested);
+                }
+
+                if (!IsDisposed)
+                {
+                    _observerState.Text = ok ? "Observer: 🟢 bám đúng LIVE" : "Observer: 🟠 chưa bám được LIVE";
+                    Log($"[FOLLOW_DONE] ok={ok} wanted={requested} current={_observer.CurrentLiveUrl}");
+                }
+
+                if (string.Equals(requested, _followRequestedUrl, StringComparison.OrdinalIgnoreCase))
+                    break;
+
+                Log($"[FOLLOW_COALESCE] old={requested} newest={_followRequestedUrl} action=FOLLOW_NEWEST");
+            }
         }
         catch (Exception ex)
         {
-            if (!IsDisposed) BeginInvoke(new Action(() => Log("FOLLOW LIVE WARN: " + ex)));
+            if (!IsDisposed) Log("FOLLOW LIVE WARN: " + ex);
         }
         finally
         {
@@ -226,17 +464,24 @@ internal sealed class MainForm : Form
         if (!_checking || !m.Profile.Equals(_targetProfile, StringComparison.OrdinalIgnoreCase)) return;
         var key = MakeSendKey(m.Profile, m.Pid, m.SendId);
         var wanted = ObserverChromeSession.NormalizeLiveUrl(m.LiveUrl);
-        var ready = wanted.Length > 0 && _observer.Connected && _observer.IsOnLive(wanted);
-        Log($"[PREPARE_SEND] PRF={m.Profile} send={m.SendId} cmt={m.ContentIndex}/{m.ContentTotal} ready={ready} observerConnected={_observer.Connected} wanted={wanted} current={_observer.CurrentLiveUrl}");
+        var freshLiveVerified = m.LiveUrlVerified && wanted.Length > 0;
+        var ready = freshLiveVerified && _observer.Connected && _observer.IsOnLive(wanted);
+        Log($"[PREPARE_SEND] PRF={m.Profile} send={m.SendId} cmt={m.ContentIndex}/{m.ContentTotal} ready={ready} liveVerified={freshLiveVerified} observerConnected={_observer.Connected} wanted={wanted} current={_observer.CurrentLiveUrl}");
+
+        // HARD GATE: chỉ arm/quét khi Worker vừa đọc URL thật ngay trước Enter VÀ
+        // Observer đang đứng đúng LIVE đó. Nếu chưa đồng bộ thì bỏ lượt comment này,
+        // follow Observer sang LIVE mới và chờ WILL_SEND tiếp theo; không tính Missing/Unknown.
+        if (!ready)
+        {
+            Log($"[PREPARE_SKIP_NOT_SYNCED] PRF={m.Profile} send={m.SendId} liveVerified={freshLiveVerified} wanted={wanted} current={_observer.CurrentLiveUrl}");
+            if (freshLiveVerified) _ = FollowTargetLiveAsync(wanted);
+            return;
+        }
 
         // Chỉ bắt đầu một vòng khi observer đã đứng đúng LIVE trước lúc Enter.
         if (_cycle is null)
         {
-            if (!ready || m.ContentTotal <= 0)
-            {
-                _ = FollowTargetLiveAsync(m.LiveUrl);
-                return;
-            }
+            if (m.ContentTotal <= 0) return;
             _cycle = new CycleState
             {
                 Profile = m.Profile,
@@ -281,41 +526,47 @@ internal sealed class MainForm : Form
                 pending.ObserverReady = false;
                 Log($"[ARM_ERROR] PRF={pending.Profile} send={pending.SendId} cmt={pending.ContentIndex} error={ex.Message}");
             }
-        }
-        else
-        {
-            _ = FollowTargetLiveAsync(m.LiveUrl);
+            finally
+            {
+                pending.PrepareDone.TrySetResult(pending.Armed && pending.ObserverReady);
+            }
         }
     }
 
-    void HandleSent(TelemetryMessage m)
+    async Task HandleSentAsync(TelemetryMessage m)
     {
         if (_cycle is null || _cycle.Profile != m.Profile || _cycle.SentCount >= _cycle.Expected) return;
         var key = MakeSendKey(m.Profile, m.Pid, m.SendId);
-        if (!_cycle.SeenSendIds.Add(m.SendId)) return;
-        _cycle.SentCount++;
 
+        // WILL_SEND được xử lý async để cài DOM observer. SENT có thể tới rất sát sau Enter,
+        // nên chờ ngắn cho ARM hoàn tất thay vì đọc Armed=false giữa chừng rồi bỏ oan.
         if (!_pending.TryGetValue(key, out var pending))
         {
-            var liveUrl = ObserverChromeSession.NormalizeLiveUrl(m.LiveUrl);
-            pending = new PendingSend
-            {
-                Key = key,
-                Profile = m.Profile,
-                SendId = m.SendId,
-                ContentIndex = m.ContentIndex,
-                Content = m.Content ?? "",
-                Username = m.Username ?? "",
-                LiveUrl = liveUrl,
-                ObserverReady = false,
-                Armed = false,
-                ArmedUtc = DateTime.UtcNow,
-                WillSendUtc = TelemetryUtcOrNow(m.SentAtUtcMs),
-                TimeoutSeconds = GetAdaptiveTimeoutSeconds(liveUrl)
-            };
-            _pending[key] = pending;
+            Log($"[SENT_SKIP_NOT_SYNCED] PRF={m.Profile} send={m.SendId} cmt={m.ContentIndex}/{m.ContentTotal} reason=NO_PREPARED_SEND current={_observer.CurrentLiveUrl}");
+            return;
         }
 
+        if (!pending.PrepareDone.Task.IsCompleted)
+            await Task.WhenAny(pending.PrepareDone.Task, Task.Delay(2000));
+
+        if (_cycle is null || _cycle.Profile != m.Profile || _cycle.SentCount >= _cycle.Expected) return;
+
+        // Không có WILL_SEND đã arm đúng LIVE => lượt này chưa đủ điều kiện kiểm tra.
+        // Tuyệt đối không tính UNKNOWN/MISSING vì sẽ làm sai thống kê.
+        if (!pending.PrepareDone.Task.IsCompletedSuccessfully
+            || !pending.PrepareDone.Task.Result
+            || !pending.ObserverReady
+            || !pending.Armed
+            || !_observer.IsOnLive(pending.LiveUrl))
+        {
+            _pending.Remove(key);
+            Log($"[SENT_SKIP_NOT_SYNCED] PRF={m.Profile} send={m.SendId} cmt={m.ContentIndex}/{m.ContentTotal} wanted={pending.LiveUrl} current={_observer.CurrentLiveUrl}");
+            _ = _observer.ClearAsync(pending.Key);
+            return;
+        }
+
+        if (!_cycle.SeenSendIds.Add(m.SendId)) return;
+        _cycle.SentCount++;
         pending.SentConfirmedUtc = TelemetryUtcOrNow(m.SentAtUtcMs);
         // Never shorten a pending request if this LIVE has just learned a longer delay.
         pending.TimeoutSeconds = Math.Max(pending.TimeoutSeconds, GetAdaptiveTimeoutSeconds(pending.LiveUrl));
@@ -445,6 +696,10 @@ internal sealed class MainForm : Form
         var done = _cycle;
         if (_profiles.TryGetValue(done.Profile, out var p))
         {
+            p.LastVisible = done.Visible;
+            p.LastMissing = done.Missing;
+            p.LastUnknown = done.Unknown;
+            p.LastExpected = done.Expected;
             p.LastResult = $"{done.Visible}/{done.Expected} hiện • {done.Missing} không thấy • {done.Unknown} không xác minh";
             p.LastCheck = DateTime.Now;
         }
@@ -477,6 +732,7 @@ internal sealed class MainForm : Form
         _cycle = null;
         _targetState.Text = $"Đang kiểm tra: {_targetProfile}";
         _cycleState.Text = "Vòng: đang đồng bộ Observer với LIVE...";
+        _summaryState.Text = "Đã quét: 0/? | Hiện: 0 | Mất: 0 | Không rõ: 0 | Kết quả: —";
         Log($"[TARGET] chuyển sang PRF {_targetProfile}.");
         _ = FollowTargetLiveAsync(active[next].LiveUrl);
     }
@@ -504,8 +760,22 @@ internal sealed class MainForm : Form
 
     void UpdateCycleLabel()
     {
-        if (_cycle is null) { _cycleState.Text = "Vòng: đang chờ bắt đầu"; return; }
-        _cycleState.Text = $"Vòng: {_cycle.SentCount}/{_cycle.Expected} • hiện {_cycle.Visible} • không thấy {_cycle.Missing} • chưa xác minh {_cycle.Unknown}";
+        if (_cycle is null)
+        {
+            _cycleState.Text = "Vòng: đang chờ bắt đầu";
+            _summaryState.Text = "Đã quét: 0/? | Hiện: 0 | Mất: 0 | Không rõ: 0 | Kết quả: —";
+            return;
+        }
+
+        _cycleState.Text = $"Vòng: gửi {_cycle.SentCount}/{_cycle.Expected} • đã quét {_cycle.ResolvedCount}/{_cycle.Expected}";
+        _summaryState.Text =
+            $"Đã quét: {_cycle.ResolvedCount}/{_cycle.Expected} | Hiện: {_cycle.Visible} | Mất: {_cycle.Missing} | Không rõ: {_cycle.Unknown} | Kết quả: {FormatVisibilityRate(_cycle.Visible, _cycle.Missing)}";
+    }
+
+    static string FormatVisibilityRate(int visible, int missing)
+    {
+        var known = visible + missing;
+        return known <= 0 ? "—" : $"{visible * 100.0 / known:0.0}%";
     }
 
     void RefreshGrid()
@@ -516,10 +786,24 @@ internal sealed class MainForm : Form
         {
             var fresh = DateTime.UtcNow - p.LastSeenUtc < TimeSpan.FromSeconds(20);
             var state = fresh ? p.RunState : "OFFLINE";
-            var progress = p.Profile.Equals(_targetProfile, StringComparison.OrdinalIgnoreCase)
-                ? (_cycle is null ? "Đồng bộ LIVE" : $"{_cycle.SentCount}/{_cycle.Expected}")
+            var isTarget = p.Profile.Equals(_targetProfile, StringComparison.OrdinalIgnoreCase);
+            var progress = isTarget
+                ? (_cycle is null ? "Đồng bộ LIVE" : $"{_cycle.ResolvedCount}/{_cycle.Expected}")
                 : "Chờ";
-            _grid.Rows.Add(p.Profile, p.Username, state, progress, p.LastResult, p.LastCheck == default ? "" : p.LastCheck.ToString("HH:mm:ss dd/MM"));
+
+            var visible = isTarget && _cycle is not null ? _cycle.Visible : p.LastVisible;
+            var missing = isTarget && _cycle is not null ? _cycle.Missing : p.LastMissing;
+            var unknown = isTarget && _cycle is not null ? _cycle.Unknown : p.LastUnknown;
+            var hasResult = (isTarget && _cycle is not null) || p.LastExpected > 0;
+            var score = hasResult ? FormatVisibilityRate(visible, missing) : "";
+
+            _grid.Rows.Add(
+                p.Profile, p.Username, state, progress,
+                hasResult ? visible.ToString() : "",
+                hasResult ? missing.ToString() : "",
+                hasResult ? unknown.ToString() : "",
+                score,
+                p.LastCheck == default ? "" : p.LastCheck.ToString("HH:mm:ss dd/MM"));
         }
         if (selected is not null)
         {
@@ -698,6 +982,10 @@ internal sealed class MainForm : Form
                     x.LastSeenUtc,
                     x.Pid,
                     x.LastResult,
+                    x.LastVisible,
+                    x.LastMissing,
+                    x.LastUnknown,
+                    x.LastExpected,
                     x.LastCheck
                 })
                 .ToArray()
@@ -718,6 +1006,97 @@ internal sealed class MainForm : Form
         return int.TryParse(digits, out var n) ? n.ToString("D10") + "_" + value : "9999999999_" + value;
     }
 
+    sealed class ObserverLoginDialog : Form
+    {
+        readonly TextBox _username = new() { Dock = DockStyle.Fill };
+        readonly TextBox _password = new() { Dock = DockStyle.Fill, UseSystemPasswordChar = true };
+        readonly TextBox _totp = new() { Dock = DockStyle.Fill, UseSystemPasswordChar = true };
+
+        public string Username => _username.Text;
+        public string Password => _password.Text;
+        public string TotpSecret => _totp.Text;
+
+        public ObserverLoginDialog(string username, string password, string totpSecret)
+        {
+            Text = "Đăng nhập Observer";
+            StartPosition = FormStartPosition.CenterParent;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+            ClientSize = new Size(470, 210);
+            Font = new Font("Segoe UI", 9F);
+
+            _username.Text = username ?? "";
+            _password.Text = password ?? "";
+            _totp.Text = totpSecret ?? "";
+
+            var grid = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                Padding = new Padding(14),
+                ColumnCount = 2,
+                RowCount = 5
+            };
+            grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 90F));
+            grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 34F));
+            grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 34F));
+            grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 34F));
+            grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 14F));
+            grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 42F));
+
+            grid.Controls.Add(new Label { Text = "Tài khoản:", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 0);
+            grid.Controls.Add(_username, 1, 0);
+            grid.Controls.Add(new Label { Text = "Mật khẩu:", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 1);
+            grid.Controls.Add(_password, 1, 1);
+            grid.Controls.Add(new Label { Text = "2FA:", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 2);
+            grid.Controls.Add(_totp, 1, 2);
+
+            var buttons = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.RightToLeft,
+                WrapContents = false,
+                Margin = new Padding(0)
+            };
+            var cancel = new Button { Text = "Hủy", AutoSize = true, DialogResult = DialogResult.Cancel };
+            var login = new Button { Text = "Đăng nhập", AutoSize = true };
+            buttons.Controls.Add(cancel);
+            buttons.Controls.Add(login);
+            grid.Controls.Add(buttons, 0, 4);
+            grid.SetColumnSpan(buttons, 2);
+
+            login.Click += (_, _) =>
+            {
+                if (string.IsNullOrWhiteSpace(_username.Text) || string.IsNullOrEmpty(_password.Text))
+                {
+                    MessageBox.Show(
+                        this,
+                        "Hãy nhập đủ tài khoản và mật khẩu.",
+                        "Đăng nhập Observer",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+                    return;
+                }
+
+                DialogResult = DialogResult.OK;
+                Close();
+            };
+
+            AcceptButton = login;
+            CancelButton = cancel;
+            Controls.Add(grid);
+        }
+    }
+
+    sealed class ObserverLoginSettings
+    {
+        public string Username { get; set; } = "";
+        public string Password { get; set; } = "";
+        public string TotpSecret { get; set; } = "";
+    }
+
     sealed class TelemetryMessage
     {
         public string Type { get; set; } = "";
@@ -725,6 +1104,7 @@ internal sealed class MainForm : Form
         public string Username { get; set; } = "";
         public string RunState { get; set; } = "";
         public string LiveUrl { get; set; } = "";
+        public bool LiveUrlVerified { get; set; }
         public int ContentIndex { get; set; }
         public int ContentTotal { get; set; }
         public string Content { get; set; } = "";
@@ -745,6 +1125,10 @@ internal sealed class MainForm : Form
         public DateTime LastSeenUtc { get; set; }
         public int Pid { get; set; }
         public string LastResult { get; set; } = "";
+        public int LastVisible { get; set; }
+        public int LastMissing { get; set; }
+        public int LastUnknown { get; set; }
+        public int LastExpected { get; set; }
         public DateTime LastCheck { get; set; }
     }
 
@@ -763,6 +1147,7 @@ internal sealed class MainForm : Form
         public DateTime WillSendUtc { get; set; }
         public DateTime SentConfirmedUtc { get; set; }
         public double TimeoutSeconds { get; set; }
+        public TaskCompletionSource<bool> PrepareDone { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 
     sealed class LiveLatencyState

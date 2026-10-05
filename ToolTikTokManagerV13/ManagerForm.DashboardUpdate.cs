@@ -522,7 +522,11 @@ public sealed partial class ManagerForm
                 await OpenProfileAsync(ctx);
             try { await RefreshStatusAsync(ctx); } catch { }
             var paused = string.Equals(GetLastConfirmedRuntimeState(ctx), RuntimeStatePaused, StringComparison.Ordinal);
-            await SendCommandAsync(ctx, paused ? "resume" : "pause", TimeSpan.FromSeconds(8));
+            await SendCommandAsync(
+                ctx,
+                paused ? "resume" : "pause",
+                TimeSpan.FromSeconds(8),
+                explicitUserStartIntent: paused);
         }));
         flow.Controls.Add(ActionButton("■ Stop", UiButtonKind.Danger, async ctx =>
         {

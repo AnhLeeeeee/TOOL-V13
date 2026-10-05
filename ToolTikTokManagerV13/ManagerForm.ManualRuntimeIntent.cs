@@ -46,6 +46,15 @@ public sealed partial class ManagerForm
         if (profileName.Length == 0)
             return;
 
+        // USER_STOP/USER_X_CLOSE là intent mạnh hơn mọi tín hiệu RUNNING suy luận từ
+        // status/runtime_stats/watchdog. Mọi caller muốn re-arm sau manual Stop phải
+        // clear suppression trước bằng một Start/Resume có user-intent thật sự.
+        if (IsManualCloseSuppressed(profileName))
+        {
+            _autoCloseNotRunningSinceUtc.Remove(profileName);
+            return;
+        }
+
         var added =
             _autoCloseExpectedRunningProfiles.Add(
                 profileName);

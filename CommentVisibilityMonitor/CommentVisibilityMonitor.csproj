@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
@@ -26,6 +26,7 @@
     <Compile Include="..\V115Core\Services\CdpClient.cs" Link="Shared\Services\CdpClient.cs" />
     <Compile Include="..\V115Core\Services\ChromeController.cs" Link="Shared\Services\ChromeController.cs" />
     <Compile Include="..\V115Core\Services\ChromeController.*.cs" Link="Shared\Services\%(Filename)%(Extension)" />
+    <Compile Include="..\ManagerShared\Services\TikTokGlobalLoginSubmitGate.cs" Link="Shared\Services\TikTokGlobalLoginSubmitGate.cs" />
     <Compile Include="..\ManagerShared\Services\TikTokAuthService.cs" Link="Shared\Services\TikTokAuthService.cs" />
   </ItemGroup>
 </Project>
