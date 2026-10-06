@@ -251,6 +251,19 @@ public sealed partial class MainForm
                 case "resume":
                     if (IsManagerEmergencyStopActive()) return "emergency_stopped";
                     if (IsVideoOperationRunning) return "video_delete_running";
+
+                    // 3C.6.4A v2: defense-in-depth ngay trong Worker.
+                    // Manager cũng đã gate trước khi gửi IPC, nhưng Worker vẫn tự kiểm tra
+                    // để không phụ thuộc duy nhất vào Manager-side command path.
+                    if (_engine.Running
+                        && _engine.Paused
+                        && !CheckManagedLiveRuntimePolicy(
+                            "ipc_resume",
+                            suppressDialogs: true))
+                    {
+                        return "policy_blocked_live";
+                    }
+
                     if (_engine.Running && _engine.Paused) _engine.TogglePause();
                     return _engine.Running && !_engine.Paused ? "running" : "not_running";
                 case "stop":
@@ -636,6 +649,7 @@ public sealed partial class MainForm
             "ACCOUNT_BANNED" => "account_banned",
             "LOGIN_FAILED" => "login_failed",
             "LOGIN_FORM_NOT_FOUND" => "login_form_not_found",
+            "LOGIN_POLICY_BLOCKED" => "policy_blocked_login",
             "ERROR" => "startup_error",
             _ => "opened"
         };

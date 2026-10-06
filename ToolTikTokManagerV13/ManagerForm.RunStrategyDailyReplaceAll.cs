@@ -65,6 +65,43 @@ public sealed partial class ManagerForm
     bool IsRunStrategyDailyReplaceAllAutoCreateBlocked()
         => IsRunStrategyDailyReplaceAllActive();
 
+    // 3C.6.4E - DAILY REPLACE ALL RuntimeGate.
+    //
+    // Gate riêng cho toàn bộ chiến lược THAY ALL. Ở giai đoạn 3C.6
+    // EnforcementEnabled=false nên hàm này chỉ quan sát/log và luôn cho chạy.
+    //
+    // Khi enforcement được bật sau này:
+    // - chặn ARM/Start THAY ALL mới;
+    // - chặn bootstrap CREATE nếu policy đổi sang block trước khi bootstrap bắt đầu;
+    // - chặn bắt đầu một daily cycle mới;
+    // - KHÔNG cắt ngang một cycle đã bắt đầu để tránh trạng thái nửa đóng/nửa mở.
+    bool IsRunStrategyDailyReplaceAllPolicyAllowed(
+        string source,
+        int target,
+        string? victim = null)
+    {
+        var allowed = RemotePolicyRuntimeGate.IsAllowed(
+            "daily_replace_all",
+            out var decision);
+
+        _log.Info(
+            $"[REMOTE_POLICY_DAILY_REPLACE_ALL_RUNTIME_CHECK] source={source} " +
+            $"target={target} victim={victim ?? "-"} revision={decision.Revision} " +
+            $"mode={decision.Mode} wouldBlock={decision.WouldBlock} " +
+            $"enforcement={decision.EnforcementEnabled} allowed={allowed} " +
+            $"adminBypass={RemotePolicyRuntimeGate.AdminBypass}");
+
+        if (!allowed)
+        {
+            _log.Warn(
+                $"[REMOTE_POLICY_DAILY_REPLACE_ALL_RUNTIME_BLOCKED] source={source} " +
+                $"target={target} victim={victim ?? "-"} revision={decision.Revision} " +
+                $"mode={decision.Mode}");
+        }
+
+        return allowed;
+    }
+
     void ResetRunStrategyDailyReplaceAllRuntime(string source)
     {
         lock (_runStrategyDailyReplaceAllLock)
@@ -379,6 +416,20 @@ public sealed partial class ManagerForm
                 return;
             }
 
+            if (!IsRunStrategyDailyReplaceAllPolicyAllowed(
+                    "bootstrap_fill",
+                    target))
+            {
+                lock (_runStrategyDailyReplaceAllLock)
+                    _runStrategyDailyReplaceAllNextAttemptUtc =
+                        DateTime.UtcNow.Add(RunStrategyDailyReplaceAllRetryDelay);
+
+                _log.Warn(
+                    $"[RUN_DAILY_REPLACE_ALL_POLICY_WAIT] source=bootstrap_fill target={target} " +
+                    $"retryIn={RunStrategyDailyReplaceAllRetryDelay:c} action=KEEP_STATE_NO_CREATE");
+                return;
+            }
+
             var bootstrapFilled = await EnsureRunStrategyDailyReplaceAllStartupTargetAsync(
                 settings,
                 target,
@@ -422,6 +473,20 @@ public sealed partial class ManagerForm
         {
             if (now < scheduled || lastCompletedDate.Date >= now.Date)
                 return;
+
+            if (!IsRunStrategyDailyReplaceAllPolicyAllowed(
+                    "daily_cycle_begin",
+                    target))
+            {
+                lock (_runStrategyDailyReplaceAllLock)
+                    _runStrategyDailyReplaceAllNextAttemptUtc =
+                        DateTime.UtcNow.Add(RunStrategyDailyReplaceAllRetryDelay);
+
+                _log.Warn(
+                    $"[RUN_DAILY_REPLACE_ALL_POLICY_WAIT] source=daily_cycle_begin target={target} " +
+                    $"retryIn={RunStrategyDailyReplaceAllRetryDelay:c} action=DO_NOT_START_CYCLE");
+                return;
+            }
 
             StartRunStrategyDailyReplaceAllCycle(settings, target, now.Date);
         }

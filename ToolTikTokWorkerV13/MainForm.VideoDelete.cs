@@ -42,6 +42,17 @@ public sealed partial class MainForm
         if (IsVideoDeleteRunning) return "already_running";
         if (IsVideoUploadRunning) return "video_upload_running";
         if (IsMessageReplyRunning) return "message_reply_running";
+
+        // 3C.6.4H - VIDEO DELETE RuntimeGate.
+        // Gate trước khi dừng automation để block sau này không làm thay đổi runtime nửa chừng.
+        if (!CheckManagedRuntimePolicyFeature(
+                "video_delete",
+                "video_delete_start",
+                suppressDialogs: true))
+        {
+            return "policy_blocked_video_delete";
+        }
+
         if (_engine.Running)
         {
             _engine.Stop("Chuẩn bị xóa video TikTok");

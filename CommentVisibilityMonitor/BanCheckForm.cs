@@ -251,6 +251,25 @@ internal sealed class BanCheckForm : Form
     async Task StartAsync()
     {
         if (_running) return;
+
+        var policy = RemotePolicyShadowReader.Evaluate("ban_check");
+        _log(
+            $"[REMOTE_POLICY_BAN_CHECK_RUNTIME_CHECK] revision={policy.Revision} " +
+            $"mode={policy.Mode} wouldBlock={policy.WouldBlock} enforcement={policy.Enforcement} " +
+            $"adminBypass={policy.AdminBypass} fresh={policy.Fresh} allowed={policy.Allowed} " +
+            $"detail={policy.Error}");
+
+        if (!policy.Allowed)
+        {
+            MessageBox.Show(
+                this,
+                "Remote Policy đang chặn chức năng CHECK BAN trên thiết bị này.",
+                "CHECK BAN",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
         if (!_canStart())
         {
             MessageBox.Show(this, "Check CMT đang chạy. Hãy dừng Check CMT trước khi Check BAN.", "CHECK BAN", MessageBoxButtons.OK, MessageBoxIcon.Information);

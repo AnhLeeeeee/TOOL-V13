@@ -2900,11 +2900,53 @@ public sealed partial class ManagerForm
             return (existingContext, false);
         }
 
+        // 3C.6.4C - CREATE PROFILE RuntimeGate.
+        //
+        // Chỉ chạy khi profile CHƯA tồn tại và tool thực sự chuẩn bị tạo profile mới.
+        // Nhánh Resume/profile đã tồn tại phía trên không bị tính là CREATE mới.
+        //
+        // Tất cả luồng tạo mới hiện tại (Auto Profile, Auto Replace, THAY ALL,
+        // Night Reserve...) đều đi qua EnsureAutoProfileExists(), nên đặt Gate ở đây
+        // sẽ bao phủ đúng hành động tạo profile thực tế mà không chặn các bước reuse.
+        var createProfileAllowed = RemotePolicyRuntimeGate.IsAllowed(
+            "create_profile",
+            out var createProfileDecision);
+
+        _log.Info(
+            $"[REMOTE_POLICY_CREATE_PROFILE_RUNTIME_CHECK] profile={item.ProfileName} " +
+            $"account={item.Account.Username} revision={createProfileDecision.Revision} " +
+            $"mode={createProfileDecision.Mode} wouldBlock={createProfileDecision.WouldBlock} " +
+            $"enforcement={createProfileDecision.EnforcementEnabled} allowed={createProfileAllowed} " +
+            $"adminBypass={RemotePolicyRuntimeGate.AdminBypass}");
+
+        // 3C.6 hiện EnforcementEnabled=false nên nhánh này chưa thể xảy ra.
+        if (!createProfileAllowed)
+        {
+            _log.Warn(
+                $"[REMOTE_POLICY_CREATE_PROFILE_RUNTIME_BLOCKED] profile={item.ProfileName} " +
+                $"account={item.Account.Username} revision={createProfileDecision.Revision} " +
+                $"mode={createProfileDecision.Mode}");
+
+            throw new InvalidOperationException(
+                "QITool policy đang chặn tạo profile mới trên thiết bị này.");
+        }
+
+        if (!CheckRemotePolicyMaxCreateBeforeCreate(
+                "auto_profile",
+                item.ProfileName))
+        {
+            throw new InvalidOperationException(
+                "QITool policy đang giới hạn số profile được tạo trong 1 giờ.");
+        }
+
         TikTokProfileEntry? entry = null;
         try
         {
             var normalized = ValidateNewProfileName(item.ProfileName, catalog);
             entry = _profileService.CreateManagedProfile(normalized);
+            RecordRemotePolicyProfileCreate(
+                "auto_profile",
+                entry.Name);
             _chromeProfileNameSync.SyncBeforeLaunch(entry.ProfilePath, entry.Name);
             var dataRoot = _profileService.ResolveDataRoot(entry);
             Directory.CreateDirectory(dataRoot);

@@ -1,10 +1,12 @@
 {
-    "version":  "14.4.4",
-    "setupUrl":  "https://github.com/AnhLeeeeee/TOOL-V13/releases/download/v14.4.4/ToolTikTok_V14.4.4_Setup.exe",
-    "sha256":  "cee819531bf43f85fcee3d38bdcc6b25659233be117753c4982da428658334f4",
-    "notes":  "Cập nhật Tool TikTok V14.4.4.",
+    "version":  "14.4.7",
+    "setupUrl":  "https://github.com/AnhLeeeeee/TOOL-V13/releases/download/v14.4.7/ToolTikTok_V14.4.7_Setup.exe",
+    "sha256":  "92de7ac601e9237ee3816f5e38a442299c8196c8c230106eb25465ab24a98a1b",
+    "notes":  "Cập nhật Tool TikTok V14.4.7.",
     "channel":  "stable",
     "status":  "stable",
-    "releaseDate":  "2026-10-05",
-    "allowInstall":  true
+    "releaseDate":  "2026-10-07",
+    "allowInstall":  true,
+    "buildId":  "14.4.7_20261006_195538_CB75F8",
+    "managerExeSha256":  "f23b18bf0d09b9b6a58b9425a7e328c7373dd755499cd566b752ab5f83f4304f"
 }

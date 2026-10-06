@@ -54,6 +54,16 @@ public sealed partial class MainForm
         if (IsVideoUploadRunning) return "already_running";
         if (IsVideoDeleteRunning) return "video_delete_running";
         if (IsMessageReplyRunning) return "message_reply_running";
+
+        // 3C.6.4H - VIDEO UPLOAD RuntimeGate.
+        if (!CheckManagedRuntimePolicyFeature(
+                "video_upload",
+                "video_upload_start",
+                suppressDialogs: true))
+        {
+            return "policy_blocked_video_upload";
+        }
+
         if (_engine.Running)
         {
             _engine.Stop("Chuẩn bị đăng video TikTok");

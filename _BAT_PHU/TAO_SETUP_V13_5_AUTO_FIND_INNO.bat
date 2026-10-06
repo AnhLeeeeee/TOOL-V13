@@ -42,6 +42,26 @@ if not exist "publish_v13_5_vm\ToolTikTokManagerV13.exe" (
     exit /b 1
 )
 
+if not exist "publish_v13_5_vm\build_identity.json" (
+    echo [LOI] Khong tim thay:
+    echo publish_v13_5_vm\build_identity.json
+    echo.
+    echo Hay chay TAO_BAN_CAI_V13_5.bat de tao build identity moi.
+    echo.
+    if /I not "%NOPAUSE%"=="--no-pause" pause
+    exit /b 1
+)
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%SYNC_VERSION.ps1" -Root "%ROOT%" -ManagerExePath "publish_v13_5_vm\ToolTikTokManagerV13.exe" -RequireBuildIdentity
+if errorlevel 1 (
+    echo.
+    echo [LOI] Build identity khong hop le hoac SHA256 Manager khong khop.
+    echo Hay build lai bang TAO_BAN_CAI_V13_5.bat.
+    echo.
+    if /I not "%NOPAUSE%"=="--no-pause" pause
+    exit /b 1
+)
+
 if not exist "ToolTikTok_V13_5.iss" (
     echo [LOI] Khong tim thay ToolTikTok_V13_5.iss
     echo.
@@ -113,7 +133,7 @@ if not exist "SETUP_OUTPUT\%SETUP_NAME%" (
     exit /b 1
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%SYNC_VERSION.ps1" -Root "%ROOT%" -SetupPath "SETUP_OUTPUT\%SETUP_NAME%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%SYNC_VERSION.ps1" -Root "%ROOT%" -SetupPath "SETUP_OUTPUT\%SETUP_NAME%" -ManagerExePath "publish_v13_5_vm\ToolTikTokManagerV13.exe" -RequireBuildIdentity
 if errorlevel 1 (
     echo.
     echo [LOI] Setup da tao nhung khong cap nhat duoc SHA-256 vao version.json.

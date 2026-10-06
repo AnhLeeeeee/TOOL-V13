@@ -1,0 +1,196 @@
+--- before/SYNC_VERSION.ps1
++++ after/SYNC_VERSION.ps1
+@@ -1,6 +1,9 @@
+ param(
+     [string]$Root = "",
+-    [string]$SetupPath = ""
++    [string]$SetupPath = "",
++    [string]$ManagerExePath = "",
++    [switch]$GenerateBuildIdentity,
++    [switch]$RequireBuildIdentity
+ )
+ 
+ $ErrorActionPreference = 'Stop'
+@@ -26,6 +29,9 @@
+ # dang doc /version.json va /versions.json tren GitHub. Nguon chinh nam trong _version.
+ $legacyLatestManifestFile = Join-Path $Root 'version.json'
+ $legacyHistoryManifestFile = Join-Path $Root 'versions.json'
++
++$publishDir = Join-Path $Root 'publish_v13_5_vm'
++$buildIdentityFile = Join-Path $publishDir 'build_identity.json'
+ 
+ if (-not (Test-Path -LiteralPath $versionFile)) {
+     throw "Khong tim thay _version/VERSION.txt: $versionFile"
+@@ -179,6 +185,113 @@
+     return $value.Trim().TrimStart('v','V')
+ }
+ 
++function Resolve-PathFromRoot([string]$value) {
++    if ([string]::IsNullOrWhiteSpace($value)) { return '' }
++    if ([System.IO.Path]::IsPathRooted($value)) {
++        return [System.IO.Path]::GetFullPath($value)
++    }
++    return [System.IO.Path]::GetFullPath((Join-Path $Root $value))
++}
++
++function Get-Sha256Lower([string]$path, [string]$label) {
++    if (-not (Test-Path -LiteralPath $path)) {
++        throw "Khong tim thay $label de tinh SHA-256: $path"
++    }
++    $sha = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
++    if ($sha -notmatch '^[0-9a-f]{64}$') {
++        throw "SHA-256 $label khong hop le: $sha"
++    }
++    return $sha
++}
++
++function New-BuildId([string]$versionValue) {
++    $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMdd_HHmmss')
++    $suffix = [Guid]::NewGuid().ToString('N').Substring(0, 6).ToUpperInvariant()
++    return "${versionValue}_${stamp}_${suffix}"
++}
++
++# ------------------------------------------------------------
++# Build identity (Shadow Mode)
++# ------------------------------------------------------------
++$resolvedManagerExe = ''
++if (-not [string]::IsNullOrWhiteSpace($ManagerExePath)) {
++    $resolvedManagerExe = Resolve-PathFromRoot $ManagerExePath
++}
++else {
++    $defaultManagerExe = Join-Path $publishDir 'ToolTikTokManagerV13.exe'
++    if (Test-Path -LiteralPath $defaultManagerExe) {
++        $resolvedManagerExe = $defaultManagerExe
++    }
++}
++
++if ($GenerateBuildIdentity) {
++    if ([string]::IsNullOrWhiteSpace($resolvedManagerExe)) {
++        throw "GenerateBuildIdentity yeu cau Manager EXE da publish."
++    }
++
++    $managerHashForNewBuild = Get-Sha256Lower $resolvedManagerExe 'Manager EXE'
++    $identity = [PSCustomObject]@{
++        schemaVersion = 1
++        version = $version
++        buildId = New-BuildId $version
++        managerExeSha256 = $managerHashForNewBuild
++        createdAtUtc = (Get-Date).ToUniversalTime().ToString('o')
++    }
++
++    New-Item -ItemType Directory -Force -Path $publishDir | Out-Null
++    Write-JsonUtf8NoBom $buildIdentityFile $identity
++    Write-Host "[BUILD] Da tao build_identity.json" -ForegroundColor Green
++    Write-Host "[BUILD] buildId = $($identity.buildId)"
++    Write-Host "[BUILD] managerExeSha256 = $($identity.managerExeSha256)"
++}
++
++$buildIdentity = Read-JsonSafe $buildIdentityFile
++$buildId = ''
++$managerExeSha256 = ''
++$buildCreatedAtUtc = ''
++
++if ($null -ne $buildIdentity) {
++    $identityVersion = Normalize-Version ([string]$buildIdentity.version)
++    $identityBuildId = ([string]$buildIdentity.buildId).Trim()
++    $identityManagerSha = ([string]$buildIdentity.managerExeSha256).Trim().ToLowerInvariant()
++
++    $identityValid =
++        ($identityVersion -eq $version) -and
++        ($identityBuildId -match '^[A-Za-z0-9._-]{1,150}$') -and
++        ($identityManagerSha -match '^[0-9a-f]{64}$')
++
++    if ($identityValid) {
++        $buildId = $identityBuildId
++        $managerExeSha256 = $identityManagerSha
++        if ($buildIdentity.PSObject.Properties.Name -contains 'createdAtUtc') {
++            $buildCreatedAtUtc = ([string]$buildIdentity.createdAtUtc).Trim()
++        }
++
++        $mustVerifyManagerHash =
++            $GenerateBuildIdentity -or
++            $RequireBuildIdentity -or
++            (-not [string]::IsNullOrWhiteSpace($ManagerExePath)) -or
++            (-not [string]::IsNullOrWhiteSpace($SetupPath))
++
++        if ($mustVerifyManagerHash) {
++            if ([string]::IsNullOrWhiteSpace($resolvedManagerExe)) {
++                throw "Khong tim thay Manager EXE de doi chieu build identity."
++            }
++
++            $actualManagerSha = Get-Sha256Lower $resolvedManagerExe 'Manager EXE'
++            if ($actualManagerSha -ne $managerExeSha256) {
++                throw "Manager EXE da thay doi sau khi tao build identity. Expected=$managerExeSha256 Actual=$actualManagerSha"
++            }
++        }
++    }
++    elseif ($RequireBuildIdentity) {
++        throw "build_identity.json khong hop le hoac khong khop version $version."
++    }
++}
++elseif ($RequireBuildIdentity) {
++    throw "Khong tim thay build_identity.json. Hay publish lai bang TAO_BAN_CAI_V13_5.bat."
++}
++
+ # ------------------------------------------------------------
+ # 1) Doc versions.json truoc de bao toan status cua ban hien tai
+ # ------------------------------------------------------------
+@@ -227,10 +340,14 @@
+ Ensure-JsonProperty $latest 'status' 'stable'
+ Ensure-JsonProperty $latest 'releaseDate' $today
+ Ensure-JsonProperty $latest 'allowInstall' $true
++Ensure-JsonProperty $latest 'buildId' ''
++Ensure-JsonProperty $latest 'managerExeSha256' ''
+ 
+ $oldVersion = Normalize-Version ([string]$latest.version)
+ if ($oldVersion -ne $version) {
+     $latest.sha256 = ''
++    $latest.buildId = ''
++    $latest.managerExeSha256 = ''
+     $latest.releaseDate = $preservedReleaseDate
+ }
+ 
+@@ -241,6 +358,10 @@
+ $latest.status = $preservedStatus
+ $latest.releaseDate = $preservedReleaseDate
+ $latest.allowInstall = $preservedAllowInstall
++if (-not [string]::IsNullOrWhiteSpace($buildId)) {
++    $latest.buildId = $buildId
++    $latest.managerExeSha256 = $managerExeSha256
++}
+ 
+ $setupSha = ''
+ if (-not [string]::IsNullOrWhiteSpace($SetupPath)) {
+@@ -254,10 +375,7 @@
+         throw "Khong tim thay Setup de tinh SHA-256: $resolvedSetup"
+     }
+ 
+-    $setupSha = (Get-FileHash -LiteralPath $resolvedSetup -Algorithm SHA256).Hash.ToLowerInvariant()
+-    if ($setupSha -notmatch '^[0-9a-f]{64}$') {
+-        throw "SHA-256 khong hop le: $setupSha"
+-    }
++    $setupSha = Get-Sha256Lower $resolvedSetup 'Setup'
+     $latest.sha256 = $setupSha
+ }
+ 
+@@ -279,6 +397,8 @@
+         status = $preservedStatus
+         releaseDate = $preservedReleaseDate
+         allowInstall = $preservedAllowInstall
++        buildId = $buildId
++        managerExeSha256 = $managerExeSha256
+     }
+ 
+     $all = @($entry) + $others
+@@ -300,6 +420,11 @@
+ Write-Host "[VERSION] Da dong bo version = $version"
+ Write-Host "[VERSION] setupUrl = $setupUrl"
+ Write-Host "[VERSION] _version/version.json = $latestManifestFile"
++if (-not [string]::IsNullOrWhiteSpace($buildId)) {
++    Write-Host "[BUILD] buildId = $buildId"
++    Write-Host "[BUILD] managerExeSha256 = $managerExeSha256"
++    Write-Host "[BUILD] identity = $buildIdentityFile"
++}
+ if (-not [string]::IsNullOrWhiteSpace($setupSha)) {
+     Write-Host "[VERSION] SHA-256 = $setupSha"
+     Write-Host "[VERSION] Da upsert vao _version/versions.json = $historyManifestFile"

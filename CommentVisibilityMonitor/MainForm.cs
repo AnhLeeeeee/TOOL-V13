@@ -27,13 +27,14 @@ internal sealed partial class MainForm : Form
     const double MaxCommentTimeoutSeconds = 30.0;
     const double CommentTimeoutBufferSeconds = 0.0;
     const int MaxLatencySamplesPerLive = 20;
-    static readonly TimeSpan ProfileCheckDuration = TimeSpan.FromMinutes(10);
+    const int ProfileCheckMinutes = 5;
+    static readonly TimeSpan ProfileCheckDuration = TimeSpan.FromMinutes(ProfileCheckMinutes);
     static readonly TimeSpan SessionPendingGrace = TimeSpan.FromSeconds(5);
 
     readonly Label _observerState = new() { AutoSize = true, Text = "Observer: chưa mở" };
     readonly Label _targetState = new() { AutoSize = true, Text = "Đang kiểm tra: —" };
     readonly Label _cycleState = new() { AutoSize = true, Text = "Phiên: —" };
-    readonly Label _summaryState = new() { AutoSize = true, Text = "Đã quét: — | Hiện: — | Mất: — | Không rõ: — | Kết quả: —" };
+    readonly Label _summaryState = new() { AutoSize = true, Text = "Tỷ lệ TB: —" };
     readonly Button _openObserver = new() { Text = "Mở Chrome Observer", AutoSize = true };
     readonly Button _start = new() { Text = "Bắt đầu kiểm tra", AutoSize = true };
     readonly Button _stop = new() { Text = "Dừng kiểm tra", AutoSize = true, Enabled = false };
@@ -63,6 +64,10 @@ internal sealed partial class MainForm : Form
     string _resumeProfile = "";
     CycleState? _resumeCycle;
     readonly CommentCheckHistoryStore _historyStore;
+    readonly Dictionary<string, HistoryAverageState> _historyAverageByProfile = new(StringComparer.OrdinalIgnoreCase);
+    // Thống kê của LƯỢT KIỂM TRA HIỆN TẠI: reset khi bấm "Bắt đầu kiểm tra".
+    // Mỗi PRF cộng dồn qua nhiều phiên 5 phút cho tới khi người dùng bấm Bắt đầu lần kế tiếp.
+    readonly Dictionary<string, RunAggregateState> _currentRunByProfile = new(StringComparer.OrdinalIgnoreCase);
 
     public MainForm()
     {
@@ -72,7 +77,8 @@ internal sealed partial class MainForm : Form
         Font = new Font("Segoe UI", 9F);
         Directory.CreateDirectory(_dataDir);
         _observer = new ObserverChromeSession(49335, Path.Combine(_dataDir, "ObserverChrome"));
-        _historyStore = new CommentCheckHistoryStore(_dataDir);
+        _historyStore = new CommentCheckHistoryStore(_dataDir, Log);
+        ReloadHistoryAverages();
         LoadObserverLoginSettings();
 
         var top = new TableLayoutPanel
@@ -106,15 +112,13 @@ internal sealed partial class MainForm : Form
         top.Controls.Add(quickBar, 0, 1);
         top.Controls.Add(statusBar, 0, 2);
 
-        _grid.Columns.Add("Profile", "PRF");
-        _grid.Columns.Add("Username", "Tài khoản");
-        _grid.Columns.Add("State", "Trạng thái");
-        _grid.Columns.Add("Progress", "Tiến độ");
-        _grid.Columns.Add("Visible", "Hiện");
-        _grid.Columns.Add("Missing", "Mất");
-        _grid.Columns.Add("Unknown", "Không rõ");
-        _grid.Columns.Add("Result", "Kết quả");
-        _grid.Columns.Add("Last", "Lần cuối");
+        AddMainGridColumn("Profile", "PRF", 10F, 65, DataGridViewContentAlignment.MiddleCenter);
+        AddMainGridColumn("Username", "Tài khoản", 22F, 135);
+        AddMainGridColumn("State", "Trạng thái", 17F, 100, DataGridViewContentAlignment.MiddleCenter);
+        AddMainGridColumn("Cmt", "CMT", 8F, 68, DataGridViewContentAlignment.MiddleCenter);
+        AddMainGridColumn("Progress", "Tiến độ", 14F, 90, DataGridViewContentAlignment.MiddleCenter);
+        AddMainGridColumn("AverageResult", "Tỷ lệ TB", 11F, 85, DataGridViewContentAlignment.MiddleCenter);
+        AddMainGridColumn("Last", "Lần cuối", 13F, 110, DataGridViewContentAlignment.MiddleCenter);
 
         var split = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterDistance = 390 };
         split.Panel1.Controls.Add(_grid);
@@ -143,6 +147,139 @@ internal sealed partial class MainForm : Form
         Log($"Đang nghe telemetry localhost UDP {TelemetryPort}. Module này không gửi lệnh điều khiển về Worker/Manager.");
         Log("Bước đầu: bấm 'Mở Chrome Observer'. Khi cần đăng nhập, bấm nút 'Đăng nhập' để mở cửa sổ TK/MK/2FA; sau đó bấm 'Bắt đầu kiểm tra'.");
         Log("Nút 'Xuất ZIP chẩn đoán' chỉ gom log/trạng thái; KHÔNG lấy thư mục ObserverChrome, cookie hay file thông tin đăng nhập Observer.");
+    }
+
+    void AddMainGridColumn(string name, string header, float fillWeight, int minimumWidth, DataGridViewContentAlignment alignment = DataGridViewContentAlignment.MiddleLeft)
+    {
+        _grid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            Name = name,
+            HeaderText = header,
+            MinimumWidth = minimumWidth,
+            FillWeight = fillWeight,
+            SortMode = DataGridViewColumnSortMode.NotSortable,
+            DefaultCellStyle = new DataGridViewCellStyle { Alignment = alignment }
+        });
+    }
+
+    void ReloadHistoryAverages()
+    {
+        _historyAverageByProfile.Clear();
+        try
+        {
+            foreach (var session in _historyStore.LoadAll())
+                AddCompletedSessionToAverage(session);
+        }
+        catch (Exception ex)
+        {
+            Log("[HISTORY_AVERAGE_LOAD_WARN] " + ex.Message);
+        }
+    }
+
+    void AddCompletedSessionToAverage(CommentCheckSessionHistory session)
+    {
+        if (string.IsNullOrWhiteSpace(session.Profile)) return;
+
+        if (!_historyAverageByProfile.TryGetValue(session.Profile, out var average))
+        {
+            average = new HistoryAverageState();
+            _historyAverageByProfile[session.Profile] = average;
+        }
+
+        // Tỷ lệ TB là tỷ lệ gộp theo toàn bộ CMT có kết luận của các phiên đã lưu:
+        // Tổng Hiện / (Tổng Hiện + Tổng Mất). Không rõ không tham gia mẫu số.
+        average.Visible += Math.Max(0, session.Visible);
+        average.Missing += Math.Max(0, session.Missing);
+        average.SessionCount++;
+
+        var endedLocal = session.EndedAt.ToLocalTime().DateTime;
+        if (endedLocal > average.LastEndedLocal)
+            average.LastEndedLocal = endedLocal;
+    }
+
+    string FormatHistoryAverage(string profile)
+    {
+        if (!_historyAverageByProfile.TryGetValue(profile, out var average))
+            return "—";
+
+        var known = average.Visible + average.Missing;
+        return known <= 0 ? "—" : $"{average.Visible * 100.0 / known:0.0}%";
+    }
+
+    DateTime GetHistoryLastCheck(string profile)
+        => _historyAverageByProfile.TryGetValue(profile, out var average)
+            ? average.LastEndedLocal
+            : default;
+
+    void ResetCurrentRunStatistics(string reason = "START_CHECKING")
+    {
+        _currentRunByProfile.Clear();
+        Log($"[RUN_STATS_RESET] reason={reason}");
+    }
+
+    void AddCompletedCycleToCurrentRun(CycleState cycle)
+    {
+        if (!_checking || cycle is null || string.IsNullOrWhiteSpace(cycle.Profile)) return;
+        if (!_currentRunByProfile.TryGetValue(cycle.Profile, out var state))
+        {
+            state = new RunAggregateState();
+            _currentRunByProfile[cycle.Profile] = state;
+        }
+
+        state.Sent += Math.Max(0, cycle.SentCount);
+        state.Visible += Math.Max(0, cycle.Visible);
+        state.Missing += Math.Max(0, cycle.Missing);
+        state.Unknown += Math.Max(0, cycle.Unknown);
+        state.CompletedSessions++;
+    }
+
+    RunAggregateSnapshot GetCurrentRunSnapshot(string profile)
+    {
+        var sent = 0;
+        var visible = 0;
+        var missing = 0;
+        var unknown = 0;
+
+        if (_currentRunByProfile.TryGetValue(profile, out var saved))
+        {
+            sent += saved.Sent;
+            visible += saved.Visible;
+            missing += saved.Missing;
+            unknown += saved.Unknown;
+        }
+
+        // Phiên đang chạy chưa được PersistCycle nên cộng trực tiếp để UI cập nhật realtime mỗi giây.
+        if (_cycle is not null && _cycle.Profile.Equals(profile, StringComparison.OrdinalIgnoreCase))
+        {
+            sent += Math.Max(0, _cycle.SentCount);
+            visible += Math.Max(0, _cycle.Visible);
+            missing += Math.Max(0, _cycle.Missing);
+            unknown += Math.Max(0, _cycle.Unknown);
+        }
+
+        // Khi CHECK NGAY tạm nhường phiên auto, phiên auto nằm ở _resumeCycle và vẫn thuộc lượt hiện tại.
+        if (_resumeCycle is not null && _resumeCycle.Profile.Equals(profile, StringComparison.OrdinalIgnoreCase))
+        {
+            sent += Math.Max(0, _resumeCycle.SentCount);
+            visible += Math.Max(0, _resumeCycle.Visible);
+            missing += Math.Max(0, _resumeCycle.Missing);
+            unknown += Math.Max(0, _resumeCycle.Unknown);
+        }
+
+        return new RunAggregateSnapshot(sent, visible, missing, unknown);
+    }
+
+    string FormatCurrentRunAverage(string profile)
+    {
+        var snapshot = GetCurrentRunSnapshot(profile);
+        var known = snapshot.Visible + snapshot.Missing;
+        return known <= 0 ? "—" : $"{snapshot.Visible * 100.0 / known:0.0}%";
+    }
+
+    string FormatCurrentRunCmt(string profile)
+    {
+        var snapshot = GetCurrentRunSnapshot(profile);
+        return snapshot.Sent <= 0 ? "—" : $"{snapshot.Visible}/{snapshot.Sent}";
     }
 
     string ObserverLoginSettingsPath => Path.Combine(_dataDir, "observer_login.json");
@@ -289,6 +426,25 @@ internal sealed partial class MainForm : Form
     void StartChecking()
     {
         if (_checking) return;
+
+        var policy = RemotePolicyShadowReader.Evaluate("comment_check");
+        Log(
+            $"[REMOTE_POLICY_COMMENT_CHECK_RUNTIME_CHECK] revision={policy.Revision} " +
+            $"mode={policy.Mode} wouldBlock={policy.WouldBlock} enforcement={policy.Enforcement} " +
+            $"adminBypass={policy.AdminBypass} fresh={policy.Fresh} allowed={policy.Allowed} " +
+            $"detail={policy.Error}");
+
+        if (!policy.Allowed)
+        {
+            MessageBox.Show(
+                this,
+                "Remote Policy đang chặn chức năng CHECK CMT trên thiết bị này.",
+                "Check CMT",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
         if (_banCheckRunning)
         {
             MessageBox.Show(
@@ -299,6 +455,7 @@ internal sealed partial class MainForm : Form
                 MessageBoxIcon.Information);
             return;
         }
+        ResetCurrentRunStatistics();
         _checking = true;
         _start.Enabled = false; _stop.Enabled = true;
         _cycle = null;
@@ -307,7 +464,7 @@ internal sealed partial class MainForm : Form
         _manualTarget = false;
         _targetProfile = "";
         ChooseNextTarget();
-        Log("Đã bật kiểm tra xoay vòng 10 phút/PRF. Observer chỉ follow LIVE sau SENT thành công; lỗi tạm không đổi PRF, chỉ Manager xác nhận thay/retire mới chuyển sớm.");
+        Log($"Đã bật kiểm tra xoay vòng {ProfileCheckMinutes} phút/PRF. Observer chỉ follow LIVE sau SENT thành công; lỗi tạm không đổi PRF, chỉ Manager xác nhận thay/retire mới chuyển sớm.");
     }
 
     void StopChecking(string reason)
@@ -333,7 +490,7 @@ internal sealed partial class MainForm : Form
         _targetProfile = "";
         _targetState.Text = "Đang kiểm tra: —";
         _cycleState.Text = "Phiên: —";
-        _summaryState.Text = "Đã quét: — | Hiện: — | Mất: — | Không rõ: — | Kết quả: —";
+        _summaryState.Text = "Tỷ lệ TB: —";
         Log("Đã dừng kiểm tra: " + reason);
     }
 
@@ -413,7 +570,7 @@ internal sealed partial class MainForm : Form
         var workerRestarted = p.Pid != 0 && m.Pid != 0 && p.Pid != m.Pid;
         if (workerRestarted && m.Profile.Equals(_targetProfile, StringComparison.OrdinalIgnoreCase))
         {
-            // Worker restart/recovery là lỗi tạm: giữ nguyên phiên + deadline 10 phút,
+            // Worker restart/recovery là lỗi tạm: giữ nguyên phiên + deadline 5 phút,
             // chỉ hủy pending gắn với PID cũ để không trộn sendId của hai process.
             CancelPendingForProfile(m.Profile, countUnknown: true, reason: "WORKER_PID_CHANGED");
             Log($"[SESSION_KEEP_WORKER_RESTART] PRF={m.Profile} Worker PID đổi {p.Pid} -> {m.Pid}; giữ target/deadline, chỉ dọn pending PID cũ.");
@@ -549,7 +706,7 @@ internal sealed partial class MainForm : Form
                 CreatedUtc = DateTime.UtcNow,
                 IsManual = _manualTarget
             };
-            Log($"[SESSION_READY] PRF={m.Profile} observer đã đúng LIVE; chờ SENT đầu tiên để bắt đầu đồng hồ 10 phút.");
+            Log($"[SESSION_READY] PRF={m.Profile} observer đã đúng LIVE; chờ SENT đầu tiên để bắt đầu đồng hồ {ProfileCheckMinutes} phút.");
             if (string.IsNullOrWhiteSpace(m.Username))
                 Log($"[MATCH_WARN] PRF={m.Profile} không có TikTok handle hợp lệ trong tiktok_auth.json; lượt này phải match theo nội dung và độ tin cậy thấp hơn.");
         }
@@ -661,7 +818,7 @@ internal sealed partial class MainForm : Form
             _cycle.StartedUtc = pending.SentConfirmedUtc;
             _cycle.DeadlineUtc = _cycle.StartedUtc.Add(ProfileCheckDuration);
             _cycle.Username = string.IsNullOrWhiteSpace(m.Username) ? _cycle.Username : m.Username;
-            Log($"[SESSION_START_10M] PRF={m.Profile} start={_cycle.StartedUtc:O} deadline={_cycle.DeadlineUtc:O} manual={_cycle.IsManual}");
+            Log($"[SESSION_START_5M] PRF={m.Profile} start={_cycle.StartedUtc:O} deadline={_cycle.DeadlineUtc:O} manual={_cycle.IsManual}");
         }
 
         if (_cycle.Closing || pending.WillSendUtc >= _cycle.DeadlineUtc)
@@ -859,13 +1016,13 @@ internal sealed partial class MainForm : Form
                     var pendingForSession = PendingForSession(_cycle.SessionId).ToList();
                     if (pendingForSession.Count == 0)
                     {
-                        FinishCurrentSession(_cycle.EndReason.Length > 0 ? _cycle.EndReason : "Hết 10 phút", cancelPendingAsUnknown: false);
+                        FinishCurrentSession(_cycle.EndReason.Length > 0 ? _cycle.EndReason : "Hết 5 phút", cancelPendingAsUnknown: false);
                     }
                     else if (_cycle.DeadlineReachedUtc != default
                              && DateTime.UtcNow - _cycle.DeadlineReachedUtc >= SessionPendingGrace)
                     {
                         Log($"[SESSION_PENDING_GRACE_EXPIRED] PRF={_cycle.Profile} pending={pendingForSession.Count} grace={SessionPendingGrace.TotalSeconds:0}s");
-                        FinishCurrentSession(_cycle.EndReason.Length > 0 ? _cycle.EndReason : "Hết 10 phút", cancelPendingAsUnknown: true);
+                        FinishCurrentSession(_cycle.EndReason.Length > 0 ? _cycle.EndReason : "Hết 5 phút", cancelPendingAsUnknown: true);
                     }
                 }
             }
@@ -891,15 +1048,18 @@ internal sealed partial class MainForm : Form
     {
         if (_cycle is null)
         {
-            _cycleState.Text = "Phiên: chờ CMT đầu tiên sau khi Observer bám đúng LIVE";
-            _summaryState.Text = "Đã quét: 0 | Hiện: 0 | Mất: 0 | Không rõ: 0 | Kết quả: —";
+            _cycleState.Text = $"Phiên {ProfileCheckMinutes} phút: chờ CMT đầu tiên sau khi Observer bám đúng LIVE";
+            _summaryState.Text = string.IsNullOrWhiteSpace(_targetProfile)
+                ? "Tỷ lệ TB: —"
+                : $"Tỷ lệ TB {_targetProfile}: {FormatCurrentRunAverage(_targetProfile)}";
             return;
         }
 
         var remain = _cycle.StartedUtc == default ? "chưa chạy giờ" : FormatRemaining(_cycle);
-        _cycleState.Text = $"Phiên 10 phút: gửi {_cycle.SentCount} • đã quét {_cycle.ResolvedCount} • còn {remain}";
-        _summaryState.Text =
-            $"Đã quét: {_cycle.ResolvedCount} | Hiện: {_cycle.Visible} | Mất: {_cycle.Missing} | Không rõ: {_cycle.Unknown} | Kết quả: {FormatVisibilityRate(_cycle.Visible, _cycle.Missing)}";
+        _cycleState.Text = $"Phiên {ProfileCheckMinutes} phút: gửi {_cycle.SentCount} • đã quét {_cycle.ResolvedCount} • còn {remain}";
+        // Tỷ lệ TB ngoài giao diện chính là tỷ lệ cộng dồn của PRF trong LƯỢT hiện tại,
+        // tính từ lúc bấm "Bắt đầu kiểm tra". Nó không reset theo từng phiên 5 phút.
+        _summaryState.Text = $"Tỷ lệ TB {_cycle.Profile}: {FormatCurrentRunAverage(_cycle.Profile)}";
     }
 
     static string FormatVisibilityRate(int visible, int missing)
@@ -908,41 +1068,101 @@ internal sealed partial class MainForm : Form
         return known <= 0 ? "—" : $"{visible * 100.0 / known:0.0}%";
     }
 
+    static bool IsExplicitlyInactiveProfileState(string? state)
+    {
+        state = (state ?? "").Trim();
+
+        return state.Equals("STOPPED", StringComparison.OrdinalIgnoreCase)
+               || state.Equals("OFFLINE", StringComparison.OrdinalIgnoreCase)
+               || state.Equals("CLOSED", StringComparison.OrdinalIgnoreCase)
+               || state.Equals("RETIRED", StringComparison.OrdinalIgnoreCase)
+               || state.Equals("RETIRE", StringComparison.OrdinalIgnoreCase)
+               || state.Equals("ĐANG THAY/RETIRE", StringComparison.OrdinalIgnoreCase);
+    }
+
+    bool IsVisibleOnMainGrid(ProfileState p)
+    {
+        // Manager đã xác nhận retire/delete/auto-close là nguồn sự thật ưu tiên.
+        if (p.ManagerTerminal)
+            return false;
+
+        var now = DateTime.UtcNow;
+        var managerFresh =
+            p.ManagerPresent
+            && p.LastManagerSeenUtc != default
+            && now - p.LastManagerSeenUtc < TimeSpan.FromSeconds(8);
+
+        if (managerFresh && !string.IsNullOrWhiteSpace(p.ManagerRunState))
+        {
+            // Manager hiện chỉ phát telemetry cho RUNNING / PAUSED / RECOVERING
+            // (ngoài terminal). Không khóa cứng 2 tên RUNNING/RECOVERING để nếu
+            // sau này Manager có trạng thái trung gian nhưng vẫn thuộc active fleet
+            // thì Check CMT vẫn hiển thị, chỉ loại các trạng thái inactive rõ ràng.
+            return !IsExplicitlyInactiveProfileState(p.ManagerRunState);
+        }
+
+        var workerFresh =
+            p.LastSeenUtc != default
+            && now - p.LastSeenUtc < TimeSpan.FromSeconds(20);
+
+        if (!workerFresh || string.IsNullOrWhiteSpace(p.RunState))
+            return false;
+
+        // Fallback chỉ dùng telemetry Worker đang còn sống/fresh.
+        return !IsExplicitlyInactiveProfileState(p.RunState);
+    }
+
+    string GetMainGridProfileState(ProfileState p)
+    {
+        var now = DateTime.UtcNow;
+        var managerFresh =
+            p.ManagerPresent
+            && p.LastManagerSeenUtc != default
+            && now - p.LastManagerSeenUtc < TimeSpan.FromSeconds(8);
+
+        if (managerFresh && !string.IsNullOrWhiteSpace(p.ManagerRunState))
+            return p.ManagerRunState;
+
+        var workerFresh =
+            p.LastSeenUtc != default
+            && now - p.LastSeenUtc < TimeSpan.FromSeconds(20);
+
+        return workerFresh && !string.IsNullOrWhiteSpace(p.RunState)
+            ? p.RunState
+            : "OFFLINE";
+    }
+
     void RefreshGrid()
     {
         var selected = _grid.CurrentRow?.Cells["Profile"].Value?.ToString();
         _grid.Rows.Clear();
-        foreach (var p in _profiles.Values.OrderBy(x => NaturalProfileKey(x.Profile), StringComparer.OrdinalIgnoreCase))
+
+        foreach (var p in _profiles.Values
+                     .Where(IsVisibleOnMainGrid)
+                     .OrderBy(x => NaturalProfileKey(x.Profile), StringComparer.OrdinalIgnoreCase))
         {
-            var fresh = DateTime.UtcNow - p.LastSeenUtc < TimeSpan.FromSeconds(20);
-            var managerFresh = p.LastManagerSeenUtc != default && DateTime.UtcNow - p.LastManagerSeenUtc < TimeSpan.FromSeconds(8);
-            var state = p.ManagerTerminal
-                ? "ĐANG THAY/RETIRE"
-                : managerFresh && !string.IsNullOrWhiteSpace(p.ManagerRunState)
-                    ? p.ManagerRunState
-                    : fresh ? p.RunState : "OFFLINE";
+            var state = GetMainGridProfileState(p);
             var isTarget = p.Profile.Equals(_targetProfile, StringComparison.OrdinalIgnoreCase);
             var progress = isTarget
                 ? (_cycle is null
-                    ? "Chờ SENT để bám LIVE"
+                    ? "Chờ SENT"
                     : _cycle.StartedUtc == default
-                        ? "Đã bám LIVE · chờ CMT đầu"
-                        : $"{_cycle.ResolvedCount} CMT · còn {FormatRemaining(_cycle)}")
+                        ? "Chờ CMT"
+                        : FormatRemaining(_cycle))
                 : "Chờ";
 
-            var visible = isTarget && _cycle is not null ? _cycle.Visible : p.LastVisible;
-            var missing = isTarget && _cycle is not null ? _cycle.Missing : p.LastMissing;
-            var unknown = isTarget && _cycle is not null ? _cycle.Unknown : p.LastUnknown;
-            var hasResult = (isTarget && _cycle is not null && _cycle.ResolvedCount > 0) || p.LastExpected > 0;
-            var score = hasResult ? FormatVisibilityRate(visible, missing) : "";
+            // CMT = số HIỆN / số ĐÃ GỬI, cộng dồn từ lúc bấm Bắt đầu kiểm tra.
+            var cmtProgress = FormatCurrentRunCmt(p.Profile);
+            // Tỷ lệ TB ngoài màn chính = Hiện / (Hiện + Mất) của lượt hiện tại.
+            // Không rõ và CMT đang chờ kết quả không tham gia mẫu số.
+            var averageScore = FormatCurrentRunAverage(p.Profile);
+            var historyLastCheck = GetHistoryLastCheck(p.Profile);
+            var lastCheck = historyLastCheck != default ? historyLastCheck : p.LastCheck;
 
             _grid.Rows.Add(
-                p.Profile, p.Username, state, progress,
-                hasResult ? visible.ToString() : "",
-                hasResult ? missing.ToString() : "",
-                hasResult ? unknown.ToString() : "",
-                score,
-                p.LastCheck == default ? "" : p.LastCheck.ToString("HH:mm:ss dd/MM"));
+                p.Profile, p.Username, state, cmtProgress, progress,
+                averageScore,
+                lastCheck == default ? "" : lastCheck.ToString("HH:mm:ss dd/MM"));
         }
         if (selected is not null)
         {
@@ -1291,6 +1511,25 @@ internal sealed partial class MainForm : Form
         public DateTime LastManagerSeenUtc { get; set; }
         public long ManagerSeq { get; set; }
     }
+
+    sealed class HistoryAverageState
+    {
+        public int Visible { get; set; }
+        public int Missing { get; set; }
+        public int SessionCount { get; set; }
+        public DateTime LastEndedLocal { get; set; }
+    }
+
+    sealed class RunAggregateState
+    {
+        public int Sent { get; set; }
+        public int Visible { get; set; }
+        public int Missing { get; set; }
+        public int Unknown { get; set; }
+        public int CompletedSessions { get; set; }
+    }
+
+    readonly record struct RunAggregateSnapshot(int Sent, int Visible, int Missing, int Unknown);
 
     sealed class PendingSend
     {

@@ -1843,6 +1843,20 @@ public sealed partial class ManagerForm
 
         if (selected.DailyReplaceAll)
         {
+            // 3C.6.4E: gate ngay khi user Bắt đầu/ARM chiến lược THAY ALL.
+            // Đây cũng bảo vệ startup fill chạy ngay trong cửa sổ Giờ thay.
+            if (!IsRunStrategyDailyReplaceAllPolicyAllowed(
+                    "run_all_start",
+                    target))
+            {
+                ModernDialog.ShowMessage(
+                    this,
+                    "QITool policy đang chặn chiến lược THAY ALL trên thiết bị này.",
+                    "Auto Run — THAY ALL",
+                    MessageBoxIcon.Warning);
+                return;
+            }
+
             // Thu hồi mọi suất bù cũ TRƯỚC StartAll để một request của chiến lược
             // trước không kịp mở thêm PRF trong lúc chuyển sang THAY ALL.
             PrepareRunStrategyDailyReplaceAllStart(target, "run_all_new_selection");

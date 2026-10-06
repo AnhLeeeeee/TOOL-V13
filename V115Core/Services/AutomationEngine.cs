@@ -149,6 +149,10 @@ public sealed partial class AutomationEngine
     public bool RuntimeLoginLostConfirmed => _runtimeLoginLostConfirmed;
     public string RuntimeLoginLostDetail => _runtimeLoginLostDetail;
 
+    // 3C.6.4I - callback từ Worker MainForm để gate các hành động runtime
+    // nằm sâu trong AutomationEngine, trước mắt là COMMENT SEND.
+    public Func<string, string, bool>? RuntimePolicyFeatureCheck { get; set; }
+
     AppSettings _s = new();
     List<string> _contents = [];
     int _contentIndex;
@@ -1035,6 +1039,15 @@ public sealed partial class AutomationEngine
                 case 3:
                 {
                     SetStatus("BƯỚC 3/8", "Enter ô 1 • theo dõi popup đăng nhập / cấm bình luận");
+
+                    if (RuntimePolicyFeatureCheck is not null
+                        && !RuntimePolicyFeatureCheck("comment_send", "point_1_enter"))
+                    {
+                        SetStatus("CHỜ POLICY", "Gửi bình luận đang bị khóa bởi Remote Policy.");
+                        await Task.Delay(1000, ct);
+                        return;
+                    }
+
                     var commentCheckSendId = await EmitCommentCheckWillSendAsync(_contentIndex + 1, content, ct);
                     await _chrome.PressKeyAsync("Enter", ct: ct);
                     if (await WatchPostEnterReactionAsync("điểm 1", restartStep: 1, ct)) return;
@@ -1070,6 +1083,15 @@ public sealed partial class AutomationEngine
                 case 7:
                 {
                     SetStatus("BƯỚC 7/8", "Enter ô 2 • theo dõi popup đăng nhập / cấm bình luận");
+
+                    if (RuntimePolicyFeatureCheck is not null
+                        && !RuntimePolicyFeatureCheck("comment_send", "point_2_enter"))
+                    {
+                        SetStatus("CHỜ POLICY", "Gửi bình luận đang bị khóa bởi Remote Policy.");
+                        await Task.Delay(1000, ct);
+                        return;
+                    }
+
                     var commentCheckSendId = await EmitCommentCheckWillSendAsync(_contentIndex + 1, content, ct);
                     await _chrome.PressKeyAsync("Enter", ct: ct);
                     if (await WatchPostEnterReactionAsync("điểm 2", restartStep: 5, ct)) return;

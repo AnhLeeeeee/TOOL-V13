@@ -1342,6 +1342,50 @@ public sealed partial class ManagerForm
                     return;
                 }
 
+                // 3C.6.4D - AUTO REPLACE RuntimeGate.
+                //
+                // Đặt tại ranh giới xử lý một request Tự bù thật sự, sau khi request
+                // đã đến hạn và execution generation hợp lệ, nhưng TRƯỚC cleanup/reuse/create.
+                //
+                // Nhờ vậy auto_replace bao phủ toàn bộ hành động Tự bù:
+                // - dùng lại PRF chờ;
+                // - NAME_SYNC reuse;
+                // - fallback tạo PRF mới.
+                //
+                // THAY ALL không đi qua đây trong lúc refresh vì queue đã bị HOLD ở đầu hàm.
+                var autoReplaceAllowed = RemotePolicyRuntimeGate.IsAllowed(
+                    "auto_replace",
+                    out var autoReplaceDecision);
+
+                _log.Info(
+                    $"[REMOTE_POLICY_AUTO_REPLACE_RUNTIME_CHECK] id={request.Id} " +
+                    $"closed={request.ClosedProfileName} reason={request.Reason} " +
+                    $"revision={autoReplaceDecision.Revision} mode={autoReplaceDecision.Mode} " +
+                    $"wouldBlock={autoReplaceDecision.WouldBlock} enforcement={autoReplaceDecision.EnforcementEnabled} " +
+                    $"allowed={autoReplaceAllowed} adminBypass={RemotePolicyRuntimeGate.AdminBypass}");
+
+                // 3C.6 hiện EnforcementEnabled=false nên nhánh này chưa thể xảy ra.
+                // Giữ request nguyên vẹn để sau này nếu bật enforcement thì không làm mất suất bù.
+                if (!autoReplaceAllowed)
+                {
+                    _log.Warn(
+                        $"[REMOTE_POLICY_AUTO_REPLACE_RUNTIME_BLOCKED] id={request.Id} " +
+                        $"closed={request.ClosedProfileName} revision={autoReplaceDecision.Revision} " +
+                        $"mode={autoReplaceDecision.Mode} action=PRESERVE_AND_RETRY");
+
+                    SetAutoReplacementUiPhase(
+                        "CHỜ POLICY",
+                        "Tự bù đang bị khóa",
+                        request.Id);
+
+                    ScheduleAutoReplacementOperationalRetry(
+                        request.Id,
+                        "Remote policy chặn Auto Replace.",
+                        AutoReplacementOperationalRetry);
+
+                    continue;
+                }
+
                 // Queue Tự bù có gate RIÊNG để các suất bù không đè nhau.
                 // Gate này KHÔNG chặn AutoClose; TIME/BAN/FAULT vẫn được đóng đúng lượt
                 // ngay cả khi một suất bù đang tạo PRF mới hoặc chờ cleanup.

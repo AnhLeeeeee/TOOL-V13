@@ -193,6 +193,7 @@ public sealed partial class ManagerForm : Form
         InitializeIdentityAutoFlow();
         InitializeMessageReplyAutoFlow();
         InitializeNightReserveFeature();
+        InitializeShadowTelemetry();
         FormClosing += OnClosing;
     }
 
@@ -959,6 +960,36 @@ public sealed partial class ManagerForm : Form
     {
         if (ctx.Worker is not null && !ctx.Worker.HasExited && await PingAsync(ctx)) return;
 
+        // 3C.6.4B - START WORKER RuntimeGate.
+        // Chỉ kiểm tra khi Manager thật sự chuẩn bị spawn Worker mới.
+        var startWorkerAllowed = RemotePolicyRuntimeGate.IsAllowed(
+            "start_worker",
+            out var startWorkerDecision);
+
+        _log.Info(
+            $"[REMOTE_POLICY_START_WORKER_RUNTIME_CHECK] profile={ctx.Profile.Name} " +
+            $"revision={startWorkerDecision.Revision} mode={startWorkerDecision.Mode} " +
+            $"wouldBlock={startWorkerDecision.WouldBlock} enforcement={startWorkerDecision.EnforcementEnabled} " +
+            $"allowed={startWorkerAllowed} adminBypass={RemotePolicyRuntimeGate.AdminBypass}");
+
+        if (!startWorkerAllowed)
+        {
+            _log.Warn(
+                $"[REMOTE_POLICY_START_WORKER_RUNTIME_BLOCKED] profile={ctx.Profile.Name} " +
+                $"revision={startWorkerDecision.Revision} mode={startWorkerDecision.Mode}");
+
+            throw new InvalidOperationException(
+                "QITool policy đang chặn khởi động Worker mới trên thiết bị này.");
+        }
+
+        if (!CheckRemotePolicyMaxWorkersBeforeSpawn(
+                ctx,
+                "ensure_worker_spawn"))
+        {
+            throw new InvalidOperationException(
+                "QITool policy đang giới hạn số Worker được phép chạy trên thiết bị này.");
+        }
+
         // Hai bản Tool chạy trên cùng một máy có thể có cùng CdpPort trong profiles.json
         // (ví dụ cả hai đều là 9222). Trước khi spawn Worker phải giữ một lease
         // liên-process cho cổng đó; nếu cổng đã thuộc Tool khác hoặc đang bị chiếm,
@@ -1229,6 +1260,42 @@ public sealed partial class ManagerForm : Form
         {
             _log.Warn($"[EMERGENCY_STOP_COMMAND_BLOCKED] profile={ctx.Profile.Name} command={command}");
             return "emergency_stopped";
+        }
+
+        // 3C.6.4A - LIVE RuntimeGate phía Manager.
+        // Chặn/quan sát các command LIVE do Manager gửi sang Worker.
+        var isLiveRuntimeCommand =
+            command.Equals("start", StringComparison.OrdinalIgnoreCase)
+            || command.Equals("start_auto", StringComparison.OrdinalIgnoreCase)
+            || command.Equals("resume", StringComparison.OrdinalIgnoreCase);
+
+        if (isLiveRuntimeCommand)
+        {
+            var liveAllowed = RemotePolicyRuntimeGate.IsAllowed(
+                "live",
+                out var liveDecision);
+
+            _log.Info(
+                $"[REMOTE_POLICY_LIVE_RUNTIME_CHECK] profile={ctx.Profile.Name} command={command} " +
+                $"revision={liveDecision.Revision} mode={liveDecision.Mode} " +
+                $"wouldBlock={liveDecision.WouldBlock} enforcement={liveDecision.EnforcementEnabled} " +
+                $"allowed={liveAllowed} adminBypass={RemotePolicyRuntimeGate.AdminBypass}");
+
+            // 3C.6 hiện vẫn enforcement=false, nên nhánh này chưa thể xảy ra.
+            if (!liveAllowed)
+            {
+                _log.Warn(
+                    $"[REMOTE_POLICY_LIVE_RUNTIME_BLOCKED] profile={ctx.Profile.Name} command={command} " +
+                    $"revision={liveDecision.Revision} mode={liveDecision.Mode}");
+                return "policy_blocked_live";
+            }
+
+            if (!CheckRemotePolicyMaxRunningBeforeStart(
+                    ctx,
+                    $"manager_command_{command.ToLowerInvariant()}"))
+            {
+                return "policy_limit_max_running_profiles";
+            }
         }
 
         // Fallback quan trọng cho PRF đã có Worker/tab sẵn: nếu cấu hình mặc định
@@ -1592,10 +1659,52 @@ public sealed partial class ManagerForm : Form
         if (request is null) return;
         var name = request.Name;
 
+        // 3C.6.4C v2 - CREATE PROFILE RuntimeGate cho nhánh tạo thủ công từ Manager.
+        // Bản 3C.6.4C đầu tiên mới bao phủ Auto Profile; nhánh "+ profile" đi thẳng
+        // qua AddProfile() nên cần gate riêng tại đây.
+        var createProfileAllowed = RemotePolicyRuntimeGate.IsAllowed(
+            "create_profile",
+            out var createProfileDecision);
+
+        _log.Info(
+            $"[REMOTE_POLICY_CREATE_PROFILE_RUNTIME_CHECK] source=manual_add profile={name} " +
+            $"revision={createProfileDecision.Revision} mode={createProfileDecision.Mode} " +
+            $"wouldBlock={createProfileDecision.WouldBlock} enforcement={createProfileDecision.EnforcementEnabled} " +
+            $"allowed={createProfileAllowed} adminBypass={RemotePolicyRuntimeGate.AdminBypass}");
+
+        if (!createProfileAllowed)
+        {
+            _log.Warn(
+                $"[REMOTE_POLICY_CREATE_PROFILE_RUNTIME_BLOCKED] source=manual_add profile={name} " +
+                $"revision={createProfileDecision.Revision} mode={createProfileDecision.Mode}");
+
+            ModernDialog.ShowMessage(
+                this,
+                "QITool policy đang chặn tạo profile mới trên thiết bị này.",
+                "Thêm profile TikTok",
+                MessageBoxIcon.Warning);
+            return;
+        }
+
+        if (!CheckRemotePolicyMaxCreateBeforeCreate(
+                "manual_add",
+                name))
+        {
+            ModernDialog.ShowMessage(
+                this,
+                "Thiết bị đã đạt giới hạn tạo profile trong 1 giờ.",
+                "Thêm profile TikTok",
+                MessageBoxIcon.Warning);
+            return;
+        }
+
         TikTokProfileEntry? entry = null;
         try
         {
             entry = _profileService.CreateManagedProfile(name);
+            RecordRemotePolicyProfileCreate(
+                "manual_add",
+                entry.Name);
             _chromeProfileNameSync.SyncBeforeLaunch(entry.ProfilePath, entry.Name);
             var dataRoot = _profileService.ResolveDataRoot(entry);
             Directory.CreateDirectory(dataRoot);

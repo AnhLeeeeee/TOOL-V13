@@ -1,4 +1,4 @@
-using ToolTikTokManagerV13.Proxy;
+﻿using ToolTikTokManagerV13.Proxy;
 using ToolTikTokV12.Models;
 
 namespace ToolTikTokManagerV13;
@@ -39,6 +39,31 @@ public sealed partial class ManagerForm
     {
         try
         {
+            // 3C.6.4I - PROXY RuntimeGate.
+            // Chỉ gate khi Proxy đang bật; Proxy OFF thì giữ nguyên đường mạng máy.
+            var proxySnapshot = ProxyModule.GetSnapshot();
+            if (proxySnapshot.Settings.Enabled)
+            {
+                var proxyAllowed = RemotePolicyRuntimeGate.IsAllowed(
+                    "proxy",
+                    out var proxyDecision);
+
+                _log.Info(
+                    $"[REMOTE_POLICY_PROXY_RUNTIME_CHECK] profile={ctx.Profile.Name} " +
+                    $"revision={proxyDecision.Revision} mode={proxyDecision.Mode} " +
+                    $"wouldBlock={proxyDecision.WouldBlock} enforcement={proxyDecision.EnforcementEnabled} " +
+                    $"allowed={proxyAllowed} adminBypass={RemotePolicyRuntimeGate.AdminBypass}");
+
+                if (!proxyAllowed)
+                {
+                    try { ProxyModule.TryForceDirectForProfile(ctx.Profile); } catch { }
+                    _log.Warn(
+                        $"[REMOTE_POLICY_PROXY_RUNTIME_BLOCKED] profile={ctx.Profile.Name} " +
+                        $"revision={proxyDecision.Revision} mode={proxyDecision.Mode} action=DIRECT_NETWORK");
+                    return;
+                }
+            }
+
             var result = await ProxyModule.PrepareForLaunchAsync(
                 ctx.Profile,
                 GetProxyProfilesSnapshot(),

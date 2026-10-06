@@ -1,0 +1,32 @@
+--- before/TAO_BAN_CAI_V13_5.bat
++++ after/TAO_BAN_CAI_V13_5.bat
+@@ -60,6 +60,13 @@
+ echo [2/4] Publish Manager self-contained win-x64...
+ dotnet publish ".\ToolTikTokManagerV13\ToolTikTokManagerV13.csproj" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -p:PublishReadyToRun=false -p:PublishTrimmed=false -o "%OUT%"
+ if errorlevel 1 goto :fail
++
++echo.
++echo [2B/4] Tao BUILD ID + SHA256 Manager cho Shadow Mode...
++powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%SYNC_VERSION.ps1" -Root "%ROOT%" -ManagerExePath "%OUT%\ToolTikTokManagerV13.exe" -GenerateBuildIdentity
++if errorlevel 1 goto :buildidentityfail
++
++if not exist "%OUT%\build_identity.json" goto :buildidentityfail
+ 
+ echo.
+ echo [3/4] Publish Comment Visibility Monitor self-contained win-x64...
+@@ -142,6 +149,15 @@
+ if /I not "%NOPAUSE%"=="--no-pause" pause
+ exit /b 0
+ 
++:buildidentityfail
++echo.
++echo ========================================
++echo LOI: KHONG TAO/DOI CHIEU DUOC BUILD IDENTITY
++echo Kiem tra ToolTikTokManagerV13.exe va SYNC_VERSION.ps1
++echo ========================================
++if /I not "%NOPAUSE%"=="--no-pause" pause
++exit /b 1
++
+ :versionfail
+ echo.
+ echo ========================================

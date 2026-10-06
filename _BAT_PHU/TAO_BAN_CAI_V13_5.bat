@@ -62,6 +62,13 @@ dotnet publish ".\ToolTikTokManagerV13\ToolTikTokManagerV13.csproj" -c Release -
 if errorlevel 1 goto :fail
 
 echo.
+echo [2B/4] Tao BUILD ID + SHA256 Manager cho Shadow Mode...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%SYNC_VERSION.ps1" -Root "%ROOT%" -ManagerExePath "%OUT%\ToolTikTokManagerV13.exe" -GenerateBuildIdentity
+if errorlevel 1 goto :buildidentityfail
+
+if not exist "%OUT%\build_identity.json" goto :buildidentityfail
+
+echo.
 echo [3/4] Publish Comment Visibility Monitor self-contained win-x64...
 if not exist ".\CommentVisibilityMonitor\CommentVisibilityMonitor.csproj" (
     echo.
@@ -141,6 +148,15 @@ echo ========================================
 echo.
 if /I not "%NOPAUSE%"=="--no-pause" pause
 exit /b 0
+
+:buildidentityfail
+echo.
+echo ========================================
+echo LOI: KHONG TAO/DOI CHIEU DUOC BUILD IDENTITY
+echo Kiem tra ToolTikTokManagerV13.exe va SYNC_VERSION.ps1
+echo ========================================
+if /I not "%NOPAUSE%"=="--no-pause" pause
+exit /b 1
 
 :versionfail
 echo.

@@ -38,7 +38,8 @@ internal sealed class CommentCheckHistoryForm : Form
         _grid.Columns.Add("Visible", "Hiện");
         _grid.Columns.Add("Missing", "Mất");
         _grid.Columns.Add("Unknown", "Không rõ");
-        _grid.Columns.Add("Rate", "Tỷ lệ");
+        _grid.Columns.Add("Rate", "Tỷ lệ phiên");
+        _grid.Columns.Add("ProfileAverage", "TB PRF");
         _grid.Columns.Add("Reason", "Kết thúc");
         _grid.CellDoubleClick += (_, e) => { if (e.RowIndex >= 0) OpenDetails(e.RowIndex); };
 
@@ -61,10 +62,24 @@ internal sealed class CommentCheckHistoryForm : Form
     void Reload()
     {
         _sessions = _store.LoadAll().OrderByDescending(x => x.StartedAt).ToList();
+        var profileAverages = _sessions
+            .GroupBy(x => x.Profile, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                g => g.Key,
+                g =>
+                {
+                    var visible = g.Sum(x => x.Visible);
+                    var missing = g.Sum(x => x.Missing);
+                    var known = visible + missing;
+                    return known > 0 ? visible * 100.0 / known : (double?)null;
+                },
+                StringComparer.OrdinalIgnoreCase);
+
         _grid.Rows.Clear();
         foreach (var s in _sessions)
         {
             var duration = TimeSpan.FromSeconds(Math.Max(0, s.DurationSeconds));
+            profileAverages.TryGetValue(s.Profile, out var profileAverage);
             var rowIndex = _grid.Rows.Add(
                 s.StartedAt.ToLocalTime().ToString("HH:mm:ss dd/MM"),
                 s.Profile,
@@ -75,6 +90,7 @@ internal sealed class CommentCheckHistoryForm : Form
                 s.Missing,
                 s.Unknown,
                 s.VisibilityRate.HasValue ? s.VisibilityRate.Value.ToString("0.0") + "%" : "—",
+                profileAverage.HasValue ? profileAverage.Value.ToString("0.0") + "%" : "—",
                 s.EndReason);
             _grid.Rows[rowIndex].Tag = s;
         }

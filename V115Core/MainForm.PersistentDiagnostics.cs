@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 
 namespace ToolTikTokV11;
 
@@ -50,6 +50,7 @@ public sealed partial class MainForm
             "[TIKTOK_STARTUP",
             "[AUTO_VIDEO_",
             "[VIDEO_",
+            "[REMOTE_POLICY_WORKER_",
             "[CHROME_CLOSE",
             "[CAPTCHA",
             "[CDP_SESSION",

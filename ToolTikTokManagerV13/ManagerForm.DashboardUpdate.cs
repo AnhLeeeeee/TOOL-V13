@@ -1169,6 +1169,33 @@ public sealed partial class ManagerForm
         }
     }
 
+    bool IsRemotePolicyUpdateAllowed(
+        string source,
+        bool showWhenBlocked)
+    {
+        var allowed = RemotePolicyRuntimeGate.IsAllowed(
+            "update",
+            out var decision);
+
+        _log.Info(
+            $"[REMOTE_POLICY_UPDATE_RUNTIME_CHECK] source={source} " +
+            $"revision={decision.Revision} mode={decision.Mode} " +
+            $"wouldBlock={decision.WouldBlock} enforcement={decision.EnforcementEnabled} " +
+            $"allowed={allowed} adminBypass={RemotePolicyRuntimeGate.AdminBypass}");
+
+        if (!allowed && showWhenBlocked)
+        {
+            // Giữ UX kín giống lớp updateBlocked hiện tại.
+            ModernDialog.ShowMessage(
+                this,
+                $"Bạn đang dùng V{ManagerDisplayVersion}. Không có bản cập nhật mới.",
+                "Trình quản lý phiên bản",
+                MessageBoxIcon.Information);
+        }
+
+        return allowed;
+    }
+
     async Task<bool> EnsureDeviceUpdateAllowedAsync(bool showWhenCurrent)
     {
         DeviceAccessService.DeviceAccessDecision access;
@@ -1282,6 +1309,12 @@ public sealed partial class ManagerForm
     async Task CheckForUpdatesAsync(bool showWhenCurrent)
     {
         if (_updateCheckInProgress) return;
+
+        if (!IsRemotePolicyUpdateAllowed(
+                "check_for_updates",
+                showWhenBlocked: showWhenCurrent))
+            return;
+
         if (!await EnsureDeviceUpdateAllowedAsync(showWhenCurrent)) return;
         var settings = LoadUpdateSettings();
         if (string.IsNullOrWhiteSpace(settings.ManifestUrl))
@@ -1602,6 +1635,12 @@ public sealed partial class ManagerForm
     async Task DownloadAndInstallSelectedVersionAsync()
     {
         if (_updateDownloadInProgress) return;
+
+        if (!IsRemotePolicyUpdateAllowed(
+                "download_install_selected_version",
+                showWhenBlocked: true))
+            return;
+
         if (!await EnsureDeviceUpdateAllowedAsync(showWhenCurrent: false)) return;
         var manifest = SelectedVersionManifest();
         if (manifest is null)

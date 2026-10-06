@@ -271,6 +271,14 @@ internal static class Program
             LicenseServerDecision? remoteLockDecision = null;
             using var managerForm = new ManagerForm();
 
+            // QITool Remote Policy Runtime Gate.
+            // 3C.7: máy thường bật enforcement; máy ADMIN vẫn full bypass.
+            RemotePolicyRuntimeGate.Bind(
+                policyProvider: () =>
+                    licenseServer?.CurrentRemotePolicy
+                    ?? RemotePolicySnapshot.AllowAll,
+                adminBypass: isAdmin);
+
             // Nếu heartbeat xác nhận khóa đúng lúc form chưa tạo handle, đóng ngay khi form vừa hiện.
             managerForm.Shown += (_, _) =>
             {
@@ -293,9 +301,18 @@ internal static class Program
                             return Task.CompletedTask;
 
                         remoteLockDecision = decision;
+                        var closeKind =
+                            string.Equals(
+                                decision.Status,
+                                "policy_tool_access_blocked",
+                                StringComparison.OrdinalIgnoreCase)
+                                ? "REMOTE_POLICY_TOOL_ACCESS"
+                                : "DEVICE_REMOTE_LOCK";
+
                         ManagerProcessDiagnostics.Append(
-                            $"[QITOOL_REMOTE_LOCK_RUNTIME_CONFIRMED] device={access.DeviceId} " +
-                            $"status={ManagerProcessDiagnostics.OneLine(decision.Status)} action=close_manager_gracefully");
+                            $"[QITOOL_RUNTIME_ACCESS_CLOSE_CONFIRMED] device={access.DeviceId} " +
+                            $"kind={closeKind} status={ManagerProcessDiagnostics.OneLine(decision.Status)} " +
+                            "action=close_manager_gracefully");
 
                         try
                         {
@@ -328,11 +345,13 @@ internal static class Program
 
                 heartbeatTask = licenseServer.RunHeartbeatLoopAsync(
                     heartbeatCts.Token,
-                    onConfirmedBlock);
+                    onConfirmedBlock,
+                    managerForm.GetShadowHeartbeatSnapshot);
 
                 ManagerProcessDiagnostics.Append(
                     $"[LICENSE_SERVER_HEARTBEAT_STARTED] session={licenseServer.SessionId} " +
-                    $"remoteLockEnforced={!isAdmin} safety=explicit_blocked_double_confirm");
+                    $"remoteLockEnforced={!isAdmin} policyEnforcement={RemotePolicyRuntimeGate.EnforcementEnabled} " +
+                    "safety=device_block_double_confirm+tool_access_double_confirm");
             }
 
             try
@@ -357,16 +376,36 @@ internal static class Program
 
             if (Volatile.Read(ref remoteLockTriggered) == 1)
             {
+                var policyToolAccessBlock =
+                    string.Equals(
+                        remoteLockDecision?.Status,
+                        "policy_tool_access_blocked",
+                        StringComparison.OrdinalIgnoreCase);
+
                 ManagerProcessDiagnostics.Append(
-                    $"[QITOOL_REMOTE_LOCK_RUNTIME_CLOSED] device={access.DeviceId} " +
+                    $"[QITOOL_RUNTIME_ACCESS_CLOSED] device={access.DeviceId} " +
+                    $"kind={(policyToolAccessBlock ? "REMOTE_POLICY_TOOL_ACCESS" : "DEVICE_REMOTE_LOCK")} " +
                     $"status={ManagerProcessDiagnostics.OneLine(remoteLockDecision?.Status)}");
 
-                MessageBox.Show(
-                    $"Thiết bị này vừa bị khóa trên QITool nên Tool đã dừng an toàn.\n\nMã thiết bị: {access.DeviceId}\n\n" +
-                    "Mở khóa trên trang quản lý QITool trước khi chạy lại Tool.",
-                    "Tool TikTok — Thiết bị đã bị khóa",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Warning);
+                if (policyToolAccessBlock)
+                {
+                    MessageBox.Show(
+                        $"Quyền sử dụng Tool của thiết bị này đang bị tắt bởi QITool policy.\n\n" +
+                        $"Mã thiết bị: {access.DeviceId}\n\n" +
+                        "Bật lại tool_access trên trang quản lý QITool trước khi chạy lại Tool.",
+                        "Tool TikTok — Quyền sử dụng đang bị tắt",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                }
+                else
+                {
+                    MessageBox.Show(
+                        $"Thiết bị này vừa bị khóa trên QITool nên Tool đã dừng an toàn.\n\nMã thiết bị: {access.DeviceId}\n\n" +
+                        "Mở khóa trên trang quản lý QITool trước khi chạy lại Tool.",
+                        "Tool TikTok — Thiết bị đã bị khóa",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                }
             }
 
             ManagerProcessDiagnostics.Append(

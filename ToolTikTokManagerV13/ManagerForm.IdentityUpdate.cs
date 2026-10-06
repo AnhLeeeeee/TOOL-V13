@@ -1950,6 +1950,43 @@ public sealed partial class ManagerForm
     {
         if (_messageReplyProfilesInFlight.Contains(ctx.Profile.Name))
             throw new InvalidOperationException("Profile đang được mục Tin nhắn TikTok xử lý. Hãy dừng/đợi Tin nhắn hoàn tất rồi cập nhật tên/ảnh.");
+
+        // 3C.6.4G - NAME / IMAGE RuntimeGate.
+        //
+        // UpdateTikTokIdentityAsync() là điểm chung của toàn bộ thao tác Tên/ảnh thật:
+        // - Tên & ảnh thủ công;
+        // - Name Guard trước Start;
+        // - Auto Profile;
+        // - Auto Replace / THAY ALL khi pipeline cần xử lý identity.
+        //
+        // Gate được đặt TRƯỚC OpenProfile/Stop automation để khi enforcement bật sau này,
+        // policy block sẽ không làm thay đổi runtime của PRF rồi mới từ chối.
+        var nameImageAllowed = RemotePolicyRuntimeGate.IsAllowed(
+            "name_image",
+            out var nameImageDecision);
+
+        _log.Info(
+            $"[REMOTE_POLICY_NAME_IMAGE_RUNTIME_CHECK] profile={ctx.Profile.Name} " +
+            $"revision={nameImageDecision.Revision} mode={nameImageDecision.Mode} " +
+            $"wouldBlock={nameImageDecision.WouldBlock} enforcement={nameImageDecision.EnforcementEnabled} " +
+            $"allowed={nameImageAllowed} adminBypass={RemotePolicyRuntimeGate.AdminBypass}");
+
+        // 3C.6 hiện EnforcementEnabled=false nên nhánh này chưa thể xảy ra.
+        if (!nameImageAllowed)
+        {
+            _log.Warn(
+                $"[REMOTE_POLICY_NAME_IMAGE_RUNTIME_BLOCKED] profile={ctx.Profile.Name} " +
+                $"revision={nameImageDecision.Revision} mode={nameImageDecision.Mode}");
+
+            return new IdentityUpdateReply
+            {
+                Ok = false,
+                Skipped = true,
+                Message = "QITool policy đang chặn cập nhật Tên/ảnh TikTok trên thiết bị này.",
+                Error = "policy_blocked_name_image"
+            };
+        }
+
         await OpenProfileAsync(ctx);
         try { await RefreshStatusAsync(ctx); } catch { }
         if (ctx.LastSnapshot?.VideoDeleteRunning == true)

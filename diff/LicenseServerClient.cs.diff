@@ -1,0 +1,27 @@
+--- before/LicenseServerClient.cs
++++ after/LicenseServerClient.cs
+@@ -36,6 +36,7 @@
+     readonly string _version;
+     readonly string _sessionId;
+     readonly string _installId;
++    readonly string _buildId;
+     readonly string _exeSha256;
+     readonly int _managerPid;
+     readonly DateTime _processStartedAtUtc;
+@@ -52,6 +53,7 @@
+         _version = version;
+         _sessionId = Guid.NewGuid().ToString("N");
+         _installId = ShadowTelemetryIdentity.GetOrCreateInstallId();
++        _buildId = ShadowTelemetryIdentity.TryGetBuildId();
+         _exeSha256 = ShadowTelemetryIdentity.TryGetExecutableSha256();
+         _managerPid = Environment.ProcessId;
+         try
+@@ -241,7 +243,7 @@
+             // Shadow telemetry: server accepts these as optional, so old/new
+             // clients remain compatible during observation rollout.
+             installId = _installId,
+-            buildId = "",
++            buildId = _buildId,
+             exeSha256 = _exeSha256,
+             managerPid = _managerPid,
+             processStartedAt = _processStartedAtUtc.ToString("O"),

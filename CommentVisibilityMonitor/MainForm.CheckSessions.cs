@@ -114,6 +114,8 @@ internal sealed partial class MainForm
 
         if (!_checking)
         {
+            // CHECK NGAY khi tool đang dừng cũng mở một lượt đếm mới, không kế thừa số liệu lượt trước.
+            ResetCurrentRunStatistics("QUICK_CHECK_START");
             _checking = true;
             _start.Enabled = false;
             _stop.Enabled = true;
@@ -151,6 +153,10 @@ internal sealed partial class MainForm
         {
             using var form = new CommentCheckHistoryForm(_historyStore, Log);
             form.ShowDialog(this);
+            // Cửa sổ lịch sử có thể đã xóa dữ liệu; nạp lại tỷ lệ TB ngay khi đóng.
+            ReloadHistoryAverages();
+            RefreshGrid();
+            UpdateCycleLabel();
         }
         catch (Exception ex)
         {
@@ -199,7 +205,7 @@ internal sealed partial class MainForm
 
         if (cycle is not null && cycle.StartedUtc != default && DateTime.UtcNow >= cycle.DeadlineUtc)
         {
-            PersistDetachedCycle(cycle, "Hết 10 phút trong lúc nhường CHECK NGAY");
+            PersistDetachedCycle(cycle, "Hết 5 phút trong lúc nhường CHECK NGAY");
             return false;
         }
 
@@ -215,12 +221,12 @@ internal sealed partial class MainForm
         var expired = _resumeCycle;
         _resumeCycle = null;
         _resumeProfile = "";
-        PersistDetachedCycle(expired, "Hết 10 phút trong lúc nhường CHECK NGAY");
+        PersistDetachedCycle(expired, "Hết 5 phút trong lúc nhường CHECK NGAY");
     }
 
     static string FormatRemaining(CycleState cycle)
     {
-        if (cycle.StartedUtc == default || cycle.DeadlineUtc == default) return "10:00";
+        if (cycle.StartedUtc == default || cycle.DeadlineUtc == default) return $"{ProfileCheckMinutes:00}:00";
         var remain = cycle.DeadlineUtc - DateTime.UtcNow;
         if (remain < TimeSpan.Zero) remain = TimeSpan.Zero;
         return $"{(int)remain.TotalMinutes:00}:{remain.Seconds:00}";
@@ -233,7 +239,7 @@ internal sealed partial class MainForm
     {
         if (_cycle is null || _cycle.StartedUtc == default || _cycle.Closing) return;
         _cycle.Closing = true;
-        _cycle.EndReason = "Hết 10 phút";
+        _cycle.EndReason = "Hết 5 phút";
         _cycle.DeadlineReachedUtc = DateTime.UtcNow;
         Log($"[SESSION_DEADLINE] PRF={_cycle.Profile} start={_cycle.StartedUtc:O} deadline={_cycle.DeadlineUtc:O} sent={_cycle.SentCount} resolved={_cycle.ResolvedCount} pending={PendingForSession(_cycle.SessionId).Count()}");
         UpdateCycleLabel();
@@ -323,7 +329,7 @@ internal sealed partial class MainForm
         }
 
         var endedUtc = DateTime.UtcNow;
-        if (reason.StartsWith("Hết 10 phút", StringComparison.OrdinalIgnoreCase) && done.DeadlineUtc != default)
+        if (reason.StartsWith("Hết 5 phút", StringComparison.OrdinalIgnoreCase) && done.DeadlineUtc != default)
             endedUtc = done.DeadlineUtc;
 
         if (_profiles.TryGetValue(done.Profile, out var p))
@@ -367,7 +373,16 @@ internal sealed partial class MainForm
             }).ToList()
         };
 
-        try { _historyStore.Append(history); }
+        // Lượt hiện tại cộng dồn qua các phiên 5 phút. Việc cộng này độc lập với file lịch sử
+        // để tỷ lệ ngoài màn chính vẫn đúng ngay cả khi lưu lịch sử gặp lỗi tạm thời.
+        AddCompletedCycleToCurrentRun(done);
+
+        try
+        {
+            _historyStore.Append(history);
+            // Lịch sử vẫn giữ thống kê dài hạn của PRF, dùng trong cửa sổ LỊCH SỬ CHECK.
+            AddCompletedSessionToAverage(history);
+        }
         catch (Exception ex) { Log("[HISTORY_SAVE_WARN] " + ex.Message); }
 
         // Giữ results.jsonl cũ để không phá workflow chẩn đoán hiện có.

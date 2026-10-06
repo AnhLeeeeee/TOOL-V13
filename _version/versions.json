@@ -2,6 +2,42 @@
     "schemaVersion":  1,
     "versions":  [
                      {
+                         "version":  "14.4.7",
+                         "setupUrl":  "https://github.com/AnhLeeeeee/TOOL-V13/releases/download/v14.4.7/ToolTikTok_V14.4.7_Setup.exe",
+                         "sha256":  "92de7ac601e9237ee3816f5e38a442299c8196c8c230106eb25465ab24a98a1b",
+                         "notes":  "Cập nhật Tool TikTok V14.4.7.",
+                         "channel":  "stable",
+                         "status":  "stable",
+                         "releaseDate":  "2026-10-07",
+                         "allowInstall":  true,
+                         "buildId":  "14.4.7_20261006_195538_CB75F8",
+                         "managerExeSha256":  "f23b18bf0d09b9b6a58b9425a7e328c7373dd755499cd566b752ab5f83f4304f"
+                     },
+                     {
+                         "version":  "14.4.6",
+                         "setupUrl":  "https://github.com/AnhLeeeeee/TOOL-V13/releases/download/v14.4.6/ToolTikTok_V14.4.6_Setup.exe",
+                         "sha256":  "b7c5bacca0ea71894998813c35ee5792b0f8a15d67ebfd79ac704c41a47fda6d",
+                         "notes":  "Cập nhật Tool TikTok V14.4.6.",
+                         "channel":  "stable",
+                         "status":  "stable",
+                         "releaseDate":  "2026-10-07",
+                         "allowInstall":  true,
+                         "buildId":  "14.4.6_20261006_190908_78959E",
+                         "managerExeSha256":  "1c3ef615b5c2f7dca22458fbc51061492b6c7efff1c02e0a4ee88d852448658c"
+                     },
+                     {
+                         "version":  "14.4.5",
+                         "setupUrl":  "https://github.com/AnhLeeeeee/TOOL-V13/releases/download/v14.4.5/ToolTikTok_V14.4.5_Setup.exe",
+                         "sha256":  "de7e41c13e0eecd50a040c94005db67dd87efe69bfbad592d6d2899ec0034543",
+                         "notes":  "Cập nhật Tool TikTok V14.4.5.",
+                         "channel":  "stable",
+                         "status":  "stable",
+                         "releaseDate":  "2026-10-05",
+                         "allowInstall":  true,
+                         "buildId":  "14.4.5_20261006_022526_62DE26",
+                         "managerExeSha256":  "e0611c1ba5cfc0a0dfe3c45dfa5a65e83b1424cc5447f470ec58125f47253563"
+                     },
+                     {
                          "version":  "14.4.4",
                          "setupUrl":  "https://github.com/AnhLeeeeee/TOOL-V13/releases/download/v14.4.4/ToolTikTok_V14.4.4_Setup.exe",
                          "sha256":  "cee819531bf43f85fcee3d38bdcc6b25659233be117753c4982da428658334f4",

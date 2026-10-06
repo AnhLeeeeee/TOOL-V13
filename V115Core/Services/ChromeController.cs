@@ -72,6 +72,10 @@ public sealed partial class ChromeController : IAsyncDisposable
     public CdpPage? Page { get; private set; }
     public bool Connected => _cdp?.Connected == true;
 
+    // 3C.6.4F - Worker hỏi RuntimeGate ngay tại credential-flow.
+    // null => fail-open để ChromeController vẫn dùng được ngoài managed mode.
+    public Func<string, bool>? LoginRuntimePolicyCheck { get; set; }
+
     /// <summary>
     /// A DOM/XPath miss is not a disconnected browser.  Keep this test deliberately
     /// narrow so normal TikTok re-renders do not make the worker report CDP loss.
@@ -2540,6 +2544,28 @@ public sealed partial class ChromeController : IAsyncDisposable
             else
                 await OpenTikTokHomeReadyAsync(ct);
             return new TikTokStartupResult("LOGIN_REQUIRED", "Profile chưa có phiên đăng nhập hoặc chưa lưu tài khoản/mật khẩu.", false, openLiveWhenReady);
+        }
+
+        // 3C.6.4F - LOGIN RuntimeGate.
+        //
+        // Chỉ kiểm tra sau khi đã xác định:
+        // - chưa có session TikTok hợp lệ;
+        // - auto login đang bật;
+        // - username/password đã có.
+        //
+        // Vì vậy policy LOGIN không chặn việc mở Chrome/profile đã đăng nhập sẵn;
+        // nó chỉ gate đúng lúc Worker chuẩn bị bước vào credential-flow thật.
+        if (LoginRuntimePolicyCheck is not null
+            && !LoginRuntimePolicyCheck("credential_flow"))
+        {
+            _log.Warn(
+                "[TIKTOK_LOGIN_POLICY_BLOCKED] source=credential_flow action=NO_NAVIGATE_NO_SUBMIT");
+
+            return new TikTokStartupResult(
+                "LOGIN_POLICY_BLOCKED",
+                "Remote policy đang chặn luồng đăng nhập TikTok trên thiết bị này.",
+                false,
+                false);
         }
 
         _log.Info("[TIKTOK_LOGIN_START] auto=true usernameConfigured=true totpConfigured=" + (!string.IsNullOrWhiteSpace(totpSecret)));

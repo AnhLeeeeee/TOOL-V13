@@ -134,7 +134,10 @@ public sealed partial class MainForm : Form
         var settingsSw = System.Diagnostics.Stopwatch.StartNew();
         _settings = _settingsService.Load();
         settingsSw.Stop();
-        _chrome = new ChromeController(_log); ApplyChromeWindowSettings(); ApplyVmOptimizationSettings(); _engine = new AutomationEngine(_baseDir, _chrome, _log); _engine.ConfigureCommentCheckTelemetryProfile(_startupOptions.ProfileName); _engine.RuntimeLiveSearchAsync = TryRuntimeLiveSearchAsync; _runtimeStats = new RuntimeStatsTracker(_baseDir, _log);
+        _chrome = new ChromeController(_log);
+        _chrome.LoginRuntimePolicyCheck = source =>
+            CheckManagedLoginRuntimePolicy(source, suppressDialogs: true);
+        ApplyChromeWindowSettings(); ApplyVmOptimizationSettings(); _engine = new AutomationEngine(_baseDir, _chrome, _log); _engine.ConfigureCommentCheckTelemetryProfile(_startupOptions.ProfileName); _engine.RuntimeLiveSearchAsync = TryRuntimeLiveSearchAsync; _engine.RuntimePolicyFeatureCheck = (feature, source) => CheckManagedRuntimePolicyFeature(feature, source, suppressDialogs: true); _runtimeStats = new RuntimeStatsTracker(_baseDir, _log);
         var profileSw = System.Diagnostics.Stopwatch.StartNew();
         if (_managedMode)
         {
@@ -1784,6 +1787,17 @@ public sealed partial class MainForm : Form
                 MessageBoxIcon.Warning);
             return;
         }
+
+        // 3C.6.4A v2: người dùng có thể bấm Resume trực tiếp trong Worker UI.
+        // Gate tại Worker để không bypass Manager-side SendCommandAsync.
+        if (_engine.Paused
+            && !CheckManagedLiveRuntimePolicy(
+                "worker_ui_resume",
+                suppressDialogs: false))
+        {
+            return;
+        }
+
         _pauseResumeCommandInFlight = true;
         UpdateRunControlButtons();
         try
@@ -1826,6 +1840,27 @@ public sealed partial class MainForm : Form
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Warning);
             }
+            return;
+        }
+
+        // 3C.6.4A v2:
+        // StartAsync là ranh giới chung cho cả:
+        // - Start bấm trực tiếp trong Worker;
+        // - F8;
+        // - IPC start/start_auto từ Manager.
+        if (!CheckManagedLiveRuntimePolicy(
+                suppressDialogs ? "start_action_auto" : "start_action_user",
+                suppressDialogs))
+        {
+            return;
+        }
+
+        if (!CheckManagedRuntimePolicyLimit(
+                "maxRunningProfiles",
+                requestedAdditional: 1,
+                suppressDialogs ? "start_action_auto" : "start_action_user",
+                suppressDialogs))
+        {
             return;
         }
 
