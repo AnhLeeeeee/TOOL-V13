@@ -1,4 +1,4 @@
-﻿using Microsoft.Win32;
+using Microsoft.Win32;
 using System.Net;
 using System.Net.Http;
 using System.Runtime.InteropServices;
@@ -311,6 +311,87 @@ public static class DeviceAccessService
     }
 
     /// <summary>
+    /// Phục hồi DeviceId local về mã chuẩn do QITool server trả về khi fingerprint hiện tại
+    /// đã khớp một thiết bị có sẵn trên server. Không tự kích hoạt quyền chạy.
+    ///
+    /// An toàn:
+    /// - DeviceId hiện tại phải đúng với ID vừa dùng để register;
+    /// - fingerprint trong device.json phải vẫn khớp máy vật lý hiện tại;
+    /// - canonicalDeviceId phải đúng định dạng TT-XXXXX-XXXXX-XXXXX-XXXXX.
+    /// </summary>
+    public static bool TryRebindCanonicalDeviceId(
+        string baseDir,
+        string expectedCurrentDeviceId,
+        string canonicalDeviceId,
+        out string reason)
+    {
+        try
+        {
+            Directory.CreateDirectory(DeviceAccessRoot);
+
+            var expected = (expectedCurrentDeviceId ?? "").Trim();
+            var canonical = (canonicalDeviceId ?? "").Trim().ToUpperInvariant();
+            if (!IsValidDeviceId(canonical))
+            {
+                reason = "Mã thiết bị chuẩn QITool không hợp lệ.";
+                return false;
+            }
+
+            var identity = LoadIdentity();
+            if (identity is null || string.IsNullOrWhiteSpace(identity.DeviceId))
+            {
+                reason = "Không tìm thấy nhận diện thiết bị local để phục hồi.";
+                return false;
+            }
+
+            if (!string.Equals(identity.DeviceId, expected, StringComparison.OrdinalIgnoreCase))
+            {
+                reason = "Mã thiết bị local đã thay đổi trong lúc phục hồi; từ chối re-bind.";
+                return false;
+            }
+
+            var fingerprint = ComputeMachineFingerprint();
+            if (!FixedEquals(identity.FingerprintHash, fingerprint))
+            {
+                reason = "Fingerprint thiết bị không khớp; từ chối re-bind.";
+                return false;
+            }
+
+            if (string.Equals(identity.DeviceId, canonical, StringComparison.OrdinalIgnoreCase))
+            {
+                reason = "Mã thiết bị local đã là mã chuẩn QITool.";
+                return true;
+            }
+
+            var oldId = identity.DeviceId;
+            identity.DeviceId = canonical;
+            identity.LastSeenUtc = DateTime.UtcNow;
+
+            // Re-bind chỉ phục hồi danh tính, không tự cấp quyền. Máy local đang pending
+            // vẫn phải nhận allowed từ server rồi mới đi qua TryActivateFromCloudApproval.
+            if (!identity.Activated)
+                identity.ActivationSource = "qitool_rebind_pending";
+
+            SaveIdentity(identity);
+
+            if (identity.Activated)
+                TryWriteMigrationConsumedMarker(baseDir, identity, "qitool_rebind_canonical");
+
+            reason = $"Đã phục hồi mã thiết bị QITool từ {oldId} về {canonical}.";
+            AppendAudit(baseDir,
+                $"[DEVICE_QITOOL_REBIND] oldId={SafeOneLine(oldId)} canonicalId={SafeOneLine(canonical)} " +
+                $"activated={identity.Activated} source={SafeOneLine(identity.ActivationSource)}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            reason = "Không thể phục hồi mã thiết bị QITool: " + ex.Message;
+            AppendAudit(baseDir, $"[DEVICE_QITOOL_REBIND_FAIL] detail={SafeOneLine(ex.Message)}");
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Chuyển một thiết bị PENDING thuần túy sang activated sau khi QITool server trả allowed.
     /// Phương thức này tự kiểm tra lại fingerprint + DeviceId + marker để không biến cloud approval
     /// thành đường bypass cho dữ liệu kích hoạt bị copy/mismatch.
@@ -501,6 +582,12 @@ public static class DeviceAccessService
         // allowed cho ĐÚNG DeviceId + fingerprint hiện tại. Việc chỉ copy thư mục
         // sang máy khác không tự mở khóa nếu chưa được admin duyệt trên QITool.
         if (string.Equals(source, "migration_consumed_pending", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // Chỉ được tạo bởi TryRebindCanonicalDeviceId sau khi server đã xác nhận
+        // fingerprint hiện tại thuộc đúng một device record có sẵn. Vẫn phải chờ
+        // register lần 2 trả allowed trước khi kích hoạt local.
+        if (string.Equals(source, "qitool_rebind_pending", StringComparison.OrdinalIgnoreCase))
             return true;
 
         // fingerprint_mismatch_pending và mọi nguồn không rõ vẫn fail-closed.
@@ -757,6 +844,22 @@ public static class DeviceAccessService
         }
         catch { }
         return "";
+    }
+
+    static bool IsValidDeviceId(string? value)
+    {
+        var text = (value ?? "").Trim().ToUpperInvariant();
+        var parts = text.Split('-', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length != 5 || !string.Equals(parts[0], "TT", StringComparison.Ordinal))
+            return false;
+
+        for (var i = 1; i < parts.Length; i++)
+        {
+            if (parts[i].Length != 5 || parts[i].Any(c => !Uri.IsHexDigit(c)))
+                return false;
+        }
+
+        return true;
     }
 
     static string NewDeviceId()

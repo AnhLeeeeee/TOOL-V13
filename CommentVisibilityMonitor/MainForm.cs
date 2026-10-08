@@ -18,6 +18,11 @@ internal sealed partial class MainForm : Form
     readonly Dictionary<string, PendingSend> _pending = new(StringComparer.Ordinal);
     readonly Dictionary<string, LiveLatencyState> _liveLatency = new(StringComparer.OrdinalIgnoreCase);
     readonly System.Windows.Forms.Timer _uiTimer = new() { Interval = 1000 };
+    static readonly TimeSpan ManagerOpenSnapshotFreshness = TimeSpan.FromSeconds(8);
+    DateTime _lastManagerOpenSnapshotUtc = DateTime.MinValue;
+    string _managerOpenSnapshotInstanceId = "";
+    long _lastManagerOpenSnapshotSeq;
+    string _lastManagerOpenSetKey = "";
 
     // User rule: mỗi comment được Observer chờ/quét tối đa cố định 30 giây.
     // Giữ cùng một giá trị min/max để adaptive learning không rút ngắn timeout
@@ -44,6 +49,7 @@ internal sealed partial class MainForm : Form
     readonly ComboBox _quickProfile = new() { Width = 92, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(8, 4, 2, 0) };
     readonly Button _quickCheck = new() { Text = "CHECK NGAY", AutoSize = true };
     readonly Button _history = new() { Text = "LỊCH SỬ CHECK", AutoSize = true };
+    readonly Button _statistics = new() { Text = "THỐNG KÊ", AutoSize = true };
     readonly Label _observerLoginState = new() { AutoSize = true, Text = "Login: —", Margin = new Padding(8, 7, 0, 0) };
     string _observerLoginUsernameValue = "";
     string _observerLoginPasswordValue = "";
@@ -52,11 +58,17 @@ internal sealed partial class MainForm : Form
     readonly TextBox _log = new() { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, WordWrap = false };
 
     bool _checking;
+    bool _startingCheck;
+    bool _receiveLoopStarted;
     bool _banCheckRunning;
     BanCheckForm? _banCheckForm;
+    CommentCheckStatisticsForm? _statisticsForm;
     string _targetProfile = "";
     CycleState? _cycle;
     int _rotationSeed = -1;
+    // Một vòng auto: mỗi PRF RUNNING chỉ được chọn một lần. Khi toàn bộ PRF
+    // đang đủ điều kiện đã được ghé qua thì mới xóa tập này và bắt đầu vòng mới.
+    readonly HashSet<string> _rotationVisited = new(StringComparer.OrdinalIgnoreCase);
     bool _followInFlight;
     string _followRequestedUrl = "";
     string _authorizedLiveUrl = "";
@@ -102,7 +114,7 @@ internal sealed partial class MainForm : Form
         quickBar.Controls.AddRange(new Control[]
         {
             new Label { Text = "PRF cần kiểm tra:", AutoSize = true, Margin = new Padding(0, 8, 2, 0) },
-            _quickProfile, _quickCheck, _history
+            _quickProfile, _quickCheck, _history, _statistics
         });
 
         var statusBar = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = true, Margin = new Padding(0) };
@@ -127,11 +139,12 @@ internal sealed partial class MainForm : Form
 
         _openObserver.Click += async (_, _) => await OpenObserverAsync();
         _observerLogin.Click += async (_, _) => await LoginObserverAsync();
-        _start.Click += (_, _) => StartChecking();
+        _start.Click += async (_, _) => await StartCheckingAsync();
         _stop.Click += (_, _) => StopChecking("Người dùng dừng");
         _exportDiagnostic.Click += (_, _) => ExportDiagnostics();
         _quickCheck.Click += (_, _) => StartQuickCheck();
         _history.Click += (_, _) => OpenHistoryWindow();
+        _statistics.Click += (_, _) => OpenStatisticsWindow();
         _banCheck.Click += (_, _) => OpenBanCheckWindow();
         _uiTimer.Tick += (_, _) => OnUiTick();
         _uiTimer.Start();
@@ -143,9 +156,9 @@ internal sealed partial class MainForm : Form
             try { await _observer.DisposeAsync(); } catch { }
         };
 
-        _ = ReceiveLoopAsync();
-        Log($"Đang nghe telemetry localhost UDP {TelemetryPort}. Module này không gửi lệnh điều khiển về Worker/Manager.");
-        Log("Bước đầu: bấm 'Mở Chrome Observer'. Khi cần đăng nhập, bấm nút 'Đăng nhập' để mở cửa sổ TK/MK/2FA; sau đó bấm 'Bắt đầu kiểm tra'.");
+        Shown += (_, _) => StartReceiveLoopAfterUiReady();
+        Log($"Telemetry localhost UDP {TelemetryPort} sẽ bắt đầu nhận sau khi cửa sổ tạo xong handle. Module này không gửi lệnh điều khiển về Worker/Manager.");
+        Log("Bấm 'Bắt đầu kiểm tra' sẽ tự mở/kết nối Chrome Observer nếu chưa mở. Nút 'Mở Chrome Observer' vẫn giữ để mở thủ công/debug; khi cần đăng nhập, bấm nút 'Đăng nhập'.");
         Log("Nút 'Xuất ZIP chẩn đoán' chỉ gom log/trạng thái; KHÔNG lấy thư mục ObserverChrome, cookie hay file thông tin đăng nhập Observer.");
     }
 
@@ -423,9 +436,9 @@ internal sealed partial class MainForm : Form
         finally { _openObserver.Enabled = true; }
     }
 
-    void StartChecking()
+    async Task StartCheckingAsync()
     {
-        if (_checking) return;
+        if (_checking || _startingCheck) return;
 
         var policy = RemotePolicyShadowReader.Evaluate("comment_check");
         Log(
@@ -455,16 +468,70 @@ internal sealed partial class MainForm : Form
                 MessageBoxIcon.Information);
             return;
         }
-        ResetCurrentRunStatistics();
-        _checking = true;
-        _start.Enabled = false; _stop.Enabled = true;
-        _cycle = null;
-        _resumeCycle = null;
-        _resumeProfile = "";
-        _manualTarget = false;
-        _targetProfile = "";
-        ChooseNextTarget();
-        Log($"Đã bật kiểm tra xoay vòng {ProfileCheckMinutes} phút/PRF. Observer chỉ follow LIVE sau SENT thành công; lỗi tạm không đổi PRF, chỉ Manager xác nhận thay/retire mới chuyển sớm.");
+
+        _startingCheck = true;
+        _start.Enabled = false;
+        _openObserver.Enabled = false;
+        UseWaitCursor = true;
+
+        try
+        {
+            if (!_observer.Connected)
+            {
+                _observerState.Text = "Observer: 🟡 đang mở...";
+                Log("[START_CHECK_AUTO_OPEN_OBSERVER_BEGIN] Chrome Observer chưa kết nối; tự mở trước khi bắt đầu check.");
+            }
+            else
+            {
+                Log("[START_CHECK_AUTO_OPEN_OBSERVER_REUSE] Chrome Observer đã kết nối; dùng lại phiên hiện tại.");
+            }
+
+            // Dùng đúng lifecycle Mở Chrome Observer hiện có: attach phiên cũ nếu còn,
+            // nếu chưa có thì launch Chrome riêng và chờ kết nối CDP hoàn tất.
+            await _observer.EnsureStartedAsync();
+
+            if (!_observer.Connected)
+                throw new InvalidOperationException("Chrome Observer chưa sẵn sàng sau khi mở/kết nối.");
+
+            _observerState.Text = "Observer: 🟢 đã kết nối";
+            Log("[START_CHECK_AUTO_OPEN_OBSERVER_READY] Chrome Observer/CDP đã sẵn sàng; bắt đầu vòng check.");
+
+            // Chỉ bắt đầu phiên 5 phút sau khi Observer thật sự READY.
+            ResetCurrentRunStatistics();
+            _checking = true;
+            _stop.Enabled = true;
+            _cycle = null;
+            _resumeCycle = null;
+            _resumeProfile = "";
+            _manualTarget = false;
+            _targetProfile = "";
+            _rotationVisited.Clear();
+            ChooseNextTarget();
+            Log($"Đã bật kiểm tra xoay vòng cứng {ProfileCheckMinutes} phút/PRF: đồng hồ bắt đầu ngay khi PRF được chọn; hết {ProfileCheckMinutes} phút bắt buộc ngắt/chuyển PRF kế tiếp; đi hết hàng chờ rồi mới xoay vòng lại.");
+        }
+        catch (OperationCanceledException)
+        {
+            _observerState.Text = _observer.Connected ? "Observer: 🟢 đã kết nối" : "Observer: ⚪ chưa mở";
+            Log("[START_CHECK_AUTO_OPEN_OBSERVER_CANCELLED] Đã hủy trước khi bắt đầu vòng check.");
+        }
+        catch (Exception ex)
+        {
+            _observerState.Text = "Observer: 🔴 lỗi";
+            Log("[START_CHECK_AUTO_OPEN_OBSERVER_ERROR] " + ex);
+            MessageBox.Show(
+                this,
+                "Không mở/kết nối được Chrome Observer nên chưa bắt đầu CHECK CMT.\n\n" + ex.Message,
+                "Check CMT",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
+        finally
+        {
+            _startingCheck = false;
+            _openObserver.Enabled = true;
+            UseWaitCursor = false;
+            _start.Enabled = !_checking && !_banCheckRunning;
+        }
     }
 
     void StopChecking(string reason)
@@ -488,6 +555,7 @@ internal sealed partial class MainForm : Form
         _resumeProfile = "";
         _manualTarget = false;
         _targetProfile = "";
+        _rotationVisited.Clear();
         _targetState.Text = "Đang kiểm tra: —";
         _cycleState.Text = "Phiên: —";
         _summaryState.Text = "Tỷ lệ TB: —";
@@ -496,6 +564,17 @@ internal sealed partial class MainForm : Form
 
     void OpenBanCheckWindow()
     {
+        if (_startingCheck)
+        {
+            MessageBox.Show(
+                this,
+                "Chrome Observer đang được mở để bắt đầu CHECK CMT. Hãy đợi thao tác mở Chrome hoàn tất.",
+                "CHECK BAN",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
         if (_banCheckForm is not null && !_banCheckForm.IsDisposed)
         {
             try
@@ -513,7 +592,7 @@ internal sealed partial class MainForm : Form
             _observer,
             _dataDir,
             Log,
-            canStart: () => !_checking && !_banCheckRunning,
+            canStart: () => !_checking && !_startingCheck && !_banCheckRunning,
             runningChanged: running =>
             {
                 _banCheckRunning = running;
@@ -530,6 +609,44 @@ internal sealed partial class MainForm : Form
         _banCheckForm.Show(this);
     }
 
+    void StartReceiveLoopAfterUiReady()
+    {
+        if (_receiveLoopStarted || _cts.IsCancellationRequested || IsDisposed || Disposing)
+            return;
+
+        // Shown chỉ chạy sau khi WinForms đã tạo window handle. Điều này tránh race-condition
+        // trên PC/VM khi Manager/Worker đã chạy trước và UDP telemetry tới ngay lúc form còn
+        // đang khởi tạo, khiến BeginInvoke ném InvalidOperationException và làm chết receive loop.
+        if (!IsHandleCreated)
+            return;
+
+        _receiveLoopStarted = true;
+        _ = ReceiveLoopAsync();
+        Log($"Đang nghe telemetry localhost UDP {TelemetryPort}. UI handle đã sẵn sàng; Manager/PRF có thể chạy trước hoặc sau Check CMT.");
+    }
+
+    bool TryPostToUi(Action action)
+    {
+        if (_cts.IsCancellationRequested || IsDisposed || Disposing || !IsHandleCreated)
+            return false;
+
+        try
+        {
+            BeginInvoke(action);
+            return true;
+        }
+        catch (ObjectDisposedException)
+        {
+            return false;
+        }
+        catch (InvalidOperationException)
+        {
+            // Handle có thể bị recreate/teardown đúng lúc packet tới. Không để một packet UI
+            // làm chết receive loop; Manager gửi full snapshot định kỳ nên trạng thái sẽ tự hồi phục.
+            return false;
+        }
+    }
+
     async Task ReceiveLoopAsync()
     {
         while (!_cts.IsCancellationRequested)
@@ -539,21 +656,37 @@ internal sealed partial class MainForm : Form
                 var r = await _udp.ReceiveAsync(_cts.Token);
                 var raw = Encoding.UTF8.GetString(r.Buffer);
                 var msg = JsonSerializer.Deserialize<TelemetryMessage>(raw);
-                if (msg is null || string.IsNullOrWhiteSpace(msg.Profile)) continue;
-                if (!IsDisposed) BeginInvoke(new Action(() => HandleTelemetry(msg)));
+                if (msg is null) continue;
+                var isManagerSnapshot = msg.Type.Equals("MANAGER_OPEN_SNAPSHOT", StringComparison.OrdinalIgnoreCase);
+                if (!isManagerSnapshot && string.IsNullOrWhiteSpace(msg.Profile)) continue;
+
+                // Nếu UI vừa mất/recreate handle, bỏ riêng packet này nhưng giữ receiver sống.
+                // Full MANAGER_OPEN_SNAPSHOT định kỳ sẽ đồng bộ lại toàn bộ PRF đang mở.
+                TryPostToUi(() => HandleTelemetry(msg));
             }
             catch (OperationCanceledException) { break; }
             catch (ObjectDisposedException) { break; }
             catch (Exception ex)
             {
-                if (!IsDisposed) BeginInvoke(new Action(() => Log("TELEMETRY ERROR: " + ex)));
-                await Task.Delay(500);
+                // Tuyệt đối không dùng BeginInvoke trực tiếp trong catch: chính việc log lỗi khi
+                // handle chưa sẵn sàng từng làm ReceiveLoopAsync fault trên PC/VM.
+                TryPostToUi(() => Log("TELEMETRY ERROR: " + ex));
+                try { await Task.Delay(500, _cts.Token); }
+                catch (OperationCanceledException) { break; }
             }
         }
     }
 
     void HandleTelemetry(TelemetryMessage m)
     {
+        if (m.Type.Equals("MANAGER_OPEN_SNAPSHOT", StringComparison.OrdinalIgnoreCase))
+        {
+            HandleManagerOpenSnapshot(m);
+            RefreshQuickProfileChoices();
+            RefreshGrid();
+            return;
+        }
+
         if (m.Type.Equals("MANAGER_STATE", StringComparison.OrdinalIgnoreCase))
         {
             HandleManagerStateTelemetry(m);
@@ -694,24 +827,32 @@ internal sealed partial class MainForm : Form
             return;
         }
 
+        // Bình thường Cycle đã được tạo ngay lúc ActivateTarget để 5 phút được tính
+        // từ lúc PRF được chọn, không phụ thuộc PRF có phát SENT hay chưa. Nhánh này
+        // chỉ là self-heal phòng trường hợp state bị mất ngoài ý muốn.
         if (_cycle is null)
         {
-            _cycle = new CycleState
-            {
-                SessionId = Guid.NewGuid().ToString("N"),
-                Profile = m.Profile,
-                Username = m.Username ?? "",
-                Expected = m.ContentTotal,
-                StartIndex = m.ContentIndex,
-                CreatedUtc = DateTime.UtcNow,
-                IsManual = _manualTarget
-            };
-            Log($"[SESSION_READY] PRF={m.Profile} observer đã đúng LIVE; chờ SENT đầu tiên để bắt đầu đồng hồ {ProfileCheckMinutes} phút.");
-            if (string.IsNullOrWhiteSpace(m.Username))
-                Log($"[MATCH_WARN] PRF={m.Profile} không có TikTok handle hợp lệ trong tiktok_auth.json; lượt này phải match theo nội dung và độ tin cậy thấp hơn.");
+            _cycle = CreateTargetCycle(m.Profile, _manualTarget);
+            Log($"[SESSION_SLOT_RECOVERED] PRF={m.Profile} start={_cycle.StartedUtc:O} deadline={_cycle.DeadlineUtc:O}");
         }
 
         if (_cycle.Profile != m.Profile || _cycle.Closing) return;
+
+        var firstTelemetryForCycle = _cycle.Expected <= 0;
+        if (firstTelemetryForCycle)
+        {
+            _cycle.Expected = m.ContentTotal;
+            _cycle.StartIndex = m.ContentIndex;
+        }
+        if (!string.IsNullOrWhiteSpace(m.Username))
+            _cycle.Username = m.Username;
+
+        if (firstTelemetryForCycle)
+        {
+            Log($"[SESSION_READY] PRF={m.Profile} observer đã đúng LIVE; slot 5 phút đã chạy từ {_cycle.StartedUtc:O}, còn={FormatRemaining(_cycle)}.");
+            if (string.IsNullOrWhiteSpace(m.Username))
+                Log($"[MATCH_WARN] PRF={m.Profile} không có TikTok handle hợp lệ trong tiktok_auth.json; lượt này phải match theo nội dung và độ tin cậy thấp hơn.");
+        }
 
         var willSendUtc = TelemetryUtcOrNow(m.SentAtUtcMs);
         if (_cycle.StartedUtc != default && willSendUtc >= _cycle.DeadlineUtc)
@@ -813,13 +954,10 @@ internal sealed partial class MainForm : Form
 
         pending.SentConfirmedUtc = TelemetryUtcOrNow(m.SentAtUtcMs);
 
-        if (_cycle.StartedUtc == default)
-        {
-            _cycle.StartedUtc = pending.SentConfirmedUtc;
-            _cycle.DeadlineUtc = _cycle.StartedUtc.Add(ProfileCheckDuration);
-            _cycle.Username = string.IsNullOrWhiteSpace(m.Username) ? _cycle.Username : m.Username;
-            Log($"[SESSION_START_5M] PRF={m.Profile} start={_cycle.StartedUtc:O} deadline={_cycle.DeadlineUtc:O} manual={_cycle.IsManual}");
-        }
+        if (!string.IsNullOrWhiteSpace(m.Username))
+            _cycle.Username = m.Username;
+        if (_cycle.SentCount == 0)
+            Log($"[SESSION_FIRST_SENT] PRF={m.Profile} sentAt={pending.SentConfirmedUtc:O} slotStart={_cycle.StartedUtc:O} deadline={_cycle.DeadlineUtc:O} remain={FormatRemaining(_cycle)} manual={_cycle.IsManual}");
 
         if (_cycle.Closing || pending.WillSendUtc >= _cycle.DeadlineUtc)
         {
@@ -908,7 +1046,7 @@ internal sealed partial class MainForm : Form
         catch (Exception ex)
         {
             result = ResultKind.Unknown;
-            if (!IsDisposed) BeginInvoke(new Action(() => Log($"[RESOLVE_ERROR] PRF={p.Profile} send={p.SendId} cmt={p.ContentIndex} error={ex}")));
+            TryPostToUi(() => Log($"[RESOLVE_ERROR] PRF={p.Profile} send={p.SendId} cmt={p.ContentIndex} error={ex}"));
         }
         finally
         {
@@ -916,7 +1054,7 @@ internal sealed partial class MainForm : Form
         }
 
         if (IsDisposed) return;
-        BeginInvoke(new Action(() => ApplyResolvedResult(p, result, mode, latencySeconds, timeoutUsed)));
+        TryPostToUi(() => ApplyResolvedResult(p, result, mode, latencySeconds, timeoutUsed));
     }
 
     void ApplyResolvedResult(PendingSend p, ResultKind result, string mode, double latencySeconds, double timeoutUsed)
@@ -984,10 +1122,23 @@ internal sealed partial class MainForm : Form
             return;
         }
 
-        var currentIndex = active.FindIndex(p => p.Profile.Equals(_targetProfile, StringComparison.OrdinalIgnoreCase));
-        var next = currentIndex >= 0 ? (currentIndex + 1) % active.Count : (_rotationSeed + 1 + active.Count) % active.Count;
-        _rotationSeed = next;
-        ActivateTarget(active[next].Profile, manual: false, cycle: null, reason: "AUTO_ROTATION");
+        // Một vòng chỉ ghé mỗi PRF một lần. PRF mới RUNNING giữa vòng chưa có trong
+        // _rotationVisited nên vẫn được đưa vào phần còn lại của vòng. Chỉ khi không còn
+        // ứng viên chưa ghé mới reset để bắt đầu vòng tiếp theo.
+        var nextProfile = active
+            .Select(p => p.Profile)
+            .FirstOrDefault(profile => !_rotationVisited.Contains(profile));
+
+        if (string.IsNullOrWhiteSpace(nextProfile))
+        {
+            _rotationVisited.Clear();
+            Log($"[ROTATION_ROUND_COMPLETE] active={active.Count}; bắt đầu vòng mới.");
+            nextProfile = active[0].Profile;
+        }
+
+        _rotationVisited.Add(nextProfile);
+        _rotationSeed = active.FindIndex(p => p.Profile.Equals(nextProfile, StringComparison.OrdinalIgnoreCase));
+        ActivateTarget(nextProfile, manual: false, cycle: null, reason: "AUTO_ROTATION");
     }
 
     void OnUiTick()
@@ -1001,38 +1152,34 @@ internal sealed partial class MainForm : Form
             {
                 ChooseNextTarget();
             }
+            else if (HasFreshManagerOpenSnapshot()
+                     && (!_profiles.TryGetValue(_targetProfile, out var openState) || !openState.ManagerPresent))
+            {
+                Log($"[TARGET_MANAGER_CLOSED] PRF={_targetProfile} action=FINISH_AND_ROTATE");
+                FinishCurrentSession("PRF_CLOSED_BY_MANAGER_SNAPSHOT", cancelPendingAsUnknown: true);
+            }
             else if (_profiles.TryGetValue(_targetProfile, out var p) && p.ManagerTerminal)
             {
                 Log($"[TARGET_MANAGER_REPLACED] PRF={_targetProfile} reason={p.ManagerReason} action=FINISH_AND_ROTATE");
                 FinishCurrentSession("MANAGER_REPLACED: " + (string.IsNullOrWhiteSpace(p.ManagerReason) ? "terminal" : p.ManagerReason), cancelPendingAsUnknown: true);
             }
-            else if (_cycle is not null && _cycle.StartedUtc != default)
+            else if (_cycle is not null && _cycle.StartedUtc != default
+                     && DateTime.UtcNow >= _cycle.DeadlineUtc)
             {
-                if (DateTime.UtcNow >= _cycle.DeadlineUtc)
-                    MarkCurrentSessionDeadlineReached();
-
-                if (_cycle.Closing)
-                {
-                    var pendingForSession = PendingForSession(_cycle.SessionId).ToList();
-                    if (pendingForSession.Count == 0)
-                    {
-                        FinishCurrentSession(_cycle.EndReason.Length > 0 ? _cycle.EndReason : "Hết 5 phút", cancelPendingAsUnknown: false);
-                    }
-                    else if (_cycle.DeadlineReachedUtc != default
-                             && DateTime.UtcNow - _cycle.DeadlineReachedUtc >= SessionPendingGrace)
-                    {
-                        Log($"[SESSION_PENDING_GRACE_EXPIRED] PRF={_cycle.Profile} pending={pendingForSession.Count} grace={SessionPendingGrace.TotalSeconds:0}s");
-                        FinishCurrentSession(_cycle.EndReason.Length > 0 ? _cycle.EndReason : "Hết 5 phút", cancelPendingAsUnknown: true);
-                    }
-                }
+                // HARD SLOT: đúng 5 phút kể từ lúc PRF được chọn. Không chờ SENT đầu tiên
+                // và cũng không gia hạn thêm để đợi các comment pending. Pending còn lại
+                // được chốt Unknown rồi chuyển PRF kế tiếp ngay.
+                MarkCurrentSessionDeadlineReached();
             }
 
-            // Mất Worker telemetry hoặc RUNNING tạm thời KHÔNG còn là lý do đổi PRF.
-            // Chỉ ManagerTerminal mới cho phép chuyển sớm trước deadline.
+            // Mất Worker telemetry hoặc RUNNING tạm thời KHÔNG làm slot dừng/đứng vô hạn.
+            // PRF vẫn giữ đúng phần thời gian còn lại của slot 5 phút; đến deadline sẽ
+            // bắt buộc chuyển. Manager terminal/đóng vẫn cho phép chuyển sớm.
             if (!string.IsNullOrWhiteSpace(_targetProfile)
                 && _profiles.TryGetValue(_targetProfile, out var target)
                 && DateTime.UtcNow - target.LastSeenUtc > TimeSpan.FromSeconds(25)
-                && !target.ManagerTerminal)
+                && !target.ManagerTerminal
+                && (!HasFreshManagerOpenSnapshot() || target.ManagerPresent))
             {
                 _targetState.Text = $"Đang kiểm tra: {_targetProfile} · chờ telemetry/lỗi tạm";
             }
@@ -1048,14 +1195,14 @@ internal sealed partial class MainForm : Form
     {
         if (_cycle is null)
         {
-            _cycleState.Text = $"Phiên {ProfileCheckMinutes} phút: chờ CMT đầu tiên sau khi Observer bám đúng LIVE";
+            _cycleState.Text = "Phiên: —";
             _summaryState.Text = string.IsNullOrWhiteSpace(_targetProfile)
                 ? "Tỷ lệ TB: —"
                 : $"Tỷ lệ TB {_targetProfile}: {FormatCurrentRunAverage(_targetProfile)}";
             return;
         }
 
-        var remain = _cycle.StartedUtc == default ? "chưa chạy giờ" : FormatRemaining(_cycle);
+        var remain = FormatRemaining(_cycle);
         _cycleState.Text = $"Phiên {ProfileCheckMinutes} phút: gửi {_cycle.SentCount} • đã quét {_cycle.ResolvedCount} • còn {remain}";
         // Tỷ lệ TB ngoài giao diện chính là tỷ lệ cộng dồn của PRF trong LƯỢT hiện tại,
         // tính từ lúc bấm "Bắt đầu kiểm tra". Nó không reset theo từng phiên 5 phút.
@@ -1080,9 +1227,26 @@ internal sealed partial class MainForm : Form
                || state.Equals("ĐANG THAY/RETIRE", StringComparison.OrdinalIgnoreCase);
     }
 
+    bool HasFreshManagerOpenSnapshot()
+        => _lastManagerOpenSnapshotUtc != default
+           && DateTime.UtcNow - _lastManagerOpenSnapshotUtc < ManagerOpenSnapshotFreshness;
+
     bool IsVisibleOnMainGrid(ProfileState p)
     {
-        // Manager đã xác nhận retire/delete/auto-close là nguồn sự thật ưu tiên.
+        // Khi đã có FULL SNAPSHOT còn fresh, Manager là nguồn sự thật tuyệt đối về
+        // profile đang MỞ. RUNNING/PAUSED/OPENING/STOPPED chỉ là trạng thái hiển thị;
+        // không được dùng các state này để làm mất dòng khỏi giao diện chính.
+        if (HasFreshManagerOpenSnapshot())
+            return p.ManagerPresent;
+
+        // Profile đã từng được FULL SNAPSHOT xác nhận đóng không được phép sống lại
+        // chỉ vì còn một HEARTBEAT Worker cũ trong cửa sổ 20 giây.
+        if (!p.ManagerPresent
+            && p.ManagerReason.Equals("NOT_IN_OPEN_SNAPSHOT", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        // Tương thích/fail-open nếu đang chạy với Manager cũ hoặc Manager telemetry
+        // tạm mất: dùng MANAGER_STATE/Worker fresh như logic cũ.
         if (p.ManagerTerminal)
             return false;
 
@@ -1090,16 +1254,10 @@ internal sealed partial class MainForm : Form
         var managerFresh =
             p.ManagerPresent
             && p.LastManagerSeenUtc != default
-            && now - p.LastManagerSeenUtc < TimeSpan.FromSeconds(8);
+            && now - p.LastManagerSeenUtc < ManagerOpenSnapshotFreshness;
 
         if (managerFresh && !string.IsNullOrWhiteSpace(p.ManagerRunState))
-        {
-            // Manager hiện chỉ phát telemetry cho RUNNING / PAUSED / RECOVERING
-            // (ngoài terminal). Không khóa cứng 2 tên RUNNING/RECOVERING để nếu
-            // sau này Manager có trạng thái trung gian nhưng vẫn thuộc active fleet
-            // thì Check CMT vẫn hiển thị, chỉ loại các trạng thái inactive rõ ràng.
             return !IsExplicitlyInactiveProfileState(p.ManagerRunState);
-        }
 
         var workerFresh =
             p.LastSeenUtc != default
@@ -1108,17 +1266,23 @@ internal sealed partial class MainForm : Form
         if (!workerFresh || string.IsNullOrWhiteSpace(p.RunState))
             return false;
 
-        // Fallback chỉ dùng telemetry Worker đang còn sống/fresh.
         return !IsExplicitlyInactiveProfileState(p.RunState);
     }
 
     string GetMainGridProfileState(ProfileState p)
     {
+        if (HasFreshManagerOpenSnapshot())
+        {
+            if (!p.ManagerPresent) return "CLOSED";
+            if (p.ManagerTerminal) return "ĐANG ĐÓNG";
+            return string.IsNullOrWhiteSpace(p.ManagerRunState) ? "OPEN" : p.ManagerRunState;
+        }
+
         var now = DateTime.UtcNow;
         var managerFresh =
             p.ManagerPresent
             && p.LastManagerSeenUtc != default
-            && now - p.LastManagerSeenUtc < TimeSpan.FromSeconds(8);
+            && now - p.LastManagerSeenUtc < ManagerOpenSnapshotFreshness;
 
         if (managerFresh && !string.IsNullOrWhiteSpace(p.ManagerRunState))
             return p.ManagerRunState;
@@ -1144,11 +1308,7 @@ internal sealed partial class MainForm : Form
             var state = GetMainGridProfileState(p);
             var isTarget = p.Profile.Equals(_targetProfile, StringComparison.OrdinalIgnoreCase);
             var progress = isTarget
-                ? (_cycle is null
-                    ? "Chờ SENT"
-                    : _cycle.StartedUtc == default
-                        ? "Chờ CMT"
-                        : FormatRemaining(_cycle))
+                ? (_cycle is null ? $"{ProfileCheckMinutes:00}:00" : FormatRemaining(_cycle))
                 : "Chờ";
 
             // CMT = số HIỆN / số ĐÃ GỬI, cộng dồn từ lúc bấm Bắt đầu kiểm tra.
@@ -1282,6 +1442,14 @@ internal sealed partial class MainForm : Form
         {
             Timestamp = DateTimeOffset.Now,
             Checking = _checking,
+            ManagerOpenSnapshot = new
+            {
+                InstanceId = _managerOpenSnapshotInstanceId,
+                LastSeq = _lastManagerOpenSnapshotSeq,
+                LastSeenUtc = _lastManagerOpenSnapshotUtc,
+                Fresh = HasFreshManagerOpenSnapshot(),
+                OpenCount = _profiles.Values.Count(x => x.ManagerPresent)
+            },
             TargetProfile = _targetProfile,
             Observer = new
             {
@@ -1310,6 +1478,8 @@ internal sealed partial class MainForm : Form
                 _cycle.DeadlineUtc,
                 _cycle.Closing,
                 _cycle.IsManual,
+                _cycle.OpenSessionId,
+                _cycle.ProfileOpenedAtUtc,
                 Remaining = FormatRemaining(_cycle)
             },
             Pending = _pending.Values.Select(x => new
@@ -1355,7 +1525,9 @@ internal sealed partial class MainForm : Form
                     x.ManagerTerminal,
                     x.ManagerReason,
                     x.ManagerRunState,
-                    x.LastManagerSeenUtc
+                    x.LastManagerSeenUtc,
+                    x.ManagerOpenSessionId,
+                    x.ManagerOpenedAtUtc
                 })
                 .ToArray()
         };
@@ -1485,7 +1657,19 @@ internal sealed partial class MainForm : Form
         public bool ManagerTerminal { get; set; }
         public string ManagerReason { get; set; } = "";
         public string ManagerRunState { get; set; } = "";
+        public string ManagerInstanceId { get; set; } = "";
         public long ManagerSeq { get; set; }
+        public List<ManagerOpenProfileTelemetry>? Profiles { get; set; }
+    }
+
+    sealed class ManagerOpenProfileTelemetry
+    {
+        public string Profile { get; set; } = "";
+        public string RunState { get; set; } = "";
+        public bool ManagerTerminal { get; set; }
+        public string ManagerReason { get; set; } = "";
+        public string OpenSessionId { get; set; } = "";
+        public long OpenedAtUtcMs { get; set; }
     }
 
     sealed class ProfileState
@@ -1510,6 +1694,8 @@ internal sealed partial class MainForm : Form
         public string ManagerRunState { get; set; } = "";
         public DateTime LastManagerSeenUtc { get; set; }
         public long ManagerSeq { get; set; }
+        public string ManagerOpenSessionId { get; set; } = "";
+        public DateTime ManagerOpenedAtUtc { get; set; }
     }
 
     sealed class HistoryAverageState
@@ -1574,6 +1760,8 @@ internal sealed partial class MainForm : Form
         public DateTime DeadlineReachedUtc { get; set; }
         public bool Closing { get; set; }
         public bool IsManual { get; set; }
+        public string OpenSessionId { get; set; } = "";
+        public DateTime ProfileOpenedAtUtc { get; set; }
         public string EndReason { get; set; } = "";
         public HashSet<long> SeenSendIds { get; } = new();
         public List<CommentResult> Details { get; } = new();

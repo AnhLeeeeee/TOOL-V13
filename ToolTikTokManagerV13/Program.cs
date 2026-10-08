@@ -1,4 +1,4 @@
-﻿using ToolTikTokV12.Services;
+using ToolTikTokV12.Services;
 using ToolTikTokV12.Utils;
 
 namespace ToolTikTokManagerV13;
@@ -66,7 +66,7 @@ internal static class Program
 
             // QITool License Server - SHADOW MODE.
             // Register được gọi trước gate local để máy mới/PENDING cũng xuất hiện trên web quản lý.
-            // Kết quả server ở bản vá này CHỈ ghi log, chưa thay đổi quyền AllowRun cũ.
+            // Register chạy trước gate local để xử lý pending, remote lock và self-heal DeviceId sau reinstall.
             using var licenseServer = LicenseServerClient.TryCreate(
                 baseDir,
                 access.DeviceId,
@@ -74,6 +74,8 @@ internal static class Program
                 AppVersionInfo.Current);
 
             LicenseServerDecision? registerDecision = null;
+            string? rebindPreviousDeviceId = null;
+            string? rebindCanonicalDeviceId = null;
             if (licenseServer is not null)
             {
                 registerDecision = licenseServer
@@ -88,6 +90,86 @@ internal static class Program
                     $"status={ManagerProcessDiagnostics.OneLine(registerDecision.Status)} " +
                     $"localAllowRun={access.AllowRun} cloudEligible={access.CloudApprovalEligible} " +
                     $"denyCode={ManagerProcessDiagnostics.OneLine(access.DenyCode)} action=shadow_or_safe_hybrid");
+            }
+
+            // QITool REINSTALL SELF-HEAL:
+            // Nếu server nhận ra đúng fingerprint nhưng DeviceId local bị sinh lại sau reinstall,
+            // phục hồi local về canonical DeviceId của server rồi register lại đúng 1 lần.
+            if (licenseServer is not null
+                && LicenseServerClient.IsRebindRequired(registerDecision))
+            {
+                var previousDeviceId = access.DeviceId;
+                var canonicalDeviceId = (registerDecision?.CanonicalDeviceId ?? "").Trim();
+                rebindPreviousDeviceId = previousDeviceId;
+                rebindCanonicalDeviceId = canonicalDeviceId;
+
+                ManagerProcessDiagnostics.Append(
+                    $"[QITOOL_REBIND_REQUIRED] oldDevice={previousDeviceId} " +
+                    $"canonicalDevice={ManagerProcessDiagnostics.OneLine(canonicalDeviceId)} action=restore_local_identity");
+
+                if (!DeviceAccessService.TryRebindCanonicalDeviceId(
+                        baseDir,
+                        previousDeviceId,
+                        canonicalDeviceId,
+                        out var rebindReason))
+                {
+                    ManagerProcessDiagnostics.Append(
+                        $"[QITOOL_REBIND_LOCAL_FAIL] oldDevice={previousDeviceId} " +
+                        $"canonicalDevice={ManagerProcessDiagnostics.OneLine(canonicalDeviceId)} " +
+                        $"detail={ManagerProcessDiagnostics.OneLine(rebindReason)}");
+
+                    MessageBox.Show(
+                        "Không thể phục hồi nhận diện thiết bị sau khi cài lại Tool.\n\n" +
+                        rebindReason +
+                        "\n\nTool chưa thay đổi quyền sử dụng. Hãy gửi log chẩn đoán để kiểm tra.",
+                        "Tool TikTok — Phục hồi mã thiết bị",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                    return;
+                }
+
+                access = DeviceAccessService
+                    .EvaluateStartupAsync(baseDir, AppVersionInfo.Current)
+                    .GetAwaiter()
+                    .GetResult();
+
+                if (!string.Equals(
+                        access.DeviceId,
+                        canonicalDeviceId,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    ManagerProcessDiagnostics.Append(
+                        $"[QITOOL_REBIND_VERIFY_FAIL] expected={ManagerProcessDiagnostics.OneLine(canonicalDeviceId)} " +
+                        $"actual={ManagerProcessDiagnostics.OneLine(access.DeviceId)} action=stop");
+                    return;
+                }
+
+                licenseServer.UseCanonicalDeviceId(canonicalDeviceId);
+                registerDecision = licenseServer
+                    .RegisterAsync()
+                    .GetAwaiter()
+                    .GetResult();
+
+                ManagerProcessDiagnostics.Append(
+                    $"[QITOOL_REBIND_REGISTER_RECHECK] device={access.DeviceId} " +
+                    $"reachable={registerDecision.Reachable} http={registerDecision.HttpStatus} " +
+                    $"allowed={(registerDecision.Allowed is null ? "unknown" : registerDecision.Allowed.Value ? "true" : "false")} " +
+                    $"status={ManagerProcessDiagnostics.OneLine(registerDecision.Status)} " +
+                    $"detail={ManagerProcessDiagnostics.OneLine(rebindReason)}");
+
+                // Không chấp nhận vòng rebind lặp do server/client không nhất quán.
+                if (LicenseServerClient.IsRebindRequired(registerDecision))
+                {
+                    ManagerProcessDiagnostics.Append(
+                        $"[QITOOL_REBIND_LOOP_BLOCK] device={access.DeviceId} action=stop");
+                    MessageBox.Show(
+                        "QITool vẫn yêu cầu phục hồi mã máy sau khi đã re-bind.\n\n" +
+                        "Tool đã dừng để tránh thay đổi nhận diện lặp. Hãy gửi log chẩn đoán.",
+                        "Tool TikTok — Phục hồi mã thiết bị",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                    return;
+                }
             }
 
             // QITool ADMIN: chỉ server mới có quyền cấp.
@@ -163,6 +245,39 @@ internal static class Program
 
                 ManagerProcessDiagnostics.Append(
                     $"[QITOOL_REMOTE_LOCK_STARTUP_NOT_CONFIRMED] device={access.DeviceId} action=fail_open_continue");
+            }
+
+            // Nếu startup vừa self-heal DeviceId thì phục hồi Version Guard SAU admin/remote-lock.
+            // ADMIN vẫn giữ full bypass như thiết kế cũ; máy bị block không cần sửa local guard.
+            if (!isAdmin
+                && !LicenseServerClient.IsExplicitBlocked(registerDecision)
+                && !string.IsNullOrWhiteSpace(rebindPreviousDeviceId)
+                && !string.IsNullOrWhiteSpace(rebindCanonicalDeviceId))
+            {
+                if (!VersionRollbackGuard.TryRebindDeviceId(
+                        rebindPreviousDeviceId,
+                        rebindCanonicalDeviceId,
+                        out var versionRebindReason))
+                {
+                    ManagerProcessDiagnostics.Append(
+                        $"[QITOOL_REBIND_VERSION_GUARD_FAIL] oldDevice={rebindPreviousDeviceId} " +
+                        $"canonicalDevice={ManagerProcessDiagnostics.OneLine(rebindCanonicalDeviceId)} " +
+                        $"detail={ManagerProcessDiagnostics.OneLine(versionRebindReason)}");
+
+                    MessageBox.Show(
+                        "Đã nhận ra đúng máy nhưng dữ liệu bảo vệ phiên bản không thể tự phục hồi an toàn.\n\n" +
+                        versionRebindReason +
+                        "\n\nTool sẽ không tự xóa hoặc hạ mốc phiên bản.",
+                        "Tool TikTok — Phiên bản không được phép",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                    return;
+                }
+
+                ManagerProcessDiagnostics.Append(
+                    $"[QITOOL_REBIND_VERSION_GUARD_OK] oldDevice={rebindPreviousDeviceId} " +
+                    $"canonicalDevice={ManagerProcessDiagnostics.OneLine(rebindCanonicalDeviceId)} " +
+                    $"detail={ManagerProcessDiagnostics.OneLine(versionRebindReason)}");
             }
 
             // HYBRID CHUYỂN TIẾP AN TOÀN:

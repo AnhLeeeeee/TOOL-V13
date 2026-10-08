@@ -119,51 +119,147 @@ internal sealed class ObserverChromeSession : IAsyncDisposable
         {
             if (_chrome.Connected)
             {
-                await RefreshCurrentUrlCoreAsync();
-                return;
-            }
-
-            // First try to attach to this observer's already-running Chrome on the
-            // dedicated port. This preserves the observer login/profile across monitor restarts.
-            var attached = false;
-            try
-            {
-                var version = await _chrome.GetVersionAsync(_port);
-                if (!string.IsNullOrWhiteSpace(version.WebSocketDebuggerUrl))
+                try
                 {
-                    await _chrome.ConnectAsync(_port);
-                    attached = _chrome.Connected;
+                    await RefreshCurrentUrlCoreAsync();
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    // WebSocket state can look connected for a short time after
+                    // Chrome has died. Drop the stale session and recover below.
+                    _chromeLog.Warn($"[COMMENT_OBSERVER_CONNECTED_PROBE_FAILED] {ex.GetType().Name}: {ex.Message}");
+                    try { await _chrome.DisconnectAsync(TimeSpan.FromSeconds(1)); } catch { }
                 }
             }
-            catch
+
+            // First try to attach to this observer's already-running Chrome on
+            // the dedicated port. This keeps the Observer login/profile intact
+            // across monitor restarts when the previous Chrome is still healthy.
+            if (await TryAttachExistingCoreAsync())
             {
-                attached = false;
+                try
+                {
+                    await CompleteReadyCoreAsync("attach-existing");
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    // The port answered, but the old Observer session is not
+                    // actually usable. Treat it as stale and rebuild cleanly.
+                    _chromeLog.Warn($"[COMMENT_OBSERVER_ATTACH_READY_FAILED] {ex.GetType().Name}: {ex.Message}");
+                    try { await _chrome.DisconnectAsync(TimeSpan.FromSeconds(1)); } catch { }
+                }
             }
 
-            if (!attached)
+            Exception? lastError = null;
+            const int maxAttempts = 2;
+
+            for (var attempt = 1; attempt <= maxAttempts; attempt++)
             {
-                // Reuse the exact launch/profile/CDP lifecycle already used by the main tool,
-                // but with an entirely separate controller, port and profile directory.
-                await _chrome.LaunchAsync(_port, _userDataDir);
-                await _chrome.ConnectAsync(_port);
+                // If CDP is not attachable but this exact dedicated profile is
+                // still owned by chrome.exe, it is an orphan/stale Observer from
+                // a failed launch. Clean ONLY this profile before launching again.
+                var owners = _chrome.DescribeProfileOwners(_userDataDir);
+                if (!string.IsNullOrWhiteSpace(owners))
+                {
+                    _chromeLog.Warn(
+                        $"[COMMENT_OBSERVER_STALE_PROFILE] attempt={attempt}/{maxAttempts} " +
+                        $"profile={_userDataDir} owners={owners}");
+
+                    var remaining = await _chrome.ForceCleanupOwnedProfileProcessesAsync(_userDataDir, _port);
+                    if (remaining.Count > 0)
+                    {
+                        throw new InvalidOperationException(
+                            "Không thể dọn Chrome Observer cũ đang giữ profile. " +
+                            $"ProfilePath={_userDataDir}. PID còn lại={string.Join(',', remaining)}");
+                    }
+                }
+
+                try
+                {
+                    _chromeLog.Info($"[COMMENT_OBSERVER_START_ATTEMPT] attempt={attempt}/{maxAttempts} port={_port} profile={_userDataDir}");
+
+                    // Reuse the exact launch/profile/CDP lifecycle already used
+                    // by the main tool, but with an isolated controller/port/profile.
+                    await _chrome.LaunchAsync(_port, _userDataDir);
+                    await _chrome.ConnectAsync(_port);
+
+                    if (!_chrome.Connected)
+                        throw new InvalidOperationException("Chrome Observer đã mở nhưng ChromeController chưa kết nối CDP.");
+
+                    await CompleteReadyCoreAsync($"launch-attempt-{attempt}");
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex;
+                    _chromeLog.Warn(
+                        $"[COMMENT_OBSERVER_START_FAILED] attempt={attempt}/{maxAttempts} " +
+                        $"error={ex.GetType().Name}: {ex.Message}");
+
+                    // Critical recovery: LaunchAsync can leave Chrome processes
+                    // alive when CDP never becomes ready. If they are not cleaned,
+                    // the next click always fails with "profile đang được sử dụng".
+                    var remaining = await _chrome.ForceCleanupOwnedProfileProcessesAsync(_userDataDir, _port);
+                    if (remaining.Count > 0)
+                    {
+                        throw new InvalidOperationException(
+                            "Chrome Observer mở lỗi và không thể dọn sạch tiến trình cũ. " +
+                            $"ProfilePath={_userDataDir}. PID còn lại={string.Join(',', remaining)}",
+                            ex);
+                    }
+
+                    if (attempt < maxAttempts)
+                    {
+                        _chromeLog.Warn("[COMMENT_OBSERVER_START_RETRY] stale Observer đã được dọn; chờ 800ms rồi thử lại đúng 1 lần.");
+                        await Task.Delay(800);
+                    }
+                }
             }
 
-            if (!_chrome.Connected)
-                throw new InvalidOperationException("Chrome Observer đã mở nhưng ChromeController chưa kết nối CDP.");
-
-            await RefreshCurrentUrlCoreAsync();
-
-            // Do NOT force /live when the user only clicks "Mở Chrome Observer".
-            // ChromeController launches the isolated observer at the normal TikTok entry page.
-            // The monitor navigates to a concrete target LIVE only after checking is started
-            // and telemetry tells us which PRF/LIVE is currently being verified.
-            _chromeLog.Info($"[COMMENT_OBSERVER_READY] port={_port} currentUrl={_currentLiveUrl}");
-            await InstallDomObserverCoreAsync();
+            throw new InvalidOperationException(
+                "Không mở/kết nối được Chrome Observer sau 2 lần thử. Các tiến trình Observer lỗi đã được dọn sạch để lần sau có thể thử lại.",
+                lastError);
         }
         finally
         {
             _gate.Release();
         }
+    }
+
+    async Task<bool> TryAttachExistingCoreAsync()
+    {
+        try
+        {
+            var version = await _chrome.GetVersionAsync(_port);
+            if (string.IsNullOrWhiteSpace(version.WebSocketDebuggerUrl)) return false;
+
+            await _chrome.ConnectAsync(_port);
+            if (!_chrome.Connected) return false;
+
+            _chromeLog.Info($"[COMMENT_OBSERVER_ATTACH_EXISTING_OK] port={_port} profile={_userDataDir}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _chromeLog.Warn($"[COMMENT_OBSERVER_ATTACH_EXISTING_FAIL] port={_port} error={ex.GetType().Name}: {ex.Message}");
+            try { await _chrome.DisconnectAsync(TimeSpan.FromSeconds(1)); } catch { }
+            return false;
+        }
+    }
+
+    async Task CompleteReadyCoreAsync(string source)
+    {
+        if (!_chrome.Connected)
+            throw new InvalidOperationException("Chrome Observer chưa kết nối CDP.");
+
+        await RefreshCurrentUrlCoreAsync();
+
+        // Do NOT force /live when the user only opens the Observer. The monitor
+        // navigates to the concrete target LIVE after checking has started.
+        _chromeLog.Info($"[COMMENT_OBSERVER_READY] source={source} port={_port} currentUrl={_currentLiveUrl}");
+        await InstallDomObserverCoreAsync();
     }
 
     public async Task<bool> EnsureLiveAsync(string liveUrl)

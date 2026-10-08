@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -32,7 +32,7 @@ internal sealed class LicenseServerClient : IDisposable
 
     readonly HttpClient _http;
     readonly LicenseServerConfig _config;
-    readonly string _deviceId;
+    string _deviceId;
     readonly string _deviceHash;
     readonly string _version;
     readonly string _sessionId;
@@ -80,6 +80,30 @@ internal sealed class LicenseServerClient : IDisposable
     }
 
     public string SessionId => _sessionId;
+
+    public string DeviceId => _deviceId;
+
+    public void UseCanonicalDeviceId(string canonicalDeviceId)
+    {
+        var next = (canonicalDeviceId ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(next))
+            throw new ArgumentException("Canonical DeviceId is empty.", nameof(canonicalDeviceId));
+
+        Log($"[LICENSE_SERVER_DEVICE_ID_REBOUND] oldDevice={OneLine(_deviceId)} canonicalDevice={OneLine(next)}");
+        _deviceId = next;
+    }
+
+    public static bool IsRebindRequired(LicenseServerDecision? decision)
+    {
+        if (decision is null || !decision.Reachable || !decision.Ok)
+            return false;
+
+        return string.Equals(
+                   (decision.Status ?? string.Empty).Trim(),
+                   "rebind_required",
+                   StringComparison.OrdinalIgnoreCase)
+               && !string.IsNullOrWhiteSpace(decision.CanonicalDeviceId);
+    }
 
     /// <summary>
     /// Policy mới nhất nhận từ device-heartbeat.
@@ -643,6 +667,7 @@ internal sealed class LicenseServerClient : IDisposable
                 UpdateBlocked: parsed?.UpdateBlocked,
                 Reason: (parsed?.Reason ?? parsed?.Error ?? "").Trim(),
                 Raw: OneLine(responseText, 500),
+                CanonicalDeviceId: (parsed?.CanonicalDeviceId ?? parsed?.DeviceId ?? "").Trim(),
                 PolicyRevision: remotePolicy?.Revision,
                 Policy: remotePolicy);
         }
@@ -664,6 +689,7 @@ internal sealed class LicenseServerClient : IDisposable
                 UpdateBlocked: null,
                 Reason: ex.Message,
                 Raw: "",
+                CanonicalDeviceId: "",
                 PolicyRevision: null,
                 Policy: null);
         }
@@ -677,6 +703,7 @@ internal sealed class LicenseServerClient : IDisposable
             $"status={OneLine(decision.Status)} isNew={FormatBool(decision.IsNew)} " +
             $"isAdmin={FormatBool(decision.IsAdmin)} identityMatched={FormatBool(decision.IdentityMatched)} " +
             $"updateBlocked={FormatBool(decision.UpdateBlocked)} " +
+            $"canonicalDevice={OneLine(decision.CanonicalDeviceId)} " +
             $"policyRevision={(decision.PolicyRevision is null ? "none" : decision.PolicyRevision.Value.ToString())} " +
             $"reason={OneLine(decision.Reason)}");
     }
@@ -740,6 +767,12 @@ internal sealed class LicenseServerClient : IDisposable
         [JsonPropertyName("updateBlocked")]
         public bool? UpdateBlocked { get; set; }
 
+        [JsonPropertyName("deviceId")]
+        public string? DeviceId { get; set; }
+
+        [JsonPropertyName("canonicalDeviceId")]
+        public string? CanonicalDeviceId { get; set; }
+
         [JsonPropertyName("policyRevision")]
         public int? PolicyRevision { get; set; }
 
@@ -766,5 +799,6 @@ internal sealed record LicenseServerDecision(
     bool? UpdateBlocked,
     string Reason,
     string Raw,
+    string CanonicalDeviceId = "",
     int? PolicyRevision = null,
     RemotePolicySnapshot? Policy = null);

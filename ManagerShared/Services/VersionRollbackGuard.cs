@@ -1,4 +1,4 @@
-﻿using Microsoft.Win32;
+using Microsoft.Win32;
 using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text;
@@ -102,6 +102,90 @@ public static class VersionRollbackGuard
     public static DateTime? LastServerPolicyFetchedUtc
     {
         get { lock (Sync) return _lastServerPolicyFetchedUtc; }
+    }
+
+    /// <summary>
+    /// Re-sign HighestVersionEver khi QITool đã xác nhận cùng fingerprint nhưng client
+    /// phải phục hồi DeviceId về canonical ID cũ sau reinstall. Không hạ mốc phiên bản.
+    ///
+    /// Chỉ sửa khi ít nhất một local store hợp lệ với previousDeviceId hoặc canonicalDeviceId.
+    /// Nếu có artifact nhưng không store nào xác minh được chữ ký thì fail-closed.
+    /// </summary>
+    public static bool TryRebindDeviceId(
+        string previousDeviceId,
+        string canonicalDeviceId,
+        out string reason)
+    {
+        lock (Sync)
+        {
+            var previous = (previousDeviceId ?? "").Trim();
+            var canonical = (canonicalDeviceId ?? "").Trim();
+
+            if (string.IsNullOrWhiteSpace(previous) || string.IsNullOrWhiteSpace(canonical))
+            {
+                reason = "Thiếu DeviceId để phục hồi Version Guard.";
+                return false;
+            }
+
+            if (string.Equals(previous, canonical, StringComparison.OrdinalIgnoreCase))
+            {
+                reason = "Version Guard không cần đổi DeviceId.";
+                return true;
+            }
+
+            var fileCanonical = ReadFileRecord(canonical);
+            var registryCanonical = ReadRegistryRecord(canonical);
+            var filePrevious = fileCanonical.Valid ? fileCanonical : ReadFileRecord(previous);
+            var registryPrevious = registryCanonical.Valid ? registryCanonical : ReadRegistryRecord(previous);
+
+            var artifactsExist = fileCanonical.Exists || registryCanonical.Exists;
+            var candidates = new[]
+            {
+                fileCanonical.Valid ? fileCanonical : filePrevious,
+                registryCanonical.Valid ? registryCanonical : registryPrevious
+            }
+            .Where(x => x.Valid && x.Version is not null)
+            .ToArray();
+
+            if (candidates.Length == 0)
+            {
+                if (!artifactsExist)
+                {
+                    reason = "Chưa có dữ liệu Version Guard; không cần migrate.";
+                    AppendAudit($"[VERSION_GUARD_REBIND_NO_RECORD] oldDevice={Safe(previous)} canonicalDevice={Safe(canonical)}");
+                    return true;
+                }
+
+                var detail = string.Join("; ", new[]
+                {
+                    $"fileCanonical:{fileCanonical.Error}",
+                    $"filePrevious:{filePrevious.Error}",
+                    $"registryCanonical:{registryCanonical.Error}",
+                    $"registryPrevious:{registryPrevious.Error}"
+                });
+                reason = "Dữ liệu Version Guard hiện có không xác minh được; không tự phục hồi.";
+                AppendAudit($"[VERSION_GUARD_REBIND_BLOCK] oldDevice={Safe(previous)} canonicalDevice={Safe(canonical)} detail={Safe(detail)}");
+                return false;
+            }
+
+            var highest = candidates[0].Version!;
+            foreach (var item in candidates.Skip(1))
+            {
+                if (item.Version is not null && item.Version.CompareTo(highest) > 0)
+                    highest = item.Version;
+            }
+
+            if (!SaveRecordToStores(canonical, highest))
+            {
+                reason = "Không thể lưu lại Version Guard theo mã thiết bị chuẩn.";
+                AppendAudit($"[VERSION_GUARD_REBIND_SAVE_FAIL] oldDevice={Safe(previous)} canonicalDevice={Safe(canonical)} highest={FormatVersion(highest)}");
+                return false;
+            }
+
+            reason = $"Đã giữ nguyên mốc {FormatVersion(highest)} và ký lại cho DeviceId chuẩn.";
+            AppendAudit($"[VERSION_GUARD_REBIND_OK] oldDevice={Safe(previous)} canonicalDevice={Safe(canonical)} highest={FormatVersion(highest)}");
+            return true;
+        }
     }
 
     public static async Task<VersionGuardDecision> EvaluateAndRecordAsync(

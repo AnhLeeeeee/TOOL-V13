@@ -418,6 +418,143 @@ public sealed partial class ChromeController : IAsyncDisposable
         return string.Join(" | ", owners.Select(x => $"PID={x.ProcessId}"));
     }
 
+    /// <summary>
+    /// Force-cleans only Chrome processes that are verified to use the exact
+    /// --user-data-dir supplied by the caller. This is intended for recovering
+    /// an orphaned dedicated browser profile after launch/CDP startup failed.
+    /// It never scans or kills arbitrary chrome.exe processes.
+    /// </summary>
+    public async Task<IReadOnlyList<int>> ForceCleanupOwnedProfileProcessesAsync(
+        string profileDir,
+        int port,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(profileDir)) return [];
+
+        var normalized = NormalizeProfilePath(profileDir);
+        try { await DisconnectAsync(TimeSpan.FromSeconds(1)); } catch { }
+
+        async Task<List<ProfileOwner>> ReadVerifiedOwnersAsync()
+        {
+            var owners = await FindChromeProcessesUsingProfileAsync(normalized, TimeSpan.FromSeconds(4));
+            return owners
+                .Where(owner => CommandLineUsesProfile(owner.CommandLine, normalized))
+                .GroupBy(owner => owner.ProcessId)
+                .Select(group => group.First())
+                .ToList();
+        }
+
+        static bool IsChromePid(int pid)
+        {
+            try
+            {
+                using var process = Process.GetProcessById(pid);
+                return process.ProcessName.Equals("chrome", StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
+        }
+
+        async Task KillVerifiedAsync(IReadOnlyList<ProfileOwner> owners, string phase)
+        {
+            if (owners.Count == 0) return;
+
+            // Prefer the browser root that owns both this exact profile and the
+            // expected CDP port. If startup died before the port was bound, fall
+            // back to the exact-profile owners only. The profile match above is
+            // mandatory in both paths.
+            var roots = owners
+                .Where(owner => CommandLineUsesRemoteDebuggingPort(owner.CommandLine, port))
+                .ToList();
+            var targets = roots.Count > 0 ? roots : owners.ToList();
+
+            foreach (var owner in targets)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (!IsChromePid(owner.ProcessId)) continue;
+                try
+                {
+                    using var process = Process.GetProcessById(owner.ProcessId);
+                    process.Kill(entireProcessTree: true);
+                    _log.Warn($"[CHROME_PROFILE_FORCE_CLEANUP_KILL] phase={phase} pid={owner.ProcessId} profilePath={normalized} port={port}");
+                }
+                catch (Exception ex)
+                {
+                    _log.Warn($"[CHROME_PROFILE_FORCE_CLEANUP_KILL_FAIL] phase={phase} pid={owner.ProcessId} message={TrimForLog(ex.Message)}");
+                }
+            }
+
+            await Task.Delay(500, ct);
+        }
+
+        var initial = await ReadVerifiedOwnersAsync();
+        if (initial.Count == 0)
+        {
+            // CIM/CommandLine lookup can be blocked on some customer machines.
+            // The PID cached directly from Process.Start is still safe to use, but
+            // only when it belongs to this exact managed profile+port context.
+            var cachedLaunchPids = IsManagedContext(normalized, port)
+                ? _managedPids.Where(IsProcessRunning).Distinct().ToList()
+                : new List<int>();
+
+            if (cachedLaunchPids.Count == 0)
+            {
+                _log.Info($"[CHROME_PROFILE_FORCE_CLEANUP] profilePath={normalized} port={port} result=already-clean");
+                return [];
+            }
+
+            _log.Warn($"[CHROME_PROFILE_FORCE_CLEANUP_CACHED_BEGIN] profilePath={normalized} port={port} pids={string.Join(',', cachedLaunchPids)}");
+            foreach (var pid in cachedLaunchPids)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (!IsChromePid(pid)) continue;
+                try
+                {
+                    using var process = Process.GetProcessById(pid);
+                    process.Kill(entireProcessTree: true);
+                    _log.Warn($"[CHROME_PROFILE_FORCE_CLEANUP_CACHED_KILL] pid={pid} profilePath={normalized} port={port}");
+                }
+                catch (Exception ex)
+                {
+                    _log.Warn($"[CHROME_PROFILE_FORCE_CLEANUP_CACHED_KILL_FAIL] pid={pid} message={TrimForLog(ex.Message)}");
+                }
+            }
+
+            await Task.Delay(500, ct);
+            initial = await ReadVerifiedOwnersAsync();
+            if (initial.Count == 0)
+            {
+                _managedPids.Clear();
+                _managedWindowHandle = IntPtr.Zero;
+                _log.Warn($"[CHROME_PROFILE_FORCE_CLEANUP_END] profilePath={normalized} port={port} remainingPids=");
+                return [];
+            }
+        }
+
+        _log.Warn($"[CHROME_PROFILE_FORCE_CLEANUP_BEGIN] profilePath={normalized} port={port} pids={string.Join(',', initial.Select(x => x.ProcessId))}");
+        await KillVerifiedAsync(initial, "initial");
+
+        var remaining = await ReadVerifiedOwnersAsync();
+        if (remaining.Count > 0)
+        {
+            // A browser root can exit before all children do. Re-query and kill
+            // only the still-verified exact-profile processes one final time.
+            await KillVerifiedAsync(remaining, "remaining");
+            remaining = await ReadVerifiedOwnersAsync();
+        }
+
+        if (_managedWindowPort == port
+            && !string.IsNullOrWhiteSpace(_managedProfileDir)
+            && NormalizeProfilePath(_managedProfileDir).Equals(normalized, StringComparison.OrdinalIgnoreCase))
+        {
+            _managedPids.Clear();
+            _managedWindowHandle = IntPtr.Zero;
+        }
+
+        var remainingPids = remaining.Select(x => x.ProcessId).Distinct().ToList();
+        _log.Warn($"[CHROME_PROFILE_FORCE_CLEANUP_END] profilePath={normalized} port={port} remainingPids={string.Join(',', remainingPids)}");
+        return remainingPids;
+    }
+
     public void AttachManagedWindow(string profileDir, int port)
     {
         if (string.IsNullOrWhiteSpace(profileDir)) return;

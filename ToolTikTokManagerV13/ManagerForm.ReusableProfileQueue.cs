@@ -1459,6 +1459,9 @@ public sealed partial class ManagerForm
 
             if (IsManualCloseSuppressed(profileName))
             {
+                ReleaseAutoReplacementCheckPoolProfile(
+                    profileName,
+                    "manual_close_suppressed_name_sync");
                 _log.Info(
                     $"[NAME_SYNC_RECOVERY_SKIP_MANUAL_CLOSE] id={request.Id} profile={profileName}");
                 continue;
@@ -1579,6 +1582,15 @@ public sealed partial class ManagerForm
 
             _autoReplacementClaimedProfiles.Add(profileName);
 
+            using var candidateTimeoutCts =
+                CancellationTokenSource.CreateLinkedTokenSource(executionToken);
+            candidateTimeoutCts.CancelAfter(AutoReplacementCandidateCheckTimeout);
+            var candidateToken = candidateTimeoutCts.Token;
+
+            _log.Info(
+                $"[AUTO_CHECK_BEGIN] request={request.Id} profile={profileName} source=name_sync_pending " +
+                $"timeout={AutoReplacementCandidateCheckTimeout:c} checking={GetAutoReplacementCheckPoolSnapshot().Count}/{AutoReplacementCheckPoolMax}");
+
             try
             {
                 _log.Info(
@@ -1600,7 +1612,7 @@ public sealed partial class ManagerForm
                     return false;
                 }
 
-                executionToken.ThrowIfCancellationRequested();
+                candidateToken.ThrowIfCancellationRequested();
 
                 SetAutoReplacementUiPhase(
                     "MỞ CHỜ TÊN",
@@ -1628,11 +1640,11 @@ public sealed partial class ManagerForm
                     return false;
                 }
 
-                executionToken.ThrowIfCancellationRequested();
+                candidateToken.ThrowIfCancellationRequested();
 
-                // Worker/Chrome trên VM có thể cần nhiều thời gian để ổn định. Không kết
-                // luận lỗi ngay sau pipe timeout 10s; giữ đúng slot này tối đa 10 phút và
-                // chỉ recovery CHÍNH profile đang thử.
+                // Worker/Chrome trên VM có thể cần thời gian ổn định, nhưng toàn bộ
+                // lượt kiểm tra PRF bị chặn bởi deadline wall-clock 5 phút ở trên.
+                // Chỉ recovery CHÍNH profile đang thử.
                 SetAutoReplacementUiPhase(
                     "CHỜ TÊN ỔN ĐỊNH",
                     profileName,
@@ -1643,7 +1655,7 @@ public sealed partial class ManagerForm
                     request,
                     "name_sync_recovery",
                     executionGeneration,
-                    executionToken);
+                    candidateToken);
 
                 if (!IsAutoReplacementExecutionAllowed(executionGeneration))
                 {
@@ -1662,7 +1674,7 @@ public sealed partial class ManagerForm
                     return false;
                 }
 
-                executionToken.ThrowIfCancellationRequested();
+                candidateToken.ThrowIfCancellationRequested();
 
                 if (!probeReady)
                 {
@@ -1684,6 +1696,9 @@ public sealed partial class ManagerForm
                         await CleanupCreatedReplacementAttemptAsync(
                             profileName,
                             "name_sync_recovery_manual_close_during_probe_grace");
+                        ReleaseAutoReplacementCheckPoolProfile(
+                            profileName,
+                            "manual_close_name_sync_probe");
                         _log.Warn(
                             $"[NAME_SYNC_RECOVERY_MANUAL_ABORT] profile={profileName} stage=probe_grace");
                         return false;
@@ -1691,8 +1706,8 @@ public sealed partial class ManagerForm
 
                     await CleanupCreatedReplacementAttemptAsync(
                         profileName,
-                        "name_sync_recovery_probe_ready_10m_timeout");
-                    TouchReusableProfileNameSyncPending(profileName, "probe_ready_10m_timeout");
+                        "name_sync_recovery_probe_ready_5m_timeout");
+                    TouchReusableProfileNameSyncPending(profileName, "probe_ready_5m_timeout");
                     continue;
                 }
 
@@ -1707,10 +1722,10 @@ public sealed partial class ManagerForm
                 {
                     excelIdentityDoneOverride = await RunAccountPoolIoAsync(
                         () => _accountPoolService.IsIdentityDone(account.Username),
-                        executionToken);
+                        candidateToken);
                 }
                 catch (OperationCanceledException)
-                    when (executionToken.IsCancellationRequested
+                    when (candidateToken.IsCancellationRequested
                           || !IsAutoReplacementExecutionAllowed(executionGeneration))
                 {
                     throw;
@@ -1804,7 +1819,7 @@ public sealed partial class ManagerForm
                             return false;
                         }
 
-                        executionToken.ThrowIfCancellationRequested();
+                        candidateToken.ThrowIfCancellationRequested();
 
                         if (!nameGuard.Allowed)
                         {
@@ -1868,7 +1883,7 @@ public sealed partial class ManagerForm
                     var identityDone = await MarkIdentityDoneVerifiedAsync(
                         account.Username,
                         profileName,
-                        executionToken);
+                        candidateToken);
 
                     if (!identityDone.Ok)
                     {
@@ -1902,14 +1917,14 @@ public sealed partial class ManagerForm
                     return false;
                 }
 
-                executionToken.ThrowIfCancellationRequested();
+                candidateToken.ThrowIfCancellationRequested();
 
                 var stabilization = await StabilizeReplacementRuntimeAsync(
                     ctx,
                     request,
                     "name_sync_recovery",
                     executionGeneration,
-                    executionToken);
+                    candidateToken);
 
                 if (!IsAutoReplacementExecutionAllowed(executionGeneration))
                 {
@@ -1928,13 +1943,16 @@ public sealed partial class ManagerForm
                     return false;
                 }
 
-                executionToken.ThrowIfCancellationRequested();
+                candidateToken.ThrowIfCancellationRequested();
 
                 if (IsManualCloseSuppressed(profileName))
                 {
                     await CleanupCreatedReplacementAttemptAsync(
                         profileName,
                         "name_sync_recovery_manual_close_during_stabilize");
+                    ReleaseAutoReplacementCheckPoolProfile(
+                        profileName,
+                        "manual_close_name_sync_stabilize");
                     _log.Warn(
                         $"[NAME_SYNC_RECOVERY_MANUAL_ABORT] profile={profileName} stage=stabilize");
                     return false;
@@ -1978,10 +1996,10 @@ public sealed partial class ManagerForm
                         profileName,
                         stabilization.HardFailed
                             ? "name_sync_recovery_hard_failed"
-                            : "name_sync_recovery_10m_timeout");
+                            : "name_sync_recovery_5m_timeout");
                     TouchReusableProfileNameSyncPending(
                         profileName,
-                        stabilization.HardFailed ? "hard_failed" : "stabilize_10m_timeout");
+                        stabilization.HardFailed ? "hard_failed" : "stabilize_5m_timeout");
                     continue;
                 }
 
@@ -2022,6 +2040,35 @@ public sealed partial class ManagerForm
                         : $"Tên đã cập nhật thành '{probe.CurrentName}'. Đã xác minh DONE và profile RUNNING khỏe.");
 
                 return true;
+            }
+            catch (OperationCanceledException)
+                when (candidateTimeoutCts.IsCancellationRequested
+                      && !executionToken.IsCancellationRequested
+                      && IsAutoReplacementExecutionAllowed(executionGeneration))
+            {
+                _log.Warn(
+                    $"[AUTO_CHECK_TIMEOUT_5M] request={request.Id} profile={profileName} source=name_sync_pending " +
+                    $"action=CLEANUP_ROTATE checking={GetAutoReplacementCheckPoolSnapshot().Count}/{AutoReplacementCheckPoolMax}");
+
+                WriteAutoActivityLog(
+                    action: "KIỂM TRA TÊN CHỜ",
+                    profile: request.ClosedProfileName,
+                    account: account.Username,
+                    reason: request.Reason,
+                    replacementProfile: profileName,
+                    result: "TIMEOUT 5 PHÚT",
+                    detail: "PRF vượt quá 5 phút kiểm tra. Đóng runtime, đưa xuống cuối vòng và chuyển candidate khác.");
+
+                await CleanupCreatedReplacementAttemptAsync(
+                    profileName,
+                    "name_sync_candidate_timeout_5m");
+                MarkReplacementProfileFailed(
+                    profileName,
+                    "name_sync_candidate_timeout_5m");
+                TouchReusableProfileNameSyncPending(
+                    profileName,
+                    "candidate_timeout_5m");
+                continue;
             }
             catch (OperationCanceledException)
                 when (executionToken.IsCancellationRequested
@@ -2205,8 +2252,8 @@ public sealed partial class ManagerForm
 
             // Policy mới: NAME_SYNC_PENDING KHÔNG giữ slot CREATE. Nếu chưa đủ
             // tuổi probe thì bỏ qua candidate này ở vòng hiện tại và tiếp tục vét
-            // các PRF khác; nếu không có PRF dùng được thì vẫn được CREATE (tối đa
-            // hard cap 3 PRF cho chính slot/request).
+            // các PRF khác; nếu không có PRF dùng được thì vẫn được CREATE miễn
+            // pool kiểm tra hiện còn dưới 3 PRF.
             if (candidate.NameSyncPending)
             {
                 var age = DateTime.UtcNow - candidate.LastCheckedUtc;
@@ -2363,6 +2410,9 @@ public sealed partial class ManagerForm
 
             if (IsManualCloseSuppressed(profileName))
             {
+                ReleaseAutoReplacementCheckPoolProfile(
+                    profileName,
+                    "manual_close_suppressed_reuse");
                 _log.Info(
                     $"[REUSE_QUEUE_SKIP_MANUAL_CLOSE] id={request.Id} profile={profileName}");
                 continue;
@@ -2464,6 +2514,15 @@ public sealed partial class ManagerForm
 
             _autoReplacementClaimedProfiles.Add(profileName);
 
+            using var candidateTimeoutCts =
+                CancellationTokenSource.CreateLinkedTokenSource(executionToken);
+            candidateTimeoutCts.CancelAfter(AutoReplacementCandidateCheckTimeout);
+            var candidateToken = candidateTimeoutCts.Token;
+
+            _log.Info(
+                $"[AUTO_CHECK_BEGIN] request={request.Id} profile={profileName} source=reuse_queue " +
+                $"timeout={AutoReplacementCandidateCheckTimeout:c} checking={GetAutoReplacementCheckPoolSnapshot().Count}/{AutoReplacementCheckPoolMax}");
+
             try
             {
                 _log.Info(
@@ -2488,7 +2547,7 @@ public sealed partial class ManagerForm
                     return false;
                 }
 
-                executionToken.ThrowIfCancellationRequested();
+                candidateToken.ThrowIfCancellationRequested();
 
                 // KHÔNG quét IsProfileInUse() theo từng profile.
                 // Chỉ mở đúng candidate đang đứng đầu queue.
@@ -2522,19 +2581,22 @@ public sealed partial class ManagerForm
                     return false;
                 }
 
-                executionToken.ThrowIfCancellationRequested();
+                candidateToken.ThrowIfCancellationRequested();
 
                 if (IsManualCloseSuppressed(profileName))
                 {
                     await CloseFailedReplacementRuntimeAsync(ctx);
+                    ReleaseAutoReplacementCheckPoolProfile(
+                        profileName,
+                        "manual_close_reuse_after_open");
                     _log.Warn(
                         $"[REUSE_QUEUE_MANUAL_ABORT] profile={profileName} stage=after_open");
                     return false;
                 }
 
                 // PRF trong Chờ dùng lại đã tồn tại + đăng nhập sẵn: chỉ xác nhận
-                // RUNNING trong cửa sổ ngắn. Grace dài 10 phút chỉ dành cho nhánh
-                // tạo mới/login, không áp vào reuse.
+                // RUNNING trong cửa sổ ngắn. Reuse không dùng grace dài của nhánh
+                // tạo mới/login và vẫn chịu deadline candidate tối đa 5 phút.
                 SetAutoReplacementUiPhase(
                     "XÁC NHẬN PRF CHỜ",
                     profileName,
@@ -2545,7 +2607,7 @@ public sealed partial class ManagerForm
                     request,
                     "reuse_queue",
                     executionGeneration,
-                    executionToken);
+                    candidateToken);
 
                 if (!IsAutoReplacementExecutionAllowed(executionGeneration))
                 {
@@ -2568,11 +2630,14 @@ public sealed partial class ManagerForm
                     return false;
                 }
 
-                executionToken.ThrowIfCancellationRequested();
+                candidateToken.ThrowIfCancellationRequested();
 
                 if (IsManualCloseSuppressed(profileName))
                 {
                     await CloseFailedReplacementRuntimeAsync(ctx);
+                    ReleaseAutoReplacementCheckPoolProfile(
+                        profileName,
+                        "manual_close_reuse_stabilize");
                     _log.Warn(
                         $"[REUSE_QUEUE_MANUAL_ABORT] profile={profileName} stage=stabilize");
                     return false;
@@ -2669,6 +2734,31 @@ public sealed partial class ManagerForm
 
                 MarkNightReserveConsumed(profileName, request.Reason);
                 return true;
+            }
+            catch (OperationCanceledException)
+                when (candidateTimeoutCts.IsCancellationRequested
+                      && !executionToken.IsCancellationRequested
+                      && IsAutoReplacementExecutionAllowed(executionGeneration))
+            {
+                _log.Warn(
+                    $"[AUTO_CHECK_TIMEOUT_5M] request={request.Id} profile={profileName} source=reuse_queue " +
+                    $"action=CLEANUP_ROTATE checking={GetAutoReplacementCheckPoolSnapshot().Count}/{AutoReplacementCheckPoolMax}");
+
+                WriteAutoActivityLog(
+                    action: "MỞ PROFILE BÙ",
+                    profile: request.ClosedProfileName,
+                    account: candidate.Username,
+                    reason: request.Reason,
+                    replacementProfile: profileName,
+                    result: "TIMEOUT 5 PHÚT",
+                    detail: "PRF vượt quá 5 phút kiểm tra. Đóng runtime, đưa vào cooldown và chuyển candidate khác.");
+
+                await MarkReusableProfileFailedAsync(
+                    request,
+                    candidate,
+                    "candidate_timeout_5m");
+                await CloseFailedReplacementRuntimeAsync(ctx);
+                continue;
             }
             catch (OperationCanceledException)
                 when (executionToken.IsCancellationRequested
@@ -2829,28 +2919,40 @@ public sealed partial class ManagerForm
         if (profileName.Length == 0)
             return;
 
+        var removed = 0;
         lock (_reusableProfileQueueLock)
         {
             var document =
                 CloneReusableProfileQueueDocument(
                     EnsureReusableProfileQueueLoadedUnsafe());
 
-            var removed =
+            removed =
                 document.Pending.RemoveAll(x =>
                     x.ProfileName.Equals(
                         profileName,
                         StringComparison.OrdinalIgnoreCase));
 
-            if (removed <= 0)
-                return;
-
-            _reusableProfileQueueCache = document;
-            _reusableProfileQueueLoaded = true;
-            SaveReusableProfileQueueUnsafe(document);
+            // Nếu entry đã nằm ở FailedProfiles hoặc đã được remove ở bước khác thì
+            // vẫn cho phép release pool phía dưới. Chỉ ghi file khi Pending thật sự đổi.
+            if (removed > 0)
+            {
+                _reusableProfileQueueCache = document;
+                _reusableProfileQueueLoaded = true;
+                SaveReusableProfileQueueUnsafe(document);
+            }
         }
 
-        _log.Info(
-            $"[REUSE_QUEUE_REMOVE] profile={profileName} reason={reason}");
+        if (removed > 0)
+        {
+            _log.Info(
+                $"[REUSE_QUEUE_REMOVE] profile={profileName} reason={reason}");
+        }
+
+        // Bất kỳ thao tác remove rõ ràng nào cũng có nghĩa PRF không còn là candidate
+        // cần giữ trong pool kiểm tra (RUNNING khỏe, BAN/retire, invalid/remap, user bỏ...).
+        ReleaseAutoReplacementCheckPoolProfile(
+            profileName,
+            "reuse_queue_remove:" + reason);
     }
 
     static bool IsReusableProfileActuallyCreated(

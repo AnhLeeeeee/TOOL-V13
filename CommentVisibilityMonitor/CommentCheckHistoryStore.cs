@@ -375,14 +375,16 @@ internal sealed class CommentCheckHistoryStore
     static void WriteSessionsCsv(string path, IReadOnlyList<CommentCheckSessionHistory> sessions)
     {
         var sb = new StringBuilder();
-        sb.AppendLine("BatDau,KetThuc,PRF,TaiKhoan,ThoiLuongGiay,DaGui,DaCheck,Hien,Mat,KhongRo,TyLeHien,LoaiPhien,LyDoKetThuc");
+        sb.AppendLine("BatDau,KetThuc,PRF,TaiKhoan,OpenSessionId,ProfileOpenedAt,ThoiLuongGiay,DaGui,DaCheck,Hien,Mat,KhongRo,TyLeHien,LoaiPhien,LyDoKetThuc");
         foreach (var x in sessions)
         {
             sb.AppendLine(string.Join(",", new[]
             {
                 Csv(x.StartedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")),
                 Csv(x.EndedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")),
-                Csv(x.Profile), Csv(x.Username), x.DurationSeconds.ToString("0"), x.Sent.ToString(), x.Resolved.ToString(),
+                Csv(x.Profile), Csv(x.Username), Csv(x.OpenSessionId),
+                Csv(x.ProfileOpenedAt?.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") ?? ""),
+                x.DurationSeconds.ToString("0"), x.Sent.ToString(), x.Resolved.ToString(),
                 x.Visible.ToString(), x.Missing.ToString(), x.Unknown.ToString(),
                 x.VisibilityRate.HasValue ? x.VisibilityRate.Value.ToString("0.0") + "%" : "",
                 x.Manual ? "CHECK_NGAY" : "AUTO", Csv(x.EndReason)
@@ -421,6 +423,8 @@ internal sealed class CommentCheckHistoryStore
 internal sealed class CommentCheckSessionHistory
 {
     public string SessionId { get; set; } = "";
+    public string OpenSessionId { get; set; } = "";
+    public DateTimeOffset? ProfileOpenedAt { get; set; }
     public string Profile { get; set; } = "";
     public string Username { get; set; } = "";
     public DateTimeOffset StartedAt { get; set; }

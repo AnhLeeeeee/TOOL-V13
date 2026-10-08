@@ -29,7 +29,7 @@ public sealed partial class ManagerForm
 
     sealed class RunAllStrategySettings
     {
-        public int Version { get; set; } = 8;
+        public int Version { get; set; } = 9;
         public RunAllStrategyMode Mode { get; set; } = RunAllStrategyMode.Time;
 
         // V3: khi user đã chọn Giờ vàng + Bắt đầu, giữ "ý định vận hành" này
@@ -70,10 +70,10 @@ public sealed partial class ManagerForm
         public bool DailyReplaceAll { get; set; }
         public int DailyReplaceAllTargetSlots { get; set; } = 10;
 
-        // V5: cầu chì chống CREATE runaway. Mặc định BẬT nhưng user có thể
-        // tắt hoặc chỉnh từng ngưỡng trong thẻ DÀN PRF. Chỉ đếm CREATE mới thật,
-        // không đếm mở lại PRF chờ / NAME_SYNC_PENDING.
-        public bool CreateLimitEnabled { get; set; } = true;
+        // V9: giới hạn CREATE theo giờ/phiên là tính năng NÂNG CAO, mặc định TẮT.
+        // Luật vận hành chính của Auto Replace là pool kiểm tra tối đa 3 PRF và
+        // timeout 5 phút/PRF; CreateLimitPerSlot chỉ giữ để tương thích config cũ.
+        public bool CreateLimitEnabled { get; set; } = false;
         public int CreateLimitPerSlot { get; set; } = 3;
         public int CreateLimitPerHour { get; set; } = 5;
         public int CreateLimitPerSession { get; set; } = 10;
@@ -307,7 +307,14 @@ public sealed partial class ManagerForm
     static RunAllStrategySettings NormalizeRunStrategySettings(
         RunAllStrategySettings settings)
     {
-        settings.Version = 8;
+        var loadedVersion = settings.Version;
+        settings.Version = 9;
+
+        // Migration V8 -> V9: trước đây CREATE limit mặc định ON nên nhiều máy có
+        // thể đang bật mà user không chủ động chọn. Một lần duy nhất chuyển về OFF;
+        // từ V9 trở đi chỉ ảnh hưởng khi user thật sự bật lại trong giao diện.
+        if (loadedVersion < 9)
+            settings.CreateLimitEnabled = false;
         if (settings.Mode != RunAllStrategyMode.PrimeFresh)
         {
             settings.PrimeModeArmed = false;
@@ -355,6 +362,7 @@ public sealed partial class ManagerForm
 
     void SaveRunStrategySettings(RunAllStrategySettings settings)
     {
+        var previousAdvancedLimitEnabled = _runStrategySettings.CreateLimitEnabled;
         settings = NormalizeRunStrategySettings(settings);
         var json = JsonSerializer.Serialize(
             settings,
@@ -364,6 +372,17 @@ public sealed partial class ManagerForm
         File.WriteAllText(temp, json, new UTF8Encoding(false));
         File.Move(temp, RunStrategySettingsPath, overwrite: true);
         _runStrategySettings = settings;
+
+        // Giới hạn nâng cao phải bắt đầu từ thời điểm user thật sự bật. Không mang
+        // counter đã ghi từ trạng thái OFF hoặc phiên cấu hình cũ sang. Khi tắt cũng
+        // xóa counter để OFF hoàn toàn không để lại ảnh hưởng cho lần bật sau.
+        if (previousAdvancedLimitEnabled != settings.CreateLimitEnabled)
+        {
+            ResetAutoReplacementAdvancedCreateLimitCounters(
+                settings.CreateLimitEnabled
+                    ? "run_strategy_advanced_limit_enabled"
+                    : "run_strategy_advanced_limit_disabled");
+        }
     }
 
     async Task ShowRunAllStrategyDialogAndStartAsync()
@@ -662,7 +681,7 @@ public sealed partial class ManagerForm
 
         var createLimitBox = new GroupBox
         {
-            Text = "GIỚI HẠN TẠO PRF",
+            Text = "GIỚI HẠN CREATE NÂNG CAO",
             Dock = DockStyle.Top,
             AutoSize = true,
             Padding = new Padding(12, 10, 12, 10),
@@ -674,7 +693,7 @@ public sealed partial class ManagerForm
         {
             Dock = DockStyle.Top,
             AutoSize = true,
-            ColumnCount = 8,
+            ColumnCount = 6,
             RowCount = 2,
             Margin = Padding.Empty,
             Padding = Padding.Empty
@@ -685,18 +704,16 @@ public sealed partial class ManagerForm
         createLimitRoot.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 72));
         createLimitRoot.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         createLimitRoot.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 72));
-        createLimitRoot.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        createLimitRoot.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 72));
 
         var createLimitEnabled = new CheckBox
         {
-            Text = "Bật giới hạn tạo PRF mới",
+            Text = "Bật giới hạn CREATE theo giờ / phiên",
             Checked = current.CreateLimitEnabled,
             AutoSize = true,
             Font = new Font("Segoe UI", 9.2F, FontStyle.Bold),
             Margin = new Padding(0, 4, 16, 6)
         };
-        createLimitRoot.SetColumnSpan(createLimitEnabled, 8);
+        createLimitRoot.SetColumnSpan(createLimitEnabled, 6);
         createLimitRoot.Controls.Add(createLimitEnabled, 0, 0);
 
         NumericUpDown CreateLimitNum(int value, int min, int max)
@@ -720,19 +737,20 @@ public sealed partial class ManagerForm
                 Margin = new Padding(0, 6, 0, 2)
             };
 
-        var createLimitPerSlot = CreateLimitNum(current.CreateLimitPerSlot, 1, 50);
+        // PerSlot cũ không còn tham gia enforcement; giữ biến nội bộ để đọc config
+        // legacy nhưng ẩn khỏi UI. Pool kiểm tra 3 PRF là hard rule riêng.
+        var createLimitPerSlot = CreateLimitNum(3, 1, 50);
+        createLimitPerSlot.Visible = false;
         var createLimitPerHour = CreateLimitNum(current.CreateLimitPerHour, 1, 200);
         var createLimitPerSession = CreateLimitNum(current.CreateLimitPerSession, 1, 500);
         var createLimitRetryMinutes = CreateLimitNum(current.CreateLimitReuseRetryMinutes, 1, 120);
 
-        createLimitRoot.Controls.Add(CreateLimitLabel("Mỗi slot"), 0, 1);
-        createLimitRoot.Controls.Add(createLimitPerSlot, 1, 1);
-        createLimitRoot.Controls.Add(CreateLimitLabel("Trong 1 giờ"), 2, 1);
-        createLimitRoot.Controls.Add(createLimitPerHour, 3, 1);
-        createLimitRoot.Controls.Add(CreateLimitLabel("Trong 1 phiên"), 4, 1);
-        createLimitRoot.Controls.Add(createLimitPerSession, 5, 1);
-        createLimitRoot.Controls.Add(CreateLimitLabel("Retry PRF chờ (phút)"), 6, 1);
-        createLimitRoot.Controls.Add(createLimitRetryMinutes, 7, 1);
+        createLimitRoot.Controls.Add(CreateLimitLabel("Trong 1 giờ"), 0, 1);
+        createLimitRoot.Controls.Add(createLimitPerHour, 1, 1);
+        createLimitRoot.Controls.Add(CreateLimitLabel("Trong 1 phiên"), 2, 1);
+        createLimitRoot.Controls.Add(createLimitPerSession, 3, 1);
+        createLimitRoot.Controls.Add(CreateLimitLabel("Retry PRF chờ (phút)"), 4, 1);
+        createLimitRoot.Controls.Add(createLimitRetryMinutes, 5, 1);
         createLimitBox.Controls.Add(createLimitRoot);
 
         var noCreateScheduleBox = new GroupBox
@@ -838,7 +856,7 @@ public sealed partial class ManagerForm
             MaximumSize = new Size(860, 0),
             ForeColor = Color.FromArgb(37, 77, 122),
             Font = new Font("Segoe UI", 9F, FontStyle.Bold),
-            Text = "Tự bù luôn ưu tiên PRF có sẵn phù hợp trước; chỉ khi hết nguồn mới dùng Auto Profile để tạo mới (trừ khi bật CHỈ PRF CHỜ hoặc đang trong khung giờ cấm CREATE).",
+            Text = "Tự bù ưu tiên PRF có sẵn. Pool kiểm tra tối đa 3 PRF, mỗi PRF tối đa 5 phút/lượt; khi một PRF chạy khỏe/rời pool thì nếu vẫn thiếu target Tool mới bổ sung PRF kiểm tra khác. Giới hạn giờ/phiên chỉ có hiệu lực khi bật mục nâng cao.",
             Margin = new Padding(0, 12, 0, 0)
         };
 
@@ -1321,7 +1339,7 @@ public sealed partial class ManagerForm
 
             return NormalizeRunStrategySettings(new RunAllStrategySettings
             {
-                Version = 8,
+                Version = 9,
                 Mode = primeMode.Checked ? RunAllStrategyMode.PrimeFresh : RunAllStrategyMode.Time,
                 PrimeModeArmed = startRequested
                     ? primeMode.Checked

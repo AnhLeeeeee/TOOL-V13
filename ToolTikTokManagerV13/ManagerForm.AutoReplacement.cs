@@ -33,8 +33,8 @@ public sealed partial class ManagerForm
         // vẫn có thể được đánh thức ngay nếu xuất hiện PRF Chờ dùng lại phù hợp.
         public DateTime? CreateNotBeforeUtc { get; set; }
 
-        // Số lần CREATE mới thật sự đã được bắt đầu cho chính slot/request này.
-        // Persist cùng queue để một request retry không thể tự reset cầu chì per-slot.
+        // Counter chẩn đoán/tương thích queue cũ: số CREATE đã bắt đầu cho request này.
+        // Từ V3 counter này KHÔNG còn là hard-cap; pool kiểm tra mới quyết định tối đa 3 PRF.
         public int CreatedProfileCount { get; set; }
 
         // Khi chạm giới hạn tạo, request chuyển sang vòng CHỜ -> vét lại toàn bộ PRF chờ.
@@ -68,13 +68,18 @@ public sealed partial class ManagerForm
 
     sealed class AutoReplacementCreateLimitStateDocument
     {
-        public int Version { get; set; } = 2;
+        public int Version { get; set; } = 3;
         public string SessionId { get; set; } = "";
         public int SessionCreatedCount { get; set; }
         public List<DateTime> CreatedUtc { get; set; } = new();
 
-        // Ngân sách CREATE dùng CHUNG cho toàn bộ một đợt thiếu capacity.
-        // Không còn 3 CREATE riêng cho từng CAPACITY_GAP/request.
+        // V3: 3 không còn là "tổng số CREATE cho cả deficit". Đây là pool các PRF
+        // đang được giữ lại để kiểm tra/xoay vòng. PRF RUNNING khỏe/retire/delete/manual
+        // remove sẽ rời pool; timeout/lỗi tạm vẫn ở lại để vòng sau kiểm tra tiếp.
+        public List<string> CheckPoolProfiles { get; set; } = new();
+
+        // Legacy V2: giữ field để đọc state cũ nhưng không còn tham gia enforcement.
+        // Khi load V3 sẽ reset toàn bộ deficit cũ để tránh kẹt "3/3" sau cập nhật.
         public bool DeficitActive { get; set; }
         public string DeficitId { get; set; } = "";
         public int DeficitCreatedCount { get; set; }
@@ -141,12 +146,15 @@ public sealed partial class ManagerForm
     static readonly TimeSpan AutoReplacementFailedProfileCooldown = TimeSpan.FromMinutes(5);
     static readonly TimeSpan AutoReplacementQueueWaitSlice = TimeSpan.FromSeconds(5);
 
-    // Hard policy của Tự bù: TOÀN BỘ một đợt thiếu capacity chỉ được phép tiêu
-    // tối đa 3 CREATE thật, dùng chung cho mọi CAPACITY_GAP/request. Sau 3/3
-    // tuyệt đối không CREATE thêm; chỉ quay vòng toàn bộ PRF chờ mỗi ~2 phút
-    // cho tới khi capacity phục hồi đủ target. Setting user thấp hơn 3 vẫn thắng.
-    const int AutoReplacementHardCreatePerSlotCap = 3;
-    static readonly TimeSpan AutoReplacementHardCreateCapReuseRetry = TimeSpan.FromMinutes(2);
+    // Pool kiểm tra: tối đa 3 PRF được giữ lại để xoay kiểm tra. Đây KHÔNG phải
+    // giới hạn tổng số CREATE. Khi một PRF trong pool lên RUNNING khỏe hoặc bị loại
+    // khỏi vòng đời, slot pool được nhả và nếu vẫn thiếu target thì CREATE mới được phép.
+    const int AutoReplacementCheckPoolMax = 3;
+    static readonly TimeSpan AutoReplacementCheckPoolRetry = TimeSpan.FromMinutes(2);
+
+    // Một candidate không được giữ queue vô hạn. Deadline 5 phút tính wall-clock từ
+    // lúc candidate bắt đầu được xử lý; cleanup dùng luồng riêng và không bị cắt bởi token này.
+    static readonly TimeSpan AutoReplacementCandidateCheckTimeout = TimeSpan.FromMinutes(5);
     static readonly TimeSpan AutoReplacementReusableStateRetry = TimeSpan.FromSeconds(5);
     static readonly TimeSpan AutoReplacementOperationalRetry = TimeSpan.FromSeconds(10);
     const int AutoReplacementCleanupBarrierRetrySeconds = 15;
@@ -220,16 +228,8 @@ public sealed partial class ManagerForm
             settings.CreateLimitReuseRetryMinutes);
     }
 
-    int GetEffectiveAutoReplacementPerSlotCreateCap(
-        AutoReplacementCreateLimitSnapshot limit)
-    {
-        // Cầu chì per-slot mới là hard rule 3 CREATE/slot. Nếu user cấu hình
-        // thấp hơn thì giữ ngưỡng thấp hơn; nếu tắt Create Limit hoặc đặt >3
-        // thì Tự bù vẫn không được vượt 3 CREATE thật cho cùng request.
-        return limit.Enabled
-            ? Math.Min(Math.Max(1, limit.PerSlot), AutoReplacementHardCreatePerSlotCap)
-            : AutoReplacementHardCreatePerSlotCap;
-    }
+    int GetAutoReplacementCheckPoolMax()
+        => AutoReplacementCheckPoolMax;
 
     AutoReplacementNoCreateScheduleSnapshot GetAutoReplacementNoCreateScheduleSnapshot()
     {
@@ -321,7 +321,8 @@ public sealed partial class ManagerForm
             state = new AutoReplacementCreateLimitStateDocument();
         }
 
-        state.Version = 2;
+        var loadedVersion = state.Version;
+        state.Version = 3;
         state.CreatedUtc ??= new List<DateTime>();
         state.CreatedUtc = state.CreatedUtc
             .Select(x => x.Kind == DateTimeKind.Utc ? x : x.ToUniversalTime())
@@ -329,19 +330,27 @@ public sealed partial class ManagerForm
             .OrderBy(x => x)
             .ToList();
         state.SessionCreatedCount = Math.Max(0, state.SessionCreatedCount);
-        state.DeficitCreatedCount = Math.Max(0, state.DeficitCreatedCount);
-        if (state.DeficitStartedUtc is DateTime deficitStarted)
-            state.DeficitStartedUtc = deficitStarted.Kind == DateTimeKind.Utc ? deficitStarted : deficitStarted.ToUniversalTime();
-        if (!state.DeficitActive)
+        state.CheckPoolProfiles ??= new List<string>();
+        state.CheckPoolProfiles = state.CheckPoolProfiles
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        // Migration V2 -> V3: hard-cap deficit 3/3 bị loại hoàn toàn. Không được
+        // mang state cũ sang vì đó chính là nguyên nhân Tool treo thiếu target qua đêm.
+        state.DeficitActive = false;
+        state.DeficitCreatedCount = 0;
+        state.DeficitId = "";
+        state.DeficitStartedUtc = null;
+
+        if (loadedVersion < 3)
         {
-            state.DeficitCreatedCount = 0;
-            state.DeficitId = "";
-            state.DeficitStartedUtc = null;
+            state.CheckPoolProfiles.Clear();
+            _log.Warn(
+                $"[AUTO_CHECK_POOL_MIGRATE_V3] oldVersion={loadedVersion} action=CLEAR_LEGACY_DEFICIT_STATE");
         }
-        else if (string.IsNullOrWhiteSpace(state.DeficitId))
-        {
-            state.DeficitId = Guid.NewGuid().ToString("N");
-        }
+
         if (string.IsNullOrWhiteSpace(state.SessionId))
             state.SessionId = Guid.NewGuid().ToString("N");
 
@@ -382,50 +391,185 @@ public sealed partial class ManagerForm
         return before - state.CreatedUtc.Count;
     }
 
-    (bool Active, string Id, int Created) GetAutoReplacementDeficitCreateBudgetSnapshot()
+    (int Count, string[] Profiles) GetAutoReplacementCheckPoolSnapshot()
     {
         lock (_autoReplacementCreateLimitLock)
         {
             var state = EnsureAutoReplacementCreateLimitStateUnsafe();
-            return (state.DeficitActive, state.DeficitId ?? "", Math.Max(0, state.DeficitCreatedCount));
+            var profiles = (state.CheckPoolProfiles ?? new List<string>())
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Select(x => x.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            return (profiles.Length, profiles);
         }
     }
 
-    void EnsureAutoReplacementDeficitCreateBudgetActiveUnsafe(string source)
+    bool TryReserveAutoReplacementCheckPoolProfile(
+        string profileName,
+        out int checkingCount)
     {
-        var state = EnsureAutoReplacementCreateLimitStateUnsafe();
-        if (state.DeficitActive)
-            return;
+        profileName = (profileName ?? "").Trim();
+        checkingCount = 0;
+        if (profileName.Length == 0)
+            return false;
 
-        state.DeficitActive = true;
-        state.DeficitId = Guid.NewGuid().ToString("N");
-        state.DeficitCreatedCount = 0;
-        state.DeficitStartedUtc = DateTime.UtcNow;
-        SaveAutoReplacementCreateLimitStateUnsafe();
+        lock (_autoReplacementCreateLimitLock)
+        {
+            var state = EnsureAutoReplacementCreateLimitStateUnsafe();
+            state.CheckPoolProfiles ??= new List<string>();
+            state.CheckPoolProfiles = state.CheckPoolProfiles
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Select(x => x.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
 
-        _log.Warn(
-            $"[AUTO_CREATE_DEFICIT_BEGIN] source={source} deficitId={state.DeficitId} hardCap={AutoReplacementHardCreatePerSlotCap}");
+            if (state.CheckPoolProfiles.Any(x =>
+                    x.Equals(profileName, StringComparison.OrdinalIgnoreCase)))
+            {
+                checkingCount = state.CheckPoolProfiles.Count;
+                return true;
+            }
+
+            if (state.CheckPoolProfiles.Count >= AutoReplacementCheckPoolMax)
+            {
+                checkingCount = state.CheckPoolProfiles.Count;
+                return false;
+            }
+
+            state.CheckPoolProfiles.Add(profileName);
+            checkingCount = state.CheckPoolProfiles.Count;
+            SaveAutoReplacementCreateLimitStateUnsafe();
+        }
+
+        _log.Info(
+            $"[AUTO_CHECK_POOL_ADD] profile={profileName} checking={checkingCount}/{AutoReplacementCheckPoolMax}");
+        return true;
     }
 
+    void ReleaseAutoReplacementCheckPoolProfile(
+        string profileName,
+        string source)
+    {
+        profileName = (profileName ?? "").Trim();
+        if (profileName.Length == 0)
+            return;
+
+        var removed = false;
+        var remaining = 0;
+        lock (_autoReplacementCreateLimitLock)
+        {
+            var state = EnsureAutoReplacementCreateLimitStateUnsafe();
+            state.CheckPoolProfiles ??= new List<string>();
+            removed = state.CheckPoolProfiles.RemoveAll(x =>
+                x.Equals(profileName, StringComparison.OrdinalIgnoreCase)) > 0;
+            remaining = state.CheckPoolProfiles.Count;
+            if (removed)
+                SaveAutoReplacementCreateLimitStateUnsafe();
+        }
+
+        if (removed)
+        {
+            _log.Info(
+                $"[AUTO_CHECK_POOL_RELEASE] profile={profileName} checking={remaining}/{AutoReplacementCheckPoolMax} source={source}");
+        }
+    }
+
+    void RebuildAutoReplacementCheckPoolFromReusableState(string source)
+    {
+        var candidateNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        try
+        {
+            lock (_reusableProfileQueueLock)
+            {
+                var queue = EnsureReusableProfileQueueLoadedUnsafe();
+                foreach (var entry in queue.Pending)
+                {
+                    if (!string.IsNullOrWhiteSpace(entry.ProfileName))
+                        candidateNames.Add(entry.ProfileName.Trim());
+                }
+
+                foreach (var profileName in queue.FailedProfiles.Keys)
+                {
+                    if (!string.IsNullOrWhiteSpace(profileName))
+                        candidateNames.Add(profileName.Trim());
+                }
+            }
+
+            foreach (var profileName in _autoReplacementClaimedProfiles)
+            {
+                if (!string.IsNullOrWhiteSpace(profileName))
+                    candidateNames.Add(profileName.Trim());
+            }
+
+            var keep = new List<string>();
+            foreach (var profileName in candidateNames)
+            {
+                var supply = GetProfileSupplyState(profileName);
+                if (supply is null)
+                    continue;
+
+                var state = (supply.State ?? "").Trim();
+                if (state.Equals("new", StringComparison.OrdinalIgnoreCase)
+                    || state.Equals("test", StringComparison.OrdinalIgnoreCase))
+                {
+                    keep.Add(profileName);
+                }
+            }
+
+            // Nếu sau migration đã có hơn 3 PRF kiểm tra tồn tại từ bản cũ thì
+            // giữ đầy đủ chúng trong state. CREATE sẽ bị khóa cho tới khi pool giảm
+            // xuống dưới 3; tuyệt đối không "quên" candidate cũ để rồi tạo thêm.
+            keep = keep
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            lock (_autoReplacementCreateLimitLock)
+            {
+                var state = EnsureAutoReplacementCreateLimitStateUnsafe();
+                state.CheckPoolProfiles = keep;
+                state.DeficitActive = false;
+                state.DeficitId = "";
+                state.DeficitCreatedCount = 0;
+                state.DeficitStartedUtc = null;
+                SaveAutoReplacementCreateLimitStateUnsafe();
+            }
+
+            _log.Info(
+                $"[AUTO_CHECK_POOL_REBUILD] source={source} checking={keep.Count}/{AutoReplacementCheckPoolMax} profiles={string.Join(",", keep)}");
+        }
+        catch (Exception ex)
+        {
+            _log.Warn(
+                $"[AUTO_CHECK_POOL_REBUILD_WARN] source={source} error={ex.Message}");
+        }
+    }
+
+    // Legacy API: từ V3 capacity phục hồi KHÔNG reset pool. Pool chỉ nhả đúng PRF
+    // khi PRF đó RUNNING khỏe hoặc rời vòng đời; như vậy lần thiếu tiếp theo không
+    // vô tình tạo thêm 3 PRF mới trong khi 3 PRF cũ vẫn đang chờ kiểm tra.
     void ResetAutoReplacementDeficitCreateBudget(string source)
     {
         lock (_autoReplacementCreateLimitLock)
         {
             var state = EnsureAutoReplacementCreateLimitStateUnsafe();
-            if (!state.DeficitActive && state.DeficitCreatedCount == 0)
+            if (!state.DeficitActive
+                && state.DeficitCreatedCount == 0
+                && string.IsNullOrWhiteSpace(state.DeficitId))
+            {
                 return;
+            }
 
-            var oldId = state.DeficitId;
-            var oldCreated = state.DeficitCreatedCount;
             state.DeficitActive = false;
             state.DeficitId = "";
             state.DeficitCreatedCount = 0;
             state.DeficitStartedUtc = null;
             SaveAutoReplacementCreateLimitStateUnsafe();
-
-            _log.Info(
-                $"[AUTO_CREATE_DEFICIT_RESET] source={source} deficitId={oldId} created={oldCreated} action=NEW_DEFICIT_MAY_CREATE_AGAIN");
         }
+
+        _log.Info(
+            $"[AUTO_CREATE_DEFICIT_LEGACY_RESET] source={source} action=NO_CHECK_POOL_RESET");
     }
 
     void ResetAutoReplacementDeficitCreateBudgetIfCapacityRecovered(
@@ -475,6 +619,21 @@ public sealed partial class ManagerForm
         }
     }
 
+    void ResetAutoReplacementAdvancedCreateLimitCounters(string source)
+    {
+        lock (_autoReplacementCreateLimitLock)
+        {
+            var state = EnsureAutoReplacementCreateLimitStateUnsafe();
+            state.SessionId = Guid.NewGuid().ToString("N");
+            state.SessionCreatedCount = 0;
+            state.CreatedUtc.Clear();
+            SaveAutoReplacementCreateLimitStateUnsafe();
+
+            _log.Info(
+                $"[AUTO_CREATE_LIMIT_ADVANCED_RESET] source={source} session={state.SessionId} hourCreated=0 sessionCreated=0");
+        }
+    }
+
     int GetAutoReplacementRequestCreatedCount(AutoReplacementRequest request)
     {
         lock (_autoReplacementQueueLock)
@@ -502,17 +661,31 @@ public sealed partial class ManagerForm
     bool TryGetAutoReplacementCreateLimitBlock(
         AutoReplacementRequest request,
         out string reason,
-        out int deficitCreated,
+        out int checkPoolCount,
         out int hourCreated,
         out int sessionCreated)
     {
         reason = "";
-        deficitCreated = 0;
+        checkPoolCount = 0;
         hourCreated = 0;
         sessionCreated = 0;
 
         var limit = GetAutoReplacementCreateLimitSnapshot();
-        var effectiveDeficitCap = GetEffectiveAutoReplacementPerSlotCreateCap(limit);
+        var pool = GetAutoReplacementCheckPoolSnapshot();
+        checkPoolCount = pool.Count;
+
+        // Luật chính luôn áp dụng: chỉ giữ tối đa 3 PRF đang xoay kiểm tra.
+        // Đây KHÔNG phải tổng số CREATE; khi một PRF rời pool sẽ có chỗ tạo mới.
+        if (checkPoolCount >= AutoReplacementCheckPoolMax)
+        {
+            reason = $"check_pool={checkPoolCount}/{AutoReplacementCheckPoolMax}";
+            return true;
+        }
+
+        // Giới hạn /giờ và /phiên là lớp nâng cao. Khi OFF thì không đọc counter
+        // để quyết định và hoàn toàn không ảnh hưởng nhánh CREATE.
+        if (!limit.Enabled)
+            return false;
 
         lock (_autoReplacementCreateLimitLock)
         {
@@ -522,20 +695,9 @@ public sealed partial class ManagerForm
             if (pruned > 0)
                 SaveAutoReplacementCreateLimitStateUnsafe();
 
-            deficitCreated = state.DeficitActive ? Math.Max(0, state.DeficitCreatedCount) : 0;
             hourCreated = state.CreatedUtc.Count;
             sessionCreated = state.SessionCreatedCount;
         }
-
-        // Hard cap dùng CHUNG cho toàn bộ đợt thiếu, không phải từng request.
-        if (deficitCreated >= effectiveDeficitCap)
-        {
-            reason = $"deficit={deficitCreated}/{effectiveDeficitCap}";
-            return true;
-        }
-
-        if (!limit.Enabled)
-            return false;
 
         if (hourCreated >= limit.PerHour)
         {
@@ -560,76 +722,95 @@ public sealed partial class ManagerForm
         blockReason = "";
         var limit = GetAutoReplacementCreateLimitSnapshot();
         var nowUtc = DateTime.UtcNow;
-        var effectiveDeficitCap = GetEffectiveAutoReplacementPerSlotCreateCap(limit);
-        string deficitId;
-        int deficitCreated;
 
-        lock (_autoReplacementCreateLimitLock)
+        // Chốt pool trước điểm CREATE thật. Nếu đã có 3 PRF đang chờ/kiểm tra thì
+        // không tiêu thêm account; scheduler sẽ xoay lại pool cũ.
+        if (!TryReserveAutoReplacementCheckPoolProfile(profileName, out var checkPoolCount))
         {
-            var state = EnsureAutoReplacementCreateLimitStateUnsafe();
-            PruneAutoReplacementCreateHourWindowUnsafe(nowUtc);
-            EnsureAutoReplacementDeficitCreateBudgetActiveUnsafe(
-                $"reserve:{request.Id}:{request.ClosedProfileName}");
+            blockReason = $"check_pool={checkPoolCount}/{AutoReplacementCheckPoolMax}";
+            return false;
+        }
 
-            state = EnsureAutoReplacementCreateLimitStateUnsafe();
-            deficitId = state.DeficitId;
-            deficitCreated = Math.Max(0, state.DeficitCreatedCount);
-
-            if (deficitCreated >= effectiveDeficitCap)
-                blockReason = $"deficit={deficitCreated}/{effectiveDeficitCap}";
-            else if (limit.Enabled && state.CreatedUtc.Count >= limit.PerHour)
-                blockReason = $"hour={state.CreatedUtc.Count}/{limit.PerHour}";
-            else if (limit.Enabled && state.SessionCreatedCount >= limit.PerSession)
-                blockReason = $"session={state.SessionCreatedCount}/{limit.PerSession}";
-
-            if (blockReason.Length > 0)
+        var limitCommitted = false;
+        try
+        {
+            if (limit.Enabled)
             {
-                SaveAutoReplacementCreateLimitStateUnsafe();
-                return false;
+                lock (_autoReplacementCreateLimitLock)
+                {
+                    var state = EnsureAutoReplacementCreateLimitStateUnsafe();
+                    PruneAutoReplacementCreateHourWindowUnsafe(nowUtc);
+
+                    if (state.CreatedUtc.Count >= limit.PerHour)
+                        blockReason = $"hour={state.CreatedUtc.Count}/{limit.PerHour}";
+                    else if (state.SessionCreatedCount >= limit.PerSession)
+                        blockReason = $"session={state.SessionCreatedCount}/{limit.PerSession}";
+
+                    if (blockReason.Length == 0)
+                    {
+                        state.CreatedUtc.Add(nowUtc);
+                        state.SessionCreatedCount++;
+                        SaveAutoReplacementCreateLimitStateUnsafe();
+                        limitCommitted = true;
+                    }
+                }
+
+                if (blockReason.Length > 0)
+                {
+                    // Chưa CREATE thật nên phải trả lại slot pool vừa reserve.
+                    ReleaseAutoReplacementCheckPoolProfile(
+                        profileName,
+                        "advanced_limit_block_before_create");
+                    return false;
+                }
             }
 
-            // Điểm COMMIT CREATE thật: tăng ngân sách dùng chung của cả deficit.
-            state.DeficitCreatedCount++;
-            deficitCreated = state.DeficitCreatedCount;
-            state.CreatedUtc.Add(nowUtc);
-            state.SessionCreatedCount++;
-            SaveAutoReplacementCreateLimitStateUnsafe();
-        }
+            // Giữ counter per-request chỉ để chẩn đoán/tương thích queue cũ; nó không
+            // còn là hard-cap 3/3.
+            int requestCreated;
+            lock (_autoReplacementQueueLock)
+            {
+                var live = _autoReplacementQueue.FirstOrDefault(x =>
+                    x.Id.Equals(request.Id, StringComparison.OrdinalIgnoreCase));
+                var target = live ?? request;
+                target.CreatedProfileCount = Math.Max(0, target.CreatedProfileCount) + 1;
+                target.CreateLimitReuseWaitActive = false;
+                target.CreateLimitWaitReason = "";
 
-        // Giữ counter per-request chỉ để chẩn đoán/tương thích queue cũ; nó KHÔNG
-        // còn quyết định hard-cap.
-        int requestCreated;
-        lock (_autoReplacementQueueLock)
+                if (live is not null)
+                    SaveAutoReplacementQueueUnsafe();
+
+                requestCreated = target.CreatedProfileCount;
+            }
+
+            int hourCreated = 0;
+            int sessionCreated = 0;
+            if (limit.Enabled)
+            {
+                lock (_autoReplacementCreateLimitLock)
+                {
+                    var state = EnsureAutoReplacementCreateLimitStateUnsafe();
+                    hourCreated = state.CreatedUtc.Count;
+                    sessionCreated = state.SessionCreatedCount;
+                }
+            }
+
+            _log.Info(
+                $"[AUTO_CHECK_POOL_RESERVE] request={request.Id} profile={profileName} " +
+                $"checking={checkPoolCount}/{AutoReplacementCheckPoolMax} requestCreated={requestCreated} " +
+                $"advancedLimit={limit.Enabled} hour={hourCreated}/{limit.PerHour} session={sessionCreated}/{limit.PerSession}");
+
+            return true;
+        }
+        catch
         {
-            var live = _autoReplacementQueue.FirstOrDefault(x =>
-                x.Id.Equals(request.Id, StringComparison.OrdinalIgnoreCase));
-            var target = live ?? request;
-            target.CreatedProfileCount = Math.Max(0, target.CreatedProfileCount) + 1;
-            target.CreateLimitReuseWaitActive = false;
-            target.CreateLimitWaitReason = "";
-
-            if (live is not null)
-                SaveAutoReplacementQueueUnsafe();
-
-            requestCreated = target.CreatedProfileCount;
+            // Nếu exception xảy ra trước CREATE, tránh giữ một slot pool ma. Counter
+            // nâng cao đã commit (nếu có) vẫn giữ nguyên theo semantics cũ.
+            ReleaseAutoReplacementCheckPoolProfile(
+                profileName,
+                limitCommitted ? "reserve_exception_after_limit_commit" : "reserve_exception");
+            throw;
         }
-
-        int hourCreated;
-        int sessionCreated;
-        lock (_autoReplacementCreateLimitLock)
-        {
-            var state = EnsureAutoReplacementCreateLimitStateUnsafe();
-            hourCreated = state.CreatedUtc.Count;
-            sessionCreated = state.SessionCreatedCount;
-        }
-
-        _log.Info(
-            $"[AUTO_CREATE_LIMIT_COUNT] request={request.Id} profile={profileName} enabled={limit.Enabled} " +
-            $"deficitId={deficitId} deficit={deficitCreated}/{effectiveDeficitCap} requestCreated={requestCreated} " +
-            $"configuredPerSlot={limit.PerSlot} hardCap={AutoReplacementHardCreatePerSlotCap} " +
-            $"hour={hourCreated}/{limit.PerHour} session={sessionCreated}/{limit.PerSession}");
-
-        return true;
     }
 
     void ScheduleAutoReplacementCreateLimitReuseRetry(
@@ -637,16 +818,13 @@ public sealed partial class ManagerForm
         string lastError)
     {
         var limit = GetAutoReplacementCreateLimitSnapshot();
-        var deficitSnapshot = GetAutoReplacementDeficitCreateBudgetSnapshot();
-        var slotCreated = deficitSnapshot.Created;
-        var effectivePerSlotCap = GetEffectiveAutoReplacementPerSlotCreateCap(limit);
-        var hardSlotCapReached = deficitSnapshot.Active && slotCreated >= effectivePerSlotCap;
+        var pool = GetAutoReplacementCheckPoolSnapshot();
+        var poolFull = pool.Count >= AutoReplacementCheckPoolMax;
 
-        // Sau khi toàn bộ đợt thiếu đã đạt 3/3 (hoặc ngưỡng user thấp hơn), không CREATE thêm.
-        // Chỉ quay vòng toàn bộ hàng chờ mỗi ~2 phút. Hour/session-only vẫn giữ
-        // RetryMinutes cấu hình cũ để không thay đổi hành vi ngoài yêu cầu này.
-        var delay = hardSlotCapReached
-            ? AutoReplacementHardCreateCapReuseRetry
+        // Pool đầy 3/3 => không tạo PRF thứ 4, chỉ xoay lại pool khoảng 2 phút/lần.
+        // Nếu chỉ vướng giới hạn nâng cao /giờ hoặc /phiên thì dùng RetryMinutes cấu hình.
+        var delay = poolFull
+            ? AutoReplacementCheckPoolRetry
             : TimeSpan.FromMinutes(limit.RetryMinutes);
 
         lock (_autoReplacementQueueLock)
@@ -669,17 +847,17 @@ public sealed partial class ManagerForm
 
             _log.Warn(
                 $"[AUTO_CREATE_LIMIT_WAIT_REUSE] id={request.Id} closed={request.ClosedProfileName} " +
-                $"retryIn={delay:c} mode={(hardSlotCapReached ? "DEFICIT_HARD_CAP_ROTATION" : "CONFIGURED_LIMIT_WAIT")} " +
-                $"deficit={slotCreated}/{effectivePerSlotCap} clearedAttempted={previousAttempted} reason={request.CreateLimitWaitReason}");
+                $"retryIn={delay:c} mode={(poolFull ? "CHECK_POOL_FULL_ROTATION" : "ADVANCED_LIMIT_WAIT")} " +
+                $"checking={pool.Count}/{AutoReplacementCheckPoolMax} clearedAttempted={previousAttempted} reason={request.CreateLimitWaitReason}");
 
             WriteAutoActivityLog(
                 action: "TỰ BÙ",
                 profile: request.ClosedProfileName,
                 reason: request.Reason,
                 result: "TẠM DỪNG TẠO / CHỜ PRF",
-                detail: hardSlotCapReached
-                    ? $"Đã đạt {slotCreated}/{effectivePerSlotCap} CREATE cho toàn bộ đợt thiếu. Khóa CREATE cho mọi suất; cứ khoảng 2 phút quét xoay vòng lại toàn bộ PRF chờ cho tới khi capacity phục hồi. {request.CreateLimitWaitReason}"
-                    : $"Tạm dừng nhánh tạo. Nghỉ {limit.RetryMinutes} phút rồi thử lại lần lượt toàn bộ PRF chờ; nếu vẫn chưa được sẽ tiếp tục chu kỳ chờ. {request.CreateLimitWaitReason}");
+                detail: poolFull
+                    ? $"Đang có đủ {pool.Count}/{AutoReplacementCheckPoolMax} PRF trong pool kiểm tra. Không tạo PRF thứ 4; khoảng 2 phút sẽ xoay kiểm tra lại pool. {request.CreateLimitWaitReason}"
+                    : $"Giới hạn CREATE nâng cao đang bật. Nghỉ {limit.RetryMinutes} phút rồi thử lại PRF chờ. {request.CreateLimitWaitReason}");
         }
     }
 
@@ -1087,6 +1265,7 @@ public sealed partial class ManagerForm
             try
             {
                 await RefreshReusableProfileQueueAsync("manager_shown");
+                RebuildAutoReplacementCheckPoolFromReusableState("manager_shown");
             }
             catch (Exception ex)
             {
@@ -1643,30 +1822,30 @@ public sealed partial class ManagerForm
                             else if (TryGetAutoReplacementCreateLimitBlock(
                                          request,
                                          out var createLimitReason,
-                                         out var createLimitDeficitCount,
+                                         out var createLimitCheckPoolCount,
                                          out var createLimitHourCount,
                                          out var createLimitSessionCount))
                             {
                                 createLimitBlocked = true;
                                 var limit = GetAutoReplacementCreateLimitSnapshot();
-                                var effectivePerSlotCap = GetEffectiveAutoReplacementPerSlotCreateCap(limit);
-                                var slotCapReached = createLimitDeficitCount >= effectivePerSlotCap;
-                                var retryDelay = slotCapReached
-                                    ? AutoReplacementHardCreateCapReuseRetry
+                                var poolFull = createLimitCheckPoolCount >= AutoReplacementCheckPoolMax;
+                                var retryDelay = poolFull
+                                    ? AutoReplacementCheckPoolRetry
                                     : TimeSpan.FromMinutes(limit.RetryMinutes);
-                                lastError =
-                                    $"Đã chạm giới hạn tạo PRF ({createLimitReason}); tạm dừng tạo và chuyển sang vòng retry PRF chờ.";
+                                lastError = poolFull
+                                    ? $"Pool kiểm tra đã đủ {createLimitCheckPoolCount}/{AutoReplacementCheckPoolMax}; không tạo PRF thứ 4, chuyển sang xoay lại PRF chờ."
+                                    : $"Đã chạm giới hạn CREATE nâng cao ({createLimitReason}); tạm dừng tạo và chuyển sang vòng retry PRF chờ.";
 
                                 _log.Warn(
                                     $"[AUTO_CREATE_LIMIT_BLOCK] id={request.Id} closed={request.ClosedProfileName} " +
-                                    $"deficit={createLimitDeficitCount}/{effectivePerSlotCap} hour={createLimitHourCount}/{limit.PerHour} " +
+                                    $"checking={createLimitCheckPoolCount}/{AutoReplacementCheckPoolMax} hour={createLimitHourCount}/{limit.PerHour} " +
                                     $"session={createLimitSessionCount}/{limit.PerSession} retryIn={retryDelay:c} reason={createLimitReason}");
 
                                 SetAutoReplacementUiPhase(
                                     "TẠM DỪNG TẠO",
-                                    slotCapReached
-                                        ? $"đã {createLimitDeficitCount}/{effectivePerSlotCap} toàn đợt · quét lại PRF chờ sau ~2 phút"
-                                        : $"retry PRF chờ sau {limit.RetryMinutes} phút",
+                                    poolFull
+                                        ? $"pool kiểm tra {createLimitCheckPoolCount}/{AutoReplacementCheckPoolMax} · xoay lại sau ~2 phút"
+                                        : $"giới hạn nâng cao · retry sau {limit.RetryMinutes} phút",
                                     request.Id);
                             }
                             else if (TryGetAutoReplacementCreateCooldown(
@@ -1760,23 +1939,23 @@ public sealed partial class ManagerForm
                                     && TryGetAutoReplacementCreateLimitBlock(
                                         request,
                                         out var postCreateLimitReason,
-                                        out var postCreateDeficitCount,
+                                        out var postCreateCheckPoolCount,
                                         out var postCreateHourCount,
                                         out var postCreateSessionCount))
                                 {
                                     createLimitBlocked = true;
                                     var limit = GetAutoReplacementCreateLimitSnapshot();
-                                    var effectivePerSlotCap = GetEffectiveAutoReplacementPerSlotCreateCap(limit);
-                                    var slotCapReached = postCreateDeficitCount >= effectivePerSlotCap;
-                                    var retryDelay = slotCapReached
-                                        ? AutoReplacementHardCreateCapReuseRetry
+                                    var poolFull = postCreateCheckPoolCount >= AutoReplacementCheckPoolMax;
+                                    var retryDelay = poolFull
+                                        ? AutoReplacementCheckPoolRetry
                                         : TimeSpan.FromMinutes(limit.RetryMinutes);
-                                    lastError =
-                                        $"Đã chạm giới hạn tạo PRF ({postCreateLimitReason}); tạm dừng tạo và chuyển sang vòng retry PRF chờ.";
+                                    lastError = poolFull
+                                        ? $"Pool kiểm tra đã đủ {postCreateCheckPoolCount}/{AutoReplacementCheckPoolMax}; xoay lại PRF hiện có trước khi tạo thêm."
+                                        : $"Đã chạm giới hạn CREATE nâng cao ({postCreateLimitReason}); tạm dừng tạo và chuyển sang vòng retry PRF chờ.";
 
                                     _log.Warn(
                                         $"[AUTO_CREATE_LIMIT_REACHED_AFTER_CREATE] id={request.Id} closed={request.ClosedProfileName} " +
-                                        $"deficit={postCreateDeficitCount}/{effectivePerSlotCap} hour={postCreateHourCount}/{limit.PerHour} " +
+                                        $"checking={postCreateCheckPoolCount}/{AutoReplacementCheckPoolMax} hour={postCreateHourCount}/{limit.PerHour} " +
                                         $"session={postCreateSessionCount}/{limit.PerSession} retryIn={retryDelay:c} reason={postCreateLimitReason}");
                                 }
                             }
@@ -2373,8 +2552,9 @@ public sealed partial class ManagerForm
         if (!outcome.Paused)
             return false;
 
-        // Chỉ grace 10 phút cho lỗi START/Worker/runtime. CAPTCHA, LOGIN, cấu hình
-        // hoặc RENAME cần luồng xử lý riêng và không được giữ slot giả 10 phút.
+        // Chỉ nhánh START/Worker/runtime mới đi vào stabilization. Auto Replace thường
+        // vẫn bị chặn bởi deadline wall-clock 5 phút/candidate; THAY ALL force-new giữ
+        // grace nội bộ cũ. CAPTCHA, LOGIN, cấu hình hoặc RENAME xử lý riêng.
         if (!outcome.Step.Equals("START_TOOL", StringComparison.OrdinalIgnoreCase))
             return false;
 
@@ -2722,8 +2902,8 @@ public sealed partial class ManagerForm
                 var startName = DetectNextAutoProfileName();
 
                 // THAY ALL có target CREATE riêng trong cửa sổ refresh hằng ngày.
-                // Cầu chì CREATE của Auto Replace thường (3/deficit, per-hour, per-session)
-                // không được chặn nhánh force-new này; các gate schedule/deadline/cooldown,
+                // Pool kiểm tra của Auto Replace thường (tối đa 3) và giới hạn nâng cao
+                // /giờ,/phiên không được chặn nhánh force-new này; các gate schedule/deadline/cooldown,
                 // Global Login, login/name/video/stabilize vẫn giữ nguyên ở pipeline hiện có.
                 if (!forceNewProfileOnly
                     && TryGetAutoReplacementCreateLimitBlock(
@@ -2948,6 +3128,21 @@ public sealed partial class ManagerForm
 
                 _autoReplacementClaimedProfiles.Add(item.ProfileName);
 
+                using var candidateTimeoutCts =
+                    CancellationTokenSource.CreateLinkedTokenSource(executionToken);
+                if (!forceNewProfileOnly)
+                    candidateTimeoutCts.CancelAfter(AutoReplacementCandidateCheckTimeout);
+                var candidateToken = forceNewProfileOnly
+                    ? executionToken
+                    : candidateTimeoutCts.Token;
+
+                if (!forceNewProfileOnly)
+                {
+                    _log.Info(
+                        $"[AUTO_CHECK_BEGIN] request={request.Id} profile={item.ProfileName} source=create_new " +
+                        $"timeout={AutoReplacementCandidateCheckTimeout:c} checking={GetAutoReplacementCheckPoolSnapshot().Count}/{AutoReplacementCheckPoolMax}");
+                }
+
                 try
                 {
                     _log.Info(
@@ -2973,7 +3168,7 @@ public sealed partial class ManagerForm
                         autoVideo: LoadAutoProfileBehaviorSettings().AutoVideoEnabled,
                         autoStart: true,
                         isPaused: static () => false,
-                        ct: executionToken,
+                        ct: candidateToken,
                         ui: (step, result, _) =>
                         {
                             SetAutoReplacementUiPhase(
@@ -2998,6 +3193,9 @@ public sealed partial class ManagerForm
                         _log.Warn(
                             $"[AUTO_REPLACE_CREATE_MANUAL_ABORT] closed={request.ClosedProfileName} profile={item.ProfileName} stage=after_process");
                         await CleanupCreatedReplacementAttemptAsync(
+                            item.ProfileName,
+                            "manual_close_after_process");
+                        ReleaseAutoReplacementCheckPoolProfile(
                             item.ProfileName,
                             "manual_close_after_process");
                         return false;
@@ -3027,7 +3225,7 @@ public sealed partial class ManagerForm
                                 request,
                                 "created",
                                 executionGeneration,
-                                executionToken);
+                                candidateToken);
 
                         if (!healthy)
                         {
@@ -3036,6 +3234,9 @@ public sealed partial class ManagerForm
                                 _log.Warn(
                                     $"[AUTO_REPLACE_CREATE_MANUAL_ABORT] closed={request.ClosedProfileName} profile={item.ProfileName} stage=healthy_wait");
                                 await CleanupCreatedReplacementAttemptAsync(
+                                    item.ProfileName,
+                                    "manual_close_during_healthy_wait");
+                                ReleaseAutoReplacementCheckPoolProfile(
                                     item.ProfileName,
                                     "manual_close_during_healthy_wait");
                                 return false;
@@ -3073,6 +3274,9 @@ public sealed partial class ManagerForm
 
                         // Profile tạo mới chỉ được coi là ĐÃ TREO sau khi RUNNING khỏe.
                         MarkProfileSupplyState(item.ProfileName, "used", "auto_replacement_created_running_confirmed");
+                        ReleaseAutoReplacementCheckPoolProfile(
+                            item.ProfileName,
+                            "created_running_confirmed");
 
                         _log.Info(
                             $"[AUTO_REPLACE_CREATE_OK] closed={request.ClosedProfileName} replacement={item.ProfileName} account={item.Account.Username} confirmed=healthy_running");
@@ -3118,7 +3322,10 @@ public sealed partial class ManagerForm
                                 detail: outcome.Note);
 
                             // Excel vừa thay đổi sau lúc dựng queue (BAN/DONE/đổi mapping).
-                            // Không coi đây là lỗi tài khoản; thử lấy ứng viên mới ở vòng kế tiếp.
+                            // Không coi đây là lỗi tài khoản; candidate này không còn thuộc pool.
+                            ReleaseAutoReplacementCheckPoolProfile(
+                                item.ProfileName,
+                                "create_skip_excel_or_active_guard");
                             continue;
                         }
 
@@ -3179,20 +3386,23 @@ public sealed partial class ManagerForm
                         {
                             _log.Warn(
                                 $"[AUTO_REPLACE_CREATE_START_GRACE] profile={item.ProfileName} status={outcome.Status} " +
-                                $"step={outcome.Step} action=STABILIZE_10M");
+                                $"step={outcome.Step} action=STABILIZE_WITH_5M_CANDIDATE_DEADLINE");
 
                             var stabilization = await StabilizeReplacementRuntimeAsync(
                                 stabilizeCtx,
                                 request,
                                 "created_start_recovery",
                                 executionGeneration,
-                                executionToken);
+                                candidateToken);
 
                             if (IsManualCloseSuppressed(item.ProfileName))
                             {
                                 _log.Warn(
                                     $"[AUTO_REPLACE_CREATE_MANUAL_ABORT] closed={request.ClosedProfileName} profile={item.ProfileName} stage=stabilize");
                                 await CleanupCreatedReplacementAttemptAsync(
+                                    item.ProfileName,
+                                    "manual_close_during_stabilize");
+                                ReleaseAutoReplacementCheckPoolProfile(
                                     item.ProfileName,
                                     "manual_close_during_stabilize");
                                 return false;
@@ -3211,6 +3421,10 @@ public sealed partial class ManagerForm
                                 ClearAutoCloseExpectedRunning(
                                     item.ProfileName,
                                     "auto_replace_created_retire_delete_abort");
+
+                                ReleaseAutoReplacementCheckPoolProfile(
+                                    item.ProfileName,
+                                    "created_retire_delete_abort");
 
                                 _log.Warn(
                                     $"[AUTO_REPLACE_CREATE_ABORT_RETIRE_DELETE] id={request.Id} profile={item.ProfileName} detail={stabilization.Detail} action=RETURN_RELEASE_CLAIM_NO_COOLDOWN");
@@ -3254,7 +3468,10 @@ public sealed partial class ManagerForm
                                 MarkProfileSupplyState(
                                     item.ProfileName,
                                     "used",
-                                    "auto_replacement_created_recovered_10m");
+                                    "auto_replacement_created_recovered_5m");
+                                ReleaseAutoReplacementCheckPoolProfile(
+                                    item.ProfileName,
+                                    "created_recovered_5m");
 
                                 WriteAutoActivityLog(
                                     action: "MỞ PROFILE BÙ",
@@ -3263,7 +3480,7 @@ public sealed partial class ManagerForm
                                     reason: request.Reason,
                                     replacementProfile: item.ProfileName,
                                     result: "THÀNH CÔNG",
-                                    detail: "Profile gặp lỗi START ban đầu nhưng đã tự phục hồi trong cửa sổ ổn định 10 phút.");
+                                    detail: "Profile gặp lỗi START ban đầu nhưng đã tự phục hồi trong cửa sổ ổn định.");
 
                                 RegisterAutoReplacementCreateCooldown(
                                     outcome,
@@ -3310,6 +3527,9 @@ public sealed partial class ManagerForm
                     // tránh xóa catalog/folder song song với cleanup của Tự bù.
                     if (outcome.Status.Equals("LOGIN_BANNED", StringComparison.OrdinalIgnoreCase))
                     {
+                        ReleaseAutoReplacementCheckPoolProfile(
+                            item.ProfileName,
+                            "login_banned");
                         QueueAutoDeleteRetiredProfileAfterExcelNote(
                             item.ProfileName,
                             "BAN");
@@ -3327,6 +3547,77 @@ public sealed partial class ManagerForm
                         request,
                         item.ProfileName,
                         "outcome_fail");
+                    return false;
+                }
+                catch (OperationCanceledException)
+                    when (!forceNewProfileOnly
+                          && candidateTimeoutCts.IsCancellationRequested
+                          && !executionToken.IsCancellationRequested
+                          && IsAutoReplacementExecutionAllowed(executionGeneration))
+                {
+                    _log.Warn(
+                        $"[AUTO_CHECK_TIMEOUT_5M] request={request.Id} profile={item.ProfileName} source=create_new " +
+                        $"action=CLEANUP_ROTATE checking={GetAutoReplacementCheckPoolSnapshot().Count}/{AutoReplacementCheckPoolMax}");
+
+                    WriteAutoActivityLog(
+                        action: "TỰ BÙ",
+                        profile: request.ClosedProfileName,
+                        account: item.Account.Username,
+                        reason: request.Reason,
+                        replacementProfile: item.ProfileName,
+                        result: "TIMEOUT 5 PHÚT",
+                        detail: "PRF vượt quá 5 phút kiểm tra. Đóng runtime, giữ PRF nếu đã tạo và chuyển sang candidate khác.");
+
+                    try
+                    {
+                        await CleanupCreatedReplacementAttemptAsync(
+                            item.ProfileName,
+                            "candidate_timeout_5m");
+                    }
+                    catch (Exception cleanupEx)
+                    {
+                        _log.Error(
+                            $"[AUTO_CHECK_TIMEOUT_CLEANUP_ERROR] profile={item.ProfileName} error={cleanupEx}");
+                        throw new AutoReplacementCleanupBarrierException(
+                            item.ProfileName,
+                            $"PRF {item.ProfileName} timeout 5 phút nhưng cleanup chưa hoàn tất.",
+                            cleanupEx);
+                    }
+
+                    MarkReplacementProfileFailed(
+                        item.ProfileName,
+                        "candidate_timeout_5m");
+
+                    if (AutoReplacementProfileExistsInCatalog(item.ProfileName))
+                    {
+                        try
+                        {
+                            await RefreshReusableProfileQueueAsync(
+                                "candidate_timeout_5m",
+                                CancellationToken.None);
+                        }
+                        catch (Exception refreshEx)
+                        {
+                            _log.Warn(
+                                $"[AUTO_CHECK_TIMEOUT_REUSE_REFRESH_WARN] profile={item.ProfileName} error={refreshEx.Message}");
+                        }
+                    }
+                    else
+                    {
+                        ReleaseAutoReplacementCheckPoolProfile(
+                            item.ProfileName,
+                            "timeout_before_profile_created");
+                    }
+
+                    RegisterAutoReplacementCreateCooldown(
+                        null,
+                        item.ProfileName,
+                        request.Id,
+                        "candidate_timeout_5m");
+                    ArmAutoReplacementReuseSweepBeforeNextCreate(
+                        request,
+                        item.ProfileName,
+                        "candidate_timeout_5m");
                     return false;
                 }
                 catch (OperationCanceledException)
@@ -3392,6 +3683,30 @@ public sealed partial class ManagerForm
                         throw new InvalidOperationException(
                             $"Profile bù {item.ProfileName} lỗi và cleanup chưa hoàn tất; chặn mở profile kế tiếp.",
                             cleanupEx);
+                    }
+
+                    // Nếu exception xảy ra trước khi profile tồn tại thật thì không được
+                    // giữ một slot pool ma. Nếu profile đã tồn tại thì giữ trong pool và
+                    // để refresh/cooldown đưa nó về vòng kiểm tra sau.
+                    if (!AutoReplacementProfileExistsInCatalog(item.ProfileName))
+                    {
+                        ReleaseAutoReplacementCheckPoolProfile(
+                            item.ProfileName,
+                            "exception_before_profile_created:" + ex.GetType().Name);
+                    }
+                    else
+                    {
+                        try
+                        {
+                            await RefreshReusableProfileQueueAsync(
+                                "create_exception_keep_check_pool",
+                                CancellationToken.None);
+                        }
+                        catch (Exception refreshEx)
+                        {
+                            _log.Warn(
+                                $"[AUTO_CHECK_POOL_EXCEPTION_REFRESH_WARN] profile={item.ProfileName} error={refreshEx.Message}");
+                        }
                     }
 
                     // Exception ngoài outcome vẫn là một lần CREATE thật đã được thử.
@@ -3473,7 +3788,7 @@ public sealed partial class ManagerForm
 
         while (!_closing)
         {
-            // Candidate có thể bị BAN/TIME trong chính cửa sổ ổn định 10 phút.
+            // Candidate có thể bị BAN/TIME trong chính cửa sổ ổn định.
             // Không được recovery/reopen nó nữa, đặc biệt khi job xóa đã được arm.
             if (IsProfileRetireDeleteBlockedForOpen(ctx.Profile.Name))
             {
@@ -3622,7 +3937,7 @@ public sealed partial class ManagerForm
                             ctx,
                             isReusableProfileOpen
                                 ? $"Đang mở lại profile chờ {ctx.Profile.Name}..."
-                                : $"Đang chờ profile {ctx.Profile.Name} ổn định (tối đa 10 phút)...");
+                                : $"Đang chờ profile {ctx.Profile.Name} ổn định...");
                     }
                     catch (Exception ex)
                     {
@@ -4732,6 +5047,29 @@ public sealed partial class ManagerForm
         MarkProfileSupplyState(profileName, "new", "auto_profile_created");
     }
 
+    bool AutoReplacementProfileExistsInCatalog(string profileName)
+    {
+        profileName = (profileName ?? "").Trim();
+        if (profileName.Length == 0)
+            return false;
+
+        try
+        {
+            return _profileService.Load().Profiles.Any(x =>
+                (x.Name ?? "").Trim().Equals(
+                    profileName,
+                    StringComparison.OrdinalIgnoreCase));
+        }
+        catch (Exception ex)
+        {
+            // Không đọc được catalog thì fail-closed: coi như profile có thể tồn tại,
+            // giữ slot pool để tránh CREATE chồng. Lượt refresh sau sẽ tự reconcile.
+            _log.Warn(
+                $"[AUTO_CHECK_POOL_CATALOG_PROBE_WARN] profile={profileName} error={ex.Message}");
+            return true;
+        }
+    }
+
     bool TryClassifyReplacementSupply(
         ProfileContext ctx,
         out string supplyState,
@@ -4811,6 +5149,7 @@ public sealed partial class ManagerForm
         if (profileName.Length == 0 || state.Length == 0)
             return;
 
+        var saved = false;
         try
         {
             lock (_profileSupplyStateLock)
@@ -4824,6 +5163,7 @@ public sealed partial class ManagerForm
                     UpdatedUtc = DateTime.UtcNow
                 };
                 SaveProfileSupplyStateDocumentUnsafe(document);
+                saved = true;
             }
         }
         catch (Exception ex)
@@ -4831,6 +5171,17 @@ public sealed partial class ManagerForm
             // State phụ không được phép làm hỏng luồng profile chính.
             _log.Warn(
                 $"[AUTO_REPLACE_SUPPLY_STATE_WARN] profile={profileName} state={state} error={ex.Message}");
+        }
+
+        // RUNNING khỏe (used) hoặc kết thúc vòng đời (retired) phải nhả ngay slot
+        // pool kiểm tra để nếu vẫn thiếu target Tool có thể bổ sung candidate mới.
+        if (saved
+            && (state.Equals("used", StringComparison.OrdinalIgnoreCase)
+                || state.Equals("retired", StringComparison.OrdinalIgnoreCase)))
+        {
+            ReleaseAutoReplacementCheckPoolProfile(
+                profileName,
+                "supply_state:" + state + ":" + source);
         }
     }
 
