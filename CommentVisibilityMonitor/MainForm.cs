@@ -45,6 +45,7 @@ internal sealed partial class MainForm : Form
     readonly Button _stop = new() { Text = "Dừng kiểm tra", AutoSize = true, Enabled = false };
     readonly Button _exportDiagnostic = new() { Text = "Xuất ZIP chẩn đoán", AutoSize = true };
     readonly Button _banCheck = new() { Text = "CHECK BAN", AutoSize = true };
+    readonly Button _idChange = new() { Text = "ĐỔI ID", AutoSize = true };
     readonly Button _observerLogin = new() { Text = "Đăng nhập", AutoSize = true };
     readonly ComboBox _quickProfile = new() { Width = 92, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(8, 4, 2, 0) };
     readonly Button _quickCheck = new() { Text = "CHECK NGAY", AutoSize = true };
@@ -62,6 +63,7 @@ internal sealed partial class MainForm : Form
     bool _receiveLoopStarted;
     bool _banCheckRunning;
     BanCheckForm? _banCheckForm;
+    IdChangeForm? _idChangeForm;
     CommentCheckStatisticsForm? _statisticsForm;
     string _targetProfile = "";
     CycleState? _cycle;
@@ -108,7 +110,7 @@ internal sealed partial class MainForm : Form
         top.RowStyles.Add(new RowStyle(SizeType.Absolute, 38F));
 
         var toolbar = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, Margin = new Padding(0) };
-        toolbar.Controls.AddRange(new Control[] { _openObserver, _observerLogin, _start, _stop, _exportDiagnostic, _banCheck, _observerState, _observerLoginState });
+        toolbar.Controls.AddRange(new Control[] { _openObserver, _observerLogin, _start, _stop, _exportDiagnostic, _banCheck, _idChange, _observerState, _observerLoginState });
 
         var quickBar = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, Margin = new Padding(0) };
         quickBar.Controls.AddRange(new Control[]
@@ -146,6 +148,7 @@ internal sealed partial class MainForm : Form
         _history.Click += (_, _) => OpenHistoryWindow();
         _statistics.Click += (_, _) => OpenStatisticsWindow();
         _banCheck.Click += (_, _) => OpenBanCheckWindow();
+        _idChange.Click += (_, _) => OpenIdChangeWindow();
         _uiTimer.Tick += (_, _) => OnUiTick();
         _uiTimer.Start();
         FormClosing += async (_, _) =>
@@ -560,6 +563,23 @@ internal sealed partial class MainForm : Form
         _cycleState.Text = "Phiên: —";
         _summaryState.Text = "Tỷ lệ TB: —";
         Log("Đã dừng kiểm tra: " + reason);
+    }
+
+    // ID change has its own CDP Chrome and independent XLSX columns.
+    // Never invoke Manager Auto Run, Check BAN, or the Worker identity update branch.
+    void OpenIdChangeWindow()
+    {
+        if (_idChangeForm is not null && !_idChangeForm.IsDisposed)
+        {
+            if (_idChangeForm.WindowState == FormWindowState.Minimized)
+                _idChangeForm.WindowState = FormWindowState.Normal;
+            _idChangeForm.BringToFront();
+            _idChangeForm.Focus();
+            return;
+        }
+        _idChangeForm = new IdChangeForm(_dataDir, Log);
+        _idChangeForm.FormClosed += (_, _) => _idChangeForm = null;
+        _idChangeForm.Show(this);
     }
 
     void OpenBanCheckWindow()

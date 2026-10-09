@@ -80,6 +80,13 @@ public sealed partial class ManagerForm
         bool suppressStatus = false,
         bool explicitUserStartIntent = false)
     {
+        // Từ lúc có lệnh Start/Start_auto, profile không còn là "mở để kiểm tra".
+        // Xóa intent ngay từ đầu (không đợi Start thành công) để Name Guard transient/
+        // NAME_SYNC_PENDING vẫn được các scheduler/recovery hiện có xử lý ở lượt sau.
+        ClearManualInspectOpen(
+            ctx.Profile.Name,
+            explicitUserStartIntent ? "user_start_requested" : $"automation_start_requested:{command}");
+
         if (IsAutomationHalted)
         {
             if (!suppressStatus)
@@ -547,19 +554,44 @@ public sealed partial class ManagerForm
                     ? "TikTok đang giới hạn thời gian đổi tên."
                     : string.IsNullOrWhiteSpace(reply.Message) ? "Đổi Tên/ảnh không thành công." : reply.Message;
 
-            // Cooldown tên hoặc lỗi DOM/CDP/UI tạm thời KHÔNG phải bằng chứng account
-            // login hỏng hay Tên/ảnh hỏng vĩnh viễn. Giữ Excel ở PROCESSING (đã ghi ở
-            // trên), cho stabilizer/reuse retry; tuyệt đối không ghi Tên/ảnh=FAIL.
-            if (reply.NameCooldown
-                || IsNameGuardRetryableIdentityUpdateFailure(reply, reason))
+            // Cooldown 7 ngày xuất hiện NGAY TRONG LẦN ĐỔI này nghĩa là TikTok đã
+            // chặn trước khi Tool có thể Save tên mới. Đây là trạng thái terminal của
+            // profile hiện tại: note doi_ten_7d + hard-retire + xóa.
+            //
+            // Trường hợp Tool ĐÃ Save/Confirm nhưng profile page chưa phản ánh tên mới
+            // không đi vào nhánh này: nó được đưa vào NAME_SYNC_PENDING bên dưới và
+            // recovery chỉ PROBE, tuyệt đối không mở Edit profile lần nữa.
+            if (reply.NameCooldown)
+            {
+                var retired = await HandleRenameCooldownTerminalAsync(
+                    ctx,
+                    username,
+                    "name_guard_before_rename_submit",
+                    CancellationToken.None);
+
+                if (retired)
+                {
+                    return new NameGuardResult(
+                        false,
+                        $"TikTok đang giới hạn đổi tên 7 ngày; đã note {RenameCooldownTerminalNote} và xếp xóa profile.",
+                        Transient: false);
+                }
+
+                return RegisterNameGuardTransientFailure(
+                    ctx,
+                    username,
+                    reason + " Chưa ghi/xác minh được note terminal nên không xóa để tránh nhầm.",
+                    "identity_update_name_cooldown_note_failed");
+            }
+
+            // Lỗi DOM/CDP/UI tạm thời không phải bằng chứng account hỏng vĩnh viễn.
+            if (IsNameGuardRetryableIdentityUpdateFailure(reply, reason))
             {
                 return RegisterNameGuardTransientFailure(
                     ctx,
                     username,
                     reason,
-                    reply.NameCooldown
-                        ? "identity_update_name_cooldown"
-                        : "identity_update_retryable_dom_or_cdp");
+                    "identity_update_retryable_dom_or_cdp");
             }
 
             if (deferTerminalCleanup)

@@ -599,7 +599,7 @@ public sealed partial class ManagerForm : Form
             AutoEllipsis = true,
             Margin = new Padding(8, 4, 12, 0)
         };
-        var openChrome = Button("Mở Chrome", async (_, _) => { try { await OpenChromeForProfileAsync(ctx); } catch (Exception ex) { ShowError(ex); } }, UiButtonKind.Primary);
+        var openChrome = Button("Mở Chrome", async (_, _) => { try { await OpenChromeForProfileAsync(ctx, manualInspectOnly: true); } catch (Exception ex) { ShowError(ex); } }, UiButtonKind.Primary);
         var closeChrome = Button("Đóng Chrome", async (_, _) => { try { await CloseChromeForProfileAsync(ctx, manualIntent: true); } catch (Exception ex) { ShowError(ex); } }, UiButtonKind.Danger);
         var viewChrome = Button("👁 View", async (_, _) => { try { await ViewChromeForProfileAsync(ctx); } catch (Exception ex) { ShowError(ex); } }, UiButtonKind.Neutral);
         var account = Button("🔐 Tài khoản", (_, _) => ConfigureTikTokAccount(ctx));
@@ -761,7 +761,7 @@ public sealed partial class ManagerForm : Form
         }
     }
 
-    async Task OpenChromeForProfileAsync(ProfileContext ctx)
+    async Task OpenChromeForProfileAsync(ProfileContext ctx, bool manualInspectOnly = false)
     {
         var autoDiagTrace = BeginAutoDiagnosticOpenChrome(ctx, "manual_open_chrome");
 
@@ -782,6 +782,14 @@ public sealed partial class ManagerForm : Form
                 "blocked_before_prepare");
             return;
         }
+
+        // Chỉ nút "Mở Chrome" thủ công của người dùng mới vào chế độ kiểm tra.
+        // Chế độ này KHÔNG thay đổi launch/login hiện có; nó chỉ chặn scheduler
+        // AutoOnReady tự chen Tên/ảnh -> VIDEO -> Start sau khi TikTok vừa READY.
+        // Các caller tự động giữ manualInspectOnly=false nên luồng Auto Profile/
+        // Auto Replace/Run Strategy không bị thay đổi.
+        if (manualInspectOnly)
+            ArmManualInspectOpen(ctx.Profile.Name, "ui_open_chrome");
 
         // Mỗi lần mở Chrome mới cho phép đúng một lượt kiểm tra Tên/ảnh mới.
         // Excel DONE vẫn được bỏ qua ngay ở Name Guard nên không phát sinh điều hướng.

@@ -3506,6 +3506,11 @@ public sealed partial class ManagerForm
                 if (snapshot.MessageReplyRunning || _messageReplyProfilesInFlight.Contains(candidate.Profile.Name)) return false;
                 if (snapshot.VideoDeleteRunning) return false;
                 if (!string.Equals(snapshot.TikTokStartupState, "READY", StringComparison.OrdinalIgnoreCase)) return false;
+
+                // Người dùng bấm Mở Chrome chỉ để kiểm tra/login: giữ Chrome READY mở
+                // nhưng tuyệt đối không cho AutoOnReady tự chạy Tên/ảnh, VIDEO hay Start.
+                if (IsManualInspectOpen(candidate.Profile.Name)) return false;
+
                 if (_autoIdentityHandledSession.Contains(candidate.Profile.Name)) return false;
 
                 // Nếu PRESTART (StartWithNameGuard) vừa xử lý VIDEO xong trong chính
@@ -3533,6 +3538,17 @@ public sealed partial class ManagerForm
         {
             var state = LoadIdentityToolState();
             if (!state.AutoOnReady) return;
+
+            // Scheduler có thể đã chọn profile ngay trước lúc user bấm Mở Chrome.
+            // Re-check sau queue gate để manual-inspect thắng race và không có pipeline
+            // Tên/ảnh/VIDEO nào bắt đầu ngoài ý muốn. Không đánh dấu handled: khi user
+            // bấm Start (hoặc một luồng tự động thật sự tiếp quản), intent sẽ được xóa.
+            if (IsManualInspectOpen(ctx.Profile.Name))
+            {
+                _log.Info(
+                    $"[AUTO_IDENTITY_SKIP_MANUAL_INSPECT] profile={ctx.Profile.Name} action=KEEP_CHROME_OPEN_LOGIN_ONLY");
+                return;
+            }
 
             // Re-check SAU khi lấy queue gate. Có thể scheduler đã chọn profile này
             // trước khi PRESTART kịp hoàn tất VIDEO; khi tới lượt chạy thật thì VIDEO

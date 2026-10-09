@@ -2191,6 +2191,15 @@ public sealed partial class ManagerForm
         var profileName = ctx.Profile.Name;
         command = (command ?? "").Trim().ToLowerInvariant();
 
+        // Defense-in-depth: mọi Start/Resume đã được Worker xác nhận nghĩa là profile
+        // đã rời chế độ mở-thủ-công-để-kiểm-tra, kể cả lệnh đến từ luồng tự động.
+        if (command is "start" or "start_auto" or "resume")
+        {
+            ClearManualInspectOpen(
+                profileName,
+                $"runtime_command_confirmed:{command}");
+        }
+
         // Manual-close suppression còn được Auto Replace/queue dùng ngay cả khi tính năng
         // Auto Close đang tắt. Vì vậy user Start/Resume phải clear intent này trước guard
         // _autoCloseFeatureInitialized, sau khi Worker đã xác nhận command thành công.

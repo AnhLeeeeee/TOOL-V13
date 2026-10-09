@@ -19,6 +19,11 @@ public sealed partial class ManagerForm
         // Vẫn dùng CHÍNH queue Chờ dùng lại; lane này được vét SAU profile chờ
         // bình thường nhưng TRƯỚC khi tạo profile mới, với min-age + one-attempt/request.
         public bool NameSyncPending { get; set; }
+        // Bằng chứng bền qua restart: entry NAME_SYNC_PENDING chỉ được tạo SAU khi
+        // Tool đã Save/Confirm tên. Recovery của entry này chỉ PROBE, không mở Edit
+        // profile lần nữa nên không thể nhầm cooldown 7 ngày hậu-Save với cooldown cũ.
+        public bool RenameSubmitted { get; set; }
+        public DateTime? RenameSubmittedUtc { get; set; }
         public DateTime? NameSyncQueuedUtc { get; set; }
         public int NameSyncCheckCount { get; set; }
 
@@ -275,6 +280,19 @@ public sealed partial class ManagerForm
                         0,
                         totalSeconds);
 
+                // doi_ten_7d là terminal note bền trong Excel. Nếu Manager restart sau
+                // lúc ghi note nhưng trước khi job xóa hoàn tất, lượt quét queue phải
+                // tự arm lại deletion thay vì chỉ bỏ PRF khỏi danh sách Chờ.
+                var accountNote = (account.Note ?? "").Trim();
+                if (IsRenameCooldownTerminalNoteValue(accountNote))
+                {
+                    reasons[profileName] = $"GHI CHÚ: {accountNote} · XẾP XÓA";
+                    QueueAutoDeleteRetiredProfileAfterExcelNote(
+                        profileName,
+                        RenameCooldownDeleteReason);
+                    continue;
+                }
+
                 // Lane đặc biệt nhưng vẫn nằm trong CHÍNH queue Chờ dùng lại:
                 // profile vừa tạo đã Save tên nhưng TikTok có thể cập nhật chậm.
                 // Giữ entry qua mọi lượt refresh, nhưng TryUseReusableProfileQueueAsync
@@ -282,9 +300,10 @@ public sealed partial class ManagerForm
                 if (nameSyncPending)
                 {
                     var pendingNote = (account.Note ?? "").Trim();
-                    if (pendingNote.Equals("ban", StringComparison.OrdinalIgnoreCase))
+                    if (pendingNote.Equals("ban", StringComparison.OrdinalIgnoreCase)
+                        || IsRenameCooldownTerminalNoteValue(pendingNote))
                     {
-                        reasons[profileName] = "GHI CHÚ: ban";
+                        reasons[profileName] = $"GHI CHÚ: {pendingNote}";
                         continue;
                     }
 
@@ -316,7 +335,9 @@ public sealed partial class ManagerForm
                             TotalRunSeconds = totalSeconds,
                             IsManual = false,
                             NameSyncPending = true,
-                            NameSyncQueuedUtc = oldEntry!.NameSyncQueuedUtc ?? oldEntry.AddedUtc,
+                            RenameSubmitted = oldEntry!.RenameSubmitted || oldEntry.NameSyncPending,
+                            RenameSubmittedUtc = oldEntry.RenameSubmittedUtc ?? oldEntry.NameSyncQueuedUtc ?? oldEntry.AddedUtc,
+                            NameSyncQueuedUtc = oldEntry.NameSyncQueuedUtc ?? oldEntry.AddedUtc,
                             NameSyncCheckCount = Math.Max(0, oldEntry.NameSyncCheckCount),
                             AddedUtc = oldEntry.AddedUtc,
                             LastCheckedUtc = oldEntry.LastCheckedUtc
@@ -327,13 +348,13 @@ public sealed partial class ManagerForm
 
                 if (isManual)
                 {
-                    // Queue thủ công giữ nguyên ưu tiên. Chỉ Ghi chú=ban là chặn tuyệt đối.
-                    if (string.Equals(
-                            (account.Note ?? "").Trim(),
-                            "ban",
-                            StringComparison.OrdinalIgnoreCase))
+                    // Queue thủ công giữ nguyên ưu tiên, nhưng BAN và cooldown đổi tên
+                    // terminal tuyệt đối không được override để tránh hồi sinh PRF đã xếp xóa.
+                    var manualNote = (account.Note ?? "").Trim();
+                    if (manualNote.Equals("ban", StringComparison.OrdinalIgnoreCase)
+                        || IsRenameCooldownTerminalNoteValue(manualNote))
                     {
-                        reasons[profileName] = "GHI CHÚ: ban";
+                        reasons[profileName] = $"GHI CHÚ: {manualNote}";
                         continue;
                     }
 
@@ -571,7 +592,7 @@ public sealed partial class ManagerForm
             var updated =
                 new ReusableProfileQueueDocument
                 {
-                    Version = 3,
+                    Version = 4,
                     Pending = eligible,
                     ExcludedProfiles =
                         excludedProfiles
@@ -809,12 +830,11 @@ public sealed partial class ManagerForm
             return false;
         }
 
-        if (note.Equals(
-                "ban",
-                StringComparison.OrdinalIgnoreCase))
+        if (note.Equals("ban", StringComparison.OrdinalIgnoreCase)
+            || IsRenameCooldownTerminalNoteValue(note))
         {
             message =
-                $"Profile {profileName} có Ghi chú = ban nên không được đưa vào Chờ dùng lại.";
+                $"Profile {profileName} có Ghi chú = {note} nên không được đưa vào Chờ dùng lại.";
             return false;
         }
 
@@ -926,7 +946,7 @@ public sealed partial class ManagerForm
                 OrderReusableProfileEntries(
                     document.Pending);
 
-            document.Version = 3;
+            document.Version = 4;
 
             _reusableProfileQueueCache = document;
             _reusableProfileQueueLoaded = true;
@@ -984,7 +1004,7 @@ public sealed partial class ManagerForm
                 document.ExcludedProfiles.Add(profileName);
             }
 
-            document.Version = 3;
+            document.Version = 4;
 
             _reusableProfileQueueCache = document;
             _reusableProfileQueueLoaded = true;
@@ -1093,7 +1113,7 @@ public sealed partial class ManagerForm
             // Giữ AddedUtc cũ để profile tồn lâu được ưu tiên dùng trước.
 
             document.Pending = OrderReusableProfileEntries(document.Pending);
-            document.Version = 3;
+            document.Version = 4;
             _reusableProfileQueueCache = document;
             _reusableProfileQueueLoaded = true;
             _reusableProfileReasonCache[profileName] =
@@ -1168,6 +1188,7 @@ public sealed partial class ManagerForm
 
             if (account is null
                 || (account.Note ?? "").Trim().Equals("ban", StringComparison.OrdinalIgnoreCase)
+                || IsRenameCooldownTerminalNoteValue(account.Note)
                 || !string.Equals((account.AssignedProfile ?? "").Trim(), profileName, StringComparison.OrdinalIgnoreCase))
             {
                 skippedCount++;
@@ -1343,6 +1364,8 @@ public sealed partial class ManagerForm
                     TotalRunSeconds = Math.Max(0, totalSeconds),
                     IsManual = false,
                     NameSyncPending = true,
+                    RenameSubmitted = true,
+                    RenameSubmittedUtc = existing?.RenameSubmittedUtc ?? nowUtc,
                     NameSyncQueuedUtc = existing?.NameSyncQueuedUtc ?? nowUtc,
                     NameSyncCheckCount = existing?.NameSyncCheckCount ?? 0,
                     AddedUtc = existing?.AddedUtc ?? nowUtc,
@@ -1350,7 +1373,7 @@ public sealed partial class ManagerForm
                 });
 
             document.Pending = OrderReusableProfileEntries(document.Pending);
-            document.Version = 3;
+            document.Version = 4;
             _reusableProfileQueueCache = document;
             _reusableProfileQueueLoaded = true;
             _reusableProfileReasonCache[profileName] = "CHỜ ĐỒNG BỘ TÊN";
@@ -1395,7 +1418,7 @@ public sealed partial class ManagerForm
             entry.AddedUtc = DateTime.UtcNow;
 
             document.Pending = OrderReusableProfileEntries(document.Pending);
-            document.Version = 3;
+            document.Version = 4;
             _reusableProfileQueueCache = document;
             _reusableProfileQueueLoaded = true;
             _reusableProfileReasonCache[profileName] =
@@ -1533,6 +1556,7 @@ public sealed partial class ManagerForm
             }
 
             if ((account.Note ?? "").Trim().Equals("ban", StringComparison.OrdinalIgnoreCase)
+                || IsRenameCooldownTerminalNoteValue(account.Note)
                 || !string.Equals((account.AssignedProfile ?? "").Trim(), profileName, StringComparison.OrdinalIgnoreCase))
             {
                 RemoveReusableProfileQueueEntry(profileName, "name_sync_account_invalid_or_remapped");
@@ -1786,17 +1810,30 @@ public sealed partial class ManagerForm
 
                     if (!probe.Matched)
                     {
-                        _log.Info(
-                            $"[NAME_SYNC_RECOVERY_NOT_YET] profile={profileName} currentName={probe.CurrentName} action=RUN_NAME_GUARD_BEFORE_CLEANUP");
+                        // Nếu entry đã có bằng chứng Save/Confirm thì tuyệt đối KHÔNG mở
+                        // Edit profile lần nữa. TikTok sẽ hiện giới hạn 7 ngày ngay cả khi
+                        // lần Save trước thực sự thành công nhưng profile page chưa sync; mở
+                        // Edit lại ở đây sẽ làm hai trạng thái bị nhầm với nhau.
+                        if (candidate.RenameSubmitted)
+                        {
+                            _log.Info(
+                                $"[NAME_SYNC_RECOVERY_NOT_YET] profile={profileName} currentName={probe.CurrentName} " +
+                                $"renameSubmitted=true submittedUtc={candidate.RenameSubmittedUtc:O} action=PROBE_ONLY_NO_EDIT");
 
-                        // PRF NAME_SYNC_PENDING có thể đang rơi đúng vào khoảng TikTok chưa
-                        // phản ánh nickname mới, hoặc AutoOnReady Name Guard vừa bắt đầu xử lý.
-                        // Không được đóng ngay khi probe đầu tiên còn thấy tên cũ: chờ/đi qua
-                        // Name Guard hiện có để nó có cơ hội xác nhận lại và đổi tên nếu cần.
-                        //
-                        // EnsureNameGuardBeforeStartAsync dùng chung _autoIdentityInFlight +
-                        // _autoIdentityQueueGate, nên nếu AutoOnReady đang đổi tên thì recovery
-                        // sẽ chờ lượt đó hoàn tất thay vì cleanup Chrome giữa chừng.
+                            await CleanupCreatedReplacementAttemptAsync(
+                                profileName,
+                                "name_sync_recovery_submitted_probe_not_matched");
+                            TouchReusableProfileNameSyncPending(
+                                profileName,
+                                "submitted_probe_not_matched_no_edit");
+                            continue;
+                        }
+
+                        _log.Info(
+                            $"[NAME_SYNC_RECOVERY_NOT_YET] profile={profileName} currentName={probe.CurrentName} action=RUN_NAME_GUARD_BEFORE_CLEANUP legacySubmitted=false");
+
+                        // Chỉ entry legacy không có bằng chứng Save mới còn được phép chạy
+                        // Name Guard để tự sửa. Entry mới từ bản vá này luôn RenameSubmitted=true.
                         _log.Info(
                             $"[NAME_SYNC_RECOVERY_NAME_GUARD_BEGIN] profile={profileName} account={account.Username} currentName={probe.CurrentName}");
 
@@ -3145,6 +3182,21 @@ public sealed partial class ManagerForm
                     loaded.FailedProfiles,
                     StringComparer.OrdinalIgnoreCase);
 
+            // V3 trở về trước chưa có cờ RenameSubmitted. Mọi entry NameSyncPending
+            // của format cũ vốn đã được tạo với ý nghĩa "đã Save tên nhưng chưa sync",
+            // nên migrate thành bằng chứng submitted để recovery sau update chỉ PROBE.
+            if (loaded.Version < 4)
+            {
+                foreach (var entry in loaded.Pending.Where(x => x.NameSyncPending))
+                {
+                    entry.RenameSubmitted = true;
+                    entry.RenameSubmittedUtc ??=
+                        entry.NameSyncQueuedUtc ?? entry.AddedUtc;
+                }
+            }
+
+            loaded.Version = Math.Max(4, loaded.Version);
+
             return loaded;
         }
         catch (Exception ex)
@@ -3186,7 +3238,7 @@ public sealed partial class ManagerForm
         NewReusableProfileQueueDocument()
         => new()
         {
-            Version = 3,
+            Version = 4,
             Pending = new List<ReusableProfileQueueEntry>(),
             ExcludedProfiles = new List<string>(),
             FailedProfiles =
@@ -3205,6 +3257,8 @@ public sealed partial class ManagerForm
             TotalRunSeconds = source.TotalRunSeconds,
             IsManual = source.IsManual,
             NameSyncPending = source.NameSyncPending,
+            RenameSubmitted = source.RenameSubmitted || source.NameSyncPending,
+            RenameSubmittedUtc = source.RenameSubmittedUtc ?? (source.NameSyncPending ? source.NameSyncQueuedUtc ?? source.AddedUtc : null),
             NameSyncQueuedUtc = source.NameSyncQueuedUtc,
             NameSyncCheckCount = source.NameSyncCheckCount,
             AddedUtc = source.AddedUtc,
@@ -3216,7 +3270,7 @@ public sealed partial class ManagerForm
             ReusableProfileQueueDocument source)
         => new()
         {
-            Version = Math.Max(3, source.Version),
+            Version = Math.Max(4, source.Version),
             Pending =
                 source.Pending
                     .Select(

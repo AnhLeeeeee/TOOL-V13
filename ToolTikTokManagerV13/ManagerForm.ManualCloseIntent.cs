@@ -142,6 +142,9 @@ public sealed partial class ManagerForm
             return;
 
         // Người dùng bấm Start trực tiếp trong Worker sau một lần manual Stop.
+        // Đây cũng là tín hiệu kết thúc chế độ "Mở Chrome để kiểm tra".
+        ClearManualInspectOpen(profileName, "worker_user_start");
+
         // Khôi phục quota theo đúng occupied hiện tại và bỏ suppression cũ.
         ClearManualCloseSuppression(profileName, "worker_user_start");
         MarkAutoCloseExpectedRunning(profileName, "worker_user_start");

@@ -2516,35 +2516,13 @@ public sealed partial class ManagerForm
 
     static bool IsNameSyncPendingOutcome(AutoProfileProcessOutcome outcome)
     {
-        // Trường hợp chuẩn sau khi Manager verify: Save Tên/ảnh đã thành công nhưng
-        // tên thực tế vẫn chưa khớp sau 3 probe. Đây chính là NAME_SYNC_PENDING:
-        // giữ PRF trong hàng chờ để quét lại sau, đồng thời cooldown resolver sẽ
-        // xếp outcome này vào nhóm "Login / tên chưa đổi".
-        if (outcome.Status.Equals("PAUSED_NAME_NOT_CHANGED", StringComparison.OrdinalIgnoreCase)
-            && outcome.Step.Equals("READY_PENDING_NAME", StringComparison.OrdinalIgnoreCase)
-            && outcome.RenameSucceeded
-            && !outcome.IdentityVerified)
-        {
-            return true;
-        }
-
-        if (!outcome.Step.Equals("RENAME", StringComparison.OrdinalIgnoreCase))
-            return false;
-
-        // Giữ tương thích cho các outcome PAUSED_RENAME cũ/khác. CAPTCHA/config là
-        // lỗi cần xử lý riêng, không phải trường hợp TikTok Save xong nhưng tên cập
-        // nhật chậm. COOLDOWN cũng KHÔNG phải name-sync: TikTok đã từ chối thao tác
-        // đổi tên nên sweep chỉ-PROBE sẽ không bao giờ tự sửa được.
-        if (!outcome.Status.StartsWith("PAUSED_RENAME", StringComparison.OrdinalIgnoreCase))
-            return false;
-
-        if (outcome.Status.Equals("PAUSED_RENAME_CONFIG", StringComparison.OrdinalIgnoreCase)
-            || outcome.Status.Equals("PAUSED_RENAME_COOLDOWN", StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-
-        return true;
+        // NAME_SYNC_PENDING chỉ được tạo khi đã có bằng chứng thao tác Save/Confirm
+        // tên thành công (RenameSucceeded=true) nhưng profile page chưa phản ánh tên mới.
+        // Mọi PAUSED_RENAME_* trước Save, đặc biệt cooldown 7 ngày, tuyệt đối không
+        // được lẫn vào lane này.
+        return outcome.Step.Equals("READY_PENDING_NAME", StringComparison.OrdinalIgnoreCase)
+               && outcome.RenameSucceeded
+               && !outcome.IdentityVerified;
     }
 
     static bool IsAutoReplacementRuntimeStabilizationEligible(AutoProfileProcessOutcome outcome)

@@ -2,16 +2,28 @@
     "schemaVersion":  1,
     "versions":  [
                      {
+                         "version":  "14.4.9",
+                         "setupUrl":  "https://github.com/AnhLeeeeee/TOOL-V13/releases/download/v14.4.9/ToolTikTok_V14.4.9_Setup.exe",
+                         "sha256":  "a426d16bb6b105c614afeb750737badbf6f533f9c31e7bfb4627141cc9a0e27b",
+                         "notes":  "Cập nhật Tool TikTok V14.4.9.",
+                         "channel":  "stable",
+                         "status":  "stable",
+                         "releaseDate":  "2026-10-10",
+                         "allowInstall":  true,
+                         "buildId":  "14.4.9_20261009_203744_363C98",
+                         "managerExeSha256":  "89eb801fd955c0b55fca592e726a38ed97a5f2fde04c19229ab4b1a217d2b58b"
+                     },
+                     {
                          "version":  "14.4.8",
                          "setupUrl":  "https://github.com/AnhLeeeeee/TOOL-V13/releases/download/v14.4.8/ToolTikTok_V14.4.8_Setup.exe",
-                         "sha256":  "4a24d9260b2c82674e4459ff932a903c048778563bd18efa1302d7ea41b6fe48",
+                         "sha256":  "4e4eba209da4c8acd546e830ee5d116d38cc88d170c6963d5b6bcb6ccb85c483",
                          "notes":  "Cập nhật Tool TikTok V14.4.8.",
                          "channel":  "stable",
                          "status":  "stable",
                          "releaseDate":  "2026-10-08",
                          "allowInstall":  true,
-                         "buildId":  "14.4.8_20261008_030518_ED0DC3",
-                         "managerExeSha256":  "43aff2e0eae80bd5b6eb26f95676c35993662d5f2d5f816ee93a19b8916b1397"
+                         "buildId":  "14.4.8_20261009_184739_E6B495",
+                         "managerExeSha256":  "132ed9ed9cef34ef5662c93460917ffe8e8a3d215e182dfdba33884086f48dde"
                      },
                      {
                          "version":  "14.4.7",

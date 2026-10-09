@@ -239,6 +239,15 @@ public sealed partial class ManagerForm
         }
     }
 
+    const string RenameCooldownTerminalNote = "doi_ten_7d";
+    const string RenameCooldownDeleteReason = "DOI_TEN_7D";
+
+    static bool IsRenameCooldownTerminalNoteValue(string? note)
+        => string.Equals(
+            (note ?? "").Trim(),
+            RenameCooldownTerminalNote,
+            StringComparison.OrdinalIgnoreCase);
+
     static bool IsAutoProfileLoginCooldownOutcome(AutoProfileProcessOutcome? outcome)
     {
         if (outcome is null) return false;
@@ -1745,7 +1754,27 @@ public sealed partial class ManagerForm
                                 // không được đưa vào Chờ.
                                 var queuedForRetry = false;
                                 var retryQueueMessage = "";
-                                if (!outcome.Status.Equals(
+
+                                // Một outcome cooldown tên đã được note + hard-retire ở ngay
+                                // nhánh RENAME. item.Account là snapshot cũ nên Note có thể vẫn
+                                // rỗng; tuyệt đối không dùng snapshot đó để override retired rồi
+                                // đưa PRF trở lại Chờ. Chặn bằng hard-retire sống + status terminal.
+                                var terminalRetireDelete =
+                                    IsProfileRetireDeleteBlockedForOpen(item.ProfileName)
+                                    || outcome.Status.Equals(
+                                        "PAUSED_RENAME_COOLDOWN_TERMINAL",
+                                        StringComparison.OrdinalIgnoreCase);
+
+                                if (terminalRetireDelete)
+                                {
+                                    retryQueueMessage =
+                                        $"Profile đã note {RenameCooldownTerminalNote}/terminal và đang hard-retire/xếp xóa — không đưa vào Chờ.";
+
+                                    _log.Warn(
+                                        $"[AUTO_PROFILE_FAILED_NEW_WAITING_BLOCK_TERMINAL] profile={item.ProfileName} account={item.Account.Username} "
+                                        + $"status={outcome.Status} step={outcome.Step} action=NO_REUSE_QUEUE");
+                                }
+                                else if (!outcome.Status.Equals(
                                         "LOGIN_BANNED",
                                         StringComparison.OrdinalIgnoreCase)
                                     && !(item.Account.Note ?? "").Trim().Equals(
@@ -1988,6 +2017,9 @@ public sealed partial class ManagerForm
         bool IsLifetimeCompleted(TikTokAccountPoolItem account)
             => TikTokAccountPoolService.IsLifetimeCompletedNoteValue(account.Note);
 
+        bool IsRenameCooldownTerminal(TikTokAccountPoolItem account)
+            => IsRenameCooldownTerminalNoteValue(account.Note);
+
         if (resumeIncomplete || retryPaused)
         {
             foreach (var account in accounts.Where(x => x.IsAssigned))
@@ -2043,7 +2075,13 @@ public sealed partial class ManagerForm
                 $"[AUTO_PROFILE_EXCEL_SKIP] mode=new user={account.Username} row={account.SourceRow} reason=NOTE_TIME_COMPLETED note={account.Note}");
         }
 
-        foreach (var account in eligible.Where(x => !IsBan(x) && !IsLifetimeCompleted(x) && IsDone(x)))
+        foreach (var account in eligible.Where(x => !IsBan(x) && !IsLifetimeCompleted(x) && IsRenameCooldownTerminal(x)))
+        {
+            _log.Info(
+                $"[AUTO_PROFILE_EXCEL_SKIP] mode=new user={account.Username} row={account.SourceRow} reason=NOTE_RENAME_COOLDOWN note={account.Note}");
+        }
+
+        foreach (var account in eligible.Where(x => !IsBan(x) && !IsLifetimeCompleted(x) && !IsRenameCooldownTerminal(x) && IsDone(x)))
         {
             _log.Info(
                 $"[AUTO_PROFILE_EXCEL_SKIP] mode=new user={account.Username} row={account.SourceRow} reason=AUTOPRF_DONE");
@@ -2052,6 +2090,7 @@ public sealed partial class ManagerForm
         foreach (var account in eligible.Where(x =>
                      !IsBan(x)
                      && !IsLifetimeCompleted(x)
+                     && !IsRenameCooldownTerminal(x)
                      && states.TryGetValue(x.Id, out var state)
                      && state.IsInProgress))
         {
@@ -2067,6 +2106,7 @@ public sealed partial class ManagerForm
             .Where(x =>
                 !IsBan(x)
                 && !IsLifetimeCompleted(x)
+                && !IsRenameCooldownTerminal(x)
                 && !IsDone(x)
                 && (!states.TryGetValue(x.Id, out var state) || !state.IsInProgress))
             .ToList();
@@ -2109,6 +2149,12 @@ public sealed partial class ManagerForm
         if (TikTokAccountPoolService.IsLifetimeCompletedNoteValue(account.Note))
         {
             reason = "NOTE_TIME_COMPLETED";
+            return false;
+        }
+
+        if (IsRenameCooldownTerminalNoteValue(account.Note))
+        {
+            reason = "NOTE_RENAME_COOLDOWN";
             return false;
         }
 
@@ -2325,6 +2371,11 @@ public sealed partial class ManagerForm
                 gateDecision = "SKIP";
                 gateReason = "NOTE_TIME_COMPLETED";
             }
+            else if (IsRenameCooldownTerminalNoteValue(freshExcel.Note))
+            {
+                gateDecision = "SKIP";
+                gateReason = "NOTE_RENAME_COOLDOWN";
+            }
             else if (freshExcel.IsAutoProfileDone)
             {
                 gateDecision = "SKIP";
@@ -2365,6 +2416,7 @@ public sealed partial class ManagerForm
                 {
                     "NOTE_BAN" => "Bỏ qua: Excel đang ghi chú BAN; không gán tài khoản vào profile.",
                     "NOTE_TIME_COMPLETED" => $"Bỏ qua: account đã chạy đủ vòng đời ({freshExcel.Note}); không tạo lại profile.",
+                    "NOTE_RENAME_COOLDOWN" => $"Bỏ qua: account đã bị giới hạn đổi tên 7 ngày và đã được đánh dấu {RenameCooldownTerminalNote}; không tạo/mở lại profile.",
                     "AUTOPRF_DONE" => "Bỏ qua: cột Auto Profile/AutoPrf đã DONE; không tạo lại profile.",
                     "AUTOPRF_PROCESSING" => "Bỏ qua: cột Auto Profile/AutoPrf đang PROCESSING; account đang thuộc một luồng Auto Profile khác.",
                     "ALREADY_ASSIGNED" => $"Bỏ qua: Excel đã gán tài khoản cho profile {freshExcel.AssignedProfile}.",
@@ -3100,7 +3152,20 @@ public sealed partial class ManagerForm
             throw new AutoProfilePauseException("PAUSED_RENAME", "RENAME", string.IsNullOrWhiteSpace(reply.Error) ? "Đổi tên/ảnh không thành công." : reply.Error);
         }
         if (reply.NameCooldown)
-            throw new AutoProfilePauseException("PAUSED_RENAME_COOLDOWN", "RENAME", "TikTok đang giới hạn thời gian đổi biệt danh; giữ profile để xử lý sau.");
+        {
+            var retired = await HandleRenameCooldownTerminalAsync(
+                ctx,
+                item.Account.Username,
+                "auto_profile_before_rename_submit",
+                CancellationToken.None);
+
+            throw new AutoProfilePauseException(
+                retired ? "PAUSED_RENAME_COOLDOWN_TERMINAL" : "PAUSED_RENAME_COOLDOWN_NOTE_FAILED",
+                "RENAME",
+                retired
+                    ? $"TikTok đang giới hạn đổi tên 7 ngày trước khi Tool Save tên mới; đã note {RenameCooldownTerminalNote} và xếp xóa profile."
+                    : "TikTok đang giới hạn đổi tên 7 ngày nhưng chưa ghi/xác minh được note terminal; giữ profile để tránh xóa nhầm.");
+        }
         if (reply.Skipped && !reply.AlreadyConfigured)
             throw new AutoProfilePauseException("PAUSED_RENAME", "RENAME", string.IsNullOrWhiteSpace(reply.Message) ? "TikTok bỏ qua thao tác đổi tên." : reply.Message);
 

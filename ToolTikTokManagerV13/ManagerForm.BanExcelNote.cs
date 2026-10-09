@@ -318,6 +318,177 @@ public sealed partial class ManagerForm
         return true;
     }
 
+    async Task<bool> HandleRenameCooldownTerminalAsync(
+        ProfileContext ctx,
+        string username,
+        string source,
+        CancellationToken ct)
+    {
+        var profileName = (ctx.Profile.Name ?? "").Trim();
+        username = (username ?? "").Trim();
+        source = string.IsNullOrWhiteSpace(source) ? "unknown" : source.Trim();
+
+        if (profileName.Length == 0 || username.Length == 0)
+            return false;
+
+        try
+        {
+            // Không được để cooldown 7 ngày trông giống một lần đổi tên thành công.
+            // Cột Tên/ảnh chuyển FAIL; Ghi chú là terminal note riêng.
+            await TrySetNameGuardExcelStatusAsync(
+                username,
+                "FAIL",
+                profileName);
+
+            var verifiedNote = await RunAccountPoolIoAsync(
+                () => MarkRenameCooldownTerminalCore(
+                    profileName,
+                    username,
+                    source),
+                ct);
+
+            _autoIdentityHandledSession.Add(profileName);
+            _autoIdentityHandledSession.Add("account:" + username.ToLowerInvariant());
+            _autoIdentityNextProbeUtc.Remove(profileName);
+            _nameGuardVerifiedSessionAccount.Remove(profileName);
+
+            WriteAutoActivityLog(
+                action: "GHI EXCEL GIỚI HẠN TÊN",
+                profile: profileName,
+                account: username,
+                reason: RenameCooldownDeleteReason,
+                result: "THÀNH CÔNG",
+                detail: $"Đã xác minh Ghi chú={verifiedNote}; source={source}. Profile sẽ hard-retire và xóa, không đưa vào Chờ dùng lại.");
+
+            // Nếu BAN/TIME/thay_all thắng race thì tôn trọng reason terminal có ưu tiên
+            // tương ứng. Trường hợp bình thường dùng đúng DOI_TEN_7D.
+            if (string.Equals(verifiedNote, "ban", StringComparison.OrdinalIgnoreCase))
+            {
+                QueueAutoDeleteRetiredProfileAfterExcelNote(profileName, "BAN");
+            }
+            else if (TikTokAccountPoolService.IsLifetimeCompletedNoteValue(verifiedNote))
+            {
+                QueueAutoDeleteRetiredProfileAfterExcelNote(profileName, verifiedNote);
+            }
+            else if (string.Equals(verifiedNote, "thay_all", StringComparison.OrdinalIgnoreCase))
+            {
+                QueueAutoDeleteRetiredProfileAfterExcelNote(profileName, "THAY_ALL");
+            }
+            else
+            {
+                QueueAutoDeleteRetiredProfileAfterExcelNote(
+                    profileName,
+                    RenameCooldownDeleteReason);
+            }
+
+            _log.Warn(
+                $"[RENAME_COOLDOWN_TERMINAL] profile={profileName} account={username} note={verifiedNote} source={source} action=NOTE_RETIRE_DELETE");
+            return true;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.Error(
+                $"[RENAME_COOLDOWN_TERMINAL_ERROR] profile={profileName} account={username} source={source} error={ex}");
+
+            WriteAutoActivityLog(
+                action: "GHI EXCEL GIỚI HẠN TÊN",
+                profile: profileName,
+                account: username,
+                reason: RenameCooldownDeleteReason,
+                result: "LỖI",
+                detail: ex.Message);
+
+            return false;
+        }
+    }
+
+    string MarkRenameCooldownTerminalCore(
+        string profileName,
+        string username,
+        string source)
+    {
+        var items = _accountPoolService.Load();
+
+        var account = items.FirstOrDefault(x =>
+            x.Username.Equals(username, StringComparison.OrdinalIgnoreCase)
+            && (x.AssignedProfile ?? "").Trim().Equals(
+                profileName,
+                StringComparison.OrdinalIgnoreCase));
+
+        account ??= items.FirstOrDefault(x =>
+            x.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
+
+        account ??= items.FirstOrDefault(x =>
+            (x.AssignedProfile ?? "").Trim().Equals(
+                profileName,
+                StringComparison.OrdinalIgnoreCase));
+
+        if (account is null)
+        {
+            throw new InvalidOperationException(
+                $"Không còn tìm thấy account của profile {profileName} để ghi {RenameCooldownTerminalNote}.");
+        }
+
+        var currentNote = (account.Note ?? "").Trim();
+
+        // BAN/TIME/thay_all là terminal reason đã có sẵn và có ưu tiên hơn việc
+        // ghi đè bằng doi_ten_7d. Nếu gặp race thì giữ nguyên reason đó.
+        var keepExistingTerminal =
+            currentNote.Equals("ban", StringComparison.OrdinalIgnoreCase)
+            || TikTokAccountPoolService.IsLifetimeCompletedNoteValue(currentNote)
+            || currentNote.Equals("thay_all", StringComparison.OrdinalIgnoreCase);
+
+        if (!keepExistingTerminal
+            && !IsRenameCooldownTerminalNoteValue(currentNote))
+        {
+            _accountPoolService.Upsert(
+                account with { Note = RenameCooldownTerminalNote });
+        }
+
+        // Cooldown đổi tên là lỗi terminal của PRF này, không được để +auto=DONE.
+        if (!keepExistingTerminal)
+            _accountPoolService.SetAutoProfileResult(account.Id, "FAIL");
+
+        _accountPoolService.ReloadCurrentExcel();
+
+        var verified = _accountPoolService.Load().FirstOrDefault(x =>
+            x.Id.Equals(account.Id, StringComparison.OrdinalIgnoreCase));
+
+        verified ??= _accountPoolService.Load().FirstOrDefault(x =>
+            x.SourceRow == account.SourceRow
+            && x.Username.Equals(account.Username, StringComparison.OrdinalIgnoreCase));
+
+        if (verified is null)
+        {
+            throw new InvalidOperationException(
+                $"Đã ghi cooldown đổi tên nhưng không đọc lại được account {account.Username}.");
+        }
+
+        var verifiedNote = (verified.Note ?? "").Trim();
+        var verifiedTerminal =
+            IsRenameCooldownTerminalNoteValue(verifiedNote)
+            || verifiedNote.Equals("ban", StringComparison.OrdinalIgnoreCase)
+            || TikTokAccountPoolService.IsLifetimeCompletedNoteValue(verifiedNote)
+            || verifiedNote.Equals("thay_all", StringComparison.OrdinalIgnoreCase);
+
+        if (!verifiedTerminal)
+        {
+            throw new InvalidOperationException(
+                $"Đã ghi nhưng đọc lại chưa thấy terminal note cho cooldown đổi tên "
+                + $"(user={account.Username}, row={account.SourceRow}, actual={verifiedNote}).");
+        }
+
+        _log.Info(
+            $"[RENAME_COOLDOWN_EXCEL_NOTE_OK] profile={profileName} user={account.Username} row={account.SourceRow} "
+            + $"note={verifiedNote} source={source}");
+
+        return verifiedNote;
+    }
+
     void QueueLifetimeExcelNoteIfNeeded(
         ProfileContext ctx,
         string reason,

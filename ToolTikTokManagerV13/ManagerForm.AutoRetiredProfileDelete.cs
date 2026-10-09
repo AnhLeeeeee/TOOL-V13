@@ -76,12 +76,17 @@ public sealed partial class ManagerForm
             "THAY_ALL",
             StringComparison.OrdinalIgnoreCase);
 
+        var isRenameCooldown = requestedReason.Equals(
+            RenameCooldownDeleteReason,
+            StringComparison.OrdinalIgnoreCase);
+
         // BAN là trạng thái không còn dùng lại được: sau khi Excel đã ghi + xác minh
         // note=ban thì luôn xóa profile (miễn công tắc Tự đóng khi BAN đang bật).
         // Checkbox DeleteProfileAfterBanOrLifetime từ đây chỉ còn quyết định auto-delete
         // cho TIME_xH; không được làm profile BAN nằm lại trong kho.
         if (requestedReason != "BAN"
             && !isThayAll
+            && !isRenameCooldown
             && !_autoCloseSettings.DeleteProfileAfterBanOrLifetime)
         {
             return;
@@ -89,6 +94,7 @@ public sealed partial class ManagerForm
 
         if (requestedReason != "BAN"
             && !isThayAll
+            && !isRenameCooldown
             && !IsAutoCloseLifetimeReason(requestedReason))
         {
             return;
@@ -124,7 +130,11 @@ public sealed partial class ManagerForm
             MarkProfileSupplyState(
                 profileName,
                 "retired",
-                (isThayAll ? "daily_replace:" : "auto_close:") + requestedReason);
+                isThayAll
+                    ? "daily_replace:" + requestedReason
+                    : isRenameCooldown
+                        ? "rename_cooldown:" + requestedReason
+                        : "auto_close:" + requestedReason);
             RemoveReusableProfileQueueEntry(
                 profileName,
                 "auto_retired_delete_queued:" + requestedReason);
@@ -158,6 +168,7 @@ public sealed partial class ManagerForm
 
                 if (requestedReason != "BAN"
                     && !requestedReason.Equals("THAY_ALL", StringComparison.OrdinalIgnoreCase)
+                    && !requestedReason.Equals(RenameCooldownDeleteReason, StringComparison.OrdinalIgnoreCase)
                     && !_autoCloseSettings.DeleteProfileAfterBanOrLifetime)
                 {
                     _log.Info(
@@ -225,7 +236,8 @@ public sealed partial class ManagerForm
                 }
 
                 // Xác minh LẠI Excel ngay trước mỗi lượt xóa.
-                // Chỉ BAN hoặc TIME_xH đã xác minh mới được phép làm mất profile.
+                // Chỉ terminal note đã xác minh (BAN / TIME_xH / thay_all / doi_ten_7d)
+                // mới được phép làm mất profile.
                 TikTokAccountPoolItem? account;
                 try
                 {
@@ -280,9 +292,14 @@ public sealed partial class ManagerForm
                         "thay_all",
                         StringComparison.OrdinalIgnoreCase);
 
+                var noteIsRenameCooldown =
+                    IsRenameCooldownTerminalNoteValue(
+                        verifiedNote);
+
                 if (!noteIsBan
                     && !noteIsLifetime
-                    && !noteIsThayAll)
+                    && !noteIsThayAll
+                    && !noteIsRenameCooldown)
                 {
                     WriteAutoActivityLog(
                         action: "TỰ XÓA PROFILE",
@@ -291,7 +308,7 @@ public sealed partial class ManagerForm
                         reason: requestedReason,
                         result: "HỦY",
                         detail:
-                            $"Ghi chú Excel không còn là ban/TIME_xH/thay_all (actual={verifiedNote}); hủy tự xóa để tránh xóa nhầm.");
+                            $"Ghi chú Excel không còn là ban/TIME_xH/thay_all/{RenameCooldownTerminalNote} (actual={verifiedNote}); hủy tự xóa để tránh xóa nhầm.");
                     return;
                 }
 
@@ -322,6 +339,21 @@ public sealed partial class ManagerForm
                         result: "HỦY",
                         detail:
                             $"Yêu cầu xóa vì THAY_ALL nhưng Excel không còn note=thay_all/ban (actual={verifiedNote}); không tự xóa.");
+                    return;
+                }
+
+                if (requestedReason.Equals(RenameCooldownDeleteReason, StringComparison.OrdinalIgnoreCase)
+                    && !noteIsRenameCooldown
+                    && !noteIsBan)
+                {
+                    WriteAutoActivityLog(
+                        action: "TỰ XÓA PROFILE",
+                        profile: profileName,
+                        account: account.Username,
+                        reason: requestedReason,
+                        result: "HỦY",
+                        detail:
+                            $"Yêu cầu xóa vì cooldown đổi tên nhưng Excel không còn note={RenameCooldownTerminalNote}/ban (actual={verifiedNote}); không tự xóa.");
                     return;
                 }
 
@@ -377,7 +409,7 @@ public sealed partial class ManagerForm
                         action: "TỰ XÓA PROFILE",
                         profile: profileName,
                         account: account.Username,
-                        reason: noteIsBan ? "BAN" : noteIsThayAll ? "THAY_ALL" : verifiedNote,
+                        reason: noteIsBan ? "BAN" : noteIsThayAll ? "THAY_ALL" : noteIsRenameCooldown ? RenameCooldownDeleteReason : verifiedNote,
                         result: "BẮT ĐẦU",
                         detail:
                             retryAttempt == 0
@@ -428,7 +460,7 @@ public sealed partial class ManagerForm
                         action: "TỰ XÓA PROFILE",
                         profile: profileName,
                         account: account.Username,
-                        reason: noteIsBan ? "BAN" : noteIsThayAll ? "THAY_ALL" : verifiedNote,
+                        reason: noteIsBan ? "BAN" : noteIsThayAll ? "THAY_ALL" : noteIsRenameCooldown ? RenameCooldownDeleteReason : verifiedNote,
                         result: "THÀNH CÔNG",
                         detail:
                             retryAttempt == 0

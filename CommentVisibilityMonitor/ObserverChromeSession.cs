@@ -91,6 +91,45 @@ internal sealed class ObserverChromeSession : IAsyncDisposable
         }
     }
 
+    // CHECK ĐỔI ID uses a completely separate ObserverChromeSession instance (port/profile).
+    // Reuse Chrome launch, cookie clearing, credentials/2FA and global login gate,
+    // but NEVER reuse the CMT observer instance or Worker browser.
+    public async Task<string> ReadOwnUsernameForIdAsync(CancellationToken ct)
+    {
+        await _gate.WaitAsync(ct);
+        try
+        {
+            if (!_chrome.Connected) return "";
+            return await new IdChangeChromeWorkflow(_chrome, msg => _chromeLog.Info(msg))
+                .ReadOwnUsernameAsync(ct);
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task<IdChangeAttemptResult> PrepareIdChangeAsync(string oldUsername, string newUsername, CancellationToken ct)
+    {
+        await _gate.WaitAsync(ct);
+        try
+        {
+            if (!_chrome.Connected) return new IdChangeAttemptResult("NOT_CONNECTED", "Chrome Đổi ID chưa kết nối.");
+            return await new IdChangeChromeWorkflow(_chrome, msg => _chromeLog.Info(msg))
+                .BeginAsync(oldUsername, newUsername, ct);
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task<IdChangeAttemptResult> CommitIdChangeAsync(string newUsername, CancellationToken ct)
+    {
+        await _gate.WaitAsync(ct);
+        try
+        {
+            if (!_chrome.Connected) return new IdChangeAttemptResult("NOT_CONNECTED", "Chrome Đổi ID đã mất kết nối.");
+            return await new IdChangeChromeWorkflow(_chrome, msg => _chromeLog.Info(msg))
+                .SaveAndVerifyAsync(newUsername, ct);
+        }
+        finally { _gate.Release(); }
+    }
+
     public static string NormalizeLiveUrl(string? raw)
     {
         if (string.IsNullOrWhiteSpace(raw)) return "";
